@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Generated runs and large artifacts
+artifacts/*
+!artifacts/.gitkeep
+runs/
+outputs/
+replays/
+checkpoints/
+logs/
+
+# Data archives and model files
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.parquet
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Local Kaggle state
+kaggle.json
+.kaggle/
