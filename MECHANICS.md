@@ -1,6 +1,6 @@
 # Kaggriculture Mechanics Ledger
 
-Last updated: 2026-08-06
+Last updated: 2026-08-07
 
 ## Purpose
 
@@ -16,21 +16,23 @@ Confidence labels:
 
 ## Engine Identity
 
-- Live Kaggle server version: `UNKNOWN`
-- Local package version: not installed
+- Latest confirmed upstream package version: `1.32.6`
+- Upstream 1.32.6 source snapshot found at commit: `bded87b0d7879078c726a93a4884d044f79c4eed`
+- Town-rebalance PR: `Kaggle/kaggle-environments#1394`
+- Town-rebalance PR merge commit: `1fa13d78387eb3661b1e621a4f5df150e6c3b646`
+- Local package version: not installed/locked in this repository yet
 - Vendored source commit: not established
 - Engine file SHA-256: not established
 - Specification file SHA-256: not established
-- Last source research snapshot: 2026-08-04
-- Status: **do not treat this ledger as an engine lock yet**
-
-The first implementation task must record exact source and hashes before relying on constants below.
+- Live Kaggle leaderboard server version: 1.32.6 rollout announced, not independently server-verified
+- Last source research snapshot: 2026-08-07
+- Status: **source version is known, but do not treat this repository as a complete engine lock until source/spec hashes and local behavioral tests are recorded**
 
 ## Match Contract
 
 | Mechanic | Current understanding | Confidence |
 |---|---|---|
-| Players | 2 | `CONFIRMED_SOURCE` in pre-repo research snapshot |
+| Players | 2 | `CONFIRMED_SOURCE` |
 | Farm size | Separate 10×10 farm per player | `CONFIRMED_SOURCE` |
 | Farm quadrants | Four 5×5 quadrants | `CONFIRMED_SOURCE` |
 | Match length | 30 days × 24 turns = 720 turns | `CONFIRMED_SOURCE` |
@@ -54,10 +56,10 @@ The first implementation task must record exact source and hashes before relying
 - unlocked quadrants;
 - hire count;
 - shared market inventory and prices;
-- town shops;
+- town shops, including duplicate shop names under 1.32.6;
 - current day and hour.
 
-Confidence: `CONFIRMED_SOURCE` in pre-repo research snapshot.
+Confidence: `CONFIRMED_SOURCE`.
 
 ### Private to each player
 
@@ -100,17 +102,15 @@ Confidence: `CONFIRMED_SOURCE`.
 
 ## Crop Snapshot
 
-These values were read from the official environment source during pre-repository research and require hash-based revalidation.
-
 | Crop | Seed cost | First/mature yield timing | Recurrence | Maximum yield |
 |---|---:|---|---|---:|
 | Wheat | 10 | first day 2; max day 4 | none | 6 |
-| Carrot | 20 | first day 2; max day 3 | none | 4 |
+| Carrot | 20 | day 2; max day 3 | none | 4 |
 | Tomato | 50 | first day 8 | every 1 day | 4 |
 | Strawberry | 100 | first day 10 | every 2 days | 4 |
 | Melon | 80 | first day 10; max day 12 | none | 6 |
 
-Confidence: `CONFIRMED_SOURCE` in the 2026-08-04 snapshot.
+Confidence: `CONFIRMED_SOURCE` in current/recent official source; still rehash exact file before implementation.
 
 Additional crop behavior:
 
@@ -138,7 +138,7 @@ Additional behavior:
 - care plus feed creates a pending production bonus;
 - animals generate collectible fertilizer daily.
 
-Confidence: `CONFIRMED_SOURCE` in the 2026-08-04 snapshot. Exact care-bonus amount must be reverified because prose and source may have differed.
+Confidence: `CONFIRMED_SOURCE`. Exact care-bonus amount must still be reverified because older prose and source may have differed.
 
 ## Labor and Logistics
 
@@ -151,7 +151,7 @@ Confidence: `CONFIRMED_SOURCE` in the 2026-08-04 snapshot. Exact care-bonus amou
 - seeds are stored separately from shed product capacity;
 - movement onto locked tiles is allowed, while tile actions there generally no-op.
 
-Confidence: `CONFIRMED_SOURCE` in pre-repo research.
+Confidence: `CONFIRMED_SOURCE`.
 
 ## Shared Market
 
@@ -180,18 +180,50 @@ Behavioral notes:
 - both players see the same pre-commit unit price during simultaneous execution;
 - order sequence and quantity affect results;
 - sales at the price floor may not add market supply;
-- town shops periodically unlock and consume products;
-- town-center demand periodically consumes products and increases later in the match.
+- lower town demand in 1.32.6 means player sell pressure should persist more strongly in inventory/prices.
 
-Confidence: `CONFIRMED_SOURCE` in the 2026-08-04 snapshot. Exact formulas and town schedules must be copied from the locked source rather than paraphrased.
+Confidence: `CONFIRMED_SOURCE`; exact formulas should be copied from the locked source rather than paraphrased when implementation starts.
+
+## Town Demand — 1.32.6 Current Contract
+
+### Town center
+
+`CONFIRMED_SOURCE` from merged PR #1394:
+
+- `townCenterSellInterval` default changed from 12 to 24 turns;
+- with 24 turns/day, town center consumes once per day;
+- each tick removes one of every non-fertilizer product;
+- demand is flat for the whole season;
+- the old `TOWN_CENTER_DEMAND_SCHEDULE` with 2× after day 10 and 4× after day 20 was removed.
+
+The previous ledger statement that town-center demand increases later in the match is now `OUTDATED`.
+
+### Town shops
+
+`CONFIRMED_SOURCE` from merged PR #1394:
+
+- shop unlock interval remains unchanged (default every 3 days);
+- each unlock samples uniformly from the full shop table **with replacement**;
+- duplicate shop names can therefore appear in `town.unlocked_shops`;
+- every duplicate instance consumes independently;
+- unlocking stops at 8 total shop instances (`MAX_SHOP_INSTANCES = 8`);
+- shop consumption cadence remains unchanged (default every 4 turns);
+- single-product shops continue to consume at their existing 2× per-tick rule.
+
+Consequences for modeling:
+
+- town state must be encoded as a multiset/count vector, not a binary set;
+- future shop composition is stochastic even after early unlocks are observed;
+- duplicated demand can make some products much more attractive in particular episodes;
+- weaker town-center cleanup increases the strategic effect of player-generated gluts.
 
 ## Known Recent Engine Drift
 
 ### 2026-08-04 shed-capacity enforcement
 
-Pre-repo research found an upstream engine change enforcing shed capacity for market `BUY_PRODUCT` and `BUY_ANIMAL` behavior.
+Upstream engine change enforced shed capacity for market `BUY_PRODUCT` and `BUY_ANIMAL` behavior.
 
-Status: `CONFIRMED_SOURCE` for that upstream commit, but the exact live Kaggle server rollout time is not established.
+Status: `CONFIRMED_SOURCE`; exact server rollout timing should still be tied to a package/server snapshot when tests begin.
 
 Required regression test:
 
@@ -199,16 +231,40 @@ Required regression test:
 - attempt product and animal purchases;
 - confirm money, inventory, market supply, and partial-fill behavior.
 
+### 2026-08-07 / package 1.32.6 town rebalance
+
+Merged upstream PR #1394:
+
+- town center 2 ticks/day → 1 tick/day;
+- town center late-game multipliers removed;
+- shops sampled with replacement;
+- duplicate shop instances consume independently;
+- maximum total shop instances remains 8.
+
+Package source snapshot `bded87b0d7879078c726a93a4884d044f79c4eed` identifies itself as `1.32.6`.
+
+Required regression tests:
+
+- verify exactly one town-center tick/day at defaults;
+- verify flat demand on days 0–29;
+- force/observe duplicate shops across seeds;
+- verify duplicated instances multiply demand independently;
+- verify no more than 8 shop instances unlock;
+- verify deterministic replay for identical seed and action streams.
+
 ## Randomness and Determinism
 
 Current interpretation:
 
 - most crop, animal, movement, labor, and market mechanics are deterministic given engine version and both action streams;
-- some daily events, including weeds and town-shop behavior, appear episode-seed-driven;
-- the opponent policy is the dominant strategic uncertainty;
+- weeds are seed-driven stochastic events;
+- town-shop draws are seed-driven and, from 1.32.6 onward, sampled with replacement;
+- the current shop multiset is public, but future shop draws remain unknown;
+- duplicated shop draws increase episode-to-episode economic variance;
+- the opponent policy remains the main strategic uncertainty beyond engine RNG;
 - seeded events should be repeatable under a fixed engine and action sequence.
 
-Confidence: mixed `CONFIRMED_SOURCE` and `UNKNOWN`; the exact random draw schedule must be mapped experimentally.
+Confidence: mostly `CONFIRMED_SOURCE`; exact RNG draw ordering should still be mapped experimentally because changes in draw order can affect seed-level reproducibility across versions.
 
 ## Required First Regression Tests
 
@@ -226,13 +282,16 @@ Confidence: mixed `CONFIRMED_SOURCE` and `UNKNOWN`; the exact random draw schedu
 12. Terminal unsold inventory receiving no reward.
 13. Repeatability under identical seed and action streams.
 14. Seat-swapped equivalence for symmetric agents.
+15. Town center consumes exactly once/day at flat 1× under 1.32.6 defaults.
+16. Duplicate shop sampling with replacement and independent duplicate demand.
+17. Eight-instance town-shop cap.
 
 ## Unresolved Questions
 
-- Exact live server engine/package version.
-- Exact episode-seed construction and random draw schedule.
+- Exact live leaderboard server version at any given time during rollout.
+- Exact episode-seed construction and RNG draw schedule.
 - Whether any server configuration differs from repository defaults.
 - Exact care bonus in the live engine.
-- Exact town shop unlock and consumption schedule.
 - Full consequences of price-floor sales.
-- Whether additional engine changes landed after the 2026-08-04 research snapshot.
+- Whether additional engine changes land after 1.32.6.
+- Magnitude of win/bank variance introduced by shop replacement sampling.
