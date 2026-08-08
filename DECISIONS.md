@@ -6,25 +6,25 @@ This file records decisions that remain authoritative across chats and work sess
 
 - Date: 2026-08-06
 - Status: active
-- Decision: Keep the project focused on research, mechanics tracking, public-baseline analysis, and evaluation design while the engine and rules remain unsettled.
+- Decision: Keep the project focused on research, mechanics tracking, public-baseline analysis, evaluation design, and RL interface/reward planning while the engine and rules remain unsettled.
 - Rationale: Large implementation work built against a moving engine risks immediate invalidation and wasted compute.
 - Revisit when: the engine has remained stable long enough to freeze a version and the first regression suite is defined.
 
-## D-002 — Do Not Start With Primitive-Action RL
+## D-002 — Do Not Start With Raw Primitive-Action RL
 
-- Date: 2026-08-06
+- Date: 2026-08-06; clarified 2026-08-07
 - Status: active
-- Decision: Do not begin with end-to-end primitive-action reinforcement learning.
-- Rationale: Most farm logistics are deterministic, current strong public agents are deterministic schedules, and the meaningful uncertainty and interaction occur at a higher level.
-- Preferred alternative: deterministic route execution, closed-loop repair, opponent-aware macro planning, and optimization over coherent experts.
-- Revisit when: structured approaches reach a measured ceiling against a strong frozen opponent pool.
+- Decision: Do not begin by asking PPO to learn unrestricted raw movement and all primitive mechanics from scratch.
+- Rationale: The primitive action space is combinatorial, crop/animal rewards are delayed, and small logistical mistakes cascade. Learning shortest paths and basic legality is unnecessary credit-assignment burden.
+- Preferred alternative: hierarchical intent/task RL in which the learned policy owns meaningful production, allocation, adaptation, and market decisions while deterministic infrastructure compiles intent into legal primitive execution.
+- Revisit when: action-abstraction experiments show that primitive control provides important strategic capability that the intent interface cannot express.
 
 ## D-003 — Treat the Shared Market as the Main Interaction Channel
 
 - Date: 2026-08-06
 - Status: active
 - Decision: Center adversarial analysis on market inventory, prices, order timing, town demand, and opponent production forecasts.
-- Rationale: Farms are physically separate and currently have little or no direct tactical interaction.
+- Rationale: Farms are physically separate and currently have little or no direct tactical interaction. The 1.32.6 reduction in town demand should make player-driven market pressure more important.
 - Revisit when: the engine or rules add meaningful direct interaction.
 
 ## D-004 — Use Seat-Swapped Fixed-Seed Evaluation
@@ -84,3 +84,38 @@ This file records decisions that remain authoritative across chats and work sess
 - Decision: Do not spend Codex on implementation at the current stage.
 - Rationale: The user does not currently have spare Codex budget and implementation is intentionally deferred.
 - Revisit when: the user explicitly authorizes a bounded Codex packet.
+
+## D-011 — RL Owns Strategy; Deterministic Code Owns Mechanics
+
+- Date: 2026-08-07
+- Status: active
+- Decision: The intended competitive architecture is RL-centered. Deterministic infrastructure may enforce mechanical feasibility, pathfinding, task persistence, and bookkeeping, but it should not quietly encode the winning farm strategy.
+- Rationale: The project goal is to learn adaptive behavior, especially under opponent-dependent markets and random shop demand, while avoiding wasted model capacity on deterministic navigation details.
+- Practical test: candidate generation may remove impossible actions; it must not remove merely unprofitable or strategically unusual legal actions just because a heuristic dislikes them.
+- Revisit when: measured results show that a different division of control produces stronger generalization without reducing learning to a cosmetic role.
+
+## D-012 — Use Public Deterministic Agents as RL Demonstrations
+
+- Date: 2026-08-07
+- Status: active
+- Decision: Strong public action-list agents should be treated as behavior-cloning/bootstrap data in addition to evaluation opponents.
+- Rationale: They contain valuable precision-sensitive logistics behavior and can initialize a viable policy before RL fine-tuning.
+- Guardrail: BC is initialization only; training must include varied seeds, shops, opponents, and perturbations so the model can depart from time-indexed public scripts.
+- Revisit when: experiments show imitation causes more harmful anchoring than training benefit.
+
+## D-013 — Dense Reward Must Preserve the Competitive Objective
+
+- Date: 2026-08-07
+- Status: active design constraint
+- Decision: Do not add arbitrary maintenance/event rewards merely to make PPO learn faster. Prefer potential-based shaping and auxiliary prediction losses whose relationship to the final objective is explicit.
+- Rationale: Bonuses for watering, harvesting, feeding, or production can be reward-hacked and may optimize farm activity instead of winning.
+- Current terminal target: investigate W/L/T `+1/0/-1`, with bank margin retained as a metric and possible controlled curriculum signal.
+- Revisit when: a different reward is demonstrated to improve competitive win rate without introducing proxy-objective pathologies.
+
+## D-014 — Encode Town Shops as a Multiset
+
+- Date: 2026-08-07
+- Status: active
+- Decision: Any observation schema, analysis, or policy input must preserve duplicate town shop instances, normally as per-shop counts or explicit shop entities rather than binary unlocked flags.
+- Rationale: Engine 1.32.6 samples shops with replacement and each duplicate instance consumes independently.
+- Revisit when: only if the upstream engine removes replacement sampling.
