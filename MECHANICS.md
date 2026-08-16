@@ -1,6 +1,6 @@
 # Kaggriculture Mechanics Ledger
 
-Last updated: 2026-08-07
+Last updated: 2026-08-16
 
 ## Purpose
 
@@ -8,25 +8,29 @@ This file separates verified engine behavior from documentation, discussion clai
 
 Confidence labels:
 
-- `CONFIRMED_SOURCE`: observed in a specific recorded engine source snapshot.
+- `CONFIRMED_SOURCE`: observed in a specific official source snapshot or merged upstream diff.
 - `CONFIRMED_EXPERIMENT`: reproduced with a controlled behavioral test.
 - `DISCUSSION_CLAIM`: reported publicly but not independently verified.
+- `HOST_REPORTED_STAT`: quantitative statistic reported by the host but not an engine constant.
 - `OUTDATED`: known to describe an older engine or contract.
 - `UNKNOWN`: unresolved or insufficiently specified.
 
 ## Engine Identity
 
-- Latest confirmed upstream package version: `1.32.6`
-- Upstream 1.32.6 source snapshot found at commit: `bded87b0d7879078c726a93a4884d044f79c4eed`
-- Town-rebalance PR: `Kaggle/kaggle-environments#1394`
-- Town-rebalance PR merge commit: `1fa13d78387eb3661b1e621a4f5df150e6c3b646`
+- Latest confirmed upstream package version: `1.32.7`
+- Upstream `pyproject.toml` currently declares `version = "1.32.7"`
+- 1.32.6 town-rebalance PR: `Kaggle/kaggle-environments#1394`
+- 1.32.6 town-rebalance merge commit: `1fa13d78387eb3661b1e621a4f5df150e6c3b646`
+- 1.32.7 situational-resources PR: `Kaggle/kaggle-environments#1399`
+- 1.32.7 situational-resources merge commit: `28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c`
+- PR #1399 head commit: `1fbd3b7571653434329d288dee9e068f54ff01c0`
 - Local package version: not installed/locked in this repository yet
 - Vendored source commit: not established
 - Engine file SHA-256: not established
 - Specification file SHA-256: not established
-- Live Kaggle leaderboard server version: 1.32.6 rollout announced, not independently server-verified
-- Last source research snapshot: 2026-08-07
-- Status: **source version is known, but do not treat this repository as a complete engine lock until source/spec hashes and local behavioral tests are recorded**
+- Live Kaggle leaderboard server version: 1.32.7 rollout announced, not independently server-verified
+- Host statement: 1.32.7 should be the last balance change except game-breaking bugs
+- Status: **current source contract is known, but do not treat this repository as a complete engine lock until local source/spec hashes and behavioral tests are recorded**
 
 ## Match Contract
 
@@ -56,10 +60,8 @@ Confidence labels:
 - unlocked quadrants;
 - hire count;
 - shared market inventory and prices;
-- town shops, including duplicate shop names under 1.32.6;
+- town shops, including duplicate shop names;
 - current day and hour.
-
-Confidence: `CONFIRMED_SOURCE`.
 
 ### Private to each player
 
@@ -73,7 +75,7 @@ Confidence: `CONFIRMED_SOURCE`.
 
 ## Worker Actions
 
-Observed action names in the researched source snapshot:
+Observed action names:
 
 - movement: `NORTH`, `SOUTH`, `EAST`, `WEST`;
 - idle: `PASS`;
@@ -85,7 +87,7 @@ Observed action names in the researched source snapshot:
 
 Invalid or illegal actions generally become silent no-ops rather than terminating the episode.
 
-Confidence: `CONFIRMED_SOURCE`; exact argument schemas remain to be locked.
+Confidence: `CONFIRMED_SOURCE`; exact argument schemas remain to be locked locally.
 
 ## Market Actions
 
@@ -110,8 +112,6 @@ Confidence: `CONFIRMED_SOURCE`.
 | Strawberry | 100 | first day 10 | every 2 days | 4 |
 | Melon | 80 | first day 10; max day 12 | none | 6 |
 
-Confidence: `CONFIRMED_SOURCE` in current/recent official source; still rehash exact file before implementation.
-
 Additional crop behavior:
 
 - planting day counts as unwatered;
@@ -119,9 +119,9 @@ Additional crop behavior:
 - one-shot crop yield depends on watering during its later growth window;
 - fertilizer doubles the relevant yield increment and remains active for the current day plus the next two days;
 - mature non-recurring crops decay after their lifespan;
-- simultaneous planting requests can be atomic by crop: if requested quantity exceeds owned seeds, the entire same-turn planting group may fail.
+- simultaneous planting requests can be atomic by crop: if requested quantity exceeds owned seeds, the same-turn planting group may fail.
 
-Confidence: `CONFIRMED_SOURCE`; atomic planting should be one of the first behavioral regression tests.
+Confidence: `CONFIRMED_SOURCE`.
 
 ## Animal Snapshot
 
@@ -138,24 +138,24 @@ Additional behavior:
 - care plus feed creates a pending production bonus;
 - animals generate collectible fertilizer daily.
 
-Confidence: `CONFIRMED_SOURCE`. Exact care-bonus amount must still be reverified because older prose and source may have differed.
+Confidence: `CONFIRMED_SOURCE`; exact care bonus still merits a local regression test.
 
 ## Labor and Logistics
 
-- hired-hand daily prices follow the Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13, ...;
-- hired hands disappear at the end of the day;
+- hired-hand daily prices follow Fibonacci: 1, 1, 2, 3, 5, 8, 13, ...;
+- hired hands disappear at end of day;
 - workers reset near the central shed at day end;
-- carried inventory automatically drops to the shed at day end;
+- carried inventory auto-drops to shed at day end;
 - default shed capacity is 100;
 - overflow is discarded;
-- seeds are stored separately from shed product capacity;
+- seeds are separate from shed product capacity;
 - movement onto locked tiles is allowed, while tile actions there generally no-op.
 
 Confidence: `CONFIRMED_SOURCE`.
 
 ## Shared Market
 
-Products observed in the market:
+Products:
 
 - wheat;
 - carrot;
@@ -167,90 +167,183 @@ Products observed in the market:
 - wool;
 - fertilizer.
 
-Researched constants:
+Global constants:
 
-- initial target inventory: 10,000;
-- price floor: 1;
-- base prices: wheat 25, carrot 35, tomato 60, strawberry 120, melon 250, egg 50, milk 160, wool 200, fertilizer 100.
+- initial target inventory `I0 = 10,000`;
+- price floor = 1.
 
-Behavioral notes:
+Base prices:
 
-- price follows a product-specific non-linear scarcity/glut curve;
+| Product | Base |
+|---|---:|
+| Wheat | 25 |
+| Carrot | 35 |
+| Tomato | 60 |
+| Strawberry | 120 |
+| Melon | 250 |
+| Egg | 50 |
+| Milk | 160 |
+| Wool | 200 |
+| Fertilizer | 100 |
+
+Behavior:
+
+- price is a product-specific function of market inventory relative to `I0`;
 - orders execute one unit at a time in lockstep;
-- both players see the same pre-commit unit price during simultaneous execution;
-- order sequence and quantity affect results;
+- both players see the same pre-commit price per unit during simultaneous execution;
+- order sequence and quantity matter;
 - sales at the price floor may not add market supply;
-- lower town demand in 1.32.6 means player sell pressure should persist more strongly in inventory/prices.
+- lower town-center demand from 1.32.6 makes player sell pressure persist more strongly.
 
-Confidence: `CONFIRMED_SOURCE`; exact formulas should be copied from the locked source rather than paraphrased when implementation starts.
+Confidence: `CONFIRMED_SOURCE`.
 
-## Town Demand — 1.32.6 Current Contract
+## Market Price Functions — 1.32.7
+
+General source formula:
+
+- if `inventory < I0`, scarcity raises price;
+- if `inventory > I0`, glut lowers price;
+- price is rounded to nearest dollar and floored at $1;
+- each resource has a calibration quantity `T`, shape function, and target amplitude.
+
+Supported shapes now include:
+
+- `linear`
+- `sq`
+- `sqrt`
+- `log`
+- `log10`
+- `hinge`
+
+### Hinge shape
+
+Added by merged PR #1399.
+
+For scarcity distance `x = I0 - inventory` and calibration quantity `T`:
+
+`u = x / T`
+
+`hinge(x, T) = u + 8 * max(0, u - 1)^2`
+
+Properties:
+
+- `hinge(T, T) = 1`;
+- below the knee (`x <= T`) the function is linear in normalized scarcity;
+- above the knee (`x > T`) a quadratic term causes a steep price increase;
+- therefore a product can remain ordinary until demand creates real scarcity, then become exceptionally valuable.
+
+### Current market curve table
+
+| Resource | Base | T | Below func | Below target | Above func | Above target | P(I0-T) | P(I0+T) | P(I0+2T) |
+|---|---:|---:|---|---:|---|---:|---:|---:|---:|
+| Wheat | 25 | 400 | sqrt | 0.80 | log | 0.20 | 45 | 20 | 19 |
+| Carrot | 35 | 450 | **hinge** | **1.00** | sqrt | 0.70 | 70 | 10 | 1 |
+| Tomato | 60 | 200 | **hinge** | 0.40 | sqrt | 0.60 | 84 | 24 | 9 |
+| Strawberry | 120 | 100 | sqrt | 0.70 | linear | 1.60 | 204 | 1 | 1 |
+| Melon | 250 | 300 | log | 0.20 | sq | 3.60 | 300 | 1 | 1 |
+| Egg | 50 | 332 | **hinge** | 0.40 | log | 0.20 | 70 | 40 | 39 |
+| Milk | 160 | 122 | sqrt | 0.60 | linear | 1.60 | 256 | 1 | 1 |
+| Wool | 200 | 105 | log | 0.20 | sq | 3.20 | 240 | 1 | 1 |
+| Fertilizer | 100 | 200 | linear | 0.40 | linear | 0.40 | 140 | 60 | 20 |
+
+### Source test points for hinge resources
+
+These are explicit expected values added with PR #1399:
+
+| Product | Market inventory | Price |
+|---|---:|---:|
+| Carrot | 10,000 | 35 |
+| Carrot | 9,775 | 53 |
+| Carrot | 9,550 | 70 |
+| Carrot | 9,400 | 113 |
+| Carrot | 9,100 | 385 |
+| Tomato | 10,000 | 60 |
+| Tomato | 9,900 | 72 |
+| Tomato | 9,800 | 84 |
+| Tomato | 9,700 | 144 |
+| Tomato | 9,500 | 552 |
+| Egg | 10,000 | 50 |
+| Egg | 9,834 | 60 |
+| Egg | 9,668 | 70 |
+| Egg | 9,502 | 120 |
+| Egg | 9,170 | 460 |
+
+Important detail: tomato and egg keep the prior linear curve's `below_target = 0.40`, so behavior through the knee is unchanged from the old linear curve; the new behavior appears only beyond the knee. Carrot also changes `below_target` from 0.20 to 1.00, making scarcity more valuable even at the knee.
+
+Confidence: `CONFIRMED_SOURCE` from merged PR #1399.
+
+## Shop Demand Relevant to 1.32.7
+
+Source notes from PR #1399:
+
+- **Carrot** is consumed by pet cafes and farmers markets. Pet cafe is single-product, so its per-tick consumption is doubled.
+- **Tomato** is consumed by pizza shops and farmers markets.
+- **Egg** is consumed by bakeries and brunch spots.
+
+Because shops are sampled with replacement since 1.32.6, repeated copies can drive one of these products past its scarcity knee if neither player supplies it.
+
+Host-reported probability of significant price increase assuming **no production**:
+
+- tomato: ~50% of games;
+- carrot: ~26% of games;
+- egg: ~22% of games.
+
+Confidence for percentages: `HOST_REPORTED_STAT`; reproduce empirically once the local 1.32.7 engine is locked.
+
+## Town Demand — Current Contract
 
 ### Town center
 
-`CONFIRMED_SOURCE` from merged PR #1394:
+From merged PR #1394 / 1.32.6:
 
-- `townCenterSellInterval` default changed from 12 to 24 turns;
-- with 24 turns/day, town center consumes once per day;
-- each tick removes one of every non-fertilizer product;
-- demand is flat for the whole season;
-- the old `TOWN_CENTER_DEMAND_SCHEDULE` with 2× after day 10 and 4× after day 20 was removed.
-
-The previous ledger statement that town-center demand increases later in the match is now `OUTDATED`.
+- default interval = 24 turns;
+- with 24 turns/day, consumes once/day;
+- removes one of each non-fertilizer product;
+- flat for the whole season;
+- old 2× after day 10 / 4× after day 20 schedule removed.
 
 ### Town shops
 
-`CONFIRMED_SOURCE` from merged PR #1394:
-
-- shop unlock interval remains unchanged (default every 3 days);
-- each unlock samples uniformly from the full shop table **with replacement**;
-- duplicate shop names can therefore appear in `town.unlocked_shops`;
+- unlock default every 3 days;
+- draw uniformly from full shop table **with replacement**;
+- duplicate shop names allowed;
 - every duplicate instance consumes independently;
-- unlocking stops at 8 total shop instances (`MAX_SHOP_INSTANCES = 8`);
-- shop consumption cadence remains unchanged (default every 4 turns);
-- single-product shops continue to consume at their existing 2× per-tick rule.
+- unlocking stops at 8 total instances;
+- shop consumption default every 4 turns;
+- single-product shops consume at 2× per tick.
 
-Consequences for modeling:
+Consequences:
 
-- town state must be encoded as a multiset/count vector, not a binary set;
-- future shop composition is stochastic even after early unlocks are observed;
-- duplicated demand can make some products much more attractive in particular episodes;
-- weaker town-center cleanup increases the strategic effect of player-generated gluts.
+- town observation must preserve shop multiplicity;
+- future demand composition remains stochastic;
+- 1.32.7 turns some rare shop compositions into sharp scarcity opportunities rather than merely mild demand differences.
+
+Confidence: `CONFIRMED_SOURCE`.
 
 ## Known Recent Engine Drift
 
-### 2026-08-04 shed-capacity enforcement
+### 2026-08-04 — shed-capacity enforcement
 
-Upstream engine change enforced shed capacity for market `BUY_PRODUCT` and `BUY_ANIMAL` behavior.
+`BUY_PRODUCT` and `BUY_ANIMAL` respect shed capacity.
 
-Status: `CONFIRMED_SOURCE`; exact server rollout timing should still be tied to a package/server snapshot when tests begin.
-
-Required regression test:
-
-- fill shed to capacity;
-- attempt product and animal purchases;
-- confirm money, inventory, market supply, and partial-fill behavior.
-
-### 2026-08-07 / package 1.32.6 town rebalance
-
-Merged upstream PR #1394:
+### 2026-08-07 / 1.32.6 — town rebalance
 
 - town center 2 ticks/day → 1 tick/day;
-- town center late-game multipliers removed;
+- late-game town-center multipliers removed;
 - shops sampled with replacement;
 - duplicate shop instances consume independently;
-- maximum total shop instances remains 8.
+- max shop instances = 8.
 
-Package source snapshot `bded87b0d7879078c726a93a4884d044f79c4eed` identifies itself as `1.32.6`.
+### 2026-08-16 / 1.32.7 — situational underused resources
 
-Required regression tests:
+Merged PR #1399:
 
-- verify exactly one town-center tick/day at defaults;
-- verify flat demand on days 0–29;
-- force/observe duplicate shops across seeds;
-- verify duplicated instances multiply demand independently;
-- verify no more than 8 shop instances unlock;
-- verify deterministic replay for identical seed and action streams.
+- adds `hinge` market shape with gain 8;
+- carrot scarcity curve: `log`/0.20 → `hinge`/1.00;
+- tomato scarcity curve: `linear`/0.40 → `hinge`/0.40;
+- egg scarcity curve: `linear`/0.40 → `hinge`/0.40;
+- glut-side curves remain unchanged;
+- intended to make carrot, tomato, and goose/egg production situationally viable under randomized shop demand.
 
 ## Randomness and Determinism
 
@@ -258,13 +351,13 @@ Current interpretation:
 
 - most crop, animal, movement, labor, and market mechanics are deterministic given engine version and both action streams;
 - weeds are seed-driven stochastic events;
-- town-shop draws are seed-driven and, from 1.32.6 onward, sampled with replacement;
-- the current shop multiset is public, but future shop draws remain unknown;
-- duplicated shop draws increase episode-to-episode economic variance;
-- the opponent policy remains the main strategic uncertainty beyond engine RNG;
-- seeded events should be repeatable under a fixed engine and action sequence.
+- town-shop draws are seed-driven and sampled with replacement;
+- current shop multiset is public, future draws are unknown;
+- market prices are deterministic functions of inventory, so the stochasticity enters through shop draws and policies rather than random prices;
+- 1.32.7 amplifies economic consequences of certain shop-draw tails without adding new RNG;
+- opponent policy remains the other major source of strategic uncertainty.
 
-Confidence: mostly `CONFIRMED_SOURCE`; exact RNG draw ordering should still be mapped experimentally because changes in draw order can affect seed-level reproducibility across versions.
+Confidence: mostly `CONFIRMED_SOURCE`; exact RNG draw ordering still needs experimental mapping.
 
 ## Required First Regression Tests
 
@@ -279,19 +372,24 @@ Confidence: mostly `CONFIRMED_SOURCE`; exact RNG draw ordering should still be m
 9. Animal feeding, care bonus, output cap, fertilizer, and escape.
 10. Day-end hand disappearance, worker reset, and carried-inventory drop.
 11. Shed overflow and purchase-capacity behavior.
-12. Terminal unsold inventory receiving no reward.
+12. Terminal unsold inventory receives no reward.
 13. Repeatability under identical seed and action streams.
 14. Seat-swapped equivalence for symmetric agents.
-15. Town center consumes exactly once/day at flat 1× under 1.32.6 defaults.
-16. Duplicate shop sampling with replacement and independent duplicate demand.
-17. Eight-instance town-shop cap.
+15. Town center consumes exactly once/day at flat 1×.
+16. Duplicate shop sampling and independent duplicate demand.
+17. Eight-instance shop cap.
+18. Hinge function exact values at/below/above `T`.
+19. Carrot/tomato/egg source test prices listed above.
+20. Other products' market curves remain unchanged across the 1.32.6 → 1.32.7 transition.
+21. Empirically estimate no-production scarcity-event frequencies for carrot/tomato/egg across many seeds.
 
 ## Unresolved Questions
 
-- Exact live leaderboard server version at any given time during rollout.
-- Exact episode-seed construction and RNG draw schedule.
+- Exact live leaderboard server version during/after rollout.
+- Exact episode-seed construction and RNG draw order.
 - Whether any server configuration differs from repository defaults.
 - Exact care bonus in the live engine.
 - Full consequences of price-floor sales.
-- Whether additional engine changes land after 1.32.6.
-- Magnitude of win/bank variance introduced by shop replacement sampling.
+- Exact operational definition used by the host for the reported 50%/26%/22% scarcity frequencies.
+- How often rational opponent production suppresses hinge-price opportunities relative to no-production statistics.
+- Whether bug-fix engine changes land after 1.32.7.
