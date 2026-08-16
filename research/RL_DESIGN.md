@@ -1,7 +1,8 @@
 # Kaggriculture RL Design
 
-Last updated: 2026-08-07
+Last updated: 2026-08-16
 Status: planning document; no training implementation has started
+Current engine target: `kaggle-environments >= 1.32.7`
 
 ## Goal
 
@@ -10,52 +11,94 @@ Make reinforcement learning the core adaptive decision-maker without forcing the
 The intended split is:
 
 - **engine/mechanics code** handles legality, pathfinding, task execution, and state bookkeeping;
-- **the learned policy** decides what the farm should do, how resources should be allocated, when plans should change, and how to react to the opponent and market;
+- **the learned policy** decides what the farm should do, how resources should be allocated, when plans should change, and how to react to the opponent, market, and randomized town demand;
 - **evaluation** is ultimately based on head-to-head win rate, not isolated farm profit.
 
-This is deliberately different from a mostly hard-coded strategy with a small learned market module. The model should own meaningful production and economic decisions.
+The model should own meaningful production and economic decisions. Deterministic code must not quietly become the real strategy.
 
-## Why RL Still Makes Sense
+## Why RL Makes Sense After 1.32.7
 
-Kaggriculture has a difficult primitive action space and delayed economic rewards, but those are reasons to design the RL interface carefully rather than abandon learning.
+The environment still has precision-sensitive deterministic logistics, but the economic decision problem is increasingly state-dependent.
 
 Important properties:
 
-- physical mechanics are largely deterministic and precision-sensitive;
-- the opponent cannot directly interfere with the farm layout;
-- the shared market couples both players economically;
-- public opponent state exposes substantial information about future supply;
-- opponent private inventory is hidden;
-- weeds introduce small stochastic disturbances;
-- from engine version 1.32.6 onward, town shops are sampled with replacement, creating materially different demand regimes between episodes;
-- reduced town-center demand makes the shared market less resistant to player sell pressure and therefore increases the importance of opponent-aware economics.
+- physical mechanics are largely deterministic;
+- the opponent cannot directly interfere with farm layout;
+- the shared market couples players economically;
+- opponent farm state is public but opponent shed/inventory is hidden;
+- weeds add small stochastic disturbances;
+- since 1.32.6, shops are sampled with replacement, so episodes realize different demand regimes;
+- lower town-center demand makes player-generated gluts more persistent;
+- since 1.32.7, carrot, tomato, and egg can enter sharp scarcity-price regimes when randomized shop demand is high and production is low.
 
-The key design problem is therefore **where to place the RL boundary**.
+This creates a useful learning problem: identify an emerging opportunity, estimate whether a pivot can pay back before the season ends, anticipate whether the opponent will exploit/suppress it, and allocate labor/land/capital accordingly.
+
+A fixed product ranking is now explicitly wrong.
+
+## 1.32.7 Scarcity Mechanic Relevant to RL
+
+PR #1399 adds a `hinge` scarcity curve for carrot, tomato, and egg.
+
+For scarcity distance `x = I0 - inventory` and product calibration quantity `T`:
+
+`u = x / T`
+
+`hinge = u + 8 * max(0, u - 1)^2`
+
+Thus the curve behaves roughly linearly until scarcity reaches `T`, then accelerates quadratically.
+
+Current knees:
+
+| Product | T | Knee inventory `I0-T` | Base price |
+|---|---:|---:|---:|
+| Carrot | 450 | 9,550 | 35 |
+| Tomato | 200 | 9,800 | 60 |
+| Egg | 332 | 9,668 | 50 |
+
+Host-reported probability of substantial scarcity under **no production**:
+
+- tomato: ~50%;
+- carrot: ~26%;
+- egg: ~22%.
+
+These percentages should be reproduced empirically and are not policy priors to hard-code.
+
+### Why this matters
+
+The value of producing one of these products is approximately a function of:
+
+- current shop multiset;
+- current market inventory and price;
+- distance to the scarcity knee;
+- expected future town draw/consumption;
+- own production lead time and capacity;
+- opponent visible production pipeline;
+- inferred opponent inventory and likely sale timing;
+- remaining season length;
+- opportunity cost of abandoning current production.
+
+This is exactly the kind of conditional value estimation that a learned policy/value function should be able to improve on versus a single deterministic route.
 
 ## Core Hypothesis: Hierarchical Intent RL
 
 Do not make the first model choose raw `NORTH`, `SOUTH`, `EAST`, and `WEST` sequences for every worker.
 
-Instead, let the model choose **intent-level actions** and let a deterministic executor compile those intents into legal primitive actions.
+Instead, let the model choose **intent-level actions** and let a deterministic executor compile intents into legal primitive actions.
 
 Example:
 
 - model: `water strawberry at tile 63`;
-- executor: assigns the selected worker, computes the path, moves until adjacent/on-target as required, performs `WATER`, then marks the task complete.
+- executor: chooses the path, moves the assigned worker, performs `WATER`, and marks task completion/failure.
 
-This preserves strategic control while removing a large amount of uninteresting navigation credit assignment.
-
-The design should be a semi-Markov hierarchy: tasks can persist for several primitive turns, while the policy is queried when a worker becomes idle, a task becomes invalid, a major event occurs, or a global replanning decision is due.
+The design should behave as a semi-Markov hierarchy: tasks may persist for several primitive turns, while the policy is queried when workers become idle, tasks fail/complete, major economic events occur, or global replanning is due.
 
 ## Proposed Action Space
 
-This is a design target, not yet a locked contract.
-
 ### A. Worker Task Head
 
-For each available worker, choose from a generated set of currently meaningful task candidates.
+For each available worker, score feasible task candidates.
 
-Candidate task families:
+Task families:
 
 - `WAIT` / continue current task;
 - `PLANT(crop, tile)`;
@@ -71,115 +114,112 @@ Candidate task families:
 - `COLLECT_FERTILIZER(tile)`;
 - `PICKUP(item, amount)`;
 - `DROP(item, amount)`;
-- movement/positioning target when movement itself is strategically useful.
+- purposeful movement/positioning when movement itself is strategic.
 
-The candidate generator should encode **mechanical feasibility**, not strategic preference. For example, excluding `HARVEST` on an empty tile is acceptable; deciding which mature crop is worth harvesting is the model's job.
+Use entity/pointer scoring rather than a huge flat categorical space.
 
-Candidate tasks can be scored with an entity/pointer head instead of allocating a huge fixed categorical output over every possible action × crop × tile combination.
+The candidate generator may encode **mechanical feasibility**, not strategic preference. It may reject harvesting an empty tile; it should not reject planting carrots because a heuristic thinks carrots are normally weak.
 
-### B. Farm Strategy Head
+### B. Global/Farm Strategy Head
 
-At lower-frequency boundaries—probably start of day and selected major events—the policy may also choose or update farm-level targets such as:
+At lower-frequency boundaries, optionally choose/update farm-level targets:
 
-- whether/when to unlock land;
-- target number of hired hands;
-- crop allocation targets;
-- desired structure/animal mix;
-- fertilizer allocation priorities;
-- desired inventory reserves;
-- risk/cash buffer;
-- whether to pivot production because of opponent development or town-shop composition.
+- expansion timing;
+- target hired hands;
+- crop allocation;
+- structure/animal mix;
+- fertilizer allocation;
+- cash/inventory reserves;
+- production pivots after shop/market changes;
+- end-game rotation/liquidation posture.
 
-These outputs should guide candidate generation and task priorities, not become a fixed scripted route.
-
-Whether this head is necessary in V0 or emerges from the task-level policy is an open experiment.
+1.32.7 makes a global head more plausible because production pivots may require coordinated changes across many workers rather than isolated local task choices.
 
 ### C. Market Head
 
-Market actions deserve a dedicated head because they have different structure and are the main direct interaction channel.
+Use a dedicated autoregressive market policy because order sequencing and price impact matter.
 
-The market policy should choose an autoregressive sequence of up to the engine limit of market orders. Each order conceptually contains:
+Each emitted order contains:
 
 - order type;
 - product/resource;
 - quantity;
 - stop/end token.
 
-Candidate order types include seed purchases, product purchases, animal purchases, selling, hiring, and land purchases as supported by the live action contract.
+Quantity representation remains open:
 
-Quantity representation is unresolved. Candidate options:
+1. exact bounded integer;
+2. discrete/log buckets plus `ALL`/`MAX_SAFE`;
+3. parameterized bounded distribution;
+4. generated candidate quantities tied to inventory/cash/capacity and market-curve landmarks.
 
-1. exact integer quantity where the feasible range is small;
-2. logarithmic/discrete buckets plus `ALL` / `MAX_SAFE`;
-3. a parameterized distribution over a bounded integer;
-4. generated candidate quantities based on current inventory, cash, and capacity.
-
-Because unit order execution and price impact matter, the order sequence should remain visible to the policy rather than collapsing market behavior into one aggregate target.
+For 1.32.7, useful **mechanically derived quantity landmarks** may include quantities that move inventory to a scarcity knee or other price-curve breakpoints. These can be offered as candidates, but candidate generation must not decide whether exploiting the breakpoint is strategically good.
 
 ### D. Action Masking
 
-Mechanical impossibilities should be masked aggressively:
+Mask mechanical impossibilities aggressively:
 
-- unaffordable purchase;
-- locked/invalid interaction target;
-- unavailable seed/product/animal;
-- shed-capacity violation;
+- invalid interaction target;
+- unavailable resource;
 - impossible structure action;
-- task requiring an absent object;
-- quantities outside engine bounds.
+- impossible quantity;
+- capacity violations;
+- actions the engine contract cannot execute.
 
-Do **not** mask merely bad strategy. The policy must be able to learn that distinction.
+Do **not** mask merely unprofitable actions. In particular, do not encode static product rankings into masks or candidate generation.
 
 ## Decision Frequency
 
-Three candidates should be compared before locking the environment wrapper:
+Compare three interfaces before locking V0:
 
 ### Turn-level
 
-Policy evaluates every primitive turn but can emit `CONTINUE_TASK` for workers already executing an intent.
-
-Pros: maximum responsiveness.
-Cons: longer credit assignment and more inference.
+Policy evaluated every primitive turn, with persistent `CONTINUE_TASK` behavior.
 
 ### Event-driven semi-MDP
 
-Policy is called only when a task completes/fails, a worker becomes idle, day boundaries occur, town/shop state changes, or market/farm conditions cross a replanning trigger.
-
-Pros: much shorter effective horizon and more meaningful decisions.
-Cons: implementation is more involved and simultaneous worker decisions must remain coherent.
+Policy queried on task completion/failure, idle workers, day boundaries, shop unlocks, major market changes, or other replanning events.
 
 ### Hybrid
 
-A low-frequency global strategy decision plus event-driven worker task decisions and turn-level market decisions.
+Low-frequency global strategy + event-driven worker tasks + frequent market decisions.
 
-This is the current leading hypothesis.
+Current leading hypothesis: **hybrid**.
+
+1.32.7 adds natural economic replanning triggers:
+
+- shop unlock changes demand composition;
+- a hinge product approaches/crosses `I0-T`;
+- opponent begins producing a hinge product;
+- price/inventory velocity indicates an opportunity is appearing/disappearing;
+- remaining time crosses the latest profitable pivot point for a crop/animal.
+
+These triggers should determine *when to ask the policy*, not *what decision to make*.
 
 ## Observation Design
-
-The observation should retain raw information while adding mechanically derived features that reduce needless learning burden.
 
 ### Global/time
 
 - day and turn within day;
 - turns remaining;
 - own/opponent money;
-- unlocked land;
-- hired-hand count;
+- land unlocked;
+- hired-hand counts;
 - shop-instance counts;
-- shop unlock count and next unlock timing;
-- engine-relevant capacities and limits.
+- next known town/shop timing;
+- engine capacities/limits.
 
 ### Own private economy
 
 - shed inventory by item;
-- seed inventory;
-- each worker's carried inventory;
+- seeds;
+- worker-carried inventory;
 - free shed capacity;
-- immediately spendable cash.
+- cash.
 
 ### Farm entities
 
-For every tile/object:
+For each relevant tile/object:
 
 - location;
 - unlocked state;
@@ -188,29 +228,40 @@ For every tile/object:
 - water/fertilizer state;
 - yield/output state;
 - feed/care state;
-- worker occupancy or distance features where useful.
+- occupancy/distances where mechanically useful.
 
-Encode both own and opponent farms, with a player/visibility flag.
+Encode both farms with player/visibility flags.
 
-### Market
+### Market product entities
 
-- current inventory by product;
-- current prices;
-- deviation from initial inventory;
-- recent price/inventory deltas;
-- known town demand implied by current shop multiset;
+For every product include at least:
+
+- current inventory;
+- current price;
+- base price;
+- `I0`;
+- `T`;
+- scarcity/glut shape identifiers or embeddings;
+- below/above target parameters;
+- normalized scarcity `(I0-inventory)/T`;
+- signed distance to scarcity knee `(I0-T)-inventory`;
+- indicator/continuous feature for being beyond the hinge knee;
+- local price sensitivity / marginal price change if useful;
+- recent inventory and price deltas;
+- known consumption implied by current shops;
 - time until town consumption ticks.
+
+Do **not** provide a handcrafted label such as `GOOD_PRODUCT`. Expose mechanics/state and let the model value it.
 
 ### Opponent information
 
-- all visible opponent farm entities;
+- visible farm entities;
 - money trajectory;
 - land/labor development;
 - crop maturity pipeline;
-- livestock production pipeline;
-- recent market changes attributable or partially attributable to opponent behavior.
-
-A recurrent policy or compact recent-history encoder may be valuable because opponent shed and carried inventory are hidden.
+- livestock/output pipeline;
+- evidence from market changes consistent with opponent sales;
+- optional inferred hidden inventory through recurrent state/auxiliary prediction.
 
 ## Model Architecture Candidates
 
@@ -218,24 +269,24 @@ Preferred starting family: **entity transformer + recurrent/global state**, not 
 
 Possible structure:
 
-1. tile/entity encoders for both farms;
-2. worker/entity encoders;
-3. market/product entities;
-4. shop-count and global scalar tokens;
+1. farm/tile/entity encoders;
+2. worker encoders;
+3. product/market entities containing curve and scarcity features;
+4. shop-count/global tokens;
 5. shared transformer trunk;
-6. optional GRU/LSTM memory over turns/decision points;
+6. optional GRU/LSTM memory;
 7. worker-task pointer head;
 8. market autoregressive head;
-9. optional daily strategy head;
+9. optional global strategy head;
 10. value head.
 
-A centralized critic with privileged simulator state is worth testing later for variance reduction, but V0 can use only actor-visible observations to keep the training stack simpler.
+A centralized privileged critic is worth testing later, especially if hidden opponent inventory makes actor-value estimation noisy.
 
 ## Reward Design
 
 ### True Objective
 
-Competition strength is primarily head-to-head winning, so the final training objective should align with win/loss/tie rather than only maximizing raw bank.
+Final training should align with competitive outcome.
 
 Candidate terminal reward:
 
@@ -243,227 +294,209 @@ Candidate terminal reward:
 - tie: `0`;
 - loss: `-1`.
 
-Bank margin remains an important metric and may be useful in curricula, but should not silently replace the competitive objective.
+Bank margin remains an important diagnostic/curriculum signal but should not silently replace W/L.
 
-### Potential-Based Dense Shaping
+### Potential-Based Shaping
 
-Avoid direct handcrafted rewards such as `+0.1 for watering` or `+1 for harvesting`; these can teach the model to optimize proxy events instead of winning.
-
-Instead, investigate potential-based shaping:
+Investigate:
 
 `r'_t = r_t + beta * (gamma * Phi(s_{t+1}) - Phi(s_t))`
 
-where `Phi` estimates liquidation/future economic value and is defined consistently at terminal state.
+Potential candidates may include:
 
-Candidate components of `Phi`:
+- bank;
+- liquidation value of inventory;
+- time-realizable crop/animal output;
+- current assets weighted by remaining productive lifetime;
+- shed overflow / crop death / animal escape risks;
+- opponent-equivalent economic value;
+- learned or model-based continuation value.
 
-- banked money;
-- liquidation value of shed inventory at current market conditions;
-- near-term harvest value of existing crops;
-- collectible animal output;
-- value of seeds/animals/structures only to the extent they can contribute before season end;
-- liabilities/risks such as imminent animal escape, crop death, shed overflow, or production that cannot be sold before termination;
-- opponent-equivalent value or estimated win margin.
+**1.32.7 warning:** naive mark-to-market inventory/crop value can massively overvalue a temporary hinge spike. If the policy itself produces/sells the resource, price moves. `Phi` must therefore avoid treating `quantity × current_spot_price` as realizable value for large quantities without price impact and time-to-production/sale considerations.
 
-With a mathematically consistent potential, the dense signal can improve credit assignment without changing the underlying optimal policy objective.
+That makes an exact/approximate liquidation simulator or learned continuation value particularly attractive.
 
-### Auxiliary Learning Instead of Reward Hacking
+### Auxiliary Learning
 
-Useful auxiliary targets may include:
+Useful targets:
 
 - next-day bank;
-- future market prices/inventory;
-- harvest/output over the next N turns;
-- opponent product sales;
-- opponent hidden inventory estimate;
+- near-term harvest/output;
+- future market inventory/price;
+- probability/time-to-crossing of each hinge knee;
+- future realized shop demand;
+- opponent sales/hidden inventory;
 - crop/animal failure risk;
-- probability of eventual win.
+- production-pivot profitability;
+- eventual win probability.
 
-These can improve representations without changing the reward function.
+Auxiliary targets should help representation learning without redefining reward.
 
 ### Discounting
 
-Because the actual objective is terminal, compare `gamma = 1.0` against values extremely close to one. A small conventional gamma can incorrectly prefer earlier money even when only final bank/win matters.
-
-GAE lambda can still be below one for variance control.
+Compare `gamma = 1.0` and very-near-one values. The actual objective is terminal.
 
 ## Imitation Bootstrap
 
-The existence of strong deterministic public agents is an advantage for RL training.
+Strong deterministic public agents remain useful demonstrations.
 
 Plan:
 
-1. archive several strong public agents under exact engine provenance;
-2. run them across many 1.32.6 seeds and opponent combinations;
+1. archive exact agents and engine provenance;
+2. roll them out across many **1.32.7** seeds/opponents;
 3. record full state/action trajectories;
-4. map primitive actions back into our intent/task representation where possible;
-5. behavior-clone the initial policy;
-6. fine-tune with RL so the policy can depart from the public scripts.
+4. map primitive actions to intent/task labels;
+5. behavior-clone initial logistics competence;
+6. fine-tune with RL so the model can depart from public routes.
 
-This gives the model competence in precision-sensitive logistics before asking policy gradient updates to discover farming from bankruptcy-level random exploration.
+Important caveats after 1.32.7:
 
-Important caveat: a pure time-indexed deterministic trace can be memorized. Training must include varying shop draws, weeds, opponents, and perturbations so the model learns state-conditioned behavior rather than only turn numbers.
+- pre-1.32.7 public traces encode outdated product economics;
+- BC should emphasize mechanical competence rather than treating demonstrated product mix as optimal labels forever;
+- collect fresh 1.32.7 traces and deliberately include unusual shop regimes;
+- state perturbation/counterfactual training may be useful so the model sees opportunities not present in the public expert's fixed route.
+
+Potential approach: down-weight or separate global economic decisions during BC while strongly cloning precision-sensitive worker logistics.
 
 ## Candidate RL Algorithm
 
-PPO is the default first algorithm because:
+PPO remains the default first algorithm because:
 
 - actions are mostly discrete/structured;
-- action masks are important;
+- masks matter;
 - recurrent PPO is well understood;
-- behavior-cloned initialization is straightforward;
-- self-play and frozen-opponent curricula fit naturally;
-- we already have experience operating PPO training infrastructure.
+- BC initialization is straightforward;
+- self-play/frozen-opponent curricula fit naturally;
+- project experience already exists with PPO infrastructure.
 
-SAC is not the natural first choice for this largely discrete/autoregressive action space.
-
-Do not lock PPO permanently until environment throughput and action-interface experiments are measured.
+Do not lock PPO until simulator throughput and action interface are measured.
 
 ## Training Curriculum
 
 ### Stage 0 — Offline imitation
 
-Behavior clone strong deterministic/public traces.
+Clone public/internal demonstrations for viable mechanics and basic economy.
 
-### Stage 1 — Robustness fine-tuning
+### Stage 1 — Regime adaptation / robustness
 
-Train against fixed public baselines across many seeds and perturbations. Optimize recovery from weeds, random shop compositions, route drift, and market deviations.
+Train against fixed public baselines across varied 1.32.7 seeds. Ensure the distribution includes:
 
-### Stage 2 — Competitive opponent pool
+- ordinary shop compositions;
+- tomato-scarcity episodes;
+- carrot-scarcity episodes;
+- egg-scarcity episodes;
+- overlapping scarcity opportunities;
+- episodes where the opponent supplies the scarce product and collapses the opportunity.
 
-Train against a frozen mixture of strong public and internal agents. Track paired win rate and not just mean bank.
+Do not artificially balance these regimes in the final training distribution without accounting for their real occurrence probabilities; targeted oversampling may be useful early for learning, followed by correction/fine-tuning on the natural distribution.
+
+### Stage 2 — Frozen competitive pool
+
+Train/evaluate against versioned strong public/internal agents. Track performance by economic regime, not only pooled average.
 
 ### Stage 3 — Population/self-play
 
-Maintain historical checkpoints and strategy diversity so the policy does not overfit one market behavior.
+Maintain champion, historical checkpoints, public baselines, and strategy-diverse agents to avoid overfitting one response to scarcity events.
 
-Potential opponent mixture:
+### Stage 4 — Targeted exploiters
 
-- current champion;
-- strong public agents;
-- historical checkpoints;
-- deliberately different economic strategies;
-- later exploiters targeted at market weaknesses.
-
-Exact percentages should be empirical, not copied from Pokémon.
-
-### Stage 4 — Exploiters / strategic specialization
-
-If useful, train policies that exploit specific common strategies and add them to the population or distill their behavior into a more general policy.
-
-## 1.32.6 Balance Change Implications
-
-The August 2026 town rebalance changes the learning problem materially.
-
-### Reduced town-center demand
-
-The town center now removes only one of each non-fertilizer product once per day and no longer ramps to 2×/4× later.
-
-Expected consequences:
-
-- player oversupply persists longer;
-- market crashes from coordinated or competing production become more severe;
-- timing of sales becomes more important;
-- opponent production forecasting becomes more valuable;
-- a high-output deterministic route can be punished if both players flood the same product.
-
-### Shops sampled with replacement
-
-Every shop unlock is now sampled from the full shop table with replacement, with at most eight instances. Duplicate shops each consume independently.
-
-Expected consequences:
-
-- episode-to-episode product demand has materially higher variance;
-- crop/animal portfolio adaptation has more value;
-- the agent should encode the shop multiset as counts, not binary unlocked/not-unlocked flags;
-- fixed public schedules become less universally optimal;
-- newly revealed shops create natural replanning points;
-- future shop draws remain uncertain even after earlier shops are known.
-
-This change strengthens the case for state-conditioned RL over a single deterministic action tape.
+If useful, train opponents that aggressively exploit or suppress hinge resources, forcing the main policy to learn game-theoretic responses rather than blindly chase spikes.
 
 ## Experiments To Design Before Training
 
-No large training run should start until these are specified.
+### E1 — 1.32.7 scarcity distribution
 
-### E1 — Shop-regime variance
+With no player production of each target resource, measure over many seeds:
 
-Run the same frozen deterministic policy over many seeds and measure outcome/production/price variance as a function of final and partial shop composition.
+- whether scarcity crosses `T`;
+- first crossing day/turn;
+- minimum inventory;
+- maximum price;
+- final shop multiset;
+- conditional distribution by shop counts.
 
-Questions:
+Compare with host-reported ~50% tomato / 26% carrot / 22% egg figures.
 
-- how much final bank variance is explained by shop multiset?
-- which duplicated shops matter most?
-- how early can an adaptive pivot pay back its switching cost?
+### E2 — Production-pivot frontier
 
-### E2 — Opponent market sensitivity
+For each target product, estimate the latest profitable commitment time under different observed scarcity states.
 
-Hold our policy fixed and vary opponent production/sale policies.
+Examples:
 
-Measure:
+- carrot planting is quick but one-shot;
+- tomato has longer setup but recurring yield;
+- eggs require coop/goose/feed logistics.
 
-- product price trajectories;
-- value of selling earlier/later;
-- value of changing product mix;
-- whether deliberate market pressure can flip match outcomes.
+Measure profit and, more importantly, head-to-head win impact after accounting for price impact from the production itself.
 
-### E3 — Action abstraction comparison
+### E3 — Opponent suppression / competition
 
-Compare primitive, task-level, event-driven, and hybrid interfaces on:
+Hold shop regime fixed and vary opponent response:
 
-- action-space size;
-- fraction of masked actions;
-- effective horizon;
-- simulator throughput;
-- behavior-cloning accuracy;
-- robustness to perturbations.
+- ignores scarce product;
+- reacts immediately;
+- reacts late;
+- already has production;
+- deliberately floods the market.
 
-### E4 — Reward-shaping sanity
+This tests whether the policy needs explicit opponent modeling to exploit scarcity safely.
 
-Before RL, replay fixed trajectories through candidate reward functions and verify:
+### E4 — Shop-regime variance
 
-- terminal ranking matches true W/L objective;
-- potential shaping telescopes as intended;
-- no reward is obtained from pointless repetitive maintenance;
-- bankruptcy/failure trajectories produce useful negative temporal signal without changing the final objective.
+Run frozen deterministic policies across many seeds and quantify score/win variance attributable to shop multiset and hinge events.
 
-### E5 — Memory requirement
+### E5 — Action abstraction
 
-Compare a Markov feed-forward policy with explicit history features and recurrent memory for opponent-inventory/sale inference.
+Compare primitive/task/event-driven/hybrid interfaces on action size, effective horizon, BC accuracy, robustness, and throughput.
 
-## Planning Agenda For The Next Week
+### E6 — Reward shaping sanity
 
-While Pokémon work finishes and the engine has time to stabilize:
+Replay fixed trajectories and verify potential shaping telescopes, preserves terminal ranking, and does not create fake reward from temporary hinge prices or self-induced mark-to-market bubbles.
 
-1. lock the exact 1.32.6 engine and enumerate all action schemas;
-2. quantify all sources of randomness and when they are revealed;
-3. design the intent/task candidate generator on paper;
-4. decide the market quantity/action representation;
-5. specify observation tensors/entities and normalization;
-6. formalize potential-based reward candidates;
-7. define the BC dataset schema from public-agent rollouts;
-8. define the PPO/self-play curriculum and evaluation gates;
-9. estimate simulator/vectorization throughput requirements;
-10. review upstream engine changes again before implementation begins.
+### E7 — Memory requirement
+
+Compare feed-forward explicit history features vs recurrent memory for opponent hidden inventory/sales and scarcity-response prediction.
+
+### E8 — Throughput
+
+Benchmark complete 720-turn games/sec and decision points/sec before selecting model size or rollout configuration.
+
+## Planning Agenda Before Implementation
+
+1. lock exact 1.32.7 engine source/spec/hash;
+2. enumerate all action schemas;
+3. map RNG sources and reveal timing;
+4. design intent/task candidate generation;
+5. choose market quantity representation;
+6. version observation schema including market-curve/knee features;
+7. formalize reward/potential candidates;
+8. define BC dataset and what parts of demonstrations receive strong vs weak imitation weight;
+9. define PPO/self-play curriculum and promotion gates;
+10. run the 1.32.7 scarcity/pivot studies before large training;
+11. benchmark simulator/vectorization throughput;
+12. recheck upstream for bug fixes immediately before implementation.
 
 ## Open Design Questions
 
-- Should the first policy have a separate daily strategic head or only task-level decisions?
-- Should task assignment be simultaneous for all workers or autoregressive by worker?
-- How should conflicts be handled when multiple workers select the same target?
-- What is the best market quantity representation?
-- Should market decisions occur every primitive turn or only when economically relevant?
-- How much action history is needed to infer opponent hidden inventory?
-- Is a centralized privileged critic worth the additional training-only state plumbing?
-- What potential function gives the lowest-variance learning signal without encoding too much strategy by hand?
-- How much behavior cloning is useful before it anchors the policy too strongly to public scripts?
-- Can the simulator be vectorized fast enough for PPO without rewriting core engine behavior?
+- Separate daily/global strategy head or task-only V0?
+- Simultaneous or autoregressive worker assignment?
+- Conflict handling for multiple workers targeting one entity?
+- Best market quantity representation?
+- How frequently should market policy run?
+- Should market curve parameters be raw features, product embeddings, or both?
+- Does recurrence materially improve hidden-inventory/opponent-response inference?
+- Is a privileged centralized critic worth the training-only plumbing?
+- What potential avoids mark-to-market exploitation under nonlinear price impact?
+- How much BC should apply to strategic crop/product choices versus mechanical execution?
+- Should early RL oversample rare scarcity regimes and then correct to natural frequency?
+- Can the simulator be vectorized fast enough for meaningful PPO/self-play?
 
 ## Non-Goals For Now
 
-- implementing the model;
-- launching expensive RL training;
-- locking a large neural architecture;
-- hand-authoring a complete winning farm strategy;
-- using arbitrary dense event rewards without objective-preservation analysis;
-- assuming engine 1.32.6 will be the final competition engine.
+- raw primitive movement PPO from random initialization;
+- launching expensive training before engine lock/throughput measurements;
+- hand-coding a fixed product priority table from 1.32.7;
+- using current spot price as naive realizable inventory value;
+- large architecture sweeps before action/reward contracts stabilize;
+- assuming host-reported scarcity percentages remain true under strategic player production;
+- assuming 1.32.7 cannot receive bug-fix changes.
