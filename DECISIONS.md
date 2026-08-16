@@ -24,7 +24,7 @@ This file records decisions that remain authoritative across chats and work sess
 - Date: 2026-08-06
 - Status: active
 - Decision: Center adversarial analysis on market inventory, prices, order timing, town demand, and opponent production forecasts.
-- Rationale: Farms are physically separate and currently have little or no direct tactical interaction. The 1.32.6 reduction in town demand should make player-driven market pressure more important.
+- Rationale: Farms are physically separate and currently have little or no direct tactical interaction. The 1.32.6 reduction in town demand makes player-driven market pressure more important; 1.32.7 adds conditional scarcity spikes that increase the value of opponent-aware production response.
 - Revisit when: the engine or rules add meaningful direct interaction.
 
 ## D-004 — Use Seat-Swapped Fixed-Seed Evaluation
@@ -74,7 +74,7 @@ This file records decisions that remain authoritative across chats and work sess
 - Status: active
 - Decision: Mechanics are authoritative only when supported by current engine source or a controlled behavioral test.
 - Rationale: Documentation and competition discussions may lag behind live implementation.
-- Confidence labels: `CONFIRMED_SOURCE`, `CONFIRMED_EXPERIMENT`, `DISCUSSION_CLAIM`, `OUTDATED`, `UNKNOWN`.
+- Confidence labels: `CONFIRMED_SOURCE`, `CONFIRMED_EXPERIMENT`, `DISCUSSION_CLAIM`, `HOST_REPORTED_STAT`, `OUTDATED`, `UNKNOWN`.
 - Revisit when: confidence labels may expand, but source priority remains.
 
 ## D-010 — No Codex Work Yet
@@ -82,7 +82,7 @@ This file records decisions that remain authoritative across chats and work sess
 - Date: 2026-08-06
 - Status: active
 - Decision: Do not spend Codex on implementation at the current stage.
-- Rationale: The user does not currently have spare Codex budget and implementation is intentionally deferred.
+- Rationale: The user did not have spare Codex budget and implementation was intentionally deferred.
 - Revisit when: the user explicitly authorizes a bounded Codex packet.
 
 ## D-011 — RL Owns Strategy; Deterministic Code Owns Mechanics
@@ -100,7 +100,7 @@ This file records decisions that remain authoritative across chats and work sess
 - Status: active
 - Decision: Strong public action-list agents should be treated as behavior-cloning/bootstrap data in addition to evaluation opponents.
 - Rationale: They contain valuable precision-sensitive logistics behavior and can initialize a viable policy before RL fine-tuning.
-- Guardrail: BC is initialization only; training must include varied seeds, shops, opponents, and perturbations so the model can depart from time-indexed public scripts.
+- Guardrail: BC is initialization only; training must include varied seeds, shops, opponents, and perturbations so the model can depart from time-indexed public scripts. Prefer fresh 1.32.7 demonstrations and avoid treating pre-1.32.7 product choices as timeless optimal labels.
 - Revisit when: experiments show imitation causes more harmful anchoring than training benefit.
 
 ## D-013 — Dense Reward Must Preserve the Competitive Objective
@@ -119,3 +119,21 @@ This file records decisions that remain authoritative across chats and work sess
 - Decision: Any observation schema, analysis, or policy input must preserve duplicate town shop instances, normally as per-shop counts or explicit shop entities rather than binary unlocked flags.
 - Rationale: Engine 1.32.6 samples shops with replacement and each duplicate instance consumes independently.
 - Revisit when: only if the upstream engine removes replacement sampling.
+
+## D-015 — Do Not Encode a Static Product Ranking
+
+- Date: 2026-08-16
+- Status: active
+- Decision: The action generator, observation preprocessing, BC labels, and policy logic must not hard-code products such as carrot/tomato/egg as globally good or globally bad.
+- Rationale: Engine 1.32.7 deliberately makes these resources conditionally valuable. Their value depends on realized shop demand, market scarcity, production lead time, opponent response, and turns remaining.
+- Required policy information: expose market curve parameters/state, shop multiplicity, scarcity distance, own/opponent production pipelines, and time remaining so the learned policy can estimate opportunity value.
+- Revisit when: only if the market contract changes so product value is no longer strongly state-dependent.
+
+## D-016 — Do Not Use Naive Spot Mark-to-Market Value for Reward Shaping
+
+- Date: 2026-08-16
+- Status: active design constraint
+- Decision: Do not value large inventories or future production as `quantity × current spot price` inside a dense reward/potential without accounting for price impact and realizability before season end.
+- Rationale: 1.32.7 hinge curves can create very high spot prices under deep scarcity, but selling production moves inventory back toward/through the knee. A naive potential could reward fake paper wealth or self-induced price manipulation instead of realizable competitive value.
+- Preferred alternatives: exact/approximate liquidation simulation, marginal-price-aware valuation, time-to-sale constraints, or a learned continuation-value estimate validated against terminal outcomes.
+- Revisit when: a tested valuation is shown to preserve trajectory ranking and resist exploitation under nonlinear market impact.
