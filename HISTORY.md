@@ -2,6 +2,124 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-16 — 1.32.7 Situational Resource Rebalance
+
+### Upstream engine change
+
+Reviewed and source-confirmed merged upstream PR `Kaggle/kaggle-environments#1399` (`Make underused resources situational`).
+
+Upstream `pyproject.toml` now declares `kaggle-environments` version `1.32.7`.
+
+PR metadata:
+
+- head commit: `1fbd3b7571653434329d288dee9e068f54ff01c0`;
+- merge commit: `28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c`.
+
+The host stated this should be the last balance change except game-breaking bugs. Live leaderboard rollout was announced but has not been independently server-locked in this repository.
+
+### New hinge price curve
+
+PR #1399 adds a new scarcity-side market function:
+
+`u = x / T`
+
+`hinge = u + 8 * max(0, u - 1)^2`
+
+where `x = I0 - market_inventory` when a product is scarce.
+
+Behavior:
+
+- below `T`, the curve is linear in normalized scarcity;
+- above `T`, a quadratic term creates a steep price spike;
+- `hinge(T) = 1`, preserving the meaning of the market target parameter.
+
+### Products changed
+
+- carrot: scarcity curve `log`/0.20 → `hinge`/1.00, `T=450`, knee inventory 9550;
+- tomato: `linear`/0.40 → `hinge`/0.40, `T=200`, knee inventory 9800;
+- egg: `linear`/0.40 → `hinge`/0.40, `T=332`, knee inventory 9668;
+- glut-side curves are unchanged.
+
+Tomato and egg are therefore unchanged through their old linear knee and diverge only in deeper scarcity. Carrot changes more broadly because its scarcity target also increases from 0.20 to 1.00.
+
+Explicit source test values include:
+
+- carrot: 9550 → $70, 9400 → $113, 9100 → $385;
+- tomato: 9800 → $84, 9700 → $144, 9500 → $552;
+- egg: 9668 → $70, 9502 → $120, 9170 → $460.
+
+### Random-shop interaction
+
+Relevant shop demand noted by the PR:
+
+- carrot: pet cafes and farmers markets; pet cafe is single-product and consumes double;
+- tomato: pizza shops and farmers markets;
+- egg: bakeries and brunch spots.
+
+Because shops have been sampled with replacement since 1.32.6, duplicate demand can push these products through their scarcity knees.
+
+Host-reported substantial-price-increase frequencies assuming **no production**:
+
+- tomato: ~50% of games;
+- carrot: ~26%;
+- egg: ~22%.
+
+These are recorded as host-reported statistics, not engine constants, and should be reproduced empirically under the locked local engine.
+
+### Strategic interpretation
+
+The change strengthens the RL-centered design rather than weakening it.
+
+The new decision problem is conditional:
+
+- detect that an episode is developing an unusual demand regime;
+- estimate whether a crop/animal pivot can produce before the opportunity disappears;
+- account for the fact that our own production/sales reduce scarcity;
+- anticipate whether the opponent is already producing or will react;
+- decide whether the expected competitive gain exceeds the opportunity cost of changing the farm plan.
+
+This is especially relevant to end-game crop rotation and situational goose/egg production.
+
+### Reward-design consequence
+
+Added a durable guardrail against naive mark-to-market shaping.
+
+Under the hinge curve, `quantity × current spot price` can hugely overstate realizable value because selling quantity moves the price back toward the knee. Future reward/potential design should use marginal-price-aware liquidation, time-to-sale constraints, exact/approximate simulation, or validated learned continuation value.
+
+### RL observation consequence
+
+Planned product entities should expose:
+
+- current inventory/price;
+- base, `I0`, `T`;
+- curve shape and target parameters;
+- normalized scarcity;
+- signed distance to the knee;
+- recent inventory/price velocity;
+- shop multiplicity/known demand;
+- own/opponent production pipeline;
+- time remaining.
+
+No static `GOOD_PRODUCT` feature or fixed product-priority table should be encoded.
+
+### New pre-training studies
+
+1. reproduce the host-reported no-production scarcity frequencies;
+2. measure first knee-crossing time and maximum prices by shop composition;
+3. estimate latest profitable pivot time for carrot, tomato, and goose/egg production;
+4. measure how opponent production suppresses the opportunity;
+5. test public deterministic baselines for 1.32.7 staleness;
+6. verify reward potentials do not exploit temporary hinge spot prices.
+
+### Files updated
+
+- `CURRENT_STATE.md`
+- `MECHANICS.md`
+- `PLANS.md`
+- `DECISIONS.md`
+- `HISTORY.md`
+- `research/RL_DESIGN.md`
+
 ## 2026-08-07 — 1.32.6 Town Rebalance and RL-Centered Planning
 
 ### Upstream engine change
