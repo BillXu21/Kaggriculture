@@ -1,6 +1,6 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-07
+Last updated: 2026-08-16
 
 ## Snapshot
 
@@ -10,43 +10,99 @@ Last updated: 2026-08-07
 - Competitive agent implementation: not started
 - Current best internal agent: none
 - Current evaluation suite: not implemented
-- Latest confirmed upstream package line: `kaggle-environments 1.32.6`
-- Live leaderboard rollout of 1.32.6: announced/rolling out; not independently server-verified yet
+- Latest confirmed upstream package line: `kaggle-environments 1.32.7`
+- Latest balance PR: `Kaggle/kaggle-environments#1399`, merged
+- Live leaderboard rollout of 1.32.7: announced/rolling out; not independently server-verified in this repo
 - Engine lock: not yet established locally or vendored
-- Immediate policy: do not launch large training while Pokémon work finishes and Kaggriculture engine/rules continue settling
+- Host statement: 1.32.7 is intended to be the last balance change except game-breaking bugs
 
-## Major 1.32.6 Balance Change
+## Major Recent Balance Changes
 
-Upstream PR #1394 (`Kaggriculture town rebalance`) is merged.
+### 1.32.6 — town demand/randomization
 
-Confirmed source changes:
+Merged PR #1394:
 
-1. **Town-center demand reduced**
-   - `townCenterSellInterval`: 12 → 24 turns;
-   - at the default 24 turns/day, town center consumes once/day instead of twice/day;
-   - town-center demand is permanently 1×;
-   - the former 2× after day 10 / 4× after day 20 schedule is removed.
+- town center consumes once/day at flat 1× instead of twice/day with later 2×/4× ramps;
+- town shops are sampled with replacement;
+- duplicate shop instances consume independently;
+- total shop instances are capped at 8.
 
-2. **Town shops sampled with replacement**
-   - each unlock samples from the full shop table rather than only unused shop types;
-   - duplicate shops are allowed;
-   - each duplicate shop instance consumes independently;
-   - total unlocked shop instances remain capped at 8;
-   - unlock cadence and per-shop consumption cadence are otherwise unchanged.
+This made the realized shop multiset a meaningful episode-specific economic regime and made player-generated sell pressure more persistent.
 
-Strategic implication: town demand is weaker overall, player oversupply should move markets more, and random duplicated shop compositions create meaningfully different economic regimes across seeds.
+### 1.32.7 — situational carrot/tomato/egg scarcity
+
+Merged PR #1399 (`Make underused resources situational`) changes the scarcity-side price curves for **carrot, tomato, and egg** to a new `hinge` shape.
+
+The hinge uses normalized scarcity `u = x/T` and:
+
+`hinge(u) = u + 8 * max(0, u - 1)^2`
+
+where `x = I0 - market_inventory` on the scarcity side.
+
+Interpretation:
+
+- below the product-specific scarcity knee `T`, price behavior is relatively ordinary;
+- once scarcity exceeds `T`, price rises quadratically and can become extremely large;
+- high randomized shop demand with little/no production can therefore create temporary high-value opportunities.
+
+Current parameters:
+
+| Product | Base | T | Scarcity curve | Below target | Knee inventory `I0-T` |
+|---|---:|---:|---|---:|---:|
+| Carrot | 35 | 450 | hinge | 1.00 | 9,550 |
+| Tomato | 60 | 200 | hinge | 0.40 | 9,800 |
+| Egg | 50 | 332 | hinge | 0.40 | 9,668 |
+
+Source examples from PR tests show the nonlinear effect after the knee:
+
+- carrot: inventory 9550 → $70; 9400 → $113; 9100 → $385;
+- tomato: 9800 → $84; 9700 → $144; 9500 → $552;
+- egg: 9668 → $70; 9502 → $120; 9170 → $460.
+
+Host-reported probability of reaching meaningful scarcity with **no production**, due to randomized shop demand:
+
+- tomato: ~50% of games;
+- carrot: ~26%;
+- egg: ~22%.
+
+Treat those percentages as host-reported balance statistics rather than engine constants.
+
+## Strategic Interpretation
+
+This strengthens the RL-centered direction.
+
+A product can now be:
+
+- mediocre in the unconditional average;
+- extremely profitable in a subset of realized shop regimes;
+- less attractive again if either player notices and starts producing it;
+- especially valuable late enough that existing public fixed routes may not have time or flexibility to pivot correctly.
+
+The policy therefore needs to reason about **opportunity conditional on state**, not a fixed global product ranking.
+
+Important state for these decisions includes:
+
+- shop-instance counts by type;
+- current market inventory and price for every product;
+- distance to each scarcity knee `T`;
+- observed inventory/price velocity;
+- own crop/animal production pipeline and time-to-yield;
+- opponent visible production pipeline;
+- turns remaining and pivot payback horizon.
+
+The 1.32.7 change is particularly relevant to end-game crop rotation and goose construction decisions.
 
 ## Current Strategic Direction
 
-The project is now intentionally **RL-centered**, but not raw primitive-action RL.
+The project remains intentionally **RL-centered**, but not raw primitive-action RL.
 
 The learned policy should own meaningful decisions such as:
 
-- production allocation;
+- production allocation and crop rotation;
 - land/labor investment;
 - crop/animal mix;
 - task assignment;
-- adaptation to random shop demand;
+- adaptation to randomized shop demand and scarcity opportunities;
 - opponent-aware production pivots;
 - market order selection and timing.
 
@@ -56,97 +112,56 @@ Deterministic code should primarily provide:
 - pathfinding and execution of selected worker intents;
 - task persistence;
 - state normalization/bookkeeping;
-- minimal safety/recovery where required to prevent meaningless invalid-action cascades.
+- minimal safety/recovery against meaningless invalid-action cascades.
 
-The working design is a **hierarchical intent-level RL policy** rather than a hard-coded farm strategy with a learned market add-on.
+The working design is hierarchical intent-level RL. Detailed design: [`research/RL_DESIGN.md`](research/RL_DESIGN.md).
 
-Detailed design: [`research/RL_DESIGN.md`](research/RL_DESIGN.md).
+## Reward / Training Direction
 
-## Why Not Raw Primitive PPO
+Current leading plan:
 
-The public RL experience reported by competitors is plausible and consistent with the engine structure:
+- terminal competitive objective aligned with W/L/T;
+- investigate potential-based shaping rather than arbitrary maintenance rewards;
+- auxiliary prediction heads for future market state, production, opponent behavior, and win probability;
+- behavior-clone strong public traces for basic logistics competence;
+- fine-tune with PPO against randomized seeds and competitive opponent pools;
+- eventually use population/self-play if throughput and results justify it.
 
-- enormous combinatorial primitive action space;
-- long delayed crop/animal rewards;
-- small logistical mistakes can cascade into catastrophic losses;
-- random exploration must first rediscover precise deterministic maintenance routines.
-
-The response is not to abandon RL. The current plan is to remove deterministic navigation/legality burden from the policy, bootstrap from strong public traces, and fine-tune adaptive strategy with RL.
-
-## Proposed RL Boundary
-
-Current leading hypothesis:
-
-1. **worker-task policy** selects intent-level tasks such as plant/water/harvest/feed/build for target entities/tiles;
-2. **deterministic executor** compiles the selected task into primitive movement + interaction actions;
-3. **market policy** emits ordered market actions with learned product/type/quantity decisions;
-4. optional **daily/global strategy head** changes higher-level production/resource targets;
-5. policy may be recurrent to infer opponent hidden inventory/sale behavior from history.
-
-Decision frequency is not locked. Turn-level, event-driven semi-MDP, and hybrid schemes must be compared before implementation.
-
-## Reward Direction
-
-Primary competitive objective should align with W/L/T rather than only absolute bank.
-
-Current leading reward plan:
-
-- terminal `+1 / 0 / -1` for win/tie/loss;
-- investigate mathematically consistent **potential-based shaping** using estimated liquidation/future economic value;
-- avoid arbitrary direct rewards such as bonuses for watering or harvesting;
-- use auxiliary prediction losses for market, production, opponent behavior, and win probability instead of distorting the reward.
-
-Discounting must respect the terminal objective; `gamma=1.0` or values extremely close to one should be evaluated rather than assumed away.
-
-## Imitation Bootstrap Direction
-
-Strong deterministic public notebooks are training data, not just opponents.
-
-Likely bootstrap:
-
-1. archive public agents with immutable provenance;
-2. roll them out over many 1.32.6 seeds and opponents;
-3. collect full state/action trajectories;
-4. map traces into the intent-level action representation;
-5. behavior-clone initial competence;
-6. use PPO/self-play to depart from those scripts and adapt to stochastic shops/opponents.
-
-This should dramatically reduce the precision/credit-assignment problem compared with learning farming from random initialization.
+1.32.7 adds useful auxiliary targets such as predicting whether/when a product will cross its scarcity knee and estimating the value of a production pivot.
 
 ## Current Experiments
 
 No training experiments are active.
 
-Planning experiments to specify before implementation:
+Planning/measurement experiments to specify before training:
 
-- shop-regime outcome variance across seeds;
-- sensitivity to opponent product mix and sale timing;
-- primitive vs task-level vs event-driven action abstractions;
-- potential-based reward sanity checks on fixed trajectories;
-- recurrent-memory value for opponent hidden-state inference;
-- simulator/vectorization throughput.
+1. **Scarcity-regime frequency:** reproduce the host's tomato/carrot/egg opportunity frequencies over many seeds.
+2. **Price-spike timing:** distribution of first knee crossing by shop composition and product.
+3. **Pivot value:** latest day at which planting tomatoes/carrots or building/geese can still profitably exploit a spike.
+4. **Opponent suppression:** how quickly an opponent producing the scarce resource removes the opportunity.
+5. **Shop-regime variance:** outcome variance of frozen deterministic agents under 1.32.7.
+6. **Action abstraction/reward/memory/throughput** studies from the prior RL plan.
 
-## Immediate Priorities — Next Week
+## Immediate Priorities
 
-1. Track upstream changes and verify that 1.32.6 behavior remains stable.
-2. Freeze/document exact 1.32.6 source, package version, commit, and hashes when implementation begins.
-3. Enumerate exact worker and market action schemas.
-4. Design the intent/task candidate generator without embedding strategy into it.
-5. Choose market order/quantity representation.
-6. Specify observation entities/tensors and normalization.
-7. Formalize candidate potential functions and reward invariants.
-8. Design BC trajectory format from public agents.
-9. Design PPO/self-play curriculum and evaluation gates.
-10. Recheck the engine before any large implementation/training packet.
+1. Treat 1.32.7 as the current implementation target, while still checking for bug-fix releases.
+2. Freeze/document exact 1.32.7 source, package version, commit, and hashes when implementation begins.
+3. Add market-curve/knee features to the planned observation schema.
+4. Enumerate exact worker and market action schemas.
+5. Finalize the intent/task candidate generator without embedding strategy into it.
+6. Choose market order/quantity representation.
+7. Formalize reward/potential candidates and BC trajectory format.
+8. Design PPO/self-play curriculum and evaluation gates.
+9. Recheck upstream immediately before the first implementation/training packet.
 
 ## Known Risks
 
-- Additional engine/balance changes.
-- Accidentally moving too much strategy into the deterministic executor and leaving RL only cosmetic decisions.
-- Going too far the other direction and asking RL to relearn pathfinding/legality.
-- Reward shaping changing the actual competitive objective.
-- BC overfitting to time-indexed deterministic public scripts.
-- Public baselines becoming stale under 1.32.6 economics.
+- Bug-fix engine releases after 1.32.7.
+- Fixed public baselines being stale under the new situational-resource economics.
+- RL overfitting product identity instead of learning conditional opportunity value.
+- Candidate generation accidentally encoding a fixed product ranking.
+- Reward shaping overvaluing mark-to-market spikes that cannot actually be harvested/sold in time.
+- BC anchoring to pre-1.32.7 deterministic routes.
 - Insufficient simulator throughput for large PPO runs.
 - Hidden opponent inventory requiring memory/inference.
 - Chat-context loss causing stale configurations or duplicated compute.
@@ -156,4 +171,4 @@ Planning experiments to specify before implementation:
 - Read `CURRENT_STATE.md`, `PLANS.md`, `DECISIONS.md`, `MECHANICS.md`, `research/RL_DESIGN.md`, and the latest section of `HISTORY.md` before substantial work.
 - Before any expensive run, record the exact command, engine identity, agent hash, seeds, opponent pool, expected outputs, and stop conditions.
 - After a substantial session, update continuity documents before switching chats.
-- Do not treat discussion claims as confirmed mechanics without source or behavioral verification.
+- Do not treat announced rollout as independently verified live-server identity.
