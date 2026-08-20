@@ -1,17 +1,64 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-16
+Last updated: 2026-08-20
 
 ## Snapshot
 
 - Repository: `BillXu21/Kaggriculture`
-- Phase: **action/observation interface design before BC implementation**
+- Phase: **game understanding and action/observation research before implementation**
 - Competitive implementation/training: not started
 - Latest confirmed upstream package: `kaggle-environments 1.32.7`
-- Latest balance PR: `Kaggle/kaggle-environments#1399`, merged
-- Host intent: 1.32.7 should be the last balance change except game-breaking bugs
 - Exact local/vendored engine lock: not yet established
-- Training direction: **behavior cloning first, then PPO refinement; self-play only after fixed-opponent/fixed-pool improvement is demonstrated**
+- Training direction: **behavior cloning first, then PPO/RL refinement; self-play only after simpler controlled improvement is demonstrated**
+- Primary competition goal: build a self-play/refinement pipeline that produces meaningful, measurable improvement over a competent starting policy across multiple promotions; a medal is not the primary objective.
+
+## Current Research Direction
+
+The project is intentionally not locking a neural architecture, observation schema, or action abstraction yet.
+
+Current work is to understand:
+
+- how strong public agents actually make money;
+- what production/logistics decisions matter strategically;
+- how the nonlinear shared market and randomized shops change those decisions;
+- what information a learned policy genuinely needs;
+- which decisions should remain learned versus handled mechanically;
+- what public notebooks/replays can provide as BC demonstrations and evaluation opponents.
+
+`research/ACTION_OBSERVATION_V0.md` contains earlier scratch design ideas and is **not an authoritative locked interface**.
+
+## Initial RL Scope
+
+The first RL milestone is deliberately simpler than the eventual competitive problem.
+
+Start from a competent behavior-cloned policy and ask whether RL can improve management of:
+
+- the acting player's own farm and private state;
+- production and reinvestment;
+- labor/logistics decisions represented by the eventual chosen action interface;
+- the shared market;
+- town/shop demand;
+- endgame realization/liquidation.
+
+Do **not** require explicit opponent modeling, opponent hidden-inventory inference, or deliberate adversarial market attacks in the first milestone. A controlled/frozen opponent may still affect the shared market naturally.
+
+Opponent-board features may even be withheld from the earliest experiment if that produces a cleaner learning test. Rich opponent modeling is a later-stage extension after BC-to-RL improvement is demonstrated.
+
+See `.agents/notes/implemented/2026-08-20-stage-initial-rl-without-opponent-modeling.md`.
+
+## Training Progression
+
+Current high-level direction:
+
+1. Study and archive strong current public agents/replays.
+2. Choose an observation/action representation only after understanding their decision structure.
+3. Behavior-clone a competent starting policy.
+4. Verify strong closed-loop BC rollouts, not only teacher-forced accuracy.
+5. Demonstrate RL improvement against a frozen/controlled opponent over held-out seeds.
+6. Expand to a frozen opponent panel.
+7. Only after those stages learn reliably, introduce changing opponents/population/self-play and measure promotions with broad cross-play evaluation.
+
+The project should not add another layer of RL complexity until the simpler stationary problem underneath it demonstrably learns.
 
 ## Current Engine/Economics
 
@@ -20,89 +67,42 @@ Last updated: 2026-08-16
 - town center consumes once/day at flat 1x;
 - town shops are sampled with replacement;
 - duplicate shops consume independently;
-- total shop instances capped at 8.
+- total shop instances are capped at 8.
 
 1.32.7:
 
 - carrot, tomato, and egg use scarcity-side `hinge` curves;
 - these products can become extremely valuable only in favorable randomized shop/scarcity regimes;
-- policy must reason conditionally about shop counts, market inventory, production lead time, opponent supply, and turns remaining rather than use a static product ranking.
+- selling adds supply and therefore erodes scarcity, so spot price times inventory is not realizable liquidation value;
+- opponent production affects the same shared market even if the early learner does not explicitly model the opponent.
 
 See `MECHANICS.md` for exact parameters and regression points.
 
-## Training Strategy
+## Useful External Research
 
-The current plan is no longer scratch self-play.
-
-1. Archive/run strong public agents under the current engine.
-2. Collect raw observation -> exact engine action trajectories.
-3. Behavior-clone a competent policy.
-4. Verify strong **closed-loop** BC rollouts, not only teacher-forced accuracy.
-5. PPO-refine against one frozen strong opponent over randomized seeds.
-6. PPO-refine against a frozen versioned opponent panel.
-7. Only then introduce slowly changing opponents/population/self-play.
-
-The project must prove learning at each simpler stationary stage before adding moving-target RL complexity.
-
-## V0 Action Interface
-
-New leading design: **direct factorized primitive actions**, not a custom task/semi-MDP language for V0.
-
-Reason: public demonstrations already provide exact primitive labels, so BC can learn navigation/logistics without random exploration. A task language would require reconstructing latent intent and adds wrapper complexity before we know it is needed.
-
-V0:
-
-- one policy decision per engine turn;
-- workers decoded in stable order (farmer, then current hands);
-- shared worker policy with autoregressive conditioning for joint constraints;
-- factor worker action into opcode + conditional item/crop + quantity;
-- ordered autoregressive market queue up to 10 actions;
-- mechanical action masks only;
-- quantity proposal: categorical 1..512 with dynamic feasibility masks, to be checked against public trace distributions.
-
-Hierarchical/task actions are now a **V1 fallback/experiment** if primitive BC proves brittle after trajectory divergence.
-
-Detailed contract: `research/ACTION_OBSERVATION_V0.md`.
-
-## V0 Observation Interface
-
-Use full actor-visible state plus mechanically derived features.
-
-Core groups:
-
-- time/season/town tick timing;
-- both 10x10 farms as spatial tensors;
-- own worker tokens including private carried inventory;
-- own shed/seeds/cash/land/labor state;
-- opponent public farm/cash/land/labor state only;
-- per-product market tokens with inventory, price, curve constants, deltas, and normalized scarcity `(I0-inventory)/T`;
-- town shop **count vector** and implied per-product demand;
-- short history features (1/4/24-turn market and money deltas) before committing to recurrence.
-
-Derived crop/animal lifecycle features such as time-to-yield, decay, escape risk, and fertilizer duration are allowed because they encode known mechanics rather than strategy.
+- `diffmap/kaggicultureRL` contains a serious Rust batch simulator, replay/BC infrastructure, parity/fuzz tests, and feature-engineering ideas. Its engine is currently pinned to 1.32.6 and lacks the 1.32.7 `hinge` market shape, so it cannot be adopted unchanged.
+- Current public RL discussion shows non-transitive matchup structure among strong route/meta-agents, reinforcing the need for cross-play evaluation rather than a single scalar strength metric.
 
 ## Immediate Priorities
 
-1. Freeze exact 1.32.7 source/spec hashes and verify all action opcodes (notably README `DROP` vs compact JSON description).
-2. Download/archive current strong public agents and inspect their actual action/quantity distributions.
-3. Finalize V0 action masks and quantity vocabulary from data.
-4. Finalize/version the observation feature schema.
-5. Define BC trajectory storage so raw observations/actions are always preserved.
-6. Define BC acceptance tests: tiny-set overfit, held-out imitation, closed-loop rollout, first-divergence/recovery analysis.
-7. Only after BC works, design the first fixed-opponent PPO refinement experiment.
+1. Continue building an intuitive strategic/economic understanding of strong Kaggriculture play.
+2. Inspect current strong notebooks and replays to identify the real decision surfaces and action distributions.
+3. Compare candidate action-control scopes and observation representations without locking one prematurely.
+4. When implementation begins, evaluate whether to vendor/port the `diffmap/kaggicultureRL` Rust engine to 1.32.7 and require parity before training.
+5. Preserve durable conclusions as Agent Notes as they become decisions rather than recording every theory-crafting idea.
 
 ## Known Risks
 
-- Primitive BC may imitate expert routes but fail to recover after small action errors because movement lacks an explicit persistent goal.
-- Too much feature engineering could leak strategy into preprocessing; derived features should remain mechanical/state-descriptive.
-- Action masks or post-hoc repairs can accidentally change the sampled policy action and invalidate PPO log-probabilities.
-- BC can memorize turn-indexed scripts rather than condition on state.
-- Hidden opponent inventory may eventually require recurrence or better history inference.
-- Context loss across chats can waste major amounts of work/compute; continuity docs remain mandatory.
+- Spending too long on architecture before proving that learning actually occurs.
+- BC memorizing turn-indexed scripts rather than learning recoverable state-conditioned behavior.
+- An action abstraction that is either too primitive for available compute or so high-level that RL becomes cosmetic.
+- Observation state aliasing that creates apparently contradictory PPO gradients.
+- Non-transitive opponent strategies making simple Elo/latest-checkpoint promotion misleading.
+- Context loss across chats wasting major amounts of work; GitHub continuity remains mandatory.
 
 ## Do Not Forget
 
-- Read `CURRENT_STATE.md`, `DECISIONS.md`, `MECHANICS.md`, `research/ACTION_OBSERVATION_V0.md`, `research/RL_DESIGN.md`, and the latest `HISTORY.md` entry before substantial work.
-- Preserve raw data/configs/hashes so representations can be changed without rerunning expensive collection.
+- Read `CURRENT_STATE.md`, `DECISIONS.md`, `MECHANICS.md`, relevant Agent Notes, `research/RL_DESIGN.md`, and the latest `HISTORY.md` entry before substantial work.
+- Treat current action/observation documents as research unless a decision note explicitly locks them.
+- Preserve raw data/configs/hashes so representations can change without rerunning expensive collection.
 - Before any expensive run, record exact command/config, code+engine hashes, seeds, opponent pool, expected outputs, and stop conditions.
-- Update continuity docs before switching chats or starting the next major experiment.
