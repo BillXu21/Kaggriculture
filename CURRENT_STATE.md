@@ -5,7 +5,7 @@ Last updated: 2026-08-21
 ## Snapshot
 
 - Repository: `BillXu21/Kaggriculture`
-- Phase: **implement and validate the canonical daily replay/BC dataset around a daily high-level manager abstraction**
+- Phase: **local canonical daily replay sample validated; BC dataset expansion is next**
 - Competitive training: not started
 - Latest confirmed upstream package: `kaggle-environments 1.32.7`
 - Exact local/vendored engine lock: not yet established
@@ -77,6 +77,15 @@ Also retain compact daily aggregates for planting/digging, fertilizer, harvests,
 
 See D-018 in `DECISIONS.md` and `.agents/notes/implemented/2026-08-21-canonical-daily-replay-record.md`.
 
+## Current Preprocessing Status
+
+- The reusable local extractor and CLI are implemented under `replay_daily/`.
+- The 15-replay 1.32.7 sample produced 900 validated records at
+  `data/canonical/2026-08-20-sample.jsonl` (ignored/local).
+- Validation details and representative rows are recorded in
+  `research/CANONICAL_DAILY_SAMPLE_VALIDATION.md`.
+- Training and the deterministic executor have not started.
+
 ## Behavior-Cloning Plan
 
 BC should learn **daily realized management decisions**, not primitive movement traces.
@@ -108,16 +117,14 @@ See D-017 in `DECISIONS.md`.
 
 Current high-level direction:
 
-1. Implement the canonical daily replay extractor locally against the already-downloaded 1.32.7 examples.
-2. Manually inspect `(episode, seat, day)` rows and verify boundaries, lifecycle timing, end-state targets, fertilizer labels, worker costs, and six-window sales.
-3. Attach/download the selected five top-daily partitions on Kaggle and scale the one-time preprocessing there.
-4. Inspect crop/animal/land/fertilizer/selling diversity and shop-conditioned reactivity in the resulting daily table.
-5. Train a first BC manager on elite demonstrations.
-6. Verify BC in closed-loop games using the eventual executor; do not rely only on teacher-forced accuracy.
-7. Compare BC-initialized PPO against scratch PPO under the same executor/opponents/training budget.
-8. Demonstrate RL improvement against a frozen/controlled opponent over held-out seeds, initially with opponent features optionally masked.
-9. Expand to a frozen opponent panel and broad cross-play evaluation.
-10. Only after those stages learn reliably, introduce richer opponent modeling, changing opponents/population/self-play, and additional learned control such as wheat or reactive selling.
+1. Attach/download the selected five top-daily partitions on Kaggle and scale the validated one-time preprocessing there.
+2. Inspect crop/animal/land/fertilizer/selling diversity and shop-conditioned reactivity in the resulting daily table.
+3. Train a first BC manager on elite demonstrations.
+4. Verify BC in closed-loop games using the eventual executor; do not rely only on teacher-forced accuracy.
+5. Compare BC-initialized PPO against scratch PPO under the same executor/opponents/training budget.
+6. Demonstrate RL improvement against a frozen/controlled opponent over held-out seeds, initially with opponent features optionally masked.
+7. Expand to a frozen opponent panel and broad cross-play evaluation.
+8. Only after those stages learn reliably, introduce richer opponent modeling, changing opponents/population/self-play, and additional learned control such as wheat or reactive selling.
 
 The project should not add another layer of RL complexity until the simpler stationary problem underneath it demonstrably learns.
 
@@ -147,13 +154,10 @@ See `MECHANICS.md` for exact parameters and regression points.
 
 ## Immediate Priorities
 
-1. Have a local implementation produce canonical daily records from the five already-downloaded replay examples.
-2. Manually sanity-check representative early/mid/late days, especially lifecycle timing and the `0/4/8/12/16/20` selling bins.
-3. Freeze a serialization format for the canonical daily dataset only after those rows look mechanically correct; do not prematurely freeze model tensors.
-4. Scale preprocessing to the selected top-daily Kaggle partitions and retain broad score/provenance metadata so training-time filtering stays cheap.
-5. Audit the elite corpus for repeated behavioral lineages and shop/market-conditioned action variation; do not filter on reactivity until measurements justify it.
-6. Train the first BC manager while the deterministic executor is designed in parallel.
-7. Later evaluate whether to vendor/port the `diffmap/kaggicultureRL` Rust engine to 1.32.7 and require parity before PPO training.
+1. Scale the validated preprocessing to the selected top-daily Kaggle partitions and retain broad score/provenance metadata.
+2. Audit the elite corpus for repeated behavioral lineages and shop/market-conditioned action variation; do not filter on reactivity until measurements justify it.
+3. Train the first BC manager while the deterministic executor is designed in parallel.
+4. Later evaluate whether to vendor/port the `diffmap/kaggicultureRL` Rust engine to 1.32.7 and require parity before PPO training.
 
 ## Future Control Alternatives Preserved by the Dataset
 

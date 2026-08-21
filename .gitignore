@@ -59,3 +59,8 @@ logs/
 # Local Kaggle state
 kaggle.json
 .kaggle/
+
+# Downloaded raw replay samples (never commit raw episode data)
+data/samples/
+data/temp/
+data/canonical/

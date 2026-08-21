@@ -2,6 +2,21 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-21 — Canonical Daily Sample Validated
+
+Completed the local 1.32.7 canonical replay foundation and generated the ignored
+15-replay sample at `data/canonical/2026-08-20-sample.jsonl`.
+
+- 900 records cover both seats and all 30 days for each replay;
+- corpus-wide boundary, privacy, lifecycle, hire, land, fertilizer, shop, and
+  six-window SELL checks passed;
+- the output is deterministic across a second CLI run;
+- representative findings are recorded in
+  `research/CANONICAL_DAILY_SAMPLE_VALIDATION.md`.
+
+Training and the deterministic executor remain unstarted; no broader dataset
+processing was performed.
+
 ## 2026-08-16 — 1.32.7 Situational Resource Rebalance
 
 ### Upstream engine change
