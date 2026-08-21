@@ -1,0 +1,4 @@
+# Runtime dependencies for replay_daily canonical extraction/storage.
+# No packaging framework exists in this repository; install with:
+#   python -m pip install -r requirements.txt
+pyarrow>=14

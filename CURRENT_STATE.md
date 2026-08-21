@@ -5,7 +5,7 @@ Last updated: 2026-08-21
 ## Snapshot
 
 - Repository: `BillXu21/Kaggriculture`
-- Phase: **local canonical daily replay sample validated; BC dataset expansion is next**
+- Phase: **canonical daily replay sample validated in Parquet production format; BC dataset expansion is next**
 - Competitive training: not started
 - Latest confirmed upstream package: `kaggle-environments 1.32.7`
 - Exact local/vendored engine lock: not yet established
@@ -80,9 +80,17 @@ See D-018 in `DECISIONS.md` and `.agents/notes/implemented/2026-08-21-canonical-
 ## Current Preprocessing Status
 
 - The reusable local extractor and CLI are implemented under `replay_daily/`.
+- **Parquet is the production canonical physical format** (PyArrow, Zstandard,
+  one row per `(episode, seat, day)`; `replay_daily/storage.py`). JSONL remains
+  an optional debug/inspection CLI output only; raw replays stay the source of
+  truth.
 - The 15-replay 1.32.7 sample produced 900 validated records at
-  `data/canonical/2026-08-20-sample.jsonl` (ignored/local).
-- Validation details and representative rows are recorded in
+  `data/canonical/2026-08-20-sample.parquet` (ignored/local; 795,154 bytes,
+  98.8% smaller than the equivalent JSONL). Exact-equality parity against fresh
+  extraction and the previously validated JSONL was confirmed on all 900
+  records.
+- Single-process extraction measured ~89 MB/s of raw replay (~0.3 h per
+  100 GiB), so no parallel preprocessing stage is justified yet. Details in
   `research/CANONICAL_DAILY_SAMPLE_VALIDATION.md`.
 - Training and the deterministic executor have not started.
 

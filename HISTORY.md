@@ -2,6 +2,28 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-21 — Parquet Production Storage for Canonical Records
+
+Adopted Zstandard-compressed Parquet as the production canonical physical
+format under D-018; the logical `(episode, seat, day)` schema is unchanged.
+
+- `replay_daily/storage.py` maps one logical record to one nested Arrow row;
+  fail-loud conformance guards reject unknown canonical keys instead of
+  silently dropping them, and bare string tile sentinels round-trip exactly.
+- CLI `extract` defaults to `--format parquet`; JSONL remains an explicit
+  debug/inspection output and is never written automatically.
+- Full-sample validation: all 900 records from the 15-replay sample compare
+  with exact Python equality across fresh extraction, the previously validated
+  JSONL, and the new `data/canonical/2026-08-20-sample.parquet` (795,154 bytes,
+  98.8% smaller than JSONL).
+- Benchmark (single process): extraction ~89 MB/s of raw replay (~0.3 h per
+  100 GiB projected), so no parallel preprocessing stage was justified; raw
+  Arrow reads are faster than JSONL parsing. No NPZ evaluation needed.
+- The old ignored JSONL sample was deleted after parity confirmation; raw
+  replays remain the source of truth. Evidence in
+  `research/CANONICAL_DAILY_SAMPLE_VALIDATION.md`. PyArrow dependency declared
+  in `requirements.txt` (`pyarrow>=14`). 44 tests pass.
+
 ## 2026-08-21 — Canonical Daily Sample Validated
 
 Completed the local 1.32.7 canonical replay foundation and generated the ignored

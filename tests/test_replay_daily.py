@@ -549,6 +549,7 @@ def test_real_replay_smoke_60_records_alignment_and_privacy():
         "--manifest", str(MANIFEST),
         "--source-dataset", "kaggle/kaggriculture-episodes-2026-08-20",
         "--partition-date", "2026-08-20",
+        "--format", "jsonl",
         "--output", str(out_path),
     ])
     assert rc == 0

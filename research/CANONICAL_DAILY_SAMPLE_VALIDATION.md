@@ -8,21 +8,99 @@ Source partition: `kaggle/kaggriculture-episodes-2026-08-20`
 
 The 15 local replays were extracted into the ignored artifact:
 
-`data/canonical/2026-08-20-sample.jsonl`
+`data/canonical/2026-08-20-sample.parquet`
+
+Parquet is now the production canonical physical format (one row per
+`(episode, seat, day)` record, Zstandard compression, native nested Arrow
+structs/lists; see `replay_daily/storage.py`). JSONL remains an optional
+debug/inspection CLI output and is no longer maintained as a duplicate
+artifact. Raw replays remain the source of truth.
 
 - 900 records: 15 episodes × 30 days × 2 seats;
-- 67,686,853 bytes;
-- SHA-256: `0d9976703503da3aaa0dcc9a51c691df80195ba9864420346c90b9068699c2e7`.
+- 795,154 bytes;
+- SHA-256: `EDE0F53618606CC04E942628209370CBDCE77F97365AD44569BD1EB57CD6F933`.
 
 Generation:
 
 ```text
-python -m replay_daily extract --input data\samples\2026-08-20 --manifest data\samples\2026-08-20\manifest.csv --source-dataset kaggle/kaggriculture-episodes-2026-08-20 --partition-date 2026-08-20 --output data\canonical\2026-08-20-sample.jsonl
+python -m replay_daily extract --input data\samples\2026-08-20 --manifest data\samples\2026-08-20\manifest.csv --source-dataset kaggle/kaggriculture-episodes-2026-08-20 --partition-date 2026-08-20 --output data\canonical\2026-08-20-sample.parquet
 ```
 
-Determinism rerun used the same command with output
-`data\temp\2026-08-20-sample-rerun.jsonl`; both outputs produced the same
-SHA-256. Focused and full validation commands:
+Training-time access without this package:
+
+```python
+import pyarrow.parquet as pq
+
+table = pq.read_table("data/canonical/2026-08-20-sample.parquet")
+meta = table.column("metadata").to_pylist()      # episode/seat/scores/provenance
+start = table.column("start").to_pylist()[0]     # boards/market/town state
+sell_bins = table.column("targets").to_pylist()[0]["sell_quantity"]
+tile = start["self"]["board"][0][0]              # tagged tile struct with derived lifecycle
+```
+
+`replay_daily.read_parquet(path)` reconstructs canonical logical records that
+compare exactly equal to fresh extractor output.
+
+## Parquet full-sample parity and benchmark (2026-08-21)
+
+Single run, `time.perf_counter`, single process. Environment: Python 3.13.1,
+PyArrow 24.0.0, 20 logical CPUs, Windows.
+
+| Metric | Value |
+| --- | --- |
+| Raw replays (15 × `.json`) | 465,360,390 bytes |
+| Previous validated JSONL | 67,686,853 bytes |
+| Parquet (zstd) | 795,154 bytes |
+| Size reduction vs JSONL | 98.8% (ratio 0.012) |
+| Extract 15 replays (parse + extraction) | 5.22 s — 172 rec/s, 89.1 MB/s raw |
+| Parquet write | 4.14 s — 217 rec/s |
+| Parquet read + logical reconstruction (`read_parquet`) | 20.42 s — 44 rec/s |
+| Raw Arrow read (`pq.read_table`) | 0.59 s — 1,537 rec/s |
+| JSONL read (before removal) | 1.21 s — 747 rec/s |
+
+Projected single-process preprocessing throughput is roughly **0.3 hours per
+100 GiB of raw replays** at the measured 89 MB/s, so replay-level parallelism
+is not justified for the planned corpus scale; simplicity was preferred.
+Full logical dict reconstruction is slower than raw Arrow reads because it
+rebuilds Python dicts per record; training code should consume Arrow columns
+directly and use `replay_daily.read_parquet` only when logical records are
+needed. The large size reduction and clean nested round-trip removed any need
+to evaluate NPZ or other alternatives.
+
+Parity evidence: all 900 records reconstructed from Parquet compare with exact
+Python equality against both freshly extracted in-memory records and the
+previously validated JSONL artifact (verified before its removal). The only
+earlier mismatch was a provenance string (`metadata.source_path` recorded as
+repo-relative in the original validated run vs absolute in the first rerun);
+regenerating with the original relative-path invocation produced exact equality,
+confirming the difference was invocation provenance, not schema or content.
+
+Corpus assertions re-run on the Parquet-reconstructed records:
+
+- 15 × 2 × 30 = 900 unique `(episode_id, seat, day)` keys; days `0..29` for
+  every seat of every episode; all `module_version == "1.32.7"`.
+- Day 29 retained for both seats with terminal boundary and non-null final
+  banks.
+- All 13,283 exact SELL events reconciled into the six bins anchored at
+  `0/4/8/12/16/20` (total quantity 1,130,784).
+- 14,342 null lifecycle values preserved on start boards (never coerced to
+  zero); BUY_LAND quadrant-null preservation is covered by focused synthetic
+  tests (this sample contains no failed land purchase).
+- 528 records carry duplicate town shops with preserved multiplicity.
+- Recursive opponent-public privacy scan over all 1,800 start/end views found
+  no `shed`/`seeds`/`inventories`/`private` payloads.
+
+After parity verification the old ignored JSONL sample
+(`data/canonical/2026-08-20-sample.jsonl`, 67,686,853 bytes) was deleted so
+Parquet is the sole maintained local production artifact.
+
+## Original JSONL validation record
+
+The original validation pass generated
+`data/canonical/2026-08-20-sample.jsonl` (67,686,853 bytes, SHA-256
+`0d9976703503da3aaa0dcc9a51c691df80195ba9864420346c90b9068699c2e7`) via the
+JSONL CLI output; that artifact has since been superseded by the Parquet file
+above after exact-parity confirmation. Focused and full validation commands:
 
 ```text
 python -m pytest -q tests/test_replay_daily.py
@@ -76,5 +154,5 @@ hour-1 WHEAT sale of quantity 3.
   `[29, 23]`.
 
 No score cutoff, reactivity filter, training run, executor, or broader dataset
-processing was introduced. Raw replays and generated JSONL remain ignored and
-local.
+processing was introduced. Raw replays and generated canonical artifacts remain
+ignored and local.
