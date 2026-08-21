@@ -1,62 +1,106 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-20
+Last updated: 2026-08-21
 
 ## Snapshot
 
 - Repository: `BillXu21/Kaggriculture`
-- Phase: **game understanding and action/observation research before implementation**
-- Competitive implementation/training: not started
+- Phase: **begin replay/BC pipeline around a daily high-level manager abstraction**
+- Competitive training: not started
 - Latest confirmed upstream package: `kaggle-environments 1.32.7`
 - Exact local/vendored engine lock: not yet established
 - Training direction: **behavior cloning first, then PPO/RL refinement; self-play only after simpler controlled improvement is demonstrated**
-- Primary competition goal: build a self-play/refinement pipeline that produces meaningful, measurable improvement over a competent starting policy across multiple promotions; a medal is not the primary objective.
+- Primary competition goal: build a refinement pipeline that produces meaningful, measurable improvement over a competent starting policy across multiple promotions; a medal is not the primary objective.
 
-## Current Research Direction
+## Current Learned-Control Abstraction
 
-The project is intentionally not locking a neural architecture, observation schema, or action abstraction yet.
+The initial learned policy is a **daily farm manager**, not a primitive 720-turn controller.
 
-Current work is to understand:
+The manager acts approximately once per game day, reducing the strategic horizon to roughly 30 decisions per episode.
 
-- how strong public agents actually make money;
-- what production/logistics decisions matter strategically;
-- how the nonlinear shared market and randomized shops change those decisions;
-- what information a learned policy genuinely needs;
-- which decisions should remain learned versus handled mechanically;
-- what public notebooks/replays can provide as BC demonstrations and evaluation opponents.
+For V0, RL owns economic intent:
 
-`research/ACTION_OBSERVATION_V0.md` contains earlier scratch design ideas and is **not an authoritative locked interface**.
+- crop planting/allocation changes;
+- target animal counts;
+- land expansion;
+- fertilizer allocation;
+- daily selling quantity plus a simple intra-day timing plan.
 
-## Initial RL Scope
+The exact output encoding is still open. The current decision locks the division of responsibility rather than a specific neural architecture or action vocabulary.
 
-The first RL milestone is deliberately simpler than the eventual competitive problem.
+The deterministic executor is assumed competent and initially owns:
 
-Start from a competent behavior-cloned policy and ask whether RL can improve management of:
+- worker assignment/routing/movement;
+- worker hiring needed for the requested workload;
+- watering and routine maintenance;
+- mechanical harvesting;
+- seed purchases implied by the crop plan;
+- animal purchase/placement/structures implied by animal targets;
+- simple wheat/feed procurement;
+- primitive execution of the requested sell plan within its selected timing window.
 
-- the acting player's own farm and private state;
-- production and reinvestment;
-- labor/logistics decisions represented by the eventual chosen action interface;
-- the shared market;
-- town/shop demand;
-- endgame realization/liquidation.
+The executor should compile learned intent, not replace it with its own economic strategy.
 
-Do **not** require explicit opponent modeling, opponent hidden-inventory inference, or deliberate adversarial market attacks in the first milestone. A controlled/frozen opponent may still affect the shared market naturally.
+Wheat management is the leading candidate to move from heuristic control to RL after the first manager learns. Selling is the first subsystem allowed to retain finer-than-daily timing; more reactive selling or a separate higher-frequency selling policy can be tested later.
 
-Opponent-board features may even be withheld from the earliest experiment if that produces a cleaner learning test. Rich opponent modeling is a later-stage extension after BC-to-RL improvement is demonstrated.
+See `.agents/notes/implemented/2026-08-21-use-daily-manager-with-deterministic-executor.md`.
 
-See `.agents/notes/implemented/2026-08-20-stage-initial-rl-without-opponent-modeling.md`.
+## Initial Observation Direction
+
+The representation should support a compact daily manager state while preserving spatial information:
+
+- day / season progress and relevant town timing;
+- full own 10x10 farm board;
+- own money, shed, seeds, land, animals, and fertilizer state;
+- shared market inventory/prices and town shop state;
+- simple previous-day execution feedback such as workers hired, labor cost, and completion/failure information;
+- opponent public board/state may be supported because the model runs only about 30 times per episode.
+
+For the cleanest first PPO experiment, opponent features may still be masked so the learner first proves it can improve own-farm management. Explicit opponent hidden-inventory inference and deliberate market attacks remain later-stage work.
+
+## Behavior-Cloning Plan
+
+BC should learn **daily realized management decisions**, not primitive movement traces.
+
+For each replay day, derive high-level labels such as:
+
+- crop additions/removals or resulting allocation changes;
+- animal-count changes;
+- land expansion;
+- fertilizer allocation;
+- quantities sold and their intra-day timing windows.
+
+Exact movement, worker assignments, watering routes, harvest routes, seed-buy commands, animal-buy commands, and worker hires do not need to be BC targets for the daily manager.
+
+For the initial pipeline, treat the public agents' low-level execution as effectively perfect. Replay preprocessing can therefore begin before our own deterministic executor is complete.
+
+## Replay Data Cutoff
+
+BC/research data must come from the post-balance **1.32.7** environment.
+
+Official patch commit:
+
+- `28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c`
+- `Make underused resources situational (#1399)`
+- created `2026-08-15T01:24:24Z`
+- bumped package `1.32.6 -> 1.32.7`
+- introduced the carrot/tomato/egg scarcity-side `hinge` curves.
+
+Preferred filtering rule: use replay environment/version metadata when available. If the daily replay dataset cannot be filtered reliably by version, use **2026-08-16 onward** as the conservative default date cutoff, excluding the patch-transition day, and validate sampled episodes against 1.32.7 mechanics before training.
+
+A large top-daily-episodes replay dataset should provide ample post-patch demonstrations. The next packet is to inspect its schema and determine reliable filtering and daily-label extraction.
 
 ## Training Progression
 
 Current high-level direction:
 
-1. Study and archive strong current public agents/replays.
-2. Choose an observation/action representation only after understanding their decision structure.
-3. Behavior-clone a competent starting policy.
-4. Verify strong closed-loop BC rollouts, not only teacher-forced accuracy.
-5. Demonstrate RL improvement against a frozen/controlled opponent over held-out seeds.
-6. Expand to a frozen opponent panel.
-7. Only after those stages learn reliably, introduce changing opponents/population/self-play and measure promotions with broad cross-play evaluation.
+1. Inspect the replay dataset and isolate confirmed post-1.32.7 games.
+2. Define/extract daily manager state-action examples.
+3. Train BC on those daily decisions while deterministic-executor design proceeds separately.
+4. Verify BC in closed-loop games using the eventual executor; do not rely only on teacher-forced accuracy.
+5. Demonstrate PPO/RL improvement against a frozen/controlled opponent over held-out seeds, initially with opponent features optionally masked.
+6. Expand to a frozen opponent panel and broad cross-play evaluation.
+7. Only after those stages learn reliably, introduce richer opponent modeling, changing opponents/population/self-play, and additional learned control such as wheat or reactive selling.
 
 The project should not add another layer of RL complexity until the simpler stationary problem underneath it demonstrably learns.
 
@@ -80,29 +124,31 @@ See `MECHANICS.md` for exact parameters and regression points.
 
 ## Useful External Research
 
-- `diffmap/kaggicultureRL` contains a serious Rust batch simulator, replay/BC infrastructure, parity/fuzz tests, and feature-engineering ideas. Its engine is currently pinned to 1.32.6 and lacks the 1.32.7 `hinge` market shape, so it cannot be adopted unchanged.
+- `diffmap/kaggicultureRL` contains a serious Rust batch simulator, replay/BC infrastructure, parity/fuzz tests, and feature-engineering ideas. Its engine is pinned to 1.32.6 and lacks the 1.32.7 `hinge` market shape, so it cannot be adopted unchanged.
 - Current public RL discussion shows non-transitive matchup structure among strong route/meta-agents, reinforcing the need for cross-play evaluation rather than a single scalar strength metric.
 
 ## Immediate Priorities
 
-1. Continue building an intuitive strategic/economic understanding of strong Kaggriculture play.
-2. Inspect current strong notebooks and replays to identify the real decision surfaces and action distributions.
-3. Compare candidate action-control scopes and observation representations without locking one prematurely.
-4. When implementation begins, evaluate whether to vendor/port the `diffmap/kaggicultureRL` Rust engine to 1.32.7 and require parity before training.
-5. Preserve durable conclusions as Agent Notes as they become decisions rather than recording every theory-crafting idea.
+1. Inspect the top-daily-episodes replay dataset schema.
+2. Establish a reliable 1.32.7-only replay filter; prefer embedded version metadata, otherwise begin with 2026-08-16+ partitions and validate samples.
+3. Decide the exact daily BC label semantics for crops, animals, fertilizer, land, and sell windows.
+4. Build the daily replay extractor and sanity-check examples manually before launching a large BC run.
+5. In parallel, design the deterministic executor interface needed to realize those high-level outputs.
+6. Later evaluate whether to vendor/port the `diffmap/kaggicultureRL` Rust engine to 1.32.7 and require parity before PPO training.
 
 ## Known Risks
 
-- Spending too long on architecture before proving that learning actually occurs.
-- BC memorizing turn-indexed scripts rather than learning recoverable state-conditioned behavior.
-- An action abstraction that is either too primitive for available compute or so high-level that RL becomes cosmetic.
-- Observation state aliasing that creates apparently contradictory PPO gradients.
-- Non-transitive opponent strategies making simple Elo/latest-checkpoint promotion misleading.
-- Context loss across chats wasting major amounts of work; GitHub continuity remains mandatory.
+- The daily action abstraction could hide strategically important intra-day decisions; selling is the first planned exception and cadence can be increased later.
+- The executor could accidentally become the strategist if it changes requested economic intent rather than merely executing it.
+- Daily labels derived from realized replay outcomes may occasionally reflect execution failures rather than intended plans; strong public traces are expected to make this acceptable initially.
+- BC may still memorize calendar scripts unless training includes sufficiently varied shops, markets, and opponents.
+- Observation state aliasing can create apparently contradictory PPO gradients.
+- Non-transitive opponent strategies can make simple Elo/latest-checkpoint promotion misleading.
+- Context loss across chats can waste major amounts of work; GitHub continuity remains mandatory.
 
 ## Do Not Forget
 
 - Read `CURRENT_STATE.md`, `DECISIONS.md`, `MECHANICS.md`, relevant Agent Notes, `research/RL_DESIGN.md`, and the latest `HISTORY.md` entry before substantial work.
-- Treat current action/observation documents as research unless a decision note explicitly locks them.
-- Preserve raw data/configs/hashes so representations can change without rerunning expensive collection.
-- Before any expensive run, record exact command/config, code+engine hashes, seeds, opponent pool, expected outputs, and stop conditions.
+- `research/ACTION_OBSERVATION_V0.md` is an older scratch primitive-action design and is not authoritative.
+- Preserve raw replay data/configs/hashes so representations and label extraction can change without reacquiring data.
+- Before any expensive run, record exact command/config, code+engine hashes, replay/version filter, seeds, opponent pool, expected outputs, and stop conditions.
