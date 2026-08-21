@@ -137,3 +137,14 @@ This file records decisions that remain authoritative across chats and work sess
 - Rationale: 1.32.7 hinge curves can create very high spot prices under deep scarcity, but selling production moves inventory back toward/through the knee. A naive potential could reward fake paper wealth or self-induced price manipulation instead of realizable competitive value.
 - Preferred alternatives: exact/approximate liquidation simulation, marginal-price-aware valuation, time-to-sale constraints, or a learned continuation-value estimate validated against terminal outcomes.
 - Revisit when: a tested valuation is shown to preserve trajectory ranking and resist exploitation under nonlinear market impact.
+
+## D-017 — Bootstrap BC From Elite Post-Patch Daily Replays
+
+- Date: 2026-08-21
+- Status: active
+- Decision: Build the first behavior-cloning corpus from Kaggle's daily **top-rated** Kaggriculture episode datasets rather than broad/random ladder data. Use both seats from an episode when the manifest's `min_score` clears the chosen elite threshold, so both demonstrations are known to come from strong submissions even though per-seat submission IDs/ratings are unavailable.
+- Initial window: use five recent complete 1.32.7 daily partitions after allowing roughly two days for competitors to adapt to the balance patch; target 2026-08-17 onward and add later daily partitions as they become available. Embedded `module_version == 1.32.7` remains the authoritative replay check.
+- Data retention: preprocess broadly enough to preserve `episode_id`, date, `avg_score`, `min_score`, derived `max_score`, player/seat, seed, final reward, and the raw replay provenance so later experiments can change score thresholds or sampling without reacquiring the original data.
+- Rationale: the top-daily archive is deliberately filled from the highest-average-rated games until its 20 GiB cap, so the main problem is selecting among strong demonstrations, not excluding obviously weak random play. Multiple submissions from one player can differ substantially in strength, making player-name filtering unreliable. A high `min_score` threshold avoids mixing in a weak seat without needing submission IDs.
+- Reactivity: do not require a shop-reactivity/diversity filter for the first BC corpus. First measure whether elite trajectories already show useful state-conditioned branching; later compare score-only filtering against optional reactivity/diversity filtering if BC appears dominated by rigid tapes.
+- Revisit when: the manifest schema changes, per-seat submission/rating metadata becomes available, or experiments show that a different replay-selection rule produces a materially better BC initialization.
