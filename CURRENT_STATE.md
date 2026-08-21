@@ -5,7 +5,7 @@ Last updated: 2026-08-21
 ## Snapshot
 
 - Repository: `BillXu21/Kaggriculture`
-- Phase: **begin replay/BC pipeline around a daily high-level manager abstraction**
+- Phase: **implement and validate the canonical daily replay/BC dataset around a daily high-level manager abstraction**
 - Competitive training: not started
 - Latest confirmed upstream package: `kaggle-environments 1.32.7`
 - Exact local/vendored engine lock: not yet established
@@ -26,7 +26,7 @@ For V0, RL owns economic intent:
 - fertilizer allocation;
 - daily selling quantity plus a simple intra-day timing plan.
 
-The exact output encoding is still open. The current decision locks the division of responsibility rather than a specific neural architecture or action vocabulary.
+The exact model output parameterization can still change. The current decision locks the division of responsibility rather than a neural architecture.
 
 The deterministic executor is assumed competent and initially owns:
 
@@ -45,36 +45,47 @@ Wheat management is the leading candidate to move from heuristic control to RL a
 
 See `.agents/notes/implemented/2026-08-21-use-daily-manager-with-deterministic-executor.md`.
 
-## Initial Observation Direction
+## Canonical Daily Replay Contract
 
-The representation should support a compact daily manager state while preserving spatial information:
+Replay preprocessing now has a stable intermediate target: one canonical record per `(episode, seat, day)`.
 
-- day / season progress and relevant town timing;
-- full own 10x10 farm board;
-- own money, shed, seeds, land, animals, and fertilizer state;
-- shared market inventory/prices and town shop state;
-- simple previous-day execution feedback such as workers hired, labor cost, and completion/failure information;
-- opponent public board/state may be supported because the model runs only about 30 times per episode.
+Each record contains:
 
-For the cleanest first PPO experiment, opponent features may still be masked so the learner first proves it can improve own-farm management. Explicit opponent hidden-inventory inference and deliberate market attacks remain later-stage work.
+- start-of-day state using explicit replay `day`/`hour` boundaries;
+- end-of-day/next-day state;
+- a compact daily event ledger;
+- full score/version/source provenance;
+- seats canonicalized as `self` and `opponent`.
+
+The canonical dataset is deliberately richer than the first model's tensors so alternative BC/action encodings can be generated without reparsing the raw 720-turn JSON.
+
+Retain the full 10x10 farm board with mechanically descriptive lifecycle state. Crop records should preserve raw age/growth information plus useful derived timing such as time to next harvest/output, harvestability, fertilizer state, and water/dry/weed state as available. Animal records should preserve production cooldown/time to next product, feed/starvation, care/bonus, and other relevant engine state.
+
+Keep opponent public state in the canonical data even if the first experiment masks it.
+
+For V0, derive high-level labels for:
+
+- crop composition/targets;
+- animal-count targets;
+- land expansion/state;
+- fertilizer applications by crop type;
+- sell quantity per product in six windows anchored at `0, 4, 8, 12, 16, 20`, corresponding to hours `0-3`, `4-7`, `8-11`, `12-15`, `16-19`, `20-23`.
+
+Preserve exact primitive sale hours in the event ledger so a future 24-turn/reactive selling policy remains possible.
+
+Also retain compact daily aggregates for planting/digging, fertilizer, harvests, animal/seed/product purchases, land purchases, workers/hire cost, and sales. These are audit/future-extension data, not necessarily V0 BC targets.
+
+See D-018 in `DECISIONS.md` and `.agents/notes/implemented/2026-08-21-canonical-daily-replay-record.md`.
 
 ## Behavior-Cloning Plan
 
 BC should learn **daily realized management decisions**, not primitive movement traces.
 
-For each replay day, derive high-level labels such as:
-
-- crop additions/removals or resulting allocation changes;
-- animal-count changes;
-- land expansion;
-- fertilizer allocation;
-- quantities sold and their intra-day timing windows.
-
-Exact movement, worker assignments, watering routes, harvest routes, seed-buy commands, animal-buy commands, and worker hires do not need to be BC targets for the daily manager.
+Exact movement, worker assignments, watering routes, harvest routes, seed-buy commands, animal-buy commands, and worker hires do not need to be BC targets when they are implied by the manager's high-level plan.
 
 For the initial pipeline, treat the strong replay agents' low-level execution as effectively perfect. Replay preprocessing can therefore begin before our own deterministic executor is complete.
 
-BC does not need to be broadly adaptive to be useful. A competent stereotyped plan is an acceptable initialization if PPO can subsequently improve and diversify it. However, top private agents already appear to contain state-conditioned branches, so replay preprocessing should preserve shop/market context rather than collapsing examples to day-indexed schedules.
+BC does not need to be broadly adaptive to be useful. A competent stereotyped plan is an acceptable initialization if PPO can subsequently improve and diversify it. However, top private agents already appear to contain state-conditioned branches, so preprocessing must preserve shop/market context rather than collapse examples to day-indexed schedules.
 
 ## Replay Corpus Decision
 
@@ -97,15 +108,16 @@ See D-017 in `DECISIONS.md`.
 
 Current high-level direction:
 
-1. Download/attach the selected top-daily replay partitions and manifests.
-2. Define/extract daily manager state-action examples while preserving score/provenance metadata.
-3. Inspect crop/animal/land/fertilizer/selling diversity and shop-conditioned reactivity in the resulting daily table.
-4. Train a first BC manager on elite demonstrations.
-5. Verify BC in closed-loop games using the eventual executor; do not rely only on teacher-forced accuracy.
-6. Compare BC-initialized PPO against scratch PPO under the same executor/opponents/training budget.
-7. Demonstrate RL improvement against a frozen/controlled opponent over held-out seeds, initially with opponent features optionally masked.
-8. Expand to a frozen opponent panel and broad cross-play evaluation.
-9. Only after those stages learn reliably, introduce richer opponent modeling, changing opponents/population/self-play, and additional learned control such as wheat or reactive selling.
+1. Implement the canonical daily replay extractor locally against the already-downloaded 1.32.7 examples.
+2. Manually inspect `(episode, seat, day)` rows and verify boundaries, lifecycle timing, end-state targets, fertilizer labels, worker costs, and six-window sales.
+3. Attach/download the selected five top-daily partitions on Kaggle and scale the one-time preprocessing there.
+4. Inspect crop/animal/land/fertilizer/selling diversity and shop-conditioned reactivity in the resulting daily table.
+5. Train a first BC manager on elite demonstrations.
+6. Verify BC in closed-loop games using the eventual executor; do not rely only on teacher-forced accuracy.
+7. Compare BC-initialized PPO against scratch PPO under the same executor/opponents/training budget.
+8. Demonstrate RL improvement against a frozen/controlled opponent over held-out seeds, initially with opponent features optionally masked.
+9. Expand to a frozen opponent panel and broad cross-play evaluation.
+10. Only after those stages learn reliably, introduce richer opponent modeling, changing opponents/population/self-play, and additional learned control such as wheat or reactive selling.
 
 The project should not add another layer of RL complexity until the simpler stationary problem underneath it demonstrably learns.
 
@@ -135,12 +147,26 @@ See `MECHANICS.md` for exact parameters and regression points.
 
 ## Immediate Priorities
 
-1. Work out the exact daily BC label semantics for crops, animal targets, fertilizer, land, and sell windows.
-2. Build a small local replay extractor against the already-downloaded 1.32.7 examples and manually inspect the resulting `(episode, seat, day)` rows.
-3. Attach/download the selected top-daily partitions on Kaggle and scale preprocessing there once the local schema is trusted.
-4. Audit the elite corpus for repeated behavioral lineages and shop/market-conditioned action variation; do not filter on reactivity until measurements justify it.
-5. Train the first BC manager while the deterministic executor is designed in parallel.
-6. Later evaluate whether to vendor/port the `diffmap/kaggicultureRL` Rust engine to 1.32.7 and require parity before PPO training.
+1. Have a local implementation produce canonical daily records from the five already-downloaded replay examples.
+2. Manually sanity-check representative early/mid/late days, especially lifecycle timing and the `0/4/8/12/16/20` selling bins.
+3. Freeze a serialization format for the canonical daily dataset only after those rows look mechanically correct; do not prematurely freeze model tensors.
+4. Scale preprocessing to the selected top-daily Kaggle partitions and retain broad score/provenance metadata so training-time filtering stays cheap.
+5. Audit the elite corpus for repeated behavioral lineages and shop/market-conditioned action variation; do not filter on reactivity until measurements justify it.
+6. Train the first BC manager while the deterministic executor is designed in parallel.
+7. Later evaluate whether to vendor/port the `diffmap/kaggicultureRL` Rust engine to 1.32.7 and require parity before PPO training.
+
+## Future Control Alternatives Preserved by the Dataset
+
+The canonical record intentionally keeps enough information to test later variants without raw replay reprocessing:
+
+- absolute targets versus daily action deltas;
+- explicit per-tile crop replacement;
+- age-bucketed/tile-specific fertilizer control;
+- learned wheat/feed economics;
+- strategic harvesting when labor/storage/timing makes it matter;
+- richer previous-day workload/completion feedback;
+- opponent-board/unobserved-holdings features;
+- 24-turn selling, a separate reactive seller, or multiple manager calls per day.
 
 ## Known Risks
 
