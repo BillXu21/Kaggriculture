@@ -5,7 +5,7 @@ false/true), config resolution + parameter print, single CPU train/validation
 steps with the clipping path, metric report contents with explicit all-zero
 nonzero-recall behavior, train-only day baseline reporting, clear v1/empty-
 split failures, checkpoint payload fields, save/load eval equivalence, a
-synthetic schema-v2 CLI end-to-end smoke writing best/last checkpoints under
+synthetic schema-v3 CLI end-to-end smoke writing best/last checkpoints under
 ignored temp, and early stopping. No network access, no full-corpus work.
 """
 

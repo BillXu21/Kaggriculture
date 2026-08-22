@@ -1,4 +1,4 @@
-"""Focused contract tests for the compact schema-v2 BC data layer."""
+"""Focused contract tests for the compact schema-v3 BC data layer."""
 
 import copy
 import math
@@ -24,6 +24,7 @@ from bc_manager.constants import (
     PRODUCT_ORDER,
 )
 from bc_manager.metrics import group_metrics, nonzero_recall, sell_metrics
+from replay_daily.constants import SCHEMA_VERSION
 from replay_daily.extractor import extract_replay
 from replay_daily.storage import RECORD_SCHEMA, records_to_table, write_parquet
 
@@ -53,8 +54,8 @@ def _records() -> list[dict]:
     return records
 
 
-def test_v2_arrow_acceptance_shapes_targets_and_metadata_separation(tmp_path):
-    path = tmp_path / "v2.parquet"
+def test_v3_arrow_acceptance_shapes_targets_and_metadata_separation(tmp_path):
+    path = tmp_path / "v3.parquet"
     write_parquet(_records(), path)
     data = load_dataset(path, dates=["2026-08-17"], min_score=2950)
 
@@ -76,10 +77,15 @@ def test_v2_arrow_acceptance_shapes_targets_and_metadata_separation(tmp_path):
     assert {"min_score", "final_bank_self", "source_path"} <= set(data["meta"][0])
 
 
-def test_v1_and_mixed_arrow_rejected(tmp_path):
+def test_v1_v2_and_mixed_arrow_rejected(tmp_path):
     rows = records_to_table(_records()).to_pylist()
-    for name, versions in (("v1", [1] * len(rows)),
-                           ("mixed", [1] + [2] * (len(rows) - 1))):
+    cases = (
+        ("v1", [1] * len(rows)),
+        ("v2", [2] * len(rows)),
+        ("mixed-v1-v2", [1] + [2] * (len(rows) - 1)),
+        ("mixed-v2-current", [2] + [SCHEMA_VERSION] * (len(rows) - 1)),
+    )
+    for name, versions in cases:
         bad = copy.deepcopy(rows)
         for row, version in zip(bad, versions):
             row["schema_version"] = version

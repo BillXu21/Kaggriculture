@@ -25,8 +25,8 @@ Physical representation
   target entries) rejects unknown keys with a ValueError naming the path and
   key, because Arrow structs would otherwise silently drop them. Dynamic map
   keys (products/crops/op names/sell bins) remain unrestricted.
-- Version policy (schema v2): writers reject logical records whose
-  `schema_version` differs from the canonical version; readers reject v1,
+- Version policy (current schema): writers reject logical records whose
+  `schema_version` differs from the canonical version; readers reject older,
   mixed-version, or otherwise incompatible Parquet tables by name. No
   migration: regenerate processed data from raw replays.
 - Localized encoding (the only non-native field): `events.market_events_ordered`
@@ -193,8 +193,8 @@ _EVENTS = pa.struct([
         ("entries", pa.list_(pa.struct(
             [*_LEDGER_ENTRY_BASE, ("item", _STR)]))),
     ])),
-    # CARE-by-animal ledger (schema v2): zero-defaulted species counts plus
-    # one entry per submitted intent; `animal` stays null for unknown/
+    # CARE-by-animal ledger (since schema v2): zero-defaulted species counts
+    # plus one entry per submitted intent; `animal` stays null for unknown/
     # non-animal CARE and never defaults to a species.
     ("care", pa.struct([
         ("by_animal", _MAP_STR_INT),

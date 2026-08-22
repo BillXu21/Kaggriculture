@@ -9,8 +9,10 @@ Sources:
 ENGINE_VERSION = "1.32.7"
 # v2: canonical `events.care` by-animal ledger + entries, derived
 # `targets.care_by_animal`, and fail-loud processed-data version checks.
-# v1 processed artifacts are rejected, never migrated; regenerate from raw.
-SCHEMA_VERSION = 2
+# v3: official [x,y] worker positions with tiles[y][x] lookup; ledger tile
+#     coordinates stay canonical [y,x]. v1/v2 processed artifacts are
+#     rejected, never migrated; regenerate from raw.
+SCHEMA_VERSION = 3
 
 # Engine CROPS table (exact copy of upstream constants).
 CROPS = {

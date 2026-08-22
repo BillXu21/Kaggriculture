@@ -63,7 +63,7 @@ class ManagerLossConfig:
 def _require_key(targets: Mapping[str, Tensor], key: str) -> Tensor:
     if key not in targets:
         raise ValueError(
-            f"missing required target {key!r}; schema-v2 targets are never "
+            f"missing required target {key!r}; schema-v3 targets are never "
             f"fabricated")
     return targets[key]
 

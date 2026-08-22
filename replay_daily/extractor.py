@@ -125,7 +125,9 @@ def _events_from_action(
     for pos, op in zip(actor_positions, worker_ops):
         if not pos or len(pos) < 2:
             continue
-        y, x = int(pos[0]), int(pos[1])
+        # Official 1.32.7 worker positions are [x, y]; board rows are indexed
+        # tiles[y][x]. Ledger tile coordinates remain canonical [y, x].
+        x, y = int(pos[0]), int(pos[1])
         if not (0 <= y < len(tiles) and 0 <= x < len(tiles[y])):
             continue
         if not isinstance(op, list):

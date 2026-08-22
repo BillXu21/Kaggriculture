@@ -1,4 +1,4 @@
-"""Stateless daily-manager tile Transformer over the compact schema-v2 arrays.
+"""Stateless daily-manager tile Transformer over the compact schema-v3 arrays.
 
 One implementation, one forward pass per day: a shared tile encoder embeds
 the own 100-tile board (and optionally the opponent PUBLIC board), five

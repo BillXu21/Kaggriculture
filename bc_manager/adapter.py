@@ -1,9 +1,9 @@
-"""Schema-v2 Parquet -> compact NumPy arrays BC adapter.
+"""Canonical Parquet -> compact NumPy arrays BC adapter.
 
 Reads canonical daily-record Parquet directly with PyArrow (nested Arrow
 columns, dotted-path projection; no `replay_daily.read_parquet` logical
-reconstruction), verifies `schema_version == 2` on every row of every
-selected file, filters once by partition date allowlist and the equal
+reconstruction), verifies `schema_version == SCHEMA_VERSION` on every row of
+every selected file, filters once by partition date allowlist and the equal
 `min_score` cutoff, and converts the selected rows exactly once into compact
 NumPy arrays resident in RAM. Never a random row split: split membership is
 defined exclusively by `metadata.partition_date`.
@@ -39,7 +39,7 @@ Target arrays:
 - `animal_target`     int32 [N,3] GOOSE/COW/SHEEP
 - `land_count`        int32 [N]   resulting unlocked quadrant count 1..4
 - `fertilizer_target` int32 [N,5] by crop (canonical "unknown" key dropped)
-- `care_target`       int32 [N,3] from targets.care_by_animal (v2 required;
+- `care_target`       int32 [N,3] from targets.care_by_animal (required;
                               missing CARE is an error, never fabricated)
 - `sell_presence`         bool    [N,9,6]
 - `sell_quantity_log1p`   float32 [N,9,6]
@@ -116,12 +116,13 @@ def _read_selected_table(path: str | Path) -> pa.Table:
         ) from exc
 
 
-def _require_schema_v2(table: pa.Table, path: str | Path) -> None:
+def _require_schema_version(table: pa.Table, path: str | Path) -> None:
+    """Fail loudly on older/mixed/missing schema_version in processed Parquet."""
     if "schema_version" not in table.column_names:
         raise SchemaVersionError(f"{path}: schema_version column missing")
     raw_versions = table.column("schema_version").to_pylist()
     # A date-filtered split may legitimately be empty; the source table still
-    # carries the schema-v2 column and there are no foreign rows to accept.
+    # carries the schema_version column and there are no foreign rows to accept.
     if not raw_versions:
         return
     if any(v is None for v in raw_versions):
@@ -130,7 +131,7 @@ def _require_schema_v2(table: pa.Table, path: str | Path) -> None:
     if versions != [SCHEMA_VERSION]:
         raise SchemaVersionError(
             f"{path}: unsupported schema_version value(s) {versions}; "
-            f"expected only {SCHEMA_VERSION}. v1/mixed processed data is "
+            f"expected only {SCHEMA_VERSION}. Older/mixed processed data is "
             f"rejected; regenerate it from raw replays."
         )
 
@@ -175,7 +176,7 @@ def load_selected_table(
         table = _read_selected_table(path)
         if empty_template is None:
             empty_template = table
-        _require_schema_v2(table, path)
+        _require_schema_version(table, path)
         meta_rows = table.column("metadata").to_pylist()
         mask = _row_filter_mask(meta_rows, dates, min_score)
         report["rows_read"] += table.num_rows
@@ -330,8 +331,8 @@ def _worker_side_arrays(state: Mapping[str, Any]) -> tuple[np.ndarray, ...]:
 def table_to_arrays(
     table: pa.Table, *, include_opponent: bool = False,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], list[dict[str, Any]]]:
-    """Convert a filtered schema-v2 table into compact NumPy arrays."""
-    _require_schema_v2(table, "in-memory Arrow table")
+    """Convert a filtered canonical table into compact NumPy arrays."""
+    _require_schema_version(table, "in-memory Arrow table")
     n = table.num_rows
     start_rows = _column_rows(table, "start")
     target_rows = _column_rows(table, "targets")
@@ -498,7 +499,7 @@ def build_targets(
         if care_by_animal is None:
             raise ValueError(
                 f"record {i}: targets.care_by_animal missing; this is a "
-                f"schema-v2 field. Refusing to fabricate CARE targets."
+                f"required canonical field. Refusing to fabricate CARE targets."
             )
         for k, name in enumerate(ANIMAL_ORDER):
             care[i, k] = int(_as_mapping(care_by_animal).get(name, 0))

@@ -4,7 +4,7 @@ Covers: exact output shapes, finite backward gradients, parameter-count
 behavior, token layout, nullable-lifecycle safety, metadata-leak rejection,
 opponent-public mode, target validation, group-balanced sell loss masking,
 adapter-owned >100 repeated sells without clipping, tiny-batch overfit,
-interleaved batches, and one bounded real schema-v2 adapter batch smoke.
+interleaved batches, and one bounded real schema-v3 adapter batch smoke.
 """
 
 import math
@@ -443,7 +443,7 @@ def test_interleaved_batch_rows_are_independent():
 
 @pytest.mark.skipif(not REAL_SAMPLE.exists(),
                     reason="local real canonical sample not present")
-def test_real_schema_v2_adapter_batch_forward_backward_smoke():
+def test_real_schema_v3_adapter_batch_forward_backward_smoke():
     table, report = load_selected_table(
         REAL_SAMPLE, dates=["2026-08-20"], min_score=0.0)
     assert report["rows_selected"] >= 8

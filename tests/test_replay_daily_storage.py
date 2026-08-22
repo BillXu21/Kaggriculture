@@ -295,14 +295,14 @@ def test_deterministic_logical_regeneration_and_order(rich_records, tmp_path):
     assert keys_a == keys_b
 
 
-# ------------------------------------------------- CARE ledger (schema v2)
+# ------------------------------------------------- CARE ledger round-trip
 
 
 def test_care_round_trip_exact_including_null_animal(rich_records, tmp_path):
     out = tmp_path / "care.parquet"
     write_parquet(rich_records, out)
     rec = read_parquet(out)[0]
-    assert rec["schema_version"] == SCHEMA_VERSION == 2
+    assert rec["schema_version"] == SCHEMA_VERSION == 3
     assert rec["events"]["care"] == {
         "by_animal": {"GOOSE": 0, "COW": 1, "SHEEP": 0},
         "entries": [
@@ -326,11 +326,12 @@ def test_care_absent_from_worker_ops_other_after_round_trip(
 # ------------------------------------------------- schema version policy
 
 
-def test_writer_rejects_v1_logical_records(rich_records):
-    records = copy.deepcopy(rich_records)
-    records[0]["schema_version"] = 1
-    with pytest.raises(ValueError, match="schema_version.*1"):
-        records_to_table(records)
+def test_writer_rejects_v1_and_v2_logical_records(rich_records):
+    for version in (1, 2):
+        records = copy.deepcopy(rich_records)
+        records[0]["schema_version"] = version
+        with pytest.raises(ValueError, match=f"schema_version.*{version}"):
+            records_to_table(records)
 
 
 def _write_rows_with_version(rows: list[dict], path: Path) -> None:
@@ -342,16 +343,27 @@ def _write_rows_with_version(rows: list[dict], path: Path) -> None:
     )
 
 
-def test_reader_rejects_v1_and_mixed_version_parquet(rich_records, tmp_path):
+def test_reader_rejects_v1_v2_and_mixed_version_parquet(rich_records, tmp_path):
     rows = records_to_table(rich_records).to_pylist()
 
     v1_rows = copy.deepcopy(rows)
     for row in v1_rows:
         row["schema_version"] = 1
-    mixed_rows = copy.deepcopy(rows)
-    mixed_rows[0]["schema_version"] = 1
+    v2_rows = copy.deepcopy(rows)
+    for row in v2_rows:
+        row["schema_version"] = 2
+    mixed_v1_rows = copy.deepcopy(rows)
+    mixed_v1_rows[0]["schema_version"] = 1
+    mixed_v2_rows = copy.deepcopy(rows)
+    mixed_v2_rows[0]["schema_version"] = 2
 
-    for name, bad_rows in (("v1.parquet", v1_rows), ("mixed.parquet", mixed_rows)):
+    cases = (
+        ("v1.parquet", v1_rows),
+        ("v2.parquet", v2_rows),
+        ("mixed-v1.parquet", mixed_v1_rows),
+        ("mixed-v2.parquet", mixed_v2_rows),
+    )
+    for name, bad_rows in cases:
         out = tmp_path / name
         _write_rows_with_version(bad_rows, out)
         with pytest.raises(ValueError, match="schema_version"):

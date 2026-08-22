@@ -1,6 +1,6 @@
 """BC training/evaluation loop for the daily-manager Transformer.
 
-In-RAM pipeline over the accepted schema-v2 Arrow adapter:
+In-RAM pipeline over the accepted schema-v3 Arrow adapter:
 Parquet -> compact NumPy (once) -> compact torch tensors -> DataLoader ->
 AdamW epochs with gradient clipping and optional CUDA AMP -> sparse
 diagnostics beside the train-split-only day baseline -> best/last

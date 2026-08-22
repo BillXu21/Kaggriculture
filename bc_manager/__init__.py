@@ -1,6 +1,6 @@
 """Compact-array BC data layer for the daily farm manager.
 
-`bc_manager.adapter`   schema-v2 Parquet -> compact NumPy arrays, date/score
+`bc_manager.adapter`   schema-v3 Parquet -> compact NumPy arrays, date/score
                        selection (never random splits)
 `bc_manager.metrics`   sparse-target NumPy metrics
 `bc_manager.baseline`  train-split-only empirical day baseline

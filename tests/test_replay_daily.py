@@ -7,6 +7,7 @@ local sample when present.
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -455,6 +456,158 @@ def test_care_derived_from_public_board_no_opponent_private_leakage():
     assert by_seat[1]["events"]["care"]["by_animal"]["GOOSE"] == 1
 
 
+# ------------------------------------------------- official [x,y] positions
+
+def _plant_tile(crop: str) -> dict:
+    return {"kind": "PLANT", "crop": crop, "planted_day": 0,
+            "yield_units": 1, "max_lifespan_step": 312,
+            "fertilized_until_day": -1, "consecutive_unwatered": 0,
+            "watered_today": True}
+
+
+def transposed_probe_tiles(actual_tile, decoy_tile) -> list[list[Any]]:
+    """6x6 board isolating the official [x,y] worker-position convention.
+
+    The worker stands at position [x=2, y=5]. The official tile lookup is
+    `tiles[y][x]` == tiles[5][2] (`actual_tile`). A deliberately different
+    decoy sits at the transposed board[2][5] and must never be consulted.
+    """
+    tiles: list[list[Any]] = [[None] * 6 for _ in range(6)]
+    tiles[5][2] = actual_tile
+    tiles[2][5] = decoy_tile
+    return tiles
+
+
+def _probe_farm(actual_tile, decoy_tile, hands: list | None = None) -> dict:
+    """Farm whose farmer stands at official position [x=2, y=5]."""
+    farm = make_farm(tiles=transposed_probe_tiles(actual_tile, decoy_tile),
+                     hands=hands)
+    farm["farmer"] = [2, 5]
+    return farm
+
+
+def _probe_specs(farm: dict, op: list, hour: int = 7) -> list[dict]:
+    # The action stored on the hour-(hour+1) entry transformed the hour-`hour`
+    # observation into it, so the event is attributed to exactly `hour`.
+    return [
+        {"day": 0, "hour": 0, "farms0": farm},
+        {"day": 0, "hour": hour, "farms0": farm},
+        {"day": 0, "hour": hour + 1, "farms0": farm,
+         "action0": {"farmer": op, "hands": [], "market": []}},
+        {"day": 1, "hour": 0},
+    ]
+
+
+def _probe_record(specs: list[dict]) -> dict:
+    records = extract_replay(make_replay(specs))
+    return next(r for r in records if r["metadata"]["seat"] == 0 and r["day"] == 0)
+
+
+def test_care_uses_official_xy_position_not_transposed_decoy():
+    farm = _probe_farm(animal_tile("COW"), animal_tile("SHEEP"))
+    rec = _probe_record(_probe_specs(farm, ["CARE"]))
+    assert rec["events"]["care"]["by_animal"] == \
+        {"GOOSE": 0, "COW": 1, "SHEEP": 0}
+    assert rec["events"]["care"]["entries"] == [
+        {"tile": [5, 2], "animal": "COW", "hour": 7}]
+    assert rec["targets"]["care_by_animal"] == rec["events"]["care"]["by_animal"]
+
+
+def test_care_hand_actor_uses_same_official_lookup():
+    farm = _probe_farm(animal_tile("GOOSE"), animal_tile("COW"),
+                       hands=[[2, 5]])
+    specs = [
+        {"day": 0, "hour": 0, "farms0": farm},
+        {"day": 0, "hour": 9, "farms0": farm},
+        {"day": 0, "hour": 10, "farms0": farm,
+         "action0": {"farmer": ["PASS"], "hands": [["CARE"]], "market": []}},
+        {"day": 1, "hour": 0},
+    ]
+    rec = _probe_record(specs)
+    assert rec["events"]["care"]["entries"] == [
+        {"tile": [5, 2], "animal": "GOOSE", "hour": 9}]
+
+
+def test_care_unknown_when_actual_tile_lacks_animal_despite_decoy():
+    # Actual board[5][2] is a bare PASTURE without an animal; only the
+    # transposed decoy board[2][5] holds a SHEEP, which must never be used.
+    farm = _probe_farm({"kind": "PASTURE"}, animal_tile("SHEEP"))
+    rec = _probe_record(_probe_specs(farm, ["CARE"]))
+    assert rec["events"]["care"]["by_animal"] == \
+        {"GOOSE": 0, "COW": 0, "SHEEP": 0}
+    assert rec["events"]["care"]["entries"] == [
+        {"tile": [5, 2], "animal": None, "hour": 7}]
+
+
+def test_care_official_lookup_both_seats_independently():
+    farms = [
+        _probe_farm(animal_tile("COW"), animal_tile("SHEEP")),
+        _probe_farm(animal_tile("GOOSE"), animal_tile("COW")),
+    ]
+    specs = [
+        {"day": 0, "hour": 0, "farms0": farms[0], "farms1": farms[1]},
+        {"day": 0, "hour": 7, "farms0": farms[0], "farms1": farms[1]},
+        {"day": 0, "hour": 8, "farms0": farms[0], "farms1": farms[1],
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []},
+         "action1": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 1, "hour": 0},
+    ]
+    by_seat = {r["metadata"]["seat"]: r
+               for r in extract_replay(make_replay(specs)) if r["day"] == 0}
+    assert by_seat[0]["events"]["care"]["entries"] == [
+        {"tile": [5, 2], "animal": "COW", "hour": 7}]
+    assert by_seat[1]["events"]["care"]["entries"] == [
+        {"tile": [5, 2], "animal": "GOOSE", "hour": 7}]
+
+
+def test_fertilize_attributes_actual_crop_not_transposed_decoy():
+    farm = _probe_farm(_plant_tile("MELON"), _plant_tile("WHEAT"))
+    rec = _probe_record(_probe_specs(farm, ["FERTILIZE"]))
+    assert rec["events"]["fertilizer_applications"]["by_crop"] == {"MELON": 1}
+    assert rec["events"]["fertilizer_applications"]["entries"] == [
+        {"tile": [5, 2], "crop": "MELON", "hour": 7}]
+    assert rec["targets"]["fertilizer_by_crop"] == {"MELON": 1}
+
+
+def test_harvest_attributes_actual_item_not_transposed_decoy():
+    # Actual COW yields MILK; the transposed SHEEP decoy would yield WOOL.
+    farm = _probe_farm(animal_tile("COW"), animal_tile("SHEEP"))
+    rec = _probe_record(_probe_specs(farm, ["HARVEST"]))
+    assert rec["events"]["harvests"]["by_item"] == {"MILK": 1}
+    assert rec["events"]["harvests"]["entries"] == [
+        {"tile": [5, 2], "item": "MILK", "hour": 7}]
+
+
+def test_harvest_crop_item_uses_actual_plant_tile():
+    farm = _probe_farm(_plant_tile("STRAWBERRY"), animal_tile("COW"))
+    rec = _probe_record(_probe_specs(farm, ["HARVEST"]))
+    assert rec["events"]["harvests"]["by_item"] == {"STRAWBERRY": 1}
+    assert rec["events"]["harvests"]["entries"] == [
+        {"tile": [5, 2], "item": "STRAWBERRY", "hour": 7}]
+
+
+def test_dig_reports_actual_replaced_tile_kind_not_transposed_decoy():
+    farm = _probe_farm({"kind": "WEED"}, "LOCKED")
+    rec = _probe_record(_probe_specs(farm, ["DIG"]))
+    assert rec["events"]["digs"] == {"total": 1, "replaced": {"WEED": 1}}
+
+
+def test_dig_on_empty_actual_tile_counts_empty_not_decoy():
+    farm = _probe_farm(None, animal_tile("COW"))
+    rec = _probe_record(_probe_specs(farm, ["DIG"]))
+    assert rec["events"]["digs"] == {"total": 1, "replaced": {"empty": 1}}
+
+
+def test_plant_crop_identity_from_args_needs_no_tile_lookup():
+    # PLANT crop identity comes from the action args; the canonical plants
+    # ledger stores counts only (no tile coordinates), so neither the actual
+    # nor the decoy tile may influence it.
+    farm = _probe_farm(None, _plant_tile("WHEAT"))
+    rec = _probe_record(_probe_specs(farm, ["PLANT", "CARROT"]))
+    assert rec["events"]["plants"] == {"CARROT": 1}
+    assert "CARROT" not in rec["targets"]["crop_composition_end"]
+
+
 # --------------------------------------------------------- sell bucketing
 
 
@@ -801,10 +954,12 @@ def test_real_replay_smoke_60_records_alignment_and_privacy():
             ops = [action.get("farmer") or [], *(action.get("hands") or [])]
             for pos, op in zip(actors, ops):
                 if isinstance(op, list) and op and op[0] == "CARE":
-                    tile = farm["tiles"][pos[0]][pos[1]]
+                    # Official 1.32.7 worker position is [x, y]; board lookup
+                    # is tiles[y][x]; ledger tile coordinates stay [y, x].
+                    tile = farm["tiles"][pos[1]][pos[0]]
                     animal = tile.get("animal") if isinstance(tile, dict) else None
                     expected_care.append(
-                        (seat, pre["day"], pos[0], pos[1], animal, pre["hour"]))
+                        (seat, pre["day"], pos[1], pos[0], animal, pre["hour"]))
     got_care = []
     for rec in records:
         for entry in rec["events"]["care"]["entries"]:

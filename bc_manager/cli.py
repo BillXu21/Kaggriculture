@@ -27,8 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bc_manager.cli",
         description="Train/evaluate the daily-manager BC Transformer on "
-                    "schema-v2 canonical daily Parquet.")
-    parser.add_argument("parquet", nargs="+", help="schema-v2 Parquet path(s)")
+                    "schema-v3 canonical daily Parquet.")
+    parser.add_argument("parquet", nargs="+", help="schema-v3 Parquet path(s)")
     parser.add_argument("--train-dates", type=_dates,
                         default=tuple(TRAIN_DATES_DEFAULT),
                         help="comma-separated train partition dates")
