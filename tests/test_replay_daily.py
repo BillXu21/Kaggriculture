@@ -134,6 +134,21 @@ def assert_no_opponent_private(node) -> None:
             assert_no_opponent_private(value)
 
 
+def animal_tile(animal: str) -> dict:
+    """Faithful 1.32.7 animal structure tile (COOP for GOOSE, else PASTURE)."""
+    return {
+        "kind": "COOP" if animal == "GOOSE" else "PASTURE",
+        "animal": animal,
+        "placed_day": 0,
+        "yield_units": 0,
+        "fed_today": False,
+        "cared_today": False,
+        "consecutive_unfed": 0,
+        "fertilizer_available": False,
+        "pending_care_bonus": 0,
+    }
+
+
 # ------------------------------------------------------- day segmentation
 
 
@@ -252,6 +267,192 @@ def test_two_seat_canonicalization_and_privacy():
             assert_no_opponent_private(rec["end"][side])
         # The opponent view must never equal the writer's own private state.
         assert rec["start"]["opponent_public"].get("shed", None) is None
+
+
+# --------------------------------------------------------- CARE ledger
+
+
+def _care_record(specs: list[dict]) -> dict:
+    records = extract_replay(make_replay(specs))
+    return next(r for r in records if r["metadata"]["seat"] == 0 and r["day"] == 0)
+
+
+def test_care_on_cow_recorded_as_cow():
+    specs = [
+        {"day": 0, "hour": 0,
+         "farms0": make_farm(tiles=[[animal_tile("COW"), None], [None, None]])},
+        {"day": 0, "hour": 1,
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 1, "hour": 0},
+    ]
+    rec = _care_record(specs)
+    assert rec["events"]["care"] == {
+        "by_animal": {"GOOSE": 0, "COW": 1, "SHEEP": 0},
+        "entries": [{"tile": [0, 0], "animal": "COW", "hour": 0}],
+    }
+    assert rec["targets"]["care_by_animal"] == {"GOOSE": 0, "COW": 1, "SHEEP": 0}
+
+
+def test_care_sheep_and_goose_attributed_by_species():
+    # GOOSE under the farmer at [0,0]; SHEEP under a hired hand at [1,1].
+    tiles = [[animal_tile("GOOSE"), None], [None, animal_tile("SHEEP")]]
+    farm = make_farm(tiles=tiles, hands=[[1, 1]])
+    specs = [
+        {"day": 0, "hour": 0, "farms0": farm},
+        {"day": 0, "hour": 1, "farms0": farm,
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 0, "hour": 2, "farms0": farm,
+         "action0": {"farmer": ["PASS"], "hands": [["CARE"]], "market": []}},
+        {"day": 1, "hour": 0},
+    ]
+    rec = _care_record(specs)
+    assert rec["events"]["care"]["by_animal"] == \
+        {"GOOSE": 1, "COW": 0, "SHEEP": 1}
+    assert rec["events"]["care"]["entries"] == [
+        {"tile": [0, 0], "animal": "GOOSE", "hour": 0},
+        {"tile": [1, 1], "animal": "SHEEP", "hour": 1},
+    ]
+
+
+def test_care_exact_primitive_hour_uses_pre_action_alignment():
+    # The action stored on the day-1 hour-0 entry acted on the day-0 hour-23
+    # observation: the CARE belongs to day 0 at hour 23, not to day 1.
+    cow_farm = make_farm(tiles=[[animal_tile("COW"), None], [None, None]])
+    specs = [
+        {"day": 0, "hour": 0, "farms0": cow_farm},
+        {"day": 0, "hour": 23, "farms0": cow_farm},
+        {"day": 1, "hour": 0,
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 1, "hour": 1},
+    ]
+    records = extract_replay(make_replay(specs))
+    day0 = next(r for r in records if r["metadata"]["seat"] == 0 and r["day"] == 0)
+    day1 = next(r for r in records if r["metadata"]["seat"] == 0 and r["day"] == 1)
+    assert day0["events"]["care"]["entries"] == [
+        {"tile": [0, 0], "animal": "COW", "hour": 23}]
+    assert day0["events"]["care"]["by_animal"] == {"GOOSE": 0, "COW": 1, "SHEEP": 0}
+    assert day1["events"]["care"]["by_animal"] == {"GOOSE": 0, "COW": 0, "SHEEP": 0}
+    assert day1["events"]["care"]["entries"] == []
+
+
+def test_care_both_seats_canonicalize_independently():
+    farms = [
+        make_farm(tiles=[[animal_tile("COW"), None], [None, None]]),
+        make_farm(tiles=[[animal_tile("SHEEP"), None], [None, None]]),
+    ]
+    specs = [
+        {"day": 0, "hour": 0, "farms0": farms[0], "farms1": farms[1]},
+        {"day": 0, "hour": 1,
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []},
+         "action1": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 1, "hour": 0},
+    ]
+    records = extract_replay(make_replay(specs))
+    by_seat = {r["metadata"]["seat"]: r for r in records if r["day"] == 0}
+    assert by_seat[0]["events"]["care"]["by_animal"] == \
+        {"GOOSE": 0, "COW": 1, "SHEEP": 0}
+    assert by_seat[1]["events"]["care"]["by_animal"] == \
+        {"GOOSE": 0, "COW": 0, "SHEEP": 1}
+    assert by_seat[0]["events"]["care"]["entries"] == [
+        {"tile": [0, 0], "animal": "COW", "hour": 0}]
+    assert by_seat[1]["events"]["care"]["entries"] == [
+        {"tile": [0, 0], "animal": "SHEEP", "hour": 0}]
+
+
+def test_care_unknown_intent_preserved_never_becomes_species():
+    """Empty tile, LOCKED sentinel, and bare PASTURE stay `animal: null`."""
+    empty = [[None, None], [None, None]]
+    locked = [["LOCKED", None], [None, None]]
+    bare_pasture = [[{"kind": "PASTURE"}, None], [None, None]]
+    specs = [
+        {"day": 0, "hour": 0, "farms0": make_farm(tiles=empty)},
+        {"day": 0, "hour": 1,
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 0, "hour": 2, "farms0": make_farm(tiles=locked)},
+        {"day": 0, "hour": 3,
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 0, "hour": 4, "farms0": make_farm(tiles=bare_pasture)},
+        {"day": 0, "hour": 5,
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 1, "hour": 0},
+    ]
+    rec = _care_record(specs)
+    assert rec["events"]["care"]["by_animal"] == \
+        {"GOOSE": 0, "COW": 0, "SHEEP": 0}
+    assert rec["events"]["care"]["entries"] == [
+        {"tile": [0, 0], "animal": None, "hour": 0},
+        {"tile": [0, 0], "animal": None, "hour": 2},
+        {"tile": [0, 0], "animal": None, "hour": 4},
+    ]
+    assert rec["targets"]["care_by_animal"] == {"GOOSE": 0, "COW": 0, "SHEEP": 0}
+
+
+def test_care_absent_from_worker_ops_other_and_other_ops_unchanged():
+    tiles = [[animal_tile("COW"), None], [None, None]]
+    specs = [
+        {"day": 0, "hour": 0, "farms0": make_farm(tiles=tiles)},
+        {"day": 0, "hour": 1,
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 0, "hour": 2,
+         "action0": {"farmer": ["FEED"], "hands": [], "market": []}},
+        {"day": 1, "hour": 0},
+    ]
+    rec = _care_record(specs)
+    # CARE is ledgered explicitly; FEED still lands in worker_ops_other.
+    assert rec["events"]["worker_ops_other"] == {"FEED": 1}
+    assert "CARE" not in rec["events"]["worker_ops_other"]
+    assert rec["events"]["care"]["by_animal"]["COW"] == 1
+
+
+def test_care_daily_merge_counts_and_target_mirror_events():
+    tiles = [[animal_tile("COW"), None], [None, animal_tile("SHEEP")]]
+    farm = make_farm(tiles=tiles, hands=[[1, 1]])
+    specs = [
+        {"day": 0, "hour": 0, "farms0": farm},
+        {"day": 0, "hour": 1, "farms0": farm,
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 0, "hour": 2, "farms0": farm,
+         "action0": {"farmer": ["PASS"], "hands": [["CARE"]], "market": []}},
+        {"day": 0, "hour": 3, "farms0": farm,
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 1, "hour": 0},
+    ]
+    rec = _care_record(specs)
+    care = rec["events"]["care"]
+    assert care["by_animal"] == {"GOOSE": 0, "COW": 2, "SHEEP": 1}
+    assert len(care["entries"]) == 3
+    # Derived target exactly mirrors the known-animal event counts.
+    assert rec["targets"]["care_by_animal"] == care["by_animal"]
+
+
+def test_care_derived_from_public_board_no_opponent_private_leakage():
+    privates = [
+        {"shed": {"WHEAT": 3}, "seeds": {}, "inventories": [{}]},
+        {"shed": {"WOOL": 7}, "seeds": {"MELON": 9}, "inventories": [{}]},
+    ]
+    farms = [
+        make_farm(tiles=[[animal_tile("COW"), None], [None, None]]),
+        make_farm(tiles=[[animal_tile("GOOSE"), None], [None, None]]),
+    ]
+    specs = [
+        {"day": 0, "hour": 0, "farms0": farms[0], "farms1": farms[1],
+         "private": privates},
+        {"day": 0, "hour": 1,
+         "action0": {"farmer": ["CARE"], "hands": [], "market": []},
+         "action1": {"farmer": ["CARE"], "hands": [], "market": []}},
+        {"day": 1, "hour": 0, "private": privates},
+    ]
+    records = extract_replay(make_replay(specs))
+    for rec in records:
+        for side in ("opponent_public",):
+            assert_no_opponent_private(rec["start"][side])
+            assert_no_opponent_private(rec["end"][side])
+        # CARE ledger and derived targets carry board-derived public data only.
+        assert_no_opponent_private(rec["events"]["care"])
+        assert_no_opponent_private(rec["targets"])
+    by_seat = {r["metadata"]["seat"]: r for r in records if r["day"] == 0}
+    assert by_seat[0]["events"]["care"]["by_animal"]["COW"] == 1
+    assert by_seat[1]["events"]["care"]["by_animal"]["GOOSE"] == 1
 
 
 # --------------------------------------------------------- sell bucketing
@@ -587,6 +788,35 @@ def test_real_replay_smoke_60_records_alignment_and_privacy():
                 sale["product"], sale["quantity"], sale["hour"],
             ))
     assert sorted(got_sells) == sorted(expected_sells)
+
+    # CARE alignment on real data: every submitted ["CARE"] worker op must be
+    # attributed to its pre-action tile/animal/hour in exactly one ledger.
+    expected_care = []
+    for i, step in enumerate(raw["steps"]):
+        for seat in (0, 1):
+            action = step[seat]["action"] or {}
+            pre = raw["steps"][i - 1][seat]["observation"]
+            farm = pre["farms"][seat]
+            actors = [farm["farmer"], *(farm.get("hands") or [])]
+            ops = [action.get("farmer") or [], *(action.get("hands") or [])]
+            for pos, op in zip(actors, ops):
+                if isinstance(op, list) and op and op[0] == "CARE":
+                    tile = farm["tiles"][pos[0]][pos[1]]
+                    animal = tile.get("animal") if isinstance(tile, dict) else None
+                    expected_care.append(
+                        (seat, pre["day"], pos[0], pos[1], animal, pre["hour"]))
+    got_care = []
+    for rec in records:
+        for entry in rec["events"]["care"]["entries"]:
+            got_care.append((
+                rec["metadata"]["seat"], rec["day"],
+                entry["tile"][0], entry["tile"][1],
+                entry["animal"], entry["hour"],
+            ))
+            assert entry["animal"] in ("GOOSE", "COW", "SHEEP", None)
+        assert rec["targets"]["care_by_animal"] == \
+            rec["events"]["care"]["by_animal"]
+    assert sorted(got_care) == sorted(expected_care)
 
     # Known probe fact: steps[2][0] SELL WHEAT 3 acted on obs[1] (day 0, hour 1).
     day0_seat0 = next(r for r in records

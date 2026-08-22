@@ -34,7 +34,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .constants import ENGINE_VERSION
+from .constants import ENGINE_VERSION, SCHEMA_VERSION
 from .extractor import VersionMismatch, extract_replay, load_manifest
 from .storage import read_parquet, write_parquet
 
@@ -125,13 +125,22 @@ def cmd_extract(args: argparse.Namespace) -> int:
 def _iter_stored_records(records_path: str):
     """Yield logical records from either storage format, by extension."""
     if Path(records_path).suffix == ".parquet":
-        yield from read_parquet(records_path)
+        yield from read_parquet(records_path)  # validates schema_version
         return
     with open(records_path, encoding="utf-8") as f:
-        for line in f:
+        for line_no, line in enumerate(f, 1):
             line = line.strip()
-            if line:
-                yield json.loads(line)
+            if not line:
+                continue
+            record = json.loads(line)
+            version = record.get("schema_version")
+            if version != SCHEMA_VERSION:
+                raise ValueError(
+                    f"{records_path}:{line_no}: unsupported schema_version "
+                    f"{version!r}; expected {SCHEMA_VERSION}. Regenerate "
+                    f"processed data from raw replays."
+                )
+            yield record
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:

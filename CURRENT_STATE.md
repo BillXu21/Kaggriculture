@@ -73,22 +73,26 @@ For V0, derive high-level labels for:
 
 Preserve exact primitive sale hours in the event ledger so a future 24-turn/reactive selling policy remains possible.
 
-Also retain compact daily aggregates for planting/digging, fertilizer, harvests, animal/seed/product purchases, land purchases, workers/hire cost, and sales. These are audit/future-extension data, not necessarily V0 BC targets.
+Also retain compact daily aggregates for planting/digging, fertilizer, harvests, care-by-animal intents, animal/seed/product purchases, land purchases, workers/hire cost, and sales. These are audit/future-extension data, not necessarily V0 BC targets.
 
 See D-018 in `DECISIONS.md` and `.agents/notes/implemented/2026-08-21-canonical-daily-replay-record.md`.
 
 ## Current Preprocessing Status
 
 - The reusable local extractor and CLI are implemented under `replay_daily/`.
+- **Canonical schema version is 2**: `events.care` records each submitted CARE
+  intent with its pre-action tile, established animal identity (or `null`), and
+  exact primitive hour; `targets.care_by_animal` mirrors the known-animal daily
+  counts. Processed-data readers and writers fail loudly on v1/mixed input;
+  regenerate from raw replays instead of migrating.
 - **Parquet is the production canonical physical format** (PyArrow, Zstandard,
   one row per `(episode, seat, day)`; `replay_daily/storage.py`). JSONL remains
   an optional debug/inspection CLI output only; raw replays stay the source of
   truth.
 - The 15-replay 1.32.7 sample produced 900 validated records at
-  `data/canonical/2026-08-20-sample.parquet` (ignored/local; 795,154 bytes,
-  98.8% smaller than the equivalent JSONL). Exact-equality parity against fresh
-  extraction and the previously validated JSONL was confirmed on all 900
-  records.
+  `data/canonical/2026-08-20-sample.parquet` (ignored/local; 806,735 bytes at
+  schema v2). Exact-equality parity against fresh extraction was reconfirmed on
+  all 900 records after the v2 CARE correction.
 - Single-process extraction measured ~89 MB/s of raw replay (~0.3 h per
   100 GiB), so no parallel preprocessing stage is justified yet. Details in
   `research/CANONICAL_DAILY_SAMPLE_VALIDATION.md`.

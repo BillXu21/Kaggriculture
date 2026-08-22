@@ -2,6 +2,35 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-22 — Canonical Schema v2: CARE-by-animal Correction
+
+Logical extension/correction under D-018 (no redesign; D-017/D-018 unchanged).
+
+- `events.care` now records every submitted CARE intent with its pre-action
+  tile `[y, x]`, the animal identity established by that board tile (or
+  `null`), and the exact primitive hour. CARE previously fell into the generic
+  `worker_ops_other` aggregate with no species attribution.
+- CARE takes no arguments: it targets the worker's own pre-action tile under
+  the verified alignment rule (`steps[i].action` transforms `obs[i-1]`).
+  Unknown/non-animal CARE stays `animal: null` and never increments a species.
+- New derived target `targets.care_by_animal` exactly mirrors the known-animal
+  daily counts for GOOSE/COW/SHEEP.
+- `SCHEMA_VERSION` bumped 1 → 2 in `replay_daily/constants.py`. Parquet Arrow
+  schema, conformance guards, normalization, reconstruction, and round-trip
+  equality extended for CARE. Writers reject logical records with a foreign
+  `schema_version`; `read_parquet`/JSONL readers fail loudly on v1 or
+  mixed-version processed data. No migration machinery: regenerate from raw.
+- Real-sample validation: all 15 local replays re-extracted to v2 Parquet
+  (900 records, exact read-back parity). 6,642 known CARE events (COW 3,724,
+  SHEEP 2,918) plus 3,083 unknown intents preserved as `animal: null`; GOOSE
+  does not occur in the local elite sample and is covered synthetically.
+  Regenerated artifact: `data/canonical/2026-08-20-sample.parquet`, 806,735
+  bytes, SHA-256 `F7176542FE34B72DCEFCF70799DEDC34F17D8DB2DBF372680BD0FEC597023441`.
+- 57 focused tests pass (13 new covering CARE attribution, hours, seats,
+  privacy, merge/target mirror, round-trip with null animal, no double count,
+  and v1/mixed rejection). Evidence in
+  `research/CANONICAL_DAILY_SAMPLE_VALIDATION.md`.
+
 ## 2026-08-21 — Parquet Production Storage for Canonical Records
 
 Adopted Zstandard-compressed Parquet as the production canonical physical

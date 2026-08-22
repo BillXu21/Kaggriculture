@@ -11,8 +11,10 @@ import copy
 import json
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
+from replay_daily.constants import SCHEMA_VERSION
 from replay_daily.storage import (
     PARQUET_COMPRESSION,
     RECORD_SCHEMA,
@@ -90,13 +92,18 @@ def rich_specs() -> list[dict]:
             "action0": {"farmer": ["PASS"], "hands": [],
                         "market": [["SELL", "WHEAT", 2]]},
         },
-        {"day": 0, "hour": 23},
+        # Hour-23 observation carries a COW under the farmer and a hand on a
+        # LOCKED tile; the terminal-boundary action below CAREs both actors,
+        # so entries are attributed back to day 0 at exact hour 23.
+        {"day": 0, "hour": 23,
+         "farms0": make_farm(tiles=[[_animal("COW"), None], ["LOCKED", None]],
+                             hands=[[1, 1]])},
         # Terminal day boundary; acts on obs hour 23. Harvest + fertilizer +
         # seed buy ledger entries come from the end-tile board state.
         {
             "day": 1, "hour": 0,
             "farms0": make_farm(tiles=end_tiles),
-            "action0": {"farmer": ["PASS"], "hands": [],
+            "action0": {"farmer": ["CARE"], "hands": [["CARE"]],
                         "market": [["SELL", "EGG", 1], ["SELL", "MELON", 3],
                                    ["BUY_SEED", "WHEAT", 5]]},
         },
@@ -286,6 +293,78 @@ def test_deterministic_logical_regeneration_and_order(rich_records, tmp_path):
     keys_b = [(r["metadata"]["episode_id"], r["metadata"]["seat"], r["day"])
               for r in reread_b]
     assert keys_a == keys_b
+
+
+# ------------------------------------------------- CARE ledger (schema v2)
+
+
+def test_care_round_trip_exact_including_null_animal(rich_records, tmp_path):
+    out = tmp_path / "care.parquet"
+    write_parquet(rich_records, out)
+    rec = read_parquet(out)[0]
+    assert rec["schema_version"] == SCHEMA_VERSION == 2
+    assert rec["events"]["care"] == {
+        "by_animal": {"GOOSE": 0, "COW": 1, "SHEEP": 0},
+        "entries": [
+            {"tile": [0, 0], "animal": "COW", "hour": 23},
+            {"tile": [1, 1], "animal": None, "hour": 23},
+        ],
+    }
+    assert rec["targets"]["care_by_animal"] == {"GOOSE": 0, "COW": 1, "SHEEP": 0}
+
+
+def test_care_absent_from_worker_ops_other_after_round_trip(
+        rich_records, tmp_path):
+    out = tmp_path / "no_double_count.parquet"
+    write_parquet(rich_records, out)
+    rec = read_parquet(out)[0]
+    assert "CARE" not in rec["events"]["worker_ops_other"]
+    assert sum(rec["events"]["care"]["by_animal"].values()) == \
+        len(rec["events"]["care"]["entries"]) - 1  # one unknown entry
+
+
+# ------------------------------------------------- schema version policy
+
+
+def test_writer_rejects_v1_logical_records(rich_records):
+    records = copy.deepcopy(rich_records)
+    records[0]["schema_version"] = 1
+    with pytest.raises(ValueError, match="schema_version.*1"):
+        records_to_table(records)
+
+
+def _write_rows_with_version(rows: list[dict], path: Path) -> None:
+    import pyarrow.parquet as pq
+
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=RECORD_SCHEMA), path,
+        compression=PARQUET_COMPRESSION,
+    )
+
+
+def test_reader_rejects_v1_and_mixed_version_parquet(rich_records, tmp_path):
+    rows = records_to_table(rich_records).to_pylist()
+
+    v1_rows = copy.deepcopy(rows)
+    for row in v1_rows:
+        row["schema_version"] = 1
+    mixed_rows = copy.deepcopy(rows)
+    mixed_rows[0]["schema_version"] = 1
+
+    for name, bad_rows in (("v1.parquet", v1_rows), ("mixed.parquet", mixed_rows)):
+        out = tmp_path / name
+        _write_rows_with_version(bad_rows, out)
+        with pytest.raises(ValueError, match="schema_version"):
+            read_parquet(out)
+
+
+def test_cli_inspect_rejects_v1_jsonl(tmp_path):
+    from replay_daily.cli import main as cli_main_fn
+
+    out = tmp_path / "v1.jsonl"
+    out.write_text('{"schema_version": 1}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="schema_version"):
+        cli_main_fn(["inspect", str(out)])
 
 
 # ------------------------------------------------- CLI format selection

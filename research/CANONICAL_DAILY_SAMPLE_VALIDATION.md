@@ -17,8 +17,9 @@ debug/inspection CLI output and is no longer maintained as a duplicate
 artifact. Raw replays remain the source of truth.
 
 - 900 records: 15 episodes × 30 days × 2 seats;
-- 795,154 bytes;
-- SHA-256: `EDE0F53618606CC04E942628209370CBDCE77F97365AD44569BD1EB57CD6F933`.
+- regenerated at canonical schema v2 on 2026-08-22 (CARE-by-animal ledger);
+  806,735 bytes;
+- SHA-256 (v2): `F7176542FE34B72DCEFCF70799DEDC34F17D8DB2DBF372680BD0FEC597023441`.
 
 Generation:
 
@@ -40,6 +41,23 @@ tile = start["self"]["board"][0][0]              # tagged tile struct with deriv
 
 `replay_daily.read_parquet(path)` reconstructs canonical logical records that
 compare exactly equal to fresh extractor output.
+
+## Schema v2 CARE regeneration (2026-08-22)
+
+The artifact was regenerated at canonical schema v2 after the CARE-by-animal
+correction (`events.care` ledger + `targets.care_by_animal`; readers/writers
+fail loudly on v1/mixed processed data). All 900 records again compare with
+exact Python equality against fresh extraction. Corpus-wide CARE results:
+
+- 6,642 known-animal CARE events: COW 3,724, SHEEP 2,918, GOOSE 0 (no geese in
+  the local elite sample; GOOSE attribution is covered by synthetic tests);
+- 3,083 unknown CARE intents preserved with `animal: null` (empty pasture,
+  empty/locked tiles) and never counted as a species;
+- every record satisfies `targets.care_by_animal == events.care.by_animal`;
+- CARE no longer appears in `worker_ops_other`;
+- spot-checked raw adjacency: e.g. episode 94735084 seat 0 step 13 CARE at
+  pre-action position `[3, 3]` on a SHEEP tile, hour 12, appears verbatim in
+  the day ledger.
 
 ## Parquet full-sample parity and benchmark (2026-08-21)
 

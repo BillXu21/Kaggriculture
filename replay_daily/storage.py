@@ -25,6 +25,10 @@ Physical representation
   target entries) rejects unknown keys with a ValueError naming the path and
   key, because Arrow structs would otherwise silently drop them. Dynamic map
   keys (products/crops/op names/sell bins) remain unrestricted.
+- Version policy (schema v2): writers reject logical records whose
+  `schema_version` differs from the canonical version; readers reject v1,
+  mixed-version, or otherwise incompatible Parquet tables by name. No
+  migration: regenerate processed data from raw replays.
 - Localized encoding (the only non-native field): `events.market_events_ordered`
   holds mixed-type order lists ([op, *args, hour]); each order is stored as one
   JSON string. Every other field is directly readable Arrow data.
@@ -51,6 +55,8 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from .constants import SCHEMA_VERSION
 
 PARQUET_COMPRESSION = "zstd"
 
@@ -187,6 +193,14 @@ _EVENTS = pa.struct([
         ("entries", pa.list_(pa.struct(
             [*_LEDGER_ENTRY_BASE, ("item", _STR)]))),
     ])),
+    # CARE-by-animal ledger (schema v2): zero-defaulted species counts plus
+    # one entry per submitted intent; `animal` stays null for unknown/
+    # non-animal CARE and never defaults to a species.
+    ("care", pa.struct([
+        ("by_animal", _MAP_STR_INT),
+        ("entries", pa.list_(pa.struct(
+            [*_LEDGER_ENTRY_BASE, ("animal", _STR)]))),
+    ])),
     ("buys", pa.struct([
         ("seeds", _MAP_STR_INT),
         ("products", _MAP_STR_INT),
@@ -223,6 +237,7 @@ _TARGETS = pa.struct([
         ("new_quadrants", pa.list_(_STR)),
     ])),
     ("fertilizer_by_crop", _MAP_STR_INT),
+    ("care_by_animal", _MAP_STR_INT),
     ("sell_quantity", pa.map_(_STR, pa.map_(_STR, _INT))),
 ])
 
@@ -283,20 +298,22 @@ _MARKET_KEYS = ("inventory", "prices")
 _TOWN_KEYS = ("unlocked_shops", "shop_counts")
 _PREVIOUS_EXECUTION_KEYS = ("workers_hired", "hire_cost")
 _EVENTS_KEYS = ("plants", "digs", "fertilizer_applications", "harvests",
-                "buys", "land_purchases", "hires", "sells",
+                "care", "buys", "land_purchases", "hires", "sells",
                 "market_events_ordered", "worker_ops_other")
 _DIGS_KEYS = ("total", "replaced")
 _FERTILIZER_APP_KEYS = ("by_crop", "entries")
 _HARVESTS_KEYS = ("by_item", "entries")
+_CARE_KEYS = ("by_animal", "entries")
 _BUYS_KEYS = ("seeds", "products", "animals")
 _HIRES_KEYS = ("submitted", "realized")
 _FERTILIZER_ENTRY_KEYS = ("tile", "crop", "hour")
 _HARVEST_ENTRY_KEYS = ("tile", "item", "hour")
+_CARE_ENTRY_KEYS = ("tile", "animal", "hour")
 _LAND_PURCHASE_KEYS = ("quadrant", "hour")
 _SELL_KEYS = ("product", "quantity", "hour")
 _TARGETS_KEYS = ("crop_composition_end", "animal_counts_end",
                  "unlocked_quadrants_end", "land_expansion",
-                 "fertilizer_by_crop", "sell_quantity")
+                 "fertilizer_by_crop", "care_by_animal", "sell_quantity")
 _LAND_EXPANSION_KEYS = ("expanded", "new_quadrants")
 
 _TILE_ALLOWED_KEYS = ("kind", "derived") + _TILE_FIELDS
@@ -408,6 +425,7 @@ def _norm_events(ev: dict[str, Any]) -> dict[str, Any]:
         _FERTILIZER_APP_KEYS, ev["fertilizer_applications"],
         "events.fertilizer_applications")
     _require_known_keys(_HARVESTS_KEYS, ev["harvests"], "events.harvests")
+    _require_known_keys(_CARE_KEYS, ev["care"], "events.care")
     _require_known_keys(_BUYS_KEYS, ev["buys"], "events.buys")
     _require_known_keys(_HIRES_KEYS, ev["hires"], "events.hires")
     _require_known_keys(
@@ -433,6 +451,14 @@ def _norm_events(ev: dict[str, Any]) -> dict[str, Any]:
                 _norm_entry(e, _HARVEST_ENTRY_KEYS,
                             f"events.harvests.entries[{i}]")
                 for i, e in enumerate(ev["harvests"]["entries"])
+            ],
+        },
+        "care": {
+            "by_animal": _pairs(ev["care"]["by_animal"]),
+            "entries": [
+                _norm_entry(e, _CARE_ENTRY_KEYS,
+                            f"events.care.entries[{i}]")
+                for i, e in enumerate(ev["care"]["entries"])
             ],
         },
         "buys": {
@@ -477,6 +503,7 @@ def _norm_targets(targets: dict[str, Any]) -> dict[str, Any]:
             "new_quadrants": list(targets["land_expansion"]["new_quadrants"]),
         },
         "fertilizer_by_crop": _pairs(targets["fertilizer_by_crop"]),
+        "care_by_animal": _pairs(targets["care_by_animal"]),
         "sell_quantity": [
             (anchor, _pairs(products))
             for anchor, products in targets["sell_quantity"].items()
@@ -623,6 +650,13 @@ def _denorm_events(ev: dict[str, Any]) -> dict[str, Any]:
                 for e in ev["harvests"]["entries"]
             ],
         },
+        "care": {
+            "by_animal": _denorm_map(ev["care"]["by_animal"]),
+            "entries": [
+                {"tile": list(e["tile"]), "animal": e["animal"], "hour": e["hour"]}
+                for e in ev["care"]["entries"]
+            ],
+        },
         "buys": {
             "seeds": _denorm_map(ev["buys"]["seeds"]),
             "products": _denorm_map(ev["buys"]["products"]),
@@ -658,6 +692,7 @@ def _denorm_targets(targets: dict[str, Any]) -> dict[str, Any]:
             "new_quadrants": list(targets["land_expansion"]["new_quadrants"]),
         },
         "fertilizer_by_crop": _denorm_map(targets["fertilizer_by_crop"]),
+        "care_by_animal": _denorm_map(targets["care_by_animal"]),
         "sell_quantity": {
             anchor: _denorm_map(products)
             for anchor, products in targets["sell_quantity"]
@@ -700,16 +735,45 @@ def row_to_record(row: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def _require_schema_version(value: Any, context: str) -> None:
+    """Fail loudly on v1/mixed/incompatible processed data; never migrate."""
+    if value != SCHEMA_VERSION:
+        raise ValueError(
+            f"{context}: unsupported schema_version {value!r}; this build "
+            f"reads and writes canonical schema version {SCHEMA_VERSION} "
+            f"only. Do not migrate processed data; regenerate it from raw "
+            f"replays."
+        )
+
+
 def records_to_table(records: list[dict[str, Any]]) -> pa.Table:
-    """Build a RECORD_SCHEMA Arrow table from logical canonical records."""
+    """Build a RECORD_SCHEMA Arrow table from logical canonical records.
+
+    Writers reject logical records whose schema_version differs from the
+    canonical version rather than emitting mislabeled rows.
+    """
+    for i, record in enumerate(records):
+        _require_schema_version(
+            record.get("schema_version"), f"record[{i}]")
     return pa.Table.from_pylist(
         [record_to_row(r) for r in records], schema=RECORD_SCHEMA,
     )
 
 
 def table_to_records(table: pa.Table) -> list[dict[str, Any]]:
-    """Reconstruct logical canonical records from a RECORD_SCHEMA table."""
-    return [row_to_record(row) for row in table.to_pylist()]
+    """Reconstruct logical canonical records from a RECORD_SCHEMA table.
+
+    Rejects v1, mixed-version, or otherwise incompatible tables up front.
+    """
+    rows = table.to_pylist()
+    seen = sorted({row.get("schema_version") for row in rows}, key=repr)
+    if seen != [SCHEMA_VERSION]:
+        raise ValueError(
+            f"unsupported schema_version value(s) {seen!r} in Parquet table; "
+            f"expected only {SCHEMA_VERSION}. Mixed-version input is rejected; "
+            f"regenerate processed data from raw replays."
+        )
+    return [row_to_record(row) for row in rows]
 
 
 def write_parquet(records: list[dict[str, Any]], path: str | Path) -> None:
@@ -720,5 +784,12 @@ def write_parquet(records: list[dict[str, Any]], path: str | Path) -> None:
 
 
 def read_parquet(path: str | Path) -> list[dict[str, Any]]:
-    """Read a Parquet file written by `write_parquet` back into logical records."""
-    return table_to_records(pq.read_table(path))
+    """Read a Parquet file written by `write_parquet` back into logical records.
+
+    Fails loudly (naming the file) on v1/mixed/incompatible schema versions.
+    """
+    table = pq.read_table(path)
+    try:
+        return table_to_records(table)
+    except ValueError as exc:
+        raise ValueError(f"{Path(path)}: {exc}") from exc

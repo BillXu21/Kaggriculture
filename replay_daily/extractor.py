@@ -16,6 +16,7 @@ from typing import Any
 
 from .constants import (
     ANIMALS,
+    CARE_SPECIES,
     ENGINE_VERSION,
     FARM_HAND_COST_MULT_DEFAULT,
     LAND_ORDER,
@@ -91,6 +92,10 @@ def empty_events() -> dict[str, Any]:
         "digs": {"total": 0, "replaced": {}},
         "fertilizer_applications": {"by_crop": {}, "entries": []},
         "harvests": {"by_item": {}, "entries": []},
+        "care": {
+            "by_animal": {name: 0 for name in CARE_SPECIES},
+            "entries": [],
+        },
         "buys": {"seeds": {}, "products": {}, "animals": {}},
         "land_purchases": [],
         "hires": {"submitted": 0},
@@ -152,6 +157,17 @@ def _events_from_action(
             if item:
                 ev["harvests"]["by_item"][item] = ev["harvests"]["by_item"].get(item, 0) + 1
                 ev["harvests"]["entries"].append({"tile": [y, x], "item": item, "hour": hour})
+        elif name == "CARE":
+            # CARE takes no arguments: it targets the worker's own pre-action
+            # tile. Animal identity is established only by that board tile;
+            # anything else stays an unknown intent and never counts as a
+            # species (no identity invention, no realization claim).
+            tile = tiles[y][x]
+            animal = tile.get("animal") if isinstance(tile, dict) else None
+            if animal is not None:
+                ev["care"]["by_animal"][animal] = \
+                    ev["care"]["by_animal"].get(animal, 0) + 1
+            ev["care"]["entries"].append({"tile": [y, x], "animal": animal, "hour": hour})
         else:
             ev["worker_ops_other"][name] = ev["worker_ops_other"].get(name, 0) + 1
 
@@ -199,6 +215,9 @@ def _merge_events(target: dict[str, Any], extra: dict[str, Any]) -> None:
     for k, n in extra["harvests"]["by_item"].items():
         target["harvests"]["by_item"][k] = target["harvests"]["by_item"].get(k, 0) + n
     target["harvests"]["entries"].extend(extra["harvests"]["entries"])
+    for k, n in extra["care"]["by_animal"].items():
+        target["care"]["by_animal"][k] = target["care"]["by_animal"].get(k, 0) + n
+    target["care"]["entries"].extend(extra["care"]["entries"])
     for group in ("seeds", "products", "animals"):
         for k, n in extra["buys"][group].items():
             target["buys"][group][k] = target["buys"][group].get(k, 0) + n
@@ -408,6 +427,7 @@ def extract_replay(
                     ],
                 },
                 "fertilizer_by_crop": dict(events["fertilizer_applications"]["by_crop"]),
+                "care_by_animal": dict(events["care"]["by_animal"]),
                 "sell_quantity": _sell_quantity_bins(events["sells"]),
             }
 

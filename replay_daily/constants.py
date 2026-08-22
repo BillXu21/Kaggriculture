@@ -7,7 +7,10 @@ Sources:
 """
 
 ENGINE_VERSION = "1.32.7"
-SCHEMA_VERSION = 1
+# v2: canonical `events.care` by-animal ledger + entries, derived
+# `targets.care_by_animal`, and fail-loud processed-data version checks.
+# v1 processed artifacts are rejected, never migrated; regenerate from raw.
+SCHEMA_VERSION = 2
 
 # Engine CROPS table (exact copy of upstream constants).
 CROPS = {
@@ -29,6 +32,9 @@ PRODUCTS = [
     "WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON",
     "EGG", "MILK", "WOOL", "FERTILIZER",
 ]
+
+# Species eligible for CARE (zero-defaulted in the canonical care ledger).
+CARE_SPECIES = ("GOOSE", "COW", "SHEEP")
 
 # NW always unlocked; players unlock the rest in this order (upstream LAND_ORDER/LAND_PRICES).
 LAND_ORDER = ["NE", "SW", "SE"]
