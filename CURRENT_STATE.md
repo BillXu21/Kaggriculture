@@ -1,11 +1,11 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-21
+Last updated: 2026-08-22
 
 ## Snapshot
 
 - Repository: `BillXu21/Kaggriculture`
-- Phase: **canonical daily replay sample validated in Parquet production format; BC dataset expansion is next**
+- Phase: **first BC manager (tile Transformer + training CLI) implemented; five-day schema-v2 corpus regeneration on Kaggle is next**
 - Competitive training: not started
 - Latest confirmed upstream package: `kaggle-environments 1.32.7`
 - Exact local/vendored engine lock: not yet established
@@ -96,7 +96,37 @@ See D-018 in `DECISIONS.md` and `.agents/notes/implemented/2026-08-21-canonical-
 - Single-process extraction measured ~89 MB/s of raw replay (~0.3 h per
   100 GiB), so no parallel preprocessing stage is justified yet. Details in
   `research/CANONICAL_DAILY_SAMPLE_VALIDATION.md`.
-- Training and the deterministic executor have not started.
+- The deterministic executor has not started.
+
+## First BC Manager Implementation (D-019)
+
+Implemented under `bc_manager/` (usage in `bc_manager/README.md`):
+
+- **Compact adapter/day baseline:** schema-v2 Parquet -> compact NumPy
+  arrays via direct Arrow projection; date-held-out selection only
+  (default train 2026-08-17..20, validation 2026-08-21, configurable
+  `min_score >= 2950`); train-split-only empirical day baseline.
+- **Model:** stateless once-per-day tile Transformer — shared encoder over
+  the 100 own board tiles plus MANAGER and 5 global tokens (106 sequence
+  length), structured heads for crop/animal/land/fertilizer-by-crop/
+  CARE-by-animal counts, sell presence `[9,6]`, and log1p sell quantity.
+  Default ~1.071M trainable parameters; tiny CPU config for tests;
+  opponent PUBLIC board optional (off by default), never private opponent
+  data; result metadata cannot leak into features.
+- **Loss:** seven fixed-weight group losses (per-group mean CE, land CE,
+  BCE over 54 sell cells, presence-masked SmoothL1 in log1p space).
+- **Training CLI:** `python -m bc_manager.cli` — in-RAM tensor dataset,
+  AdamW + gradient clipping, optional CUDA AMP, sparse diagnostics beside
+  the day baseline, early stopping, atomic best/last checkpoints that
+  serialize model config. v1/mixed Parquet and empty splits fail loudly.
+- **Status:** 92 tests pass including real forward/backward, tiny-batch
+  overfit, checkpoint save/load equivalence, and synthetic end-to-end CLI
+  smoke. Full training has NOT been run: the five-day schema-v2 corpus does
+  not exist yet. Next action: regenerate v2 Parquets on Kaggle, then run the
+  default date-held-out BC command from `bc_manager/README.md`.
+
+See D-019 in `DECISIONS.md` and
+`.agents/notes/implemented/2026-08-22-use-configurable-tile-transformer-for-initial-bc-manager.md`.
 
 ## Behavior-Cloning Plan
 
@@ -168,7 +198,7 @@ See `MECHANICS.md` for exact parameters and regression points.
 
 1. Scale the validated preprocessing to the selected top-daily Kaggle partitions and retain broad score/provenance metadata.
 2. Audit the elite corpus for repeated behavioral lineages and shop/market-conditioned action variation; do not filter on reactivity until measurements justify it.
-3. Train the first BC manager while the deterministic executor is designed in parallel.
+3. Run the first date-held-out BC training with the implemented `bc_manager` CLI once the five-day v2 Parquets exist; design the deterministic executor in parallel.
 4. Later evaluate whether to vendor/port the `diffmap/kaggicultureRL` Rust engine to 1.32.7 and require parity before PPO training.
 
 ## Future Control Alternatives Preserved by the Dataset

@@ -162,3 +162,15 @@ This file records decisions that remain authoritative across chats and work sess
 - Future alternatives intentionally preserved: delta rather than absolute crop/animal targets; explicit per-tile replacement control; age-bucketed/tile-specific fertilizer; learned wheat/feed economics; learned harvesting; richer workload feedback; opponent-aware inputs; and finer 24-turn or separate reactive selling policies.
 - Detailed contract and alternatives: `.agents/notes/implemented/2026-08-21-canonical-daily-replay-record.md`.
 - Revisit when: manually inspected replay rows show the contract loses strategically necessary information, engine state semantics change, or a later learned subsystem requires detail that cannot be derived from the retained start/end states and event ledger.
+
+## D-019 - Use a Configurable Tile Transformer as the First BC Manager
+
+- Date: 2026-08-22
+- Status: active
+- Decision: Implement the first learned manager as a stateless once-per-day (day/hour0) configurable PyTorch Transformer over [MANAGER, 100 own tile tokens, 5 compact global tokens] with structured heads for crop/animal/land/fertilizer-by-crop/CARE-by-animal counts, sell presence, and log1p sell quantity. Shared spatial tile encoder over the actual schema-v2 lifecycle/presence fields; opponent PUBLIC board tokens optional and off by default; opponent private data has no feature path. Group-balanced loss (per-group mean CE/BCE/masked SmoothL1) prevents the 54 sell cells from dominating. Default ~1.071M parameters with a tiny CPU validation config.
+- Validation protocol: date-held-out splits only (default train 2026-08-17..20, validation 2026-08-21) with configurable elite cutoff (default min_score >= 2950); train-split-only day baseline reported beside model metrics; sparse nonzero diagnostics make zero collapse visible.
+- Explicitly deferred: temporal/RNN/value heads, opponent inference, self-play, executor/legal-order mapping. The deterministic executor later retains exact tile/animal/routing details.
+- Rationale: after D-017/D-018 the missing piece was a first learnable policy over the canonical daily records. A standard small Transformer on a stable compact interface is the cheapest genuine learning step; scaling is a config change, not a redesign. Flattened MLPs discard board structure; temporal and value machinery add complexity before the stationary problem learns.
+- CARE attribution remains the schema-v2 correction under D-018 (`targets.care_by_animal`); this decision consumes it as one head and does not re-decide it.
+- Detailed contract and alternatives: `.agents/notes/implemented/2026-08-22-use-configurable-tile-transformer-for-initial-bc-manager.md`.
+- Revisit when: closed-loop evaluation shows the daily abstraction or output parameterization loses strategically necessary control, or when PPO refinement requires value/temporal extensions.

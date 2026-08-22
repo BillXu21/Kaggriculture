@@ -2,6 +2,42 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-22 — First BC Manager: Adapter/Baseline, Tile Transformer, Training CLI
+
+Implemented the complete first behavior-cloning stack over the canonical
+schema-v2 records; D-019 published. No full training run (five-day v2 corpus
+pending).
+
+- **Compact BC data layer** (66fbaea): bc_manager/adapter.py reads
+  schema-v2 Parquet directly with PyArrow (dotted-path projection, no logical
+  reconstruction), verifies schema_version == 2, selects rows only by the
+  date allowlist + equal min_score cutoff, and converts once into compact
+  NumPy arrays (own/opponent-public boards, resource/market/town/labor/day
+  features, count/CARE/sell targets). bc_manager/baseline.py fits a per-day
+  empirical baseline on train rows only. Date-held-out splits; never random.
+- **Tile Transformer + loss** (6b9db3b): stateless day/hour0 manager —
+  shared tile encoder (kind/crop/animal embeddings, scaled lifecycle
+  numerics with NaN indicators, bool/presence channels, row/col embeddings),
+  MANAGER + 5 global tokens (106 sequence length), standard norm-first
+  TransformerEncoder, structured heads for crop/animal/land/fertilizer/CARE
+  counts plus sell presence and log1p quantity. Seven fixed-weight group
+  losses; metadata keys rejected loudly; opponent PUBLIC board optional/off
+  by default. Default config 1,071,040 trainable parameters; tiny CPU
+  config for tests.
+- **Training CLI** (86b8433): python -m bc_manager.cli — in-RAM tensor
+  dataset, AdamW + gradient clipping + optional CUDA AMP, sparse diagnostics
+  (exact/MAE/nonzero recall incl. per-animal GOOSE visibility) beside the
+  train-only day baseline, early stopping, atomic best/last checkpoints that
+  serialize model config and reload to equivalent eval outputs.
+- **Validation:** 92 tests pass (65 data-layer, 16 model/loss, 11 training)
+  including real forward/backward on the local 900-row v2 sample, genuine
+  tiny-batch overfit (~770x loss reduction), checkpoint equivalence, and a
+  synthetic two-date end-to-end CLI smoke. Full five-day training was not
+  run; old v1 data fails loudly everywhere.
+- **Decision publication:** D-019 added to DECISIONS.md; implemented note
+  .agents/notes/implemented/2026-08-22-use-configurable-tile-transformer-for-initial-bc-manager.md;
+  usage/handoff commands in bc_manager/README.md.
+
 ## 2026-08-22 — Canonical Schema v2: CARE-by-animal Correction
 
 Logical extension/correction under D-018 (no redesign; D-017/D-018 unchanged).
