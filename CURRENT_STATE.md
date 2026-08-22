@@ -5,236 +5,229 @@ Last updated: 2026-08-22
 ## Snapshot
 
 - Repository: `BillXu21/Kaggriculture`
-- Phase: **first BC manager implemented; canonical schema v3 corrects the official worker `[x,y]` tile lookup; five-day schema-v3 corpus regeneration on Kaggle is next**
+- Phase: **first BC manager implemented; five-day canonical schema-v3 corpus regenerated and verified; adapter audit / private Kaggle dataset versioning are the immediate handoff before the first real BC run**
 - Competitive training: not started
 - Latest confirmed upstream package: `kaggle-environments 1.32.7`
-- Exact local/vendored engine lock: not yet established
-- Training direction: **behavior cloning first, then PPO/RL refinement; scratch PPO remains an important comparison because the manager horizon is only ~30 steps**
-- Primary competition goal: build a refinement pipeline that produces meaningful, measurable improvement over a competent starting policy across multiple promotions; a medal is not the primary objective.
+- Training direction: **behavior cloning first, then PPO/RL refinement; scratch PPO remains a useful comparison because the manager horizon is only ~30 steps**
+- Primary project goal: demonstrate a self-play/refinement pipeline that measurably improves a competent starting policy across multiple promotions; a medal is not the primary objective.
 
-## Current Learned-Control Abstraction
+## Learned-Control Abstraction
 
-The initial learned policy is a **daily farm manager**, not a primitive 720-turn controller.
+The learned policy is a **once-per-day farm manager**, not a primitive 720-turn controller. The strategic horizon is therefore roughly 30 decisions per episode.
 
-The manager acts approximately once per game day, reducing the strategic horizon to roughly 30 decisions per episode.
+V0 manager ownership:
 
-For V0, RL owns economic intent:
-
-- crop planting/allocation changes;
+- crop composition / planting allocation;
 - target animal counts;
 - land expansion;
-- fertilizer allocation;
-- daily selling quantity plus a simple intra-day timing plan.
+- fertilizer allocation by crop type;
+- CARE allocation by animal type;
+- daily selling intent with six 4-hour timing bins.
 
-The exact model output parameterization can still change. The current decision locks the division of responsibility rather than a neural architecture.
+Deterministic executor ownership:
 
-The deterministic executor is assumed competent and initially owns:
-
-- worker assignment/routing/movement;
-- worker hiring needed for the requested workload;
+- exact worker assignment/routing/movement;
+- hiring enough workers to execute requested work;
 - watering and routine maintenance;
 - mechanical harvesting;
-- seed purchases implied by the crop plan;
-- animal purchase/placement/structures implied by animal targets;
-- simple wheat/feed procurement;
-- primitive execution of the requested sell plan within its selected timing window.
+- seed purchases implied by crop targets;
+- animal purchases / structures / placement implied by animal targets;
+- simple initial wheat/feed procurement;
+- exact tile/animal choice for fertilizer and CARE;
+- legal primitive execution of requested sell intent.
 
-The executor should compile learned intent, not replace it with its own economic strategy.
+The executor should compile learned economic intent, not replace it with its own farm strategy.
 
-Wheat management is the leading candidate to move from heuristic control to RL after the first manager learns. Selling is the first subsystem allowed to retain finer-than-daily timing; more reactive selling or a separate higher-frequency selling policy can be tested later.
+See D-011 and `.agents/notes/implemented/2026-08-21-use-daily-manager-with-deterministic-executor.md`.
 
-See `.agents/notes/implemented/2026-08-21-use-daily-manager-with-deterministic-executor.md`.
+## Canonical Daily Replay Contract (D-018)
 
-## Canonical Daily Replay Contract
-
-Replay preprocessing now has a stable intermediate target: one canonical record per `(episode, seat, day)`.
+One canonical record exists per `(episode, seat, day)`.
 
 Each record contains:
 
-- start-of-day state using explicit replay `day`/`hour` boundaries;
-- end-of-day/next-day state;
+- explicit start-of-day state using replay `day`/`hour` boundaries;
+- end-of-day / next-day state;
 - a compact daily event ledger;
-- full score/version/source provenance;
-- seats canonicalized as `self` and `opponent`.
+- complete replay / score provenance;
+- seats canonicalized as `self` / `opponent`.
 
-The canonical dataset is deliberately richer than the first model's tensors so alternative BC/action encodings can be generated without reparsing the raw 720-turn JSON.
+The canonical dataset remains richer than the first model tensors so later action/observation adapters can change without reparsing raw 720-turn JSON.
 
-Retain the full 10x10 farm board with mechanically descriptive lifecycle state. Crop records should preserve raw age/growth information plus useful derived timing such as time to next harvest/output, harvestability, fertilizer state, and water/dry/weed state as available. Animal records should preserve production cooldown/time to next product, feed/starvation, care/bonus, and other relevant engine state.
+Important contracts:
 
-Keep opponent public state in the canonical data even if the first experiment masks it.
+- full 10x10 board plus crop/animal lifecycle state is retained;
+- opponent PUBLIC state is retained even though V0 masks it;
+- simulator worker positions are `[x, y]` while board/ledger coordinates are canonical `[y, x]`; tile-dependent lookups must use `tiles[y][x]` after `x, y = pos`;
+- strategic labels include crop composition, animal counts, land state, fertilizer-by-crop, CARE-by-animal, and six-bin selling;
+- exact event timing remains in the ledger;
+- compressed nested Parquet is the production format;
+- canonical schema versions are fail-loud semantic boundaries; incompatible processed files are regenerated from raw rather than silently migrated.
 
-For V0, derive high-level labels for:
+Current canonical schema version: **3**.
 
-- crop composition/targets;
-- animal-count targets;
-- land expansion/state;
-- fertilizer applications by crop type;
-- sell quantity per product in six windows anchored at `0, 4, 8, 12, 16, 20`, corresponding to hours `0-3`, `4-7`, `8-11`, `12-15`, `16-19`, `20-23`.
+## Five-Day Schema-v3 Corpus
 
-Preserve exact primitive sale hours in the event ledger so a future 24-turn/reactive selling policy remains possible.
+The complete elite 1.32.7 corpus for 2026-08-17 through 2026-08-21 has now been regenerated and verified on Kaggle.
 
-Also retain compact daily aggregates for planting/digging, fertilizer, harvests, care-by-animal intents, animal/seed/product purchases, land purchases, workers/hire cost, and sales. These are audit/future-extension data, not necessarily V0 BC targets.
+| date | episodes | seat-days |
+| --- | ---: | ---: |
+| 2026-08-17 | 699 | 41,940 |
+| 2026-08-18 | 697 | 41,820 |
+| 2026-08-19 | 695 | 41,700 |
+| 2026-08-20 | 698 | 41,880 |
+| 2026-08-21 | 697 | 41,820 |
+| **total** | **3,486** | **209,160** |
 
-See D-018 in `DECISIONS.md` and `.agents/notes/implemented/2026-08-21-canonical-daily-replay-record.md`.
+Final corpus checks:
 
-## Current Preprocessing Status
+- 5 Parquet files;
+- 209,160 total rows;
+- schema versions exactly `{3}`;
+- regeneration wall time: 1.08 h;
+- Kaggle output: `/kaggle/working/kaggriculture-canonical-v3`.
 
-- The reusable local extractor and CLI are implemented under `replay_daily/`.
-- **Canonical schema version is 3**: worker positions follow the official
-  1.32.7 `[x, y]` convention with board lookup `tiles[y][x]` (the extractor
-  previously unpacked them transposed, mislabeling tile-dependent CARE/
-  FERTILIZE/HARVEST/DIG events); ledger tile coordinates remain canonical
-  `[y, x]`. `events.care` records each submitted CARE intent with its
-  pre-action tile, established animal identity (or `null`), and exact
-  primitive hour; `targets.care_by_animal` mirrors the known-animal daily
-  counts. Processed-data readers and writers fail loudly on v1/v2/mixed
-  input; regenerate from raw replays instead of migrating.
-- **Parquet is the production canonical physical format** (PyArrow, Zstandard,
-  one row per `(episode, seat, day)`; `replay_daily/storage.py`). JSONL remains
-  an optional debug/inspection CLI output only; raw replays stay the source of
-  truth.
-- The 15-replay 1.32.7 sample produced 900 validated records at
-  `data/canonical/2026-08-20-sample.parquet` (ignored/local; 805,435 bytes at
-  schema v3). Exact-equality parity against fresh extraction was reconfirmed
-  on all 900 records after the v3 coordinate correction, and every raw
-  pre-action worker op was reconciled against the emitted ledgers with zero
-  mismatches. Any older five-day v1/v2 processed corpora are rejected by the
-  current readers and must be regenerated at v3 before BC training.
-- Single-process extraction measured ~89 MB/s of raw replay (~0.3 h per
-  100 GiB), so no parallel preprocessing stage is justified yet. Details in
-  `research/CANONICAL_DAILY_SAMPLE_VALIDATION.md`.
-- The deterministic executor has not started.
+Full-corpus CARE attribution:
 
-## First BC Manager Implementation (D-019)
+- COW: 1,309,686;
+- SHEEP: 892,397;
+- GOOSE: 14,996;
+- unknown: 13,045 (~0.585% of CARE submissions).
 
-Implemented under `bc_manager/` (usage in `bc_manager/README.md`):
+Fertilizer unknown attribution totals 2,666 across all five partitions. The residual unknown tail is small and not currently a blocker for V0 BC; unknown labels remain honest rather than fabricated.
 
-- **Compact adapter/day baseline:** schema-v3 Parquet -> compact NumPy
-  arrays via direct Arrow projection; date-held-out selection only
-  (default train 2026-08-17..20, validation 2026-08-21, configurable
-  `min_score >= 2950`); train-split-only empirical day baseline.
-- **Model:** stateless once-per-day tile Transformer — shared encoder over
-  the 100 own board tiles plus MANAGER and 5 global tokens (106 sequence
-  length), structured heads for crop/animal/land/fertilizer-by-crop/
-  CARE-by-animal counts, sell presence `[9,6]`, and log1p sell quantity.
-  Default ~1.071M trainable parameters; tiny CPU config for tests;
-  opponent PUBLIC board optional (off by default), never private opponent
-  data; result metadata cannot leak into features.
-- **Loss:** seven fixed-weight group losses (per-group mean CE, land CE,
-  BCE over 54 sell cells, presence-masked SmoothL1 in log1p space).
-- **Training CLI:** `python -m bc_manager.cli` — in-RAM tensor dataset,
-  AdamW + gradient clipping, optional CUDA AMP, sparse diagnostics beside
-  the day baseline, early stopping, atomic best/last checkpoints that
-  serialize model config. v1/v2/mixed Parquet and empty splits fail loudly.
-- **Status:** 102 tests pass including real forward/backward, tiny-batch
-  overfit, checkpoint save/load equivalence, and synthetic end-to-end CLI
-  smoke. Full training has NOT been run: the five-day schema-v3 corpus does
-  not exist yet. Next action: regenerate v3 Parquets on Kaggle, then run the
-  default date-held-out BC command from `bc_manager/README.md`.
+Detailed corpus note: `research/FIVE_DAY_V3_CORPUS.md`.
 
-See D-019 in `DECISIONS.md` and
-`.agents/notes/implemented/2026-08-22-use-configurable-tile-transformer-for-initial-bc-manager.md`.
+## First BC Manager (D-019)
 
-## Behavior-Cloning Plan
+Implemented under `bc_manager/`.
 
-BC should learn **daily realized management decisions**, not primitive movement traces.
+Architecture:
 
-Exact movement, worker assignments, watering routes, harvest routes, seed-buy commands, animal-buy commands, and worker hires do not need to be BC targets when they are implied by the manager's high-level plan.
+- stateless one-day-in / one-plan-out policy;
+- 100 own-board tile tokens with a shared spatial tile encoder;
+- MANAGER + SELF RESOURCE + MARKET + TOWN + LABOR + DAY context in one standard PyTorch TransformerEncoder;
+- opponent PUBLIC board optional and off by default;
+- own private shed/seeds/inventory included; opponent private state has no feature path;
+- structured crop / animal / land / fertilizer / CARE / selling heads;
+- sell presence plus masked log1p quantity regression using per-event 0..100 bounded intent in the BC adapter;
+- seven group-balanced losses.
 
-For the initial pipeline, treat the strong replay agents' low-level execution as effectively perfect. Replay preprocessing can therefore begin before our own deterministic executor is complete.
+Default model:
 
-BC does not need to be broadly adaptive to be useful. A competent stereotyped plan is an acceptable initialization if PPO can subsequently improve and diversify it. However, top private agents already appear to contain state-conditioned branches, so preprocessing must preserve shop/market context rather than collapse examples to day-indexed schedules.
+- `d_model=128`
+- 4 layers
+- 4 heads
+- FFN 384
+- ~1,071,040 trainable parameters
 
-## Replay Corpus Decision
+Tiny CPU validation config is also implemented. Full suite after schema-v3 correction: **102 tests pass**; tiny-batch overfit and checkpoint reload are validated.
 
-Use Kaggle's daily **top-rated** episode datasets, not random ladder data. These partitions are deliberately filled from the highest-average-rated available games until the daily ~20 GiB cap, so the corpus is already strongly selected for competitive play.
+Default data protocol:
 
-Initial selection:
+- train: 2026-08-17 through 2026-08-20;
+- validation: 2026-08-21;
+- `min_score >= 2950`;
+- never random seat-day splitting;
+- report train-only empirical day baseline beside model metrics;
+- sparse nonzero diagnostics make tomato/goose/etc. collapse visible.
 
-- use five recent complete daily partitions from 1.32.7 after allowing roughly two days for competitors to adjust to the balance patch; target **2026-08-17 onward**, adding later complete partitions as they become available;
-- require embedded `module_version == 1.32.7` when parsing each replay;
-- retain manifest `avg_score` and `min_score` and choose the actual elite cutoff empirically from the distribution; values around 3000 are plausible, but the threshold is not locked yet;
-- train on **both seats** when `min_score` is above the selected cutoff, because this guarantees both demonstrations are strong without needing unavailable per-seat submission IDs/ratings;
-- retain `episode_id`, partition date, `avg_score`, `min_score`, derived `max_score`, player/seat, seed, final reward, and source provenance in the preprocessed dataset;
-- do not apply a reactivity/diversity filter initially. First measure whether the elite score-filtered corpus already contains enough shop/market-conditioned variation, then compare score-only versus optional reactivity filtering if useful.
+`bc_manager/README.md` now contains the schema-v3 command and correctly passes all five Parquets, including the held-out Aug-21 validation file.
 
-The official 1.32.7 patch commit was `28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c` (`Make underused resources situational (#1399)`), created `2026-08-15T01:24:24Z`, and bumped package `1.32.6 -> 1.32.7` while adding the carrot/tomato/egg scarcity-side `hinge` curves.
+No full five-day BC training run has been completed yet.
 
-See D-017 in `DECISIONS.md`.
+## Corpus Findings Relevant to BC
+
+The earlier five-day audit found substantial strategy duplication:
+
+- 6,972 seat trajectories;
+- 2,342 unique exact crop/animal/land trajectories;
+- ~66.4% exact duplicate rate;
+- largest exact family: 786 trajectories.
+
+This is why random seat-day validation is prohibited and why the day-only baseline matters.
+
+Default `min_score >= 2950` previously yielded ~31,200 seat-days across all five partitions; the schema-v3 adapter audit should reconfirm the exact current train/validation counts before the first run.
+
+Crop composition changed on ~86% of non-day0 decisions in the prior audit, supporting the once-per-day manager rather than a single episode-level strategy choice.
+
+## Replay Selection (D-017)
+
+Use Kaggle's daily **top-rated** episode datasets rather than broad/random ladder data.
+
+Initial corpus rules:
+
+- five recent complete post-patch 1.32.7 partitions beginning 2026-08-17;
+- embedded `module_version == 1.32.7` is authoritative;
+- retain both seats when the episode's `min_score` clears the configured threshold;
+- preserve score/provenance metadata but never feed demonstrator identity/result metadata to the model;
+- do not impose a reactivity/diversity filter until measurements justify it.
 
 ## Training Progression
 
-Current high-level direction:
+1. **Current:** version/upload the verified schema-v3 corpus to the private Kaggle dataset and audit the exact `bc_manager.adapter` train/validation arrays.
+2. Run the first ~1.071M date-held-out BC training and compare against the train-only day baseline.
+3. Build the deterministic executor / foreman and evaluate BC closed-loop; teacher-forced accuracy alone is insufficient.
+4. Compare BC-initialized PPO against scratch PPO under the same executor/opponents/budget.
+5. Demonstrate improvement against a frozen opponent on held-out seeds.
+6. Expand to a frozen opponent panel / cross-play.
+7. Only after those stages learn reliably, introduce changing opponents/population/self-play and richer opponent/temporal/value machinery.
 
-1. Attach/download the selected five top-daily partitions on Kaggle and scale the validated one-time preprocessing there.
-2. Inspect crop/animal/land/fertilizer/selling diversity and shop-conditioned reactivity in the resulting daily table.
-3. Train a first BC manager on elite demonstrations.
-4. Verify BC in closed-loop games using the eventual executor; do not rely only on teacher-forced accuracy.
-5. Compare BC-initialized PPO against scratch PPO under the same executor/opponents/training budget.
-6. Demonstrate RL improvement against a frozen/controlled opponent over held-out seeds, initially with opponent features optionally masked.
-7. Expand to a frozen opponent panel and broad cross-play evaluation.
-8. Only after those stages learn reliably, introduce richer opponent modeling, changing opponents/population/self-play, and additional learned control such as wheat or reactive selling.
+Do not add another layer of RL complexity until the simpler stationary problem underneath it demonstrably learns.
 
-The project should not add another layer of RL complexity until the simpler stationary problem underneath it demonstrably learns.
+## Deterministic Executor: Next Research Subsystem
 
-## Current Engine/Economics
+Implementation has not started.
 
-1.32.6:
+Current direction to investigate after the first BC run is underway:
 
-- town center consumes once/day at flat 1x;
-- town shops are sampled with replacement;
-- duplicate shops consume independently;
-- total shop instances are capped at 8.
+- infer useful compact crop/livestock layouts from elite replay board states;
+- likely keep service-heavy livestock close to the shed and crops in the next compact region;
+- preserve stable preferred slots rather than relayout the farm every day;
+- task generation -> standing-on-useful-work actions -> small worker/task assignment problem -> primitive navigation;
+- use simple assignment/routing first and only move toward VRP/facility-location optimization if measured executor completion is insufficient.
 
-1.32.7:
+The manager should choose economic targets; the executor should minimize mechanical work needed to realize them.
 
-- carrot, tomato, and egg use scarcity-side `hinge` curves;
-- these products can become extremely valuable only in favorable randomized shop/scarcity regimes;
-- selling adds supply and therefore erodes scarcity, so spot price times inventory is not realizable liquidation value;
-- opponent production affects the same shared market even if the early learner does not explicitly model the opponent.
+## Current Engine / Economics
 
-See `MECHANICS.md` for exact parameters and regression points.
+Latest confirmed upstream package: `kaggle-environments 1.32.7`.
 
-## Useful External Research
+Relevant 1.32.7 change:
 
-- `diffmap/kaggicultureRL` contains a serious Rust batch simulator, replay/BC infrastructure, parity/fuzz tests, and feature-engineering ideas. Its engine is pinned to 1.32.6 and lacks the 1.32.7 `hinge` market shape, so it cannot be adopted unchanged.
-- Current public RL discussion shows non-transitive matchup structure among strong route/meta-agents, reinforcing the need for cross-play evaluation rather than a single scalar strength metric.
-- Community reports of failed primitive end-to-end RL reinforce the daily-manager choice: low-level execution failures can make strategic actions such as land expansion appear negative-value to PPO.
+- carrot, tomato, and egg use scarcity-side hinge curves;
+- product value is state-dependent on shop demand, shared market inventory, opponent production, and time remaining;
+- therefore no static product ranking should be encoded;
+- naive inventory × spot-price reward shaping is unsafe because liquidation changes the price curve.
+
+See `MECHANICS.md`, D-015, and D-016.
 
 ## Immediate Priorities
 
-1. Scale the validated preprocessing to the selected top-daily Kaggle partitions and retain broad score/provenance metadata.
-2. Audit the elite corpus for repeated behavioral lineages and shop/market-conditioned action variation; do not filter on reactivity until measurements justify it.
-3. Run the first date-held-out BC training with the implemented `bc_manager` CLI once the five-day v3 Parquets exist; design the deterministic executor in parallel.
-4. Later evaluate whether to vendor/port the `diffmap/kaggicultureRL` Rust engine to 1.32.7 and require parity before PPO training.
-
-## Future Control Alternatives Preserved by the Dataset
-
-The canonical record intentionally keeps enough information to test later variants without raw replay reprocessing:
-
-- absolute targets versus daily action deltas;
-- explicit per-tile crop replacement;
-- age-bucketed/tile-specific fertilizer control;
-- learned wheat/feed economics;
-- strategic harvesting when labor/storage/timing makes it matter;
-- richer previous-day workload/completion feedback;
-- opponent-board/unobserved-holdings features;
-- 24-turn selling, a separate reactive seller, or multiple manager calls per day.
+1. Finish private Kaggle dataset versioning with the five schema-v3 Parquets.
+2. Audit the exact BC adapter outputs: train/validation counts, score ranges, CARE sparsity, bounded selling, and target ranges.
+3. Launch the first real ~1.071M BC run in the foreground with date-held-out validation and a train-only day baseline.
+4. While BC work runs, study elite spatial layouts / public executor approaches before implementing the deterministic foreman.
 
 ## Known Risks
 
-- The daily action abstraction could hide strategically important intra-day decisions; selling is the first planned exception and cadence can be increased later.
-- The executor could accidentally become the strategist if it changes requested economic intent rather than merely executing it.
-- Daily labels derived from realized replay outcomes may occasionally reflect execution failures rather than intended plans; elite traces are expected to make this acceptable initially.
-- BC may still memorize calendar scripts if the elite corpus contains too many near-identical tapes; this is acceptable as a bootstrap unless it prevents PPO from improving.
-- Multiple submissions from the same player can have very different strength, so player-name-only replay filtering is unsafe.
-- Observation state aliasing can create apparently contradictory PPO gradients.
-- Non-transitive opponent strategies can make simple Elo/latest-checkpoint promotion misleading.
-- Context loss across chats can waste major amounts of work; GitHub continuity remains mandatory.
+- BC may mostly memorize common calendar scripts; the day-only baseline is the direct diagnostic.
+- Sparse targets such as goose/tomato can collapse to zero without obvious aggregate-loss failure; keep nonzero recall visible.
+- The daily abstraction may omit strategically important intra-day decisions; selling is the first explicit higher-frequency exception.
+- The executor could accidentally become the strategist if it overrides manager economic intent.
+- Opponent hidden inventory creates partial observability; richer opponent modeling is deferred until basic learning works.
+- Non-transitive strategy matchups can make simple latest-checkpoint/Elo promotion misleading.
+- Context loss across chats can waste major work; GitHub continuity remains mandatory.
 
 ## Do Not Forget
 
-- Read `CURRENT_STATE.md`, `DECISIONS.md`, `MECHANICS.md`, relevant Agent Notes, `research/RL_DESIGN.md`, and the latest `HISTORY.md` entry before substantial work.
-- `research/ACTION_OBSERVATION_V0.md` is an older scratch primitive-action design and is not authoritative.
-- Preserve raw replay data/configs/hashes so representations and label extraction can change without reacquiring data.
-- Before any expensive run, record exact command/config, code+engine hashes, replay/version/score filter, seeds, opponent pool, expected outputs, and stop conditions.
+Before substantial work, read:
+
+- `CURRENT_STATE.md`
+- `DECISIONS.md`
+- `MECHANICS.md`
+- relevant `.agents/notes/implemented/`
+- `research/RL_DESIGN.md`
+- latest `HISTORY.md`
+
+Before expensive runs, record the exact command/configuration, code+engine identity, data/version/filter, seeds/opponents where relevant, expected outputs, stop conditions, and recovery plan.
