@@ -77,13 +77,13 @@ This file records decisions that remain authoritative across chats and work sess
 - Confidence labels: `CONFIRMED_SOURCE`, `CONFIRMED_EXPERIMENT`, `DISCUSSION_CLAIM`, `HOST_REPORTED_STAT`, `OUTDATED`, `UNKNOWN`.
 - Revisit when: confidence labels may expand, but source priority remains.
 
-## D-010 — No Codex Work Yet
+## D-010 — Use Codex Only for Explicitly Authorized, Bounded Implementation Packets
 
-- Date: 2026-08-06
+- Date: 2026-08-06; superseded/clarified 2026-08-21
 - Status: active
-- Decision: Do not spend Codex on implementation at the current stage.
-- Rationale: The user did not have spare Codex budget and implementation was intentionally deferred.
-- Revisit when: the user explicitly authorizes a bounded Codex packet.
+- Decision: Do not spend Codex speculatively. Use it only when the user explicitly authorizes a bounded implementation packet with a concrete stop condition; research/discussion and simple notebook glue should not automatically be delegated to Codex.
+- Rationale: Codex budget is finite, and prior projects lost time to broad implementation/architecture churn before simpler learning assumptions were established. Bounded packets keep implementation aligned with validated decisions.
+- Revisit when: Codex cost/availability or the project workflow changes materially.
 
 ## D-011 — RL Owns Strategy; Deterministic Code Owns Mechanics
 
@@ -151,15 +151,19 @@ This file records decisions that remain authoritative across chats and work sess
 
 ## D-018 — Preserve a Canonical Daily Replay Dataset Before Model-Specific Encoding
 
-- Date: 2026-08-21
+- Date: 2026-08-21; clarified 2026-08-22
 - Status: active
 - Decision: Parse each selected replay once into a canonical `(episode, seat, day)` record containing start-of-day state, end-of-day state, a compact daily event ledger, and complete replay/score provenance. Treat this as the stable preprocessing boundary; derive BC tensors and alternative action encodings from it rather than reparsing raw 720-turn JSON for every experiment.
 - Day boundaries: use explicit replay `day`/`hour` fields. Canonicalize seats as `self`/`opponent` so both sides share one representation.
 - Board state: retain the full 10x10 board and mechanically descriptive lifecycle information. For crops preserve age/raw growth state plus derived time-to-next-harvest/output, harvestability, fertilizer state, and water/dry/weed state as available. For animals preserve production cooldown/time-to-next-product, feed/starvation, care/bonus, and fertilizer-related state as available.
-- V0 daily labels: derive crop composition targets, animal-count targets, land state/expansion, fertilizer applications by crop type, and sell quantities for every product across six windows anchored at hours `0, 4, 8, 12, 16, 20` (`0-3`, `4-7`, `8-11`, `12-15`, `16-19`, `20-23`). Preserve exact sale hours in the ledger even when V0 trains on six bins.
-- Retention rule: keep opponent public state in the canonical dataset even when V0 masks it, and retain compact aggregates for plant/dig/fertilize/harvest, animal/seed/product buys, land buys, hires/costs, and sales. The canonical dataset should remain mechanically descriptive rather than contain hard-coded strategic profitability scores.
+- Daily strategic labels: derive crop composition targets, animal-count targets, land state/expansion, fertilizer applications by crop type, CARE applications by animal type, and sell quantities for every product across six windows anchored at hours `0, 4, 8, 12, 16, 20` (`0-3`, `4-7`, `8-11`, `12-15`, `16-19`, `20-23`). Preserve exact sale hours and exact fertilizer/CARE event timing in the ledger even when the learned manager uses aggregated daily targets.
+- Strategic ownership boundary: fertilizer and CARE species/type allocation belong to the manager; exact tile/animal selection remains an executor responsibility. The canonical ledger therefore preserves crop/animal identity and exact event location/timing so richer future adapters can be derived without reparsing raw replays.
+- Coordinate contract: simulator worker positions are `[x, y]`, while canonical board/event locations use row-major board coordinates `[y, x]`. Any tile-dependent worker-event attribution (including DIG/FERTILIZE/HARVEST/CARE) must index `tiles[y][x]` after unpacking `x, y = pos`; asymmetric-coordinate regression tests are required so transposition bugs cannot silently poison labels.
+- Retention rule: keep opponent public state in the canonical dataset even when V0 masks it, and retain compact aggregates for plant/dig/fertilize/CARE/harvest, animal/seed/product buys, land buys, hires/costs, and sales. The canonical dataset should remain mechanically descriptive rather than contain hard-coded strategic profitability scores.
+- Physical storage: use compressed Parquet as the production canonical format; JSONL is optional inspection/debug output only. Raw Kaggle replays remain the source of truth and processed files may be regenerated rather than duplicated indefinitely.
+- Compatibility rule: canonical schema versions are fail-loud semantic compatibility boundaries. If a correction or extension changes the meaning/availability of training-relevant fields, bump the schema version and regenerate from raw replays rather than silently fabricating/migrating labels.
 - Rationale: after collapsing each 720-turn game into roughly 30 daily decisions, processed-data throughput/RAM is unlikely to be difficult. The expensive part is repeatedly parsing huge raw replays. A rich intermediate representation lets observation/action experiments change cheaply while preserving auditability.
-- Future alternatives intentionally preserved: delta rather than absolute crop/animal targets; explicit per-tile replacement control; age-bucketed/tile-specific fertilizer; learned wheat/feed economics; learned harvesting; richer workload feedback; opponent-aware inputs; and finer 24-turn or separate reactive selling policies.
+- Future alternatives intentionally preserved: delta rather than absolute crop/animal targets; explicit per-tile replacement control; age-bucketed/tile-specific fertilizer/CARE; learned wheat/feed economics; learned harvesting; richer workload feedback; opponent-aware inputs; and finer 24-turn or separate reactive selling policies.
 - Detailed contract and alternatives: `.agents/notes/implemented/2026-08-21-canonical-daily-replay-record.md`.
 - Revisit when: manually inspected replay rows show the contract loses strategically necessary information, engine state semantics change, or a later learned subsystem requires detail that cannot be derived from the retained start/end states and event ledger.
 
@@ -167,10 +171,12 @@ This file records decisions that remain authoritative across chats and work sess
 
 - Date: 2026-08-22
 - Status: active
-- Decision: Implement the first learned manager as a stateless once-per-day (day/hour0) configurable PyTorch Transformer over [MANAGER, 100 own tile tokens, 5 compact global tokens] with structured heads for crop/animal/land/fertilizer-by-crop/CARE-by-animal counts, sell presence, and log1p sell quantity. Shared spatial tile encoder over the actual schema-v2 lifecycle/presence fields; opponent PUBLIC board tokens optional and off by default; opponent private data has no feature path. Group-balanced loss (per-group mean CE/BCE/masked SmoothL1) prevents the 54 sell cells from dominating. Default ~1.071M parameters with a tiny CPU validation config.
+- Decision: Implement the first learned manager as a stateless once-per-day (day/hour0) configurable PyTorch Transformer over [MANAGER, 100 own tile tokens, 5 compact global tokens] with structured heads for crop/animal/land/fertilizer-by-crop/CARE-by-animal counts, sell presence, and log1p sell quantity. The shared spatial tile encoder consumes the current canonical lifecycle/presence fields; own private shed/seeds/inventory and shared market/town/labor/day context are encoded in the same forward context. Opponent PUBLIC board tokens are optional and off by default; opponent private data has no feature path. Group-balanced loss (per-group mean CE/BCE/masked SmoothL1) prevents the 54 sell cells from dominating. Default ~1.071M parameters with a tiny CPU validation config; width/depth/head count remain ordinary configuration values so validation can use tiny models and later BC/PPO models can scale without a redesign.
 - Validation protocol: date-held-out splits only (default train 2026-08-17..20, validation 2026-08-21) with configurable elite cutoff (default min_score >= 2950); train-split-only day baseline reported beside model metrics; sparse nonzero diagnostics make zero collapse visible.
-- Explicitly deferred: temporal/RNN/value heads, opponent inference, self-play, executor/legal-order mapping. The deterministic executor later retains exact tile/animal/routing details.
+- Selling adapter: preserve raw submitted sell events canonically, but cap each individual event to 0..100 only in the BC target adapter before six-bin aggregation; repeated events in one bin may sum above 100. Predict sell presence plus presence-masked log1p quantity rather than regress sentinel-like million-unit submitted quantities directly.
+- Compute scope: ordinary batched inference is the intended optimization path (including both seats as separate batch rows during future self-play). Do not contort the architecture around Orbit-Wars-style double-sided public-state compute reuse; private per-seat state makes that optimization less attractive and current model sizes are small.
+- Explicitly deferred: temporal/RNN/value heads, opponent inference, self-play, executor/legal-order mapping, and special symmetric compute reuse. The deterministic executor later retains exact tile/animal/routing details.
 - Rationale: after D-017/D-018 the missing piece was a first learnable policy over the canonical daily records. A standard small Transformer on a stable compact interface is the cheapest genuine learning step; scaling is a config change, not a redesign. Flattened MLPs discard board structure; temporal and value machinery add complexity before the stationary problem learns.
-- CARE attribution remains the schema-v2 correction under D-018 (`targets.care_by_animal`); this decision consumes it as one head and does not re-decide it.
+- CARE attribution remains a canonical-schema correction under D-018 (`targets.care_by_animal`); this decision consumes it as one head and does not re-decide it.
 - Detailed contract and alternatives: `.agents/notes/implemented/2026-08-22-use-configurable-tile-transformer-for-initial-bc-manager.md`.
-- Revisit when: closed-loop evaluation shows the daily abstraction or output parameterization loses strategically necessary control, or when PPO refinement requires value/temporal extensions.
+- Revisit when: closed-loop evaluation shows the daily abstraction or output parameterization loses strategically necessary control, the state-aware model fails to beat the train-only day baseline, or PPO refinement requires value/temporal extensions.
