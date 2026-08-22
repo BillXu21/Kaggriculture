@@ -4,3 +4,5 @@
 #   python -m pip install -r requirements.txt
 pyarrow>=14
 numpy>=1.26
+# bc_manager.model / bc_manager.loss (daily-manager tile Transformer)
+torch>=2.0
