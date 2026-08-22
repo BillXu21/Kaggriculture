@@ -1,4 +1,6 @@
-# Runtime dependencies for replay_daily canonical extraction/storage.
+# Runtime dependencies for replay_daily canonical extraction/storage and
+# the bc_manager compact-array BC data layer.
 # No packaging framework exists in this repository; install with:
 #   python -m pip install -r requirements.txt
 pyarrow>=14
+numpy>=1.26
