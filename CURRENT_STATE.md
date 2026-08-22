@@ -5,7 +5,7 @@ Last updated: 2026-08-22
 ## Snapshot
 
 - Repository: `BillXu21/Kaggriculture`
-- Phase: **first BC manager (tile Transformer + training CLI) implemented; five-day schema-v2 corpus regeneration on Kaggle is next**
+- Phase: **first BC manager implemented; canonical schema v3 corrects the official worker `[x,y]` tile lookup; five-day schema-v3 corpus regeneration on Kaggle is next**
 - Competitive training: not started
 - Latest confirmed upstream package: `kaggle-environments 1.32.7`
 - Exact local/vendored engine lock: not yet established
@@ -80,19 +80,26 @@ See D-018 in `DECISIONS.md` and `.agents/notes/implemented/2026-08-21-canonical-
 ## Current Preprocessing Status
 
 - The reusable local extractor and CLI are implemented under `replay_daily/`.
-- **Canonical schema version is 2**: `events.care` records each submitted CARE
-  intent with its pre-action tile, established animal identity (or `null`), and
-  exact primitive hour; `targets.care_by_animal` mirrors the known-animal daily
-  counts. Processed-data readers and writers fail loudly on v1/mixed input;
-  regenerate from raw replays instead of migrating.
+- **Canonical schema version is 3**: worker positions follow the official
+  1.32.7 `[x, y]` convention with board lookup `tiles[y][x]` (the extractor
+  previously unpacked them transposed, mislabeling tile-dependent CARE/
+  FERTILIZE/HARVEST/DIG events); ledger tile coordinates remain canonical
+  `[y, x]`. `events.care` records each submitted CARE intent with its
+  pre-action tile, established animal identity (or `null`), and exact
+  primitive hour; `targets.care_by_animal` mirrors the known-animal daily
+  counts. Processed-data readers and writers fail loudly on v1/v2/mixed
+  input; regenerate from raw replays instead of migrating.
 - **Parquet is the production canonical physical format** (PyArrow, Zstandard,
   one row per `(episode, seat, day)`; `replay_daily/storage.py`). JSONL remains
   an optional debug/inspection CLI output only; raw replays stay the source of
   truth.
 - The 15-replay 1.32.7 sample produced 900 validated records at
-  `data/canonical/2026-08-20-sample.parquet` (ignored/local; 806,735 bytes at
-  schema v2). Exact-equality parity against fresh extraction was reconfirmed on
-  all 900 records after the v2 CARE correction.
+  `data/canonical/2026-08-20-sample.parquet` (ignored/local; 805,435 bytes at
+  schema v3). Exact-equality parity against fresh extraction was reconfirmed
+  on all 900 records after the v3 coordinate correction, and every raw
+  pre-action worker op was reconciled against the emitted ledgers with zero
+  mismatches. Any older five-day v1/v2 processed corpora are rejected by the
+  current readers and must be regenerated at v3 before BC training.
 - Single-process extraction measured ~89 MB/s of raw replay (~0.3 h per
   100 GiB), so no parallel preprocessing stage is justified yet. Details in
   `research/CANONICAL_DAILY_SAMPLE_VALIDATION.md`.
@@ -102,7 +109,7 @@ See D-018 in `DECISIONS.md` and `.agents/notes/implemented/2026-08-21-canonical-
 
 Implemented under `bc_manager/` (usage in `bc_manager/README.md`):
 
-- **Compact adapter/day baseline:** schema-v2 Parquet -> compact NumPy
+- **Compact adapter/day baseline:** schema-v3 Parquet -> compact NumPy
   arrays via direct Arrow projection; date-held-out selection only
   (default train 2026-08-17..20, validation 2026-08-21, configurable
   `min_score >= 2950`); train-split-only empirical day baseline.
@@ -118,11 +125,11 @@ Implemented under `bc_manager/` (usage in `bc_manager/README.md`):
 - **Training CLI:** `python -m bc_manager.cli` — in-RAM tensor dataset,
   AdamW + gradient clipping, optional CUDA AMP, sparse diagnostics beside
   the day baseline, early stopping, atomic best/last checkpoints that
-  serialize model config. v1/mixed Parquet and empty splits fail loudly.
-- **Status:** 92 tests pass including real forward/backward, tiny-batch
+  serialize model config. v1/v2/mixed Parquet and empty splits fail loudly.
+- **Status:** 102 tests pass including real forward/backward, tiny-batch
   overfit, checkpoint save/load equivalence, and synthetic end-to-end CLI
-  smoke. Full training has NOT been run: the five-day schema-v2 corpus does
-  not exist yet. Next action: regenerate v2 Parquets on Kaggle, then run the
+  smoke. Full training has NOT been run: the five-day schema-v3 corpus does
+  not exist yet. Next action: regenerate v3 Parquets on Kaggle, then run the
   default date-held-out BC command from `bc_manager/README.md`.
 
 See D-019 in `DECISIONS.md` and
@@ -198,7 +205,7 @@ See `MECHANICS.md` for exact parameters and regression points.
 
 1. Scale the validated preprocessing to the selected top-daily Kaggle partitions and retain broad score/provenance metadata.
 2. Audit the elite corpus for repeated behavioral lineages and shop/market-conditioned action variation; do not filter on reactivity until measurements justify it.
-3. Run the first date-held-out BC training with the implemented `bc_manager` CLI once the five-day v2 Parquets exist; design the deterministic executor in parallel.
+3. Run the first date-held-out BC training with the implemented `bc_manager` CLI once the five-day v3 Parquets exist; design the deterministic executor in parallel.
 4. Later evaluate whether to vendor/port the `diffmap/kaggicultureRL` Rust engine to 1.32.7 and require parity before PPO training.
 
 ## Future Control Alternatives Preserved by the Dataset

@@ -2,6 +2,52 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-22 — Canonical Schema v3: Official Worker `[x,y]` Tile-Lookup Correction
+
+Correctness fix under D-018 (commit `e67f1b7`; no architecture change; D-019
+untouched).
+
+- **Root cause:** official 1.32.7 worker positions are `[x, y]` with board
+  lookup `tiles[y][x]`, but `_events_from_action` unpacked them transposed
+  (`y, x = pos[0], pos[1]`), so every tile-dependent worker event read the
+  transposed tile. Affected: CARE animal attribution, FERTILIZE crop
+  attribution, HARVEST item attribution, and DIG replaced-tile labels. PLANT
+  is action-provided and was never affected.
+- **Fix:** `x, y = int(pos[0]), int(pos[1])`; bounds checked in x/y;
+  `tile = tiles[y][x]`; emitted ledger tile coordinates remain canonical
+  `[y, x]`. Honest unknown behavior preserved: CARE stays `animal: null`
+  unless the actual pre-action tile establishes GOOSE/COW/SHEEP; a decoy at
+  the transposed tile can never be attributed.
+- **Schema:** `SCHEMA_VERSION` bumped 2 → 3 (single authoritative constant).
+  Parquet storage and the BC adapter expect v3 via the imported constant;
+  v1/v2/mixed logical records and Parquet files fail loudly in both
+  `replay_daily.storage` and the BC loader. No migration: regenerate from raw.
+- **Asymmetric regression tests:** worker at `[x=2, y=5]`, actual tile only at
+  `board[5][2]`, deliberately different decoy at `board[2][5]`, across CARE
+  (species + honest unknown + hand actor + both seats), FERTILIZE, HARVEST,
+  DIG, and PLANT coordinate semantics. Real-sample smoke expectation updated
+  to the official convention. Full suite: 102 tests pass.
+- **Local sample audit:** regenerated
+  `data/canonical/2026-08-20-sample.parquet` at schema v3 (900 records,
+  805,435 bytes, SHA-256
+  `932617FF02EF7B5DF74C5AF2E766F3EC3423B3FAC24513992E218C0629F4054E`);
+  exact read-back parity; every raw pre-action worker op reconciled against
+  the emitted ledgers with zero mismatches. Corrected counts: CARE COW 5,614 /
+  SHEEP 4,091 / GOOSE 20 / unknown 0 (9,725 entries); FERTILIZE 2,020 entries
+  (known 2,011 = STRAWBERRY 1,960, WHEAT 27, TOMATO 24; unknown 9); DIG 889
+  submissions; HARVEST 11,948 submissions with 11,905 item-bearing ledger
+  entries (43 no-item submissions intentionally omitted under the existing
+  item-only HARVEST ledger semantics). Total tile-dependent submissions:
+  **24,582**.
+- **Erratum:** the implementation commit report/message stated 14,582
+  reconciled worker ops; the correct total is 24,582 (CARE 9,725 +
+  HARVEST 11,948 + DIG 889 + FERTILIZE 2,020). The reconciliation itself was
+  complete; only the reported aggregate was wrong. Recorded here without
+  amending history.
+- The v2 event labels were semantically wrong (transposed lookups), so no
+  migration path exists or is desired; all processed corpora must be
+  regenerated from raw replays at v3 before BC training.
+
 ## 2026-08-22 — First BC Manager: Adapter/Baseline, Tile Transformer, Training CLI
 
 Implemented the complete first behavior-cloning stack over the canonical

@@ -17,9 +17,9 @@ debug/inspection CLI output and is no longer maintained as a duplicate
 artifact. Raw replays remain the source of truth.
 
 - 900 records: 15 episodes × 30 days × 2 seats;
-- regenerated at canonical schema v2 on 2026-08-22 (CARE-by-animal ledger);
-  806,735 bytes;
-- SHA-256 (v2): `F7176542FE34B72DCEFCF70799DEDC34F17D8DB2DBF372680BD0FEC597023441`.
+- regenerated at canonical schema v3 on 2026-08-22 (official worker `[x,y]`
+  tile-lookup correction); 805,435 bytes;
+- SHA-256 (v3): `932617FF02EF7B5DF74C5AF2E766F3EC3423B3FAC24513992E218C0629F4054E`.
 
 Generation:
 
@@ -42,22 +42,61 @@ tile = start["self"]["board"][0][0]              # tagged tile struct with deriv
 `replay_daily.read_parquet(path)` reconstructs canonical logical records that
 compare exactly equal to fresh extractor output.
 
-## Schema v2 CARE regeneration (2026-08-22)
+## Schema v3 coordinate-correction regeneration (2026-08-22)
 
-The artifact was regenerated at canonical schema v2 after the CARE-by-animal
-correction (`events.care` ledger + `targets.care_by_animal`; readers/writers
-fail loudly on v1/mixed processed data). All 900 records again compare with
-exact Python equality against fresh extraction. Corpus-wide CARE results:
+The artifact was regenerated at canonical schema v3 after correcting the
+worker tile lookup (commit `e67f1b7`). Official 1.32.7 worker positions are
+`[x, y]` and the board is indexed `tiles[y][x]`; the extractor previously
+unpacked them transposed, so tile-dependent CARE/FERTILIZE/HARVEST/DIG labels
+read the wrong tile. Ledger tile coordinates remain canonical `[y, x]`
+(board row, board column) regardless of the engine's `[x, y]` position order.
+PLANT crop identity is action-provided and was never affected. The v2 event
+labels were therefore semantically wrong; no migration path exists or is
+desired — processed data must be regenerated from raw replays. Current
+readers/writers fail loudly on v1/v2/mixed processed data in both
+`replay_daily.storage` and the BC loader.
 
-- 6,642 known-animal CARE events: COW 3,724, SHEEP 2,918, GOOSE 0 (no geese in
-  the local elite sample; GOOSE attribution is covered by synthetic tests);
-- 3,083 unknown CARE intents preserved with `animal: null` (empty pasture,
-  empty/locked tiles) and never counted as a species;
-- every record satisfies `targets.care_by_animal == events.care.by_animal`;
-- CARE no longer appears in `worker_ops_other`;
-- spot-checked raw adjacency: e.g. episode 94735084 seat 0 step 13 CARE at
-  pre-action position `[3, 3]` on a SHEEP tile, hour 12, appears verbatim in
-  the day ledger.
+All 900 records again compare with exact Python equality against fresh
+extraction. Every raw pre-action worker op was independently reconciled
+against the emitted ledgers using official `tiles[pos[1]][pos[0]]` lookups:
+**24,582 tile-dependent submissions checked, zero mismatches**.
+
+Corrected corpus-wide counts:
+
+- CARE: 9,725 entries — COW 5,614, SHEEP 4,091, GOOSE 20, unknown 0. Every
+  CARE now resolves to its actual pre-action animal; `targets.care_by_animal`
+  equals `events.care.by_animal` in every record.
+- FERTILIZE: 2,020 entries — known-by-crop 2,011 (STRAWBERRY 1,960,
+  WHEAT 27, TOMATO 24); unknown 9 (actual pre-action tile cannot establish a
+  crop). Submitted intent vs successful realization remains distinguished as
+  before: applications are ledgered per submitted intent with the pre-action
+  tile's crop.
+- DIG: 889 submissions, replaced-tile labels now read from the actual tile.
+- HARVEST: 11,948 submissions; 11,905 item-bearing ledger entries. The 43
+  no-item submissions are intentionally omitted under the existing item-only
+  HARVEST ledger semantics (unchanged behavior, not misattribution).
+
+The v2 → v3 count changes are fully explained by the transpose correction:
+workers stand on their own structures, so the correct lookup hits the
+intended tile far more often (e.g. CARE unknown 3,083 → 0; GOOSE 0 → 20;
+FERTILIZE unknown 392 → 9).
+
+Regression protection: asymmetric tests place the worker at `[x=2, y=5]`,
+the actual tile only at `board[5][2]`, and a deliberately different decoy at
+the transposed `board[2][5]`, across CARE (species and honest unknown),
+FERTILIZE, HARVEST, DIG, and PLANT coordinate semantics; both seats are
+covered. The full suite passes (102 tests).
+
+## Superseded schema-v2 CARE regeneration record (2026-08-22)
+
+Historical record of the previous regeneration, superseded by schema v3
+above; its counts were computed with transposed lookups and are retained only
+for provenance:
+
+- 6,642 known-animal CARE events (COW 3,724, SHEEP 2,918, GOOSE 0) plus
+  3,083 unknown intents at schema v2;
+- artifact then 806,735 bytes, SHA-256
+  `F7176542FE34B72DCEFCF70799DEDC34F17D8DB2DBF372680BD0FEC597023441`.
 
 ## Parquet full-sample parity and benchmark (2026-08-21)
 
@@ -162,8 +201,8 @@ hour-1 WHEAT sale of quantity 3.
   realized 5 at Fibonacci total cost 12.
 - Land example: seat 0, day 6 records `BUY_LAND` at hour 4 as `NE`; the end
   target reports expansion with new quadrant `NE`.
-- Fertilizer example: seat 0, day 14 records two STRAWBERRY and two WHEAT
-  applications with exact tile/hour entries.
+- Fertilizer example: seat 0, day 14 records four STRAWBERRY applications
+  with exact canonical `[y, x]` tile/hour entries (at schema v3).
 - Duplicate shops: seat 0, day 20 preserves `ICE_CREAM_SHOP` twice in ordered
   `unlocked_shops` and reports count 2.
 - Lifecycle examples: a WHEAT tile at age 1 reports one day to harvest; a
