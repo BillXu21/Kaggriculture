@@ -330,9 +330,9 @@ Do not start here before a functioning RL baseline.
 
 ## Immediate Planning Agenda
 
-1. finish the real engine-executed BC-manager + executor smoke and require non-empty per-day diagnostics/compliance;
+1. ~~finish the real engine-executed BC-manager + executor smoke and require non-empty per-day diagnostics/compliance~~ Done for the repo-local checkpoint plumbing path; continue to inspect compliance before score claims;
 2. implement the common official-engine evaluation/match runner from `research/CODING_AGENT_SPRINT.md`;
-3. implement the scalar exact fast engine and differential oracle against pinned 1.32.7 (differential oracle live; Stage-2b mechanic-cluster parity slices 1-4 done at zero divergence; full-episode legal-ish corpus DONE 2026-08-23: 8 complete 720-step seeds, zero divergence, D-022 — remaining: closed-loop A/B, throughput/benchmarks);
+3. implement the scalar exact fast engine and differential oracle against pinned 1.32.7 (differential oracle live; Stage-2b mechanic-cluster parity slices 1-4 done at zero divergence; full-episode legal-ish corpus DONE 2026-08-23: 8 complete 720-step seeds, zero divergence, D-022; independent stateful closed-loop A/B DONE for three fixed-plan seeds plus one repo-local checkpoint episode — remaining: throughput/benchmarks);
 4. implement population/league infrastructure with deterministic paired scheduling and explicit promotion gates;
 5. implement algorithm-neutral rollout storage, returns/GAE, and deterministic minibatching;
 6. prove self-play orchestration with fake/frozen policies before attaching a learner;

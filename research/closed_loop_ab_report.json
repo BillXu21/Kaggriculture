@@ -1,0 +1,361 @@
+{
+  "accounting": {
+    "accepted_steps_per_episode": 719,
+    "canonical_terminal_step": 719,
+    "reset_observation": 1
+  },
+  "action_families_total": {
+    "farmer.BUILD_COOP": 6,
+    "farmer.CARE": 174,
+    "farmer.COLLECT_FERTILIZER": 174,
+    "farmer.EAST": 334,
+    "farmer.FEED": 161,
+    "farmer.FERTILIZE": 174,
+    "farmer.HARVEST": 189,
+    "farmer.NORTH": 879,
+    "farmer.PASS": 6,
+    "farmer.PICKUP": 246,
+    "farmer.PLACE": 6,
+    "farmer.PLANT": 256,
+    "farmer.SOUTH": 524,
+    "farmer.WATER": 590,
+    "farmer.WEST": 595,
+    "hands.EAST": 327,
+    "hands.FEED": 13,
+    "hands.HARVEST": 466,
+    "hands.NORTH": 1557,
+    "hands.PASS": 2284,
+    "hands.PICKUP": 171,
+    "hands.PLANT": 282,
+    "hands.SOUTH": 583,
+    "hands.WATER": 746,
+    "hands.WEST": 1425,
+    "market.BUY_ANIMAL": 6,
+    "market.BUY_PRODUCT": 84,
+    "market.BUY_SEED": 459,
+    "market.HIRE": 342,
+    "market.SELL": 359
+  },
+  "agent": "executor_v0.ExecutorAgent + FixedPlanProvider",
+  "checkpoint_evidence": {
+    "available": true,
+    "repo_local_pt_files": [
+      "data\\temp\\bc-train-smoke\\ckpt\\best.pt",
+      "data\\temp\\bc-train-smoke\\ckpt\\last.pt"
+    ],
+    "status": "repo-local checkpoint exists; this deterministic-plan report does not substitute for its real BC run"
+  },
+  "engine_pair": {
+    "fast": "fast_env Rust engine",
+    "official": "kaggle_environments 1.32.7"
+  },
+  "episodes": [
+    {
+      "action_families": {
+        "farmer.BUILD_COOP": 2,
+        "farmer.CARE": 58,
+        "farmer.COLLECT_FERTILIZER": 58,
+        "farmer.EAST": 110,
+        "farmer.FEED": 54,
+        "farmer.FERTILIZE": 58,
+        "farmer.HARVEST": 60,
+        "farmer.NORTH": 295,
+        "farmer.PASS": 2,
+        "farmer.PICKUP": 86,
+        "farmer.PLACE": 2,
+        "farmer.PLANT": 90,
+        "farmer.SOUTH": 173,
+        "farmer.WATER": 197,
+        "farmer.WEST": 193,
+        "hands.EAST": 90,
+        "hands.FEED": 4,
+        "hands.HARVEST": 160,
+        "hands.NORTH": 514,
+        "hands.PASS": 802,
+        "hands.PICKUP": 56,
+        "hands.PLANT": 90,
+        "hands.SOUTH": 169,
+        "hands.WATER": 256,
+        "hands.WEST": 477,
+        "market.BUY_ANIMAL": 2,
+        "market.BUY_PRODUCT": 28,
+        "market.BUY_SEED": 150,
+        "market.HIRE": 114,
+        "market.SELL": 126
+      },
+      "agent_calls": 2876,
+      "fast_rewards": [
+        4683.0,
+        4567.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "observation_comparisons": 1440,
+      "official_rewards": [
+        4683.0,
+        4567.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 0,
+      "steps_executed": 719,
+      "terminal_step": 719,
+      "wall_time_seconds": 13.31105070002377
+    },
+    {
+      "action_families": {
+        "farmer.BUILD_COOP": 2,
+        "farmer.CARE": 58,
+        "farmer.COLLECT_FERTILIZER": 58,
+        "farmer.EAST": 114,
+        "farmer.FEED": 54,
+        "farmer.FERTILIZE": 58,
+        "farmer.HARVEST": 60,
+        "farmer.NORTH": 298,
+        "farmer.PASS": 2,
+        "farmer.PICKUP": 86,
+        "farmer.PLACE": 2,
+        "farmer.PLANT": 86,
+        "farmer.SOUTH": 180,
+        "farmer.WATER": 194,
+        "farmer.WEST": 186,
+        "hands.EAST": 78,
+        "hands.FEED": 4,
+        "hands.HARVEST": 160,
+        "hands.NORTH": 502,
+        "hands.PASS": 834,
+        "hands.PICKUP": 56,
+        "hands.PLANT": 94,
+        "hands.SOUTH": 162,
+        "hands.WATER": 256,
+        "hands.WEST": 472,
+        "market.BUY_ANIMAL": 2,
+        "market.BUY_PRODUCT": 28,
+        "market.BUY_SEED": 150,
+        "market.HIRE": 114,
+        "market.SELL": 126
+      },
+      "agent_calls": 2876,
+      "fast_rewards": [
+        4174.0,
+        4174.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "observation_comparisons": 1440,
+      "official_rewards": [
+        4174.0,
+        4174.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 7,
+      "steps_executed": 719,
+      "terminal_step": 719,
+      "wall_time_seconds": 9.623326999950223
+    },
+    {
+      "action_families": {
+        "farmer.BUILD_COOP": 2,
+        "farmer.CARE": 58,
+        "farmer.COLLECT_FERTILIZER": 58,
+        "farmer.EAST": 110,
+        "farmer.FEED": 53,
+        "farmer.FERTILIZE": 58,
+        "farmer.HARVEST": 69,
+        "farmer.NORTH": 286,
+        "farmer.PASS": 2,
+        "farmer.PICKUP": 74,
+        "farmer.PLACE": 2,
+        "farmer.PLANT": 80,
+        "farmer.SOUTH": 171,
+        "farmer.WATER": 199,
+        "farmer.WEST": 216,
+        "hands.EAST": 159,
+        "hands.FEED": 5,
+        "hands.HARVEST": 146,
+        "hands.NORTH": 541,
+        "hands.PASS": 648,
+        "hands.PICKUP": 59,
+        "hands.PLANT": 98,
+        "hands.SOUTH": 252,
+        "hands.WATER": 234,
+        "hands.WEST": 476,
+        "market.BUY_ANIMAL": 2,
+        "market.BUY_PRODUCT": 28,
+        "market.BUY_SEED": 159,
+        "market.HIRE": 114,
+        "market.SELL": 107
+      },
+      "agent_calls": 2876,
+      "fast_rewards": [
+        3332.0,
+        4464.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "observation_comparisons": 1440,
+      "official_rewards": [
+        3332.0,
+        4464.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 42,
+      "steps_executed": 719,
+      "terminal_step": 719,
+      "wall_time_seconds": 9.483567300019786
+    }
+  ],
+  "real_checkpoint_executor_ab": {
+    "checkpoint": "data\\temp\\bc-train-smoke\\ckpt\\best.pt",
+    "result": {
+      "action_families": {
+        "farmer.BUILD_COOP": 98,
+        "farmer.CARE": 20,
+        "farmer.COLLECT_FERTILIZER": 26,
+        "farmer.EAST": 2,
+        "farmer.HARVEST": 2,
+        "farmer.NORTH": 28,
+        "farmer.PASS": 1220,
+        "farmer.PICKUP": 2,
+        "farmer.PLACE": 2,
+        "farmer.SOUTH": 8,
+        "farmer.WATER": 8,
+        "farmer.WEST": 22,
+        "hands.BUILD_COOP": 70,
+        "hands.CARE": 26,
+        "hands.COLLECT_FERTILIZER": 4,
+        "hands.EAST": 18,
+        "hands.FEED": 8,
+        "hands.FERTILIZE": 2,
+        "hands.HARVEST": 4,
+        "hands.NORTH": 76,
+        "hands.PASS": 2260,
+        "hands.PICKUP": 12,
+        "hands.PLACE": 16,
+        "hands.PLANT": 6,
+        "hands.SOUTH": 30,
+        "hands.WATER": 2,
+        "hands.WEST": 88,
+        "market.BUY_ANIMAL": 1438,
+        "market.BUY_PRODUCT": 246,
+        "market.BUY_SEED": 2,
+        "market.HIRE": 114,
+        "market.SELL": 2
+      },
+      "agent_calls": 2876,
+      "fast_rewards": [
+        0.0,
+        0.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "observation_comparisons": 1440,
+      "official_rewards": [
+        0.0,
+        0.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 0,
+      "steps_executed": 719,
+      "terminal_step": 719,
+      "wall_time_seconds": 11.58673690003343
+    },
+    "status": "passed"
+  },
+  "runner": "oracle.run_closed_loop",
+  "schema_version": 1,
+  "seeds": [
+    0,
+    7,
+    42
+  ],
+  "terminal_outcomes": [
+    {
+      "fast_rewards": [
+        4683.0,
+        4567.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "official_rewards": [
+        4683.0,
+        4567.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 0,
+      "steps": 719,
+      "terminal_step": 719
+    },
+    {
+      "fast_rewards": [
+        4174.0,
+        4174.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "official_rewards": [
+        4174.0,
+        4174.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 7,
+      "steps": 719,
+      "terminal_step": 719
+    },
+    {
+      "fast_rewards": [
+        3332.0,
+        4464.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "official_rewards": [
+        3332.0,
+        4464.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 42,
+      "steps": 719,
+      "terminal_step": 719
+    }
+  ],
+  "wall_time_seconds": 52.64688400004525
+}

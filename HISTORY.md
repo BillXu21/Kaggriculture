@@ -2,6 +2,40 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Independent Stateful Closed-Loop Agent A/B: Zero Divergence
+
+Added the secondary policy-interface gate after the same-action parity corpus.
+`oracle/closed_loop.py::run_closed_loop` creates independent official/fast
+backends and four fresh stateful agent instances, compares reset and every
+next presented observation, computes actions independently from each backend's
+observation, compares actions before either step, then compares canonical next
+state/rewards/statuses immediately. The official full status history is still
+checked for hidden ERROR/INVALID/TIMEOUT anomalies.
+
+- `make_deterministic_executor_factory` uses the existing stateful
+  `executor_v0.ExecutorAgent` and `FixedPlanProvider` with a nontrivial fixed
+  crop/animal/fertilizer/sell plan. Its narrow fast view adapter converts only
+  age/placed-day wire aliases and sparse private maps required by the existing
+  executor; no agent state or actions are shared.
+- Fixed-plan seeds `0`, `7`, and `42` each completed reset + 719 accepted
+  primitive steps, reached canonical step 719 with `DONE/DONE`, and matched
+  official/fast rewards exactly. The union covered 30 submitted farmer,
+  hand, and market action families.
+- Repo-local `data/temp/bc-train-smoke/ckpt/best.pt` was available and passed
+  one real checkpoint/executor A/B episode on seed 0: 719 accepted steps,
+  `DONE/DONE`, equal `[0.0, 0.0]` rewards. This is plumbing evidence only,
+  not a competitive result.
+- Deliberate reset-observation drift and pre-step action drift tests report
+  seed/step/day/hour/seat/path/official/fast/actions and stop before stepping.
+- Machine-readable report: `research/closed_loop_ab_report.json`; runner:
+  `python scripts/run_closed_loop_ab.py` in the pinned official venv.
+- Focused validation: `tests/test_oracle_closed_loop.py` — **7 passed** in the
+  official venv; the report run covered four full episodes in 52.65 seconds.
+  Import isolation and the existing same-action corpus remain separate gates.
+
+Not claimed: universal parity, competitive BC quality, executor redesign/tuning,
+PPO/self-play, throughput, or benchmark results.
+
 ## 2026-08-23 — Full-Episode Same-Action Parity Corpus: Zero First Divergence on 8 Complete 720-Step Episodes
 
 Built the deterministic legal-ish corpus stage (decision D-022) and drove the

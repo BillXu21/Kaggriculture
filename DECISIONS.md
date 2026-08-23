@@ -212,3 +212,12 @@ This file records decisions that remain authoritative across chats and work sess
 - Coverage is measured, not assumed: every attempted family increments a histogram published in the corpus report (`research/parity_corpus_report.json`); families not naturally reached must be reached by generator bias/targeted prefixes, never by weakening same-action semantics.
 - Primitive-turn accounting (locked): a default "720-step episode" = ONE reset observation + exactly 719 accepted primitive `step` calls; terminal DONE lands at canonical step 719 = day 29 hour 23; 29 day-boundary transitions.
 - Evidence boundary: zero first divergence over the fixed 8-seed corpus proves parity only for states those episodes reach — bounded coverage, not universal mathematical proof. Training-safety claims must cite the exact corpus result.
+
+## D-023 - Add an Independent Stateful-Agent A/B Gate After Same-Action Parity
+
+- Date: 2026-08-23
+- Status: active
+- Decision: Keep same-action replay as the primary engine-correctness gate, and add `oracle.run_closed_loop` as a secondary policy-interface gate. It must construct fresh official/fast backends and fresh agent instances for both seats, compare each corresponding presented observation before independent action computation, compare actions before stepping, then compare canonical next state/rewards/statuses immediately. The official full status history remains subject to anomaly validation.
+- Deterministic fixture: use the existing stateful `executor_v0.ExecutorAgent` with a fixed nontrivial `DailyPlan` through `make_deterministic_executor_factory`; no mutable agent state may be shared across backends or seats. The narrow fast observation adapter only reconciles wire aliases/sparse maps that the existing executor cannot consume directly; it does not synchronize decisions.
+- Evidence: `tests/test_oracle_closed_loop.py` and `research/closed_loop_ab_report.json` cover seeds 0, 7, and 42 for complete reset + 719-step episodes with `DONE/DONE`, equal rewards, and zero divergence; one repo-local `best.pt` checkpoint episode also passed. Deliberate observation/action drift tests stop before stepping and retain full first-failure context.
+- Scope boundary: this proves deterministic interface/transition plumbing for the exercised fixed-plan and checkpoint paths, not competitive score, BC quality, universal engine parity, executor redesign, BC tuning, PPO, throughput, or benchmarks.

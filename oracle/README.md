@@ -1,4 +1,4 @@
-# Official-vs-Fast Differential Oracle (Stage 2a)
+# Official-vs-Fast Differential Oracle (Stages 2a-2b)
 
 Reusable same-action oracle that proves the fast Rust engine matches the
 official pinned `kaggle-environments` 1.32.7 engine turn-by-turn. The official
@@ -101,6 +101,38 @@ see the Stage-2a HISTORY entry; the trace is
   & $env:VIRTUAL_ENV\Scripts\python.exe scripts\run_parity_corpus.py
   ```
 
-  Exit code 0 means zero divergence across all requested seeds. This is a
-  bounded result: parity is proven for the states those episodes reach, not
-  universally. Closed-loop A/B remains open Stage-2b/3 work.
+Exit code 0 means zero divergence across all requested seeds. This is a
+bounded result: parity is proven for the states those episodes reach, not
+universally. The independent closed-loop A/B gate is described below.
+
+## Independent closed-loop A/B
+
+`run_closed_loop(configuration, max_steps=719, backend_factories=...,`
+`agent_factories=...)` creates independent backend instances and four fresh
+stateful agents. At reset and before every transition it compares the
+corresponding observations; each backend's agents then compute actions from
+their own observations. Actions are compared before either backend is stepped,
+and the canonical next state, rewards, and statuses are compared immediately.
+The first failure is a `ClosedLoopDivergenceReport` with seed, step, day, hour,
+seat, field path, both values, and both actions. Official full status history
+validation is preserved.
+
+The default deterministic fixture is
+`make_deterministic_executor_factory()`: it uses the existing stateful
+`executor_v0.ExecutorAgent` with a fixed nontrivial `DailyPlan`, not a shared
+agent or a fabricated checkpoint. `make_checkpoint_executor_factory(path)` is
+the corresponding explicit real-checkpoint adapter. The fast fixture converts
+only fast wire tile aliases and sparse private maps that the existing executor
+does not consume directly; decisions remain independently computed.
+
+Run the bounded report in the pinned official venv:
+
+```text
+& $env:VIRTUAL_ENV\Scripts\python.exe scripts/run_closed_loop_ab.py
+```
+
+The report records seeds, transitions, action families, terminal outcomes, wall
+time, and repo-local checkpoint evidence. Deliberate observation and action
+drift tests prove that the runner stops before stepping at the first
+policy-interface mismatch. This secondary gate does not replace the primary
+same-action engine parity corpus.

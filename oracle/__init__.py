@@ -16,6 +16,14 @@ from .backend import FastBackendAdapter, make_backend
 from .canonical import FieldDiff, canonical_state_fast, canonical_state_official, deep_diff
 from .provenance import ProvenanceError, verify_official_provenance
 from .replay import DivergenceError, DivergenceReport, ReplayResult, run_same_action_replay
+from .closed_loop import (
+    ClosedLoopDivergenceError,
+    ClosedLoopDivergenceReport,
+    ClosedLoopResult,
+    make_checkpoint_executor_factory,
+    make_deterministic_executor_factory,
+    run_closed_loop,
+)
 
 __all__ = [
     "FastBackendAdapter",
@@ -30,4 +38,10 @@ __all__ = [
     "DivergenceReport",
     "ReplayResult",
     "run_same_action_replay",
+    "ClosedLoopDivergenceError",
+    "ClosedLoopDivergenceReport",
+    "ClosedLoopResult",
+    "make_checkpoint_executor_factory",
+    "make_deterministic_executor_factory",
+    "run_closed_loop",
 ]

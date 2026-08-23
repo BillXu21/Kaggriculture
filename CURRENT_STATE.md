@@ -4,7 +4,7 @@ Last updated: 2026-08-23
 
 ## Snapshot
 
-- Phase: **Stage-2b mechanic slices 1-4, the MAX_HANDS=240 exact layout, AND the full-episode legal-ish parity corpus are all at zero first divergence vs the real official 1.32.7 engine (27 + 16 + 12 + 10 + 5 focused tests; corpus: 8 complete 720-step seeds — 0, 1, 2, 7, 17, 42, 123, 999 — reset + 719 primitive steps each, 33 action families, terminal/repeatability locked, zero divergence; see below); next gates are closed-loop A/B; plus issue #2 throughput gates (GIL release, configurable Rayon thread count, batched/multi-core/memory benchmarks — fused executor/day-step explicitly deferred) and a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`); issue #4 opening book implemented and officially validated (15/16 strict matrix passes, see below)**.
+- Phase: **Stage-2b mechanic slices 1-4, the MAX_HANDS=240 exact layout, the full-episode legal-ish parity corpus, AND the secondary independent closed-loop agent A/B gate are all at zero first divergence vs the real official 1.32.7 engine**; same-action parity remains primary. The closed-loop gate covers three fixed-seed full episodes plus one repo-local checkpoint episode; next gates are issue #2 throughput (GIL release, configurable Rayon thread count, batched/multi-core/memory benchmarks — fused executor/day-step explicitly deferred), then broader evaluation/review.
 - Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
 - Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
 - Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.
@@ -96,6 +96,29 @@ reset+replay canonical states/rewards/statuses) locked in
 full-corpus command: `python scripts/run_parity_corpus.py` (oracle venv).
 Bounded claim: parity proven for the states these episodes reach — not a
 universal mathematical proof; closed-loop A/B is the next gate.
+
+## Secondary Closed-Loop Agent A/B Gate
+
+`oracle/closed_loop.py::run_closed_loop` is the secondary policy-interface
+check. It constructs four fresh stateful agents (official/fast × seat 0/1),
+compares the reset and every next presented observation, computes each backend's
+actions independently, compares actions before stepping, and then compares the
+canonical next state/rewards/statuses immediately. The official full status
+history remains validated for anomalies.
+
+- Fixed-plan `executor_v0.ExecutorAgent` factory: seeds `0`, `7`, and `42`,
+  each with one reset plus 719 accepted steps, terminal `DONE/DONE` at step
+  719, equal rewards, and zero closed-loop divergence.
+- Action-family union: 30 submitted farmer/hand/market families; report:
+  `research/closed_loop_ab_report.json`.
+- Real repo-local checkpoint: `data/temp/bc-train-smoke/ckpt/best.pt`, one
+  seed-0 full episode, also `DONE/DONE` at step 719 with equal `[0.0, 0.0]`
+  rewards. This is a plumbing A/B result, not a competitive score claim.
+- Deliberate observation and action drift tests stop before stepping and report
+  seed/step/day/hour/seat/path/official/fast/actions. The primary same-action
+  corpus remains the engine-correctness gate; this stage does not replace it.
+- Wall time for the three fixed-plan episodes plus checkpoint episode was
+  52.65 seconds in the authorized official temp venv on this host.
 
 ## Learned-Control Contract
 
