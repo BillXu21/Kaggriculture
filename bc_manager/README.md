@@ -23,10 +23,11 @@ elite 1.32.7 daily partitions 2026-08-17 through 2026-08-21:
 - 209,160 `(episode, seat, day)` rows;
 - schema versions exactly `{3}`.
 
-Default BC selection remains `min_score >= 2950`, with train dates
-2026-08-17..2026-08-20 and validation date 2026-08-21.
+Default BC selection is `min_score >= 2950`, with train dates
+2026-08-17..2026-08-20 and validation date 2026-08-21. That selects 25,500
+train rows and 5,700 held-out validation rows.
 
-## Training command (full-data handoff)
+## Training command
 
 All five Parquets must be passed to the CLI because the held-out Aug-21 file is
 still required for validation:
@@ -47,9 +48,41 @@ python -m bc_manager.cli \
 Defaults: AdamW lr 3e-4, weight decay 1e-2, batch size 256, 30 epochs,
 gradient clip 1.0, seed 0, date split and cutoff as above. Device is CUDA
 when available else CPU; `--amp auto` enables CUDA AMP only. Checkpoints
-`best.pt`/`last.pt` are written under the caller-provided directory (use an
-ignored path such as `data/temp`). Model config is serialized inside each
-checkpoint; reload with `bc_manager.training.load_model_from_checkpoint`.
+`best.pt`/`last.pt` are written under the caller-provided directory. Model
+config is serialized inside each checkpoint; reload with
+`bc_manager.training.load_model_from_checkpoint`.
+
+## First full reference run
+
+The first untouched default-size run completed on CUDA+AMP over the schema-v3
+five-day corpus. Provenance and complete held-out metrics are recorded in
+`research/FIRST_BC_V0_EVAL.md`.
+
+Headline result:
+
+- 1,071,040 parameters;
+- best epoch 29/30;
+- best Aug-21 validation total 2.8889;
+- ~237 s total runtime;
+- state-aware model materially beat the train-only day baseline on every
+  manager group measured.
+
+Examples of the held-out model vs day baseline gap:
+
+- crop MAE: 1.273 vs 3.622;
+- animal MAE: 0.268 vs 1.694;
+- CARE MAE: 0.330 vs 1.668;
+- land accuracy: 0.991 vs 0.909;
+- tomato nonzero recall: 83.8% vs 0%;
+- goose nonzero recall: 96.8% vs 0%;
+- goose CARE nonzero recall: 95.5% vs 0%.
+
+Selling is less complete: held-out sell-presence recall is ~64.8% despite
+93.9% presence accuracy, so sparse accuracy alone should not be treated as
+success.
+
+The next gate is closed-loop evaluation with a deterministic executor. Do not
+interpret this teacher-forced result as proof of competitive game strength.
 
 ## Tiny CPU smoke
 
@@ -70,5 +103,3 @@ python -m bc_manager.cli <schema-v3.parquet> --tiny --epochs 2 \
   reaches the model; unknown batch keys are rejected.
 - Sell quantities are bounded per primitive event only in the BC adapter before
   six-bin aggregation; raw canonical sale events remain untouched.
-- No full five-day BC training run has been completed yet. The schema-v3 corpus
-  is ready; adapter audit and the first date-held-out training run are next.
