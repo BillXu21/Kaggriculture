@@ -8,8 +8,8 @@ never mutates its inputs.
 Priority groups (issue #1 urgency ordering):
 
 - ``MAINTENANCE``: hard deadline/mechanic-upkeep work (WATER, FEED,
-  COLLECT_FERTILIZER) — two dry days kill a plant, unfed animals escape,
-  fertilizer accrues daily.
+  COLLECT_FERTILIZER when the canonical raw ``fertilizer_available`` field
+  is True) — two dry days kill a plant, unfed animals escape.
 - ``PRODUCTIVE``: revenue work (HARVEST of actually harvestable tiles).
 - ``MANAGER``: manager-directed changes (DIG/PLANT reconciliation,
   BUILD/PLACE deficits, CARE/FERTILIZE allocations, BUY_LAND).
@@ -233,11 +233,11 @@ def generate_tasks(
                     harvest_animal_targets.append(coord)
                 if tile.get("fed_today") is not True:
                     feed_targets.append(coord)
-                # Animals generate collectible fertilizer daily
-                # (MECHANICS.md, CONFIRMED_SOURCE); readiness is not
-                # separately observable, so every occupied structure is a
-                # valid daily collection target.
-                collect_targets.append(coord)
+                # Collectible fertilizer readiness comes from the canonical
+                # raw `fertilizer_available` field; missing/unknown is never
+                # treated as available.
+                if tile.get("fertilizer_available") is True:
+                    collect_targets.append(coord)
                 if species in care_eligible \
                         and tile.get("cared_today") is not True:
                     care_eligible[species].append(coord)

@@ -62,8 +62,9 @@ def plant_tile(crop="WHEAT", *, planted_day=1, yield_units=0,
 
 
 def animal_tile(animal="GOOSE", *, yield_units=0, fed_today=True,
-                cared_today=False, consecutive_unfed=0) -> dict:
-    return {
+                cared_today=False, consecutive_unfed=0,
+                fertilizer_available=None) -> dict:
+    tile = {
         "kind": ANIMALS[animal]["structure"], "animal": animal,
         "placed_day": 0, "yield_units": yield_units,
         "consecutive_unfed": consecutive_unfed, "fed_today": fed_today,
@@ -75,6 +76,9 @@ def animal_tile(animal="GOOSE", *, yield_units=0, fed_today=True,
             "days_until_next_product": None,
         },
     }
+    if fertilizer_available is not None:
+        tile["fertilizer_available"] = fertilizer_available
+    return tile
 
 
 def make_obs(day=3, hour=2, step=90, tiles=None, unlocked=("NW",),
@@ -187,8 +191,10 @@ def test_water_harvest_feed_collect_from_actual_lifecycle_fields():
     tiles[0][2] = plant_tile(yield_units=3, planted_day=1)
     tiles[0][3] = plant_tile(watered_today=False, yield_units=2,
                              planted_day=0)
-    tiles[1][1] = animal_tile("GOOSE", fed_today=False, cared_today=False)
-    tiles[1][2] = animal_tile("COW", yield_units=2, fed_today=True)
+    tiles[1][1] = animal_tile("GOOSE", fed_today=False, cared_today=False,
+                              fertilizer_available=True)
+    tiles[1][2] = animal_tile("COW", yield_units=2, fed_today=True,
+                              fertilizer_available=True)
     obs = make_obs(tiles=tiles)
     result = generate_tasks(obs, 0, feasible_plan=make_plan(),
                             remaining_sells={})
@@ -206,6 +212,26 @@ def test_water_harvest_feed_collect_from_actual_lifecycle_fields():
     # Fed+cared animals get no FEED/CARE; unfed uncared goose gets CARE only
     # when the plan requests it (zero here).
     assert by_kind(result, "CARE") == []
+
+
+def test_collect_fertilizer_requires_actual_availability_field():
+    """Regression: collection only on raw fertilizer_available is True."""
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[0][1] = animal_tile("GOOSE", fertilizer_available=True)
+    tiles[0][2] = animal_tile("COW", fertilizer_available=False)
+    tiles[0][3] = animal_tile("SHEEP")            # field missing: unknown
+    tiles[1][1] = {"kind": "COOP"}                # empty structure: none
+    obs = make_obs(tiles=tiles)
+    result = generate_tasks(obs, 0, feasible_plan=make_plan(),
+                            remaining_sells={})
+    collect = [(t.tile, t.animal) for t in by_kind(result,
+                                                   "COLLECT_FERTILIZER")]
+    assert collect == [((0, 1), "GOOSE")]
+    # Availability becoming false removes the task on recompute.
+    tiles[0][1]["fertilizer_available"] = False
+    again = generate_tasks(obs, 0, feasible_plan=make_plan(),
+                           remaining_sells={})
+    assert by_kind(again, "COLLECT_FERTILIZER") == []
 
 
 def test_completed_task_disappears_on_recompute_no_mutation():
