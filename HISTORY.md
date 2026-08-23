@@ -2,6 +2,43 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Issue #2 A/B Benchmarks: Official 1.32.7 vs Fast Engine vs diffmap Reference
+
+Ran the reproducible same-machine benchmark suite required by issue #2
+(decision D-025). New artifacts: `scripts/benchmark_engine_throughput.py`
+(worker/all/report subcommands, deterministic scripted traces, warmup-aware
+median/min/max, loud rejection of NaN/impossible rates),
+`docs/benchmarks/issue2_results.json` (raw machine-readable summary), and
+`docs/benchmarks/ISSUE2_THROUGHPUT.md` (generated report). Focused tests:
+`tests/test_benchmark_script.py` (7 passed, 1 official smoke skipped without
+the pinned venv).
+
+- Reference build: upstream `diffmap/kaggicultureRL` @ `ef8bb3a` cloned under
+  the authorized temp root, wheel built release-mode with the temp-local GNU
+  toolchain into an isolated venv (`CARGO_TARGET_DIR` outside the clone; the
+  upstream checkout stayed byte-clean). Reference is provenance-pinned 1.32.6
+  with old shapes (OBS_SIZE 5630, ACTION_SLOTS 27) — performance reference only.
+- Scalar full episodes (720 steps = reset + exactly 719 accepted step calls,
+  both engines): official 1.32.7 ~1.30 s/episode (~553 turns/s); fast dict API
+  ~0.279 s (~2,580 turns/s) = **4.7x speedup**; fast native floor ~188k
+  turns/s (341x vs official); reference native ~499k turns/s.
+- Batch steady-state (`step_into`, preallocated buffers, transitions counted
+  as N*steps): ours scales from ~58k t/s (N=512, T=1) to ~167k t/s (default
+  pool) = 2.87x at N=512 and 2.89x at N=1024; best cell N=128/T=4 ~204k t/s.
+  Below N=128 the serial loop makes thread counts irrelevant, as designed.
+- Profile finding: observation writing is **84%** of our steady step_into cost
+  at N=512 (224k obs t/s vs 1.16M transition-only t/s). The unmodified
+  reference core is ~2.7x faster per env-transition at N=1, consistent with
+  its old 16-hand layout vs our exact-contract MAX_HANDS=240 writer.
+- Decision recorded: no engine change in this stage; observation-writer cost
+  is the single bounded optimization candidate, deferred to a distinct stage.
+- Memory: theoretical obs buffer 70,128 B/env + action tensor 12,048 B/env;
+  measured RSS deltas ~65-107 KB/env (allocator/pool overhead included,
+  explicitly not GameState sizes).
+- Environment: i7-12700H (14C/20T), Windows 11 build 26200, Python 3.13.1,
+  numpy 2.5.2, kaggle-environments 1.32.7 pinned wheel, repo @ 63c8113.
+  No TPU claim; laptop absolute numbers do not transfer.
+
 ## 2026-08-23 — Issue #2 Throughput Seam: GIL Release + Optional Instance-Local Rayon Pool
 
 Implemented the throughput seam for the Rust batch backend (decision D-024).

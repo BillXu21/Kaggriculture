@@ -332,14 +332,14 @@ Do not start here before a functioning RL baseline.
 
 1. ~~finish the real engine-executed BC-manager + executor smoke and require non-empty per-day diagnostics/compliance~~ Done for the repo-local checkpoint plumbing path; continue to inspect compliance before score claims;
 2. implement the common official-engine evaluation/match runner from `research/CODING_AGENT_SPRINT.md`;
-3. implement the scalar exact fast engine and differential oracle against pinned 1.32.7 (differential oracle live; Stage-2b mechanic-cluster parity slices 1-4 done at zero divergence; full-episode legal-ish corpus DONE 2026-08-23: 8 complete 720-step seeds, zero divergence, D-022; independent stateful closed-loop A/B DONE for three fixed-plan seeds plus one repo-local checkpoint episode — remaining: throughput/benchmarks);
+3. implement the scalar exact fast engine and differential oracle against pinned 1.32.7 (differential oracle live; Stage-2b mechanic-cluster parity slices 1-4 done at zero divergence; full-episode legal-ish corpus DONE 2026-08-23: 8 complete 720-step seeds, zero divergence, D-022; independent stateful closed-loop A/B DONE for three fixed-plan seeds plus one repo-local checkpoint episode; throughput/benchmarks DONE 2026-08-23, D-025);
 4. implement population/league infrastructure with deterministic paired scheduling and explicit promotion gates;
 5. implement algorithm-neutral rollout storage, returns/GAE, and deterministic minibatching;
 6. prove self-play orchestration with fake/frozen policies before attaching a learner;
 7. only then add the PPO-specific value/log-prob/loss interface after the executor compliance gate;
 8. freeze 1.32.7 source/spec/hash and keep upstream bug-fix watch;
 9. map remaining RNG/reveal timing and maintain engine differential tests;
-10. benchmark official and fast simulator throughput — per issue #2 this now includes releasing the GIL across the Python/Rust seam, a configurable Rayon thread count, and batched/multi-core/memory benchmarks; the fused executor/day-step design is explicitly deferred and must not derail differential-parity work;
+10. benchmark official and fast simulator throughput — DONE 2026-08-23 (`docs/benchmarks/ISSUE2_THROUGHPUT.md`, D-025): scalar dict API 4.7x vs official, native floor 341x, default-pool scaling ~2.9x at N>=512; observation-writer cost (84% of large-batch step time) is the single deferred optimization candidate for a distinct correction stage;
 11. build frozen competent-opponent panels and strategy-family cross-play;
 12. recheck upstream immediately before substantive training.
 

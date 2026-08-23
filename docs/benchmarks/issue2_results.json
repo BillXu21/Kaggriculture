@@ -1,0 +1,555 @@
+{
+  "schema": "kaggriculture-issue2-benchmarks-v1",
+  "engines": {
+    "official": {
+      "schema": "kaggriculture-issue2-benchmarks-v1",
+      "engine": "official",
+      "suite": "full",
+      "date": "2026-08-23T18:41:15",
+      "environment": {
+        "os": "Windows 11 build 10.0.26200",
+        "cpu": "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+        "logical_processors": 20,
+        "python": "3.13.1",
+        "numpy": "2.5.2",
+        "executable": "C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Scripts\\python.exe",
+        "kaggle_environments": "1.32.7",
+        "repo_commit": "63c8113585575fd6c3edf1417795eb553b44ddae"
+      },
+      "cold_import": {
+        "target": "import kaggle_environments",
+        "reps_total": 3,
+        "reps_kept": 2,
+        "median_s": 1.0407223500078544,
+        "min_s": 1.0315447000321,
+        "max_s": 1.0498999999836087
+      },
+      "reset_latency": {
+        "reset": {
+          "reps_total": 9,
+          "reps_kept": 8,
+          "median_s": 0.025434100010897964,
+          "min_s": 0.012838899972848594,
+          "max_s": 0.02734719996806234
+        }
+      },
+      "scalar_episodes": {
+        "official:pass_only": {
+          "reps_total": 5,
+          "reps_kept": 4,
+          "median_s": 1.3201021499698982,
+          "min_s": 1.3183116000145674,
+          "max_s": 1.356265899958089,
+          "step_calls_per_episode": 719,
+          "turns_per_sec_median": 545.4123379894638,
+          "episodes_per_sec_median": 0.7575171360964775
+        },
+        "official:mixed": {
+          "reps_total": 5,
+          "reps_kept": 4,
+          "median_s": 1.3024320999975316,
+          "min_s": 1.2859490999253467,
+          "max_s": 1.3291349000064656,
+          "step_calls_per_episode": 719,
+          "turns_per_sec_median": 552.8119277783192,
+          "episodes_per_sec_median": 0.7677943441365543
+        }
+      },
+      "memory": {
+        "rss_baseline_bytes": 203583488,
+        "theoretical_per_env": {},
+        "samples": {
+          "1": {
+            "rss_delta_bytes": 0,
+            "rss_delta_bytes_per_env": 0.0
+          }
+        },
+        "note": "Official engine has no batch seam; the sample isolates one full kaggle_environments episode object (interpreter + state), not a GameState."
+      },
+      "profile_scalar": {
+        "top_cumulative": "         6568779 function calls (5361439 primitive calls) in 3.871 seconds\n\n   Ordered by: cumulative time\n   List reduced from 354 to 14 due to restriction <14>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n        1    0.007    0.007    3.876    3.876 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\scripts\\benchmark_engine_throughput.py:565(<lambda>)\n        1    0.004    0.004    3.869    3.869 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\scripts\\benchmark_engine_throughput.py:297(run_scalar_episode_official)\n      719    0.006    0.000    3.699    0.005 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\oracle\\official_backend.py:68(step)\n      719    0.019    0.000    3.690    0.005 C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Lib\\site-packages\\kaggle_environments\\core.py:256(step)\n     1448    0.008    0.000    1.826    0.001 C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Lib\\site-packages\\kaggle_environments\\utils.py:187(process_schema)\n1148784/4335    1.097    0.000    1.705    0.000 C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Lib\\site-packages\\kaggle_environments\\utils.py:117(structify)\n      721    0.002    0.000    1.684    0.002 C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Lib\\site-packages\\kaggle_environments\\core.py:681(__run_interpreter)\n      721    0.019    0.000    1.682    0.002 C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Lib\\site-packages\\kaggle_environments\\core.py:640(__run_interpreter_prod)\n      721    0.016    0.000    1.652    0.002 C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Lib\\site-packages\\kaggle_environments\\core.py:621(__loop_through_interpreter)\n     1448    0.012    0.000    1.632    0.001 C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Lib\\site-packages\\jsonschema\\validators.py:1265(validate)\n     1448    0.006    0.000    1.555    0.001 C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Lib\\site-packages\\jsonschema\\validators.py:306(check_schema)\n     2896    0.008    0.000    1.486    0.001 C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Lib\\site-packages\\jsonschema\\validators.py:349(iter_errors)\n1584/1448    0.014    0.000    1.448    0.001 C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Lib\\site-packages\\jsonschema\\_keywords.py:332(allOf)\n31985/10202    0.129    0.000    1.438    0.000 C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Lib\\site-packages\\jsonschema\\validators.py:396(descend)\n\n\n"
+      },
+      "batch_throughput": {}
+    },
+    "fast": {
+      "schema": "kaggriculture-issue2-benchmarks-v1",
+      "engine": "fast",
+      "suite": "full",
+      "date": "2026-08-23T18:41:39",
+      "environment": {
+        "os": "Windows 11 build 10.0.26200",
+        "cpu": "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+        "logical_processors": 20,
+        "python": "3.13.1",
+        "numpy": "2.5.2",
+        "executable": "C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_oracle_venv\\Scripts\\python.exe",
+        "kaggle_environments": "1.32.7",
+        "repo_commit": "63c8113585575fd6c3edf1417795eb553b44ddae"
+      },
+      "cold_import": {
+        "target": "import fast_env",
+        "reps_total": 3,
+        "reps_kept": 2,
+        "median_s": 0.23887174995616078,
+        "min_s": 0.21460840001236647,
+        "max_s": 0.2631350998999551
+      },
+      "reset_latency": {
+        "reset": {
+          "reps_total": 9,
+          "reps_kept": 8,
+          "median_s": 8.000002708286047e-06,
+          "min_s": 7.699942216277122e-06,
+          "max_s": 1.4699995517730713e-05
+        }
+      },
+      "scalar_episodes": {
+        "fast_api:pass_only": {
+          "reps_total": 5,
+          "reps_kept": 4,
+          "median_s": 0.2964912499883212,
+          "min_s": 0.2751789999892935,
+          "max_s": 0.30741310003213584,
+          "step_calls_per_episode": 719,
+          "turns_per_sec_median": 2428.402187344014,
+          "episodes_per_sec_median": 3.3727808157555743
+        },
+        "fast_api:mixed": {
+          "reps_total": 5,
+          "reps_kept": 4,
+          "median_s": 0.2790222499752417,
+          "min_s": 0.2651474999729544,
+          "max_s": 0.2868288999889046,
+          "step_calls_per_episode": 719,
+          "turns_per_sec_median": 2580.439373791471,
+          "episodes_per_sec_median": 3.5839435747103763
+        },
+        "fast_native:mixed": {
+          "reps_total": 5,
+          "reps_kept": 4,
+          "median_s": 0.0038223500014282763,
+          "min_s": 0.0035249999491497874,
+          "max_s": 0.00802429998293519,
+          "step_calls_per_episode": 719,
+          "turns_per_sec_median": 188365.7958405069,
+          "episodes_per_sec_median": 261.61916088959293
+        }
+      },
+      "memory": {
+        "rss_baseline_bytes": 182779904,
+        "theoretical_per_env": {
+          "obs_buffer_bytes_per_env": 70128,
+          "action_tensor_bytes_per_env": 12048,
+          "mask_buffer_bytes_per_env": 68052
+        },
+        "samples": {
+          "128": {
+            "rss_delta_bytes": 13737984,
+            "rss_delta_bytes_per_env": 107328.0
+          },
+          "512": {
+            "rss_delta_bytes": 33443840,
+            "rss_delta_bytes_per_env": 65320.0
+          }
+        },
+        "note": "RSS deltas measure allocator/working-set growth including Rayon pool threads and arena slack; they upper-bound the true per-env state cost and must not be read as exact GameState size."
+      },
+      "profile_scalar": {
+        "top_cumulative": "         511984 function calls (509108 primitive calls) in 0.573 seconds\n\n   Ordered by: cumulative time\n   List reduced from 46 to 14 due to restriction <14>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n        1    0.000    0.000    0.573    0.573 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\scripts\\benchmark_engine_throughput.py:567(<lambda>)\n        1    0.004    0.004    0.573    0.573 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\scripts\\benchmark_engine_throughput.py:311(run_scalar_episode_fast_wrapper)\n      719    0.008    0.000    0.557    0.001 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\fast_env\\api.py:333(step)\n      720    0.006    0.000    0.513    0.001 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\fast_env\\api.py:321(_decode)\n     1440    0.278    0.000    0.507    0.000 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\fast_env\\api.py:227(_decode_observation)\n   288000    0.139    0.000    0.139    0.000 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\fast_env\\api.py:191(_tile)\n    89856    0.040    0.000    0.060    0.000 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\fast_env\\api.py:187(_round)\n     2880    0.026    0.000    0.048    0.000 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\fast_env\\api.py:223(_inventory)\n      719    0.010    0.000    0.023    0.000 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\fast_env\\api.py:162(_encode_actions)\n    89856    0.020    0.000    0.020    0.000 {built-in method builtins.round}\n      719    0.014    0.000    0.014    0.000 {method 'step' of 'builtins.RustBatchEnv' objects}\n        1    0.008    0.008    0.008    0.008 C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\fast_env\\api.py:282(__init__)\n6055/3179    0.002    0.000    0.007    0.000 {built-in method builtins.isinstance}\n     1438    0.001    0.000    0.005    0.000 C:\\Users\\liuyi\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\typing.py:1374(__instancecheck__)\n\n\n"
+      },
+      "batch_throughput": {
+        "N=1,T=1": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.0011680999305099249,
+          "min_s": 0.001131500001065433,
+          "max_s": 0.0011967000318691134,
+          "env_transitions": 100,
+          "transitions_per_sec_median": 85609.11390204927,
+          "per_step_us_median": 11.680999305099249,
+          "gil_released_during_call": true
+        },
+        "N=1,T=2": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.0013705999590456486,
+          "min_s": 0.0011665000347420573,
+          "max_s": 0.0016968999989330769,
+          "env_transitions": 100,
+          "transitions_per_sec_median": 72960.7492981615,
+          "per_step_us_median": 13.705999590456486,
+          "gil_released_during_call": true
+        },
+        "N=1,T=4": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.001159899984486401,
+          "min_s": 0.001106700045056641,
+          "max_s": 0.0011820999206975102,
+          "env_transitions": 100,
+          "transitions_per_sec_median": 86214.32997456206,
+          "per_step_us_median": 11.59899984486401,
+          "gil_released_during_call": true
+        },
+        "N=1,T=default": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.001016699941828847,
+          "min_s": 0.0007995999185368419,
+          "max_s": 0.0016194999916478992,
+          "env_transitions": 100,
+          "transitions_per_sec_median": 98357.43653148961,
+          "per_step_us_median": 10.16699941828847,
+          "gil_released_during_call": true
+        },
+        "N=16,T=1": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.018604999990202487,
+          "min_s": 0.01856019999831915,
+          "max_s": 0.018774299998767674,
+          "env_transitions": 1600,
+          "transitions_per_sec_median": 85998.38757552112,
+          "per_step_us_median": 186.04999990202487,
+          "gil_released_during_call": true
+        },
+        "N=16,T=2": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.018336899927817285,
+          "min_s": 0.013083699974231422,
+          "max_s": 0.01869029994122684,
+          "env_transitions": 1600,
+          "transitions_per_sec_median": 87255.75240626044,
+          "per_step_us_median": 183.36899927817285,
+          "gil_released_during_call": true
+        },
+        "N=16,T=4": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.018213799921795726,
+          "min_s": 0.013585199951194227,
+          "max_s": 0.01958229998126626,
+          "env_transitions": 1600,
+          "transitions_per_sec_median": 87845.4801782106,
+          "per_step_us_median": 182.13799921795726,
+          "gil_released_during_call": true
+        },
+        "N=16,T=default": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.017532699974253774,
+          "min_s": 0.014246699982322752,
+          "max_s": 0.019162400043569505,
+          "env_transitions": 1600,
+          "transitions_per_sec_median": 91258.04937913443,
+          "per_step_us_median": 175.32699974253774,
+          "gil_released_during_call": true
+        },
+        "N=128,T=1": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.21219950006343424,
+          "min_s": 0.19237059995066375,
+          "max_s": 0.24110879993531853,
+          "env_transitions": 12800,
+          "transitions_per_sec_median": 60320.59451682784,
+          "per_step_us_median": 2121.9950006343424,
+          "gil_released_during_call": true
+        },
+        "N=128,T=2": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.1118080000160262,
+          "min_s": 0.09855150000657886,
+          "max_s": 0.13682080002035946,
+          "env_transitions": 12800,
+          "transitions_per_sec_median": 114481.96907345887,
+          "per_step_us_median": 1118.080000160262,
+          "gil_released_during_call": true
+        },
+        "N=128,T=4": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.06265439989510924,
+          "min_s": 0.05233630002476275,
+          "max_s": 0.06456920003984123,
+          "env_transitions": 12800,
+          "transitions_per_sec_median": 204295.30921098424,
+          "per_step_us_median": 626.5439989510924,
+          "gil_released_during_call": true
+        },
+        "N=128,T=default": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.0690788000356406,
+          "min_s": 0.06899199995677918,
+          "max_s": 0.07084139995276928,
+          "env_transitions": 12800,
+          "transitions_per_sec_median": 185295.63329698768,
+          "per_step_us_median": 690.788000356406,
+          "gil_released_during_call": true
+        },
+        "N=512,T=1": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.8774620000040159,
+          "min_s": 0.8459797999821603,
+          "max_s": 1.01064860005863,
+          "env_transitions": 51200,
+          "transitions_per_sec_median": 58350.10518947336,
+          "per_step_us_median": 8774.620000040159,
+          "gil_released_during_call": true
+        },
+        "N=512,T=2": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.5606910000788048,
+          "min_s": 0.4619963000295684,
+          "max_s": 0.5629955000476912,
+          "env_transitions": 51200,
+          "transitions_per_sec_median": 91315.89412493489,
+          "per_step_us_median": 5606.910000788048,
+          "gil_released_during_call": true
+        },
+        "N=512,T=4": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.3848560999613255,
+          "min_s": 0.38067330000922084,
+          "max_s": 0.3987864999799058,
+          "env_transitions": 51200,
+          "transitions_per_sec_median": 133036.7376407575,
+          "per_step_us_median": 3848.5609996132553,
+          "gil_released_during_call": true
+        },
+        "N=512,T=default": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.30610079993493855,
+          "min_s": 0.29129030008334666,
+          "max_s": 0.3064381000585854,
+          "env_transitions": 51200,
+          "transitions_per_sec_median": 167265.16236116507,
+          "per_step_us_median": 3061.0079993493855,
+          "gil_released_during_call": true
+        },
+        "N=1024,T=1": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 1.7176752000814304,
+          "min_s": 1.712182999937795,
+          "max_s": 1.762780599994585,
+          "env_transitions": 102400,
+          "transitions_per_sec_median": 59615.46163974743,
+          "per_step_us_median": 17176.752000814304,
+          "gil_released_during_call": true
+        },
+        "N=1024,T=2": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 1.0661800000816584,
+          "min_s": 1.056653599953279,
+          "max_s": 1.066999900038354,
+          "env_transitions": 102400,
+          "transitions_per_sec_median": 96043.81998551579,
+          "per_step_us_median": 10661.800000816584,
+          "gil_released_during_call": true
+        },
+        "N=1024,T=4": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.771139599964954,
+          "min_s": 0.7678328000474721,
+          "max_s": 0.793012399924919,
+          "env_transitions": 102400,
+          "transitions_per_sec_median": 132790.48307810127,
+          "per_step_us_median": 7711.39599964954,
+          "gil_released_during_call": true
+        },
+        "N=1024,T=default": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.5933522999985144,
+          "min_s": 0.5837903000647202,
+          "max_s": 0.6274613999994472,
+          "env_transitions": 102400,
+          "transitions_per_sec_median": 172578.75296052007,
+          "per_step_us_median": 5933.5229999851435,
+          "gil_released_during_call": true
+        }
+      },
+      "phase_split_N512": {
+        "transition_only": {
+          "reps_total": 3,
+          "reps_kept": 2,
+          "median_s": 0.044005899981129915,
+          "min_s": 0.04385140002705157,
+          "max_s": 0.04416039993520826,
+          "transitions_per_sec_median": 1163480.3519972316
+        },
+        "observe_only": {
+          "reps_total": 3,
+          "reps_kept": 2,
+          "median_s": 0.2279640999622643,
+          "min_s": 0.22299629996996373,
+          "max_s": 0.23293189995456487,
+          "transitions_per_sec_median": 224596.7676861195
+        },
+        "observation_share_of_step": 0.8387744464071459
+      },
+      "profile_batch_N512": {
+        "top_tottime": "         51 function calls in 0.163 seconds\n\n   Ordered by: internal time\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n       50    0.163    0.003    0.163    0.003 {method 'step_into' of 'builtins.RustBatchEnv' objects}\n        1    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}\n\n\n",
+        "batch_size": 512,
+        "steps": 50
+      }
+    },
+    "reference": {
+      "schema": "kaggriculture-issue2-benchmarks-v1",
+      "engine": "reference",
+      "suite": "full",
+      "date": "2026-08-23T18:42:17",
+      "environment": {
+        "os": "Windows 11 build 10.0.26200",
+        "cpu": "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+        "logical_processors": 20,
+        "python": "3.13.1",
+        "numpy": "2.5.2",
+        "executable": "C:\\Users\\liuyi\\AppData\\Local\\Temp\\opencode\\kagg_ref_venv\\Scripts\\python.exe",
+        "repo_commit": "63c8113585575fd6c3edf1417795eb553b44ddae"
+      },
+      "cold_import": {
+        "target": "import _kaggriculture_env",
+        "reps_total": 3,
+        "reps_kept": 2,
+        "median_s": 0.04665139998542145,
+        "min_s": 0.046382399974390864,
+        "max_s": 0.046920399996452034
+      },
+      "reset_latency": {
+        "reset": {
+          "reps_total": 9,
+          "reps_kept": 8,
+          "median_s": 3.2500247471034527e-06,
+          "min_s": 2.9999064281582832e-06,
+          "max_s": 5.800044164061546e-06
+        }
+      },
+      "scalar_episodes": {
+        "reference_native:mixed": {
+          "reps_total": 5,
+          "reps_kept": 4,
+          "median_s": 0.0014417499769479036,
+          "min_s": 0.0013812000397592783,
+          "max_s": 0.0015300000086426735,
+          "step_calls_per_episode": 719,
+          "turns_per_sec_median": 499393.10664959805,
+          "episodes_per_sec_median": 693.6015370133307
+        }
+      },
+      "memory": {
+        "rss_baseline_bytes": 39645184,
+        "theoretical_per_env": {
+          "obs_buffer_bytes_per_env": 45040,
+          "action_tensor_bytes_per_env": 1296,
+          "mask_buffer_bytes_per_env": null
+        },
+        "samples": {
+          "128": {
+            "rss_delta_bytes": 7028736,
+            "rss_delta_bytes_per_env": 54912.0
+          },
+          "512": {
+            "rss_delta_bytes": 10764288,
+            "rss_delta_bytes_per_env": 21024.0
+          }
+        },
+        "note": "RSS deltas measure allocator/working-set growth including Rayon pool threads and arena slack; they upper-bound the true per-env state cost and must not be read as exact GameState size."
+      },
+      "profile_scalar": {
+        "skipped": "reference has no Python scalar wrapper worth profiling"
+      },
+      "batch_throughput": {
+        "N=1,T=default": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.00039000005926936865,
+          "min_s": 0.00024259998463094234,
+          "max_s": 0.0004100000951439142,
+          "env_transitions": 100,
+          "transitions_per_sec_median": 256410.21744289307,
+          "per_step_us_median": 3.9000005926936865,
+          "gil_released_during_call": false
+        },
+        "N=16,T=default": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.0030197000596672297,
+          "min_s": 0.0024609999964013696,
+          "max_s": 0.0038942000828683376,
+          "env_transitions": 1600,
+          "transitions_per_sec_median": 529853.9485329943,
+          "per_step_us_median": 30.197000596672297,
+          "gil_released_during_call": false
+        },
+        "N=128,T=default": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.05315429996699095,
+          "min_s": 0.05216699989978224,
+          "max_s": 0.053734199958853424,
+          "env_transitions": 12800,
+          "transitions_per_sec_median": 240808.36372502046,
+          "per_step_us_median": 531.5429996699095,
+          "gil_released_during_call": false
+        },
+        "N=512,T=default": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.1648748000152409,
+          "min_s": 0.16265820001717657,
+          "max_s": 0.170790100004524,
+          "env_transitions": 51200,
+          "transitions_per_sec_median": 310538.66324791365,
+          "per_step_us_median": 1648.748000152409,
+          "gil_released_during_call": false
+        },
+        "N=1024,T=default": {
+          "reps_total": 4,
+          "reps_kept": 3,
+          "median_s": 0.3620907999575138,
+          "min_s": 0.3405385999940336,
+          "max_s": 0.3958523999899626,
+          "env_transitions": 102400,
+          "transitions_per_sec_median": 282801.99334535754,
+          "per_step_us_median": 3620.907999575138,
+          "gil_released_during_call": false
+        }
+      },
+      "phase_split_N512": {
+        "transition_only": {
+          "reps_total": 3,
+          "reps_kept": 2,
+          "median_s": 0.03582340001594275,
+          "min_s": 0.035777300014160573,
+          "max_s": 0.03586950001772493,
+          "transitions_per_sec_median": 1429233.405461628
+        },
+        "observe_only": {
+          "reps_total": 3,
+          "reps_kept": 2,
+          "median_s": 0.13177735003409907,
+          "min_s": 0.12671750003937632,
+          "max_s": 0.13683720002882183,
+          "transitions_per_sec_median": 388534.14480372646
+        },
+        "observation_share_of_step": 0.7529367395747102
+      },
+      "profile_batch_N512": {
+        "top_tottime": "         51 function calls in 0.091 seconds\n\n   Ordered by: internal time\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n       50    0.091    0.002    0.091    0.002 {method 'step_into' of 'builtins.RustBatchEnv' objects}\n        1    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}\n\n\n",
+        "batch_size": 512,
+        "steps": 50
+      }
+    }
+  }
+}
