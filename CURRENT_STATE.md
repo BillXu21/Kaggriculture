@@ -4,7 +4,7 @@ Last updated: 2026-08-23
 
 ## Snapshot
 
-- Phase: **Stage-2b slices 1-4 done: worker/ordering/hiring/market cluster, crop/seed/tile lifecycle cluster, animal/structure/fertilizer lifecycle cluster, and town/world/day-RNG/reset/terminal cluster each at zero first divergence vs the real official 1.32.7 engine (27 + 16 + 12 + 10 focused tests); the >16-hired-hands deferral is CLOSED by the MAX_HANDS=240 exact-layout revision (5 real-official hands parity tests green; see below); next gates are the remaining Stage-2b clusters and random/legal-ish full 720-turn traces, then closed-loop A/B; plus issue #2 throughput gates (GIL release, configurable Rayon thread count, batched/multi-core/memory benchmarks — fused executor/day-step explicitly deferred) and a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`); issue #4 opening book implemented and officially validated (15/16 strict matrix passes, see below)**.
+- Phase: **Stage-2b mechanic slices 1-4, the MAX_HANDS=240 exact layout, AND the full-episode legal-ish parity corpus are all at zero first divergence vs the real official 1.32.7 engine (27 + 16 + 12 + 10 + 5 focused tests; corpus: 8 complete 720-step seeds — 0, 1, 2, 7, 17, 42, 123, 999 — reset + 719 primitive steps each, 33 action families, terminal/repeatability locked, zero divergence; see below); next gates are closed-loop A/B; plus issue #2 throughput gates (GIL release, configurable Rayon thread count, batched/multi-core/memory benchmarks — fused executor/day-step explicitly deferred) and a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`); issue #4 opening book implemented and officially validated (15/16 strict matrix passes, see below)**.
 - Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
 - Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
 - Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.
@@ -79,8 +79,23 @@ all hands, day-reset/rehire Fibonacci restart, mask formula both sides) and
 `tests/test_oracle_hands.py` (5 real-official same-action replays: exactly-16
 boundary, 17th–23rd crossing, 23-hand hires + subsequent hand actions,
 day-end reset from 23 hands + rehire parity, per-turn mask ==
-official-reachable gate) — all green. **Remaining mechanic/full-episode parity
-is still open Stage-2b work; no full-parity or training-safety claim is made.**
+official-reachable gate) — all green.
+
+Full-episode legal-ish corpus DONE (2026-08-23, decision D-022): the
+deterministic state-aware generator `oracle/action_generator.py` drove
+complete default episodes for seeds 0, 1, 2, 7, 17, 42, 123, 999 through
+`run_same_action_replay` — **zero first divergence**; every episode ran the
+reset observation + exactly 719 accepted primitive steps with terminal
+DONE/DONE at canonical step 719 (day 29 hour 23), equal official/fast
+rewards for both seats, and 29 day transitions; coverage union 33 action
+families / 28,508 attempted instances incl. malformed/no-op/truncation
+surfaces; repeatability (identical trace per seed; identical fast
+reset+replay canonical states/rewards/statuses) locked in
+`tests/test_action_generator.py`; official-gated episode tests in
+`tests/test_oracle_corpus.py`. Report: `research/parity_corpus_report.json`;
+full-corpus command: `python scripts/run_parity_corpus.py` (oracle venv).
+Bounded claim: parity proven for the states these episodes reach — not a
+universal mathematical proof; closed-loop A/B is the next gate.
 
 ## Learned-Control Contract
 

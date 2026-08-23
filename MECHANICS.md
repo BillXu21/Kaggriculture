@@ -563,6 +563,36 @@ in addition to `CONFIRMED_SOURCE`):
 
 Confidence: `CONFIRMED_EXPERIMENT` (differential oracle, pinned 1.32.7).
 
+## Fast-Engine Differential Parity - Full-Episode Legal-ish Corpus (2026-08-23)
+
+Broad semantic acceptance campaign over complete default episodes
+(decision D-022; generator `oracle/action_generator.py`, runner
+`scripts/run_parity_corpus.py`, report `research/parity_corpus_report.json`):
+
+- Episode contract (locked): a default "720-step episode" is ONE reset
+  observation plus exactly 719 accepted primitive `step` calls; the terminal
+  DONE transition lands at canonical step 719 = day 29 hour 23; 29
+  day-boundary transitions per episode.
+- Result: ZERO first divergence across seeds 0, 1, 2, 7, 17, 42, 123, 999 —
+  initial state plus all 719 transitions per episode compared on the full
+  canonical schema; official and fast terminal observations/rewards/statuses
+  equal for both seats in every episode.
+- Coverage: 33 action families, 28,508 attempted instances across the corpus
+  union — movement, PASS, PICKUP/PLACE/DROP, PLANT/WATER/FERTILIZE/HARVEST/
+  DIG, BUILD_COOP/BUILD_PASTURE, FEED/CARE/COLLECT_FERTILIZER (farmer and
+  hands), BUY_SEED/BUY_PRODUCT/BUY_ANIMAL/SELL/HIRE/BUY_LAND, malformed
+  market entries, unknown ops, missing/non-integer quantities, >10-order
+  truncation bursts, extra hand slots, unaffordable orders; both seats every
+  turn; 30 day cycles including day-RNG weed/shop draws and town consumption.
+- No new engine mismatch was found at full-episode scale: the earlier
+  cluster fixes (money f32 decode, MAX_QUANTITY clamp, wire no-op
+  translation, zero-yield decay) held under broad legal-ish pressure.
+- Repeatability: same generator seed reproduces an identical action trace;
+  fast reset+replay reproduces identical canonical states/rewards/statuses.
+
+Confidence: `CONFIRMED_EXPERIMENT` (bounded: parity proven for the states
+these episodes reach, not universal proof).
+
 ## Randomness and Determinism
 
 Current interpretation:

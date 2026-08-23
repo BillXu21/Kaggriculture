@@ -89,5 +89,18 @@ see the Stage-2a HISTORY entry; the trace is
 - Canonical comparison covers everything listed above; it does not compare
   internal RNG streams or unreached code paths. Passing traces prove parity
   only for the actions exercised.
-- No broad random/legal-ish corpus, no multiple full 720-turn episodes, no
-  closed-loop A/B, no benchmark report: all Stage 2b.
+- Full-episode legal-ish corpus DONE (2026-08-23, decision D-022): seeds 0,
+  1, 2, 7, 17, 42, 123, 999 each ran a complete default 720-step episode
+  (reset observation + exactly 719 accepted primitive `step` calls; terminal
+  DONE at canonical step 719 = day 29 hour 23) with ZERO first divergence,
+  33 action families covered, and locked repeatability. Report:
+  `research/parity_corpus_report.json`. Re-run the full gate with the oracle
+  venv interpreter from the repo root:
+
+  ```text
+  & $env:VIRTUAL_ENV\Scripts\python.exe scripts\run_parity_corpus.py
+  ```
+
+  Exit code 0 means zero divergence across all requested seeds. This is a
+  bounded result: parity is proven for the states those episodes reach, not
+  universally. Closed-loop A/B remains open Stage-2b/3 work.

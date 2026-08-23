@@ -1,0 +1,519 @@
+{
+  "coverage_union": {
+    "hand.CARE": 133,
+    "hand.COLLECT_FERTILIZER": 139,
+    "hand.DIG": 43,
+    "hand.FEED": 185,
+    "hand.PASS": 2178,
+    "hand.PICKUP": 199,
+    "hand.extra_slot": 435,
+    "hand.move_random": 4402,
+    "hand.move_toward": 1783,
+    "market.BUY_ANIMAL": 74,
+    "market.BUY_LAND": 433,
+    "market.BUY_PRODUCT": 1221,
+    "market.BUY_SEED": 64,
+    "market.HIRE": 964,
+    "market.SELL": 2350,
+    "market.malformed": 2282,
+    "market.order_truncation": 590,
+    "unit.BUILD_COOP": 25,
+    "unit.BUILD_PASTURE": 18,
+    "unit.CARE": 202,
+    "unit.COLLECT_FERTILIZER": 140,
+    "unit.DIG": 185,
+    "unit.DROP": 55,
+    "unit.FEED": 41,
+    "unit.FERTILIZE": 580,
+    "unit.HARVEST": 5835,
+    "unit.PASS": 616,
+    "unit.PICKUP": 391,
+    "unit.PLACE": 58,
+    "unit.PLANT": 365,
+    "unit.WATER": 968,
+    "unit.move_random": 645,
+    "unit.move_toward": 909
+  },
+  "engine_identity": "kaggle-environments 1.32.7 @ 28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c",
+  "episode_contract": "default configuration, 720-step episodes = reset observation + 719 accepted primitive step calls; terminal DONE at canonical step 719 (day 29 hour 23)",
+  "episodes_completed": 8,
+  "episodes_failed": 0,
+  "expected_day_transitions": 29,
+  "expected_primitive_steps": 719,
+  "results": [
+    {
+      "coverage": {
+        "hand.CARE": 24,
+        "hand.COLLECT_FERTILIZER": 29,
+        "hand.DIG": 2,
+        "hand.FEED": 37,
+        "hand.PASS": 359,
+        "hand.PICKUP": 38,
+        "hand.extra_slot": 68,
+        "hand.move_random": 369,
+        "hand.move_toward": 406,
+        "market.BUY_ANIMAL": 17,
+        "market.BUY_LAND": 48,
+        "market.BUY_PRODUCT": 161,
+        "market.BUY_SEED": 8,
+        "market.HIRE": 137,
+        "market.SELL": 285,
+        "market.malformed": 289,
+        "market.order_truncation": 83,
+        "unit.BUILD_COOP": 5,
+        "unit.BUILD_PASTURE": 1,
+        "unit.CARE": 39,
+        "unit.COLLECT_FERTILIZER": 28,
+        "unit.DIG": 15,
+        "unit.DROP": 9,
+        "unit.FEED": 2,
+        "unit.FERTILIZE": 115,
+        "unit.HARVEST": 556,
+        "unit.PASS": 118,
+        "unit.PICKUP": 79,
+        "unit.PLACE": 10,
+        "unit.PLANT": 29,
+        "unit.WATER": 115,
+        "unit.move_random": 105,
+        "unit.move_toward": 131
+      },
+      "day_transitions": 29,
+      "fast_rewards": [
+        2.0,
+        0.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "official_rewards": [
+        2.0,
+        0.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 0,
+      "turns_executed": 719,
+      "wall_seconds": 4.58
+    },
+    {
+      "coverage": {
+        "hand.CARE": 5,
+        "hand.COLLECT_FERTILIZER": 7,
+        "hand.DIG": 2,
+        "hand.FEED": 11,
+        "hand.PASS": 258,
+        "hand.PICKUP": 11,
+        "hand.extra_slot": 45,
+        "hand.move_random": 686,
+        "hand.move_toward": 135,
+        "market.BUY_ANIMAL": 5,
+        "market.BUY_LAND": 54,
+        "market.BUY_PRODUCT": 158,
+        "market.BUY_SEED": 8,
+        "market.HIRE": 125,
+        "market.SELL": 317,
+        "market.malformed": 278,
+        "market.order_truncation": 60,
+        "unit.BUILD_COOP": 1,
+        "unit.BUILD_PASTURE": 3,
+        "unit.CARE": 19,
+        "unit.COLLECT_FERTILIZER": 13,
+        "unit.DIG": 8,
+        "unit.DROP": 7,
+        "unit.FEED": 7,
+        "unit.FERTILIZE": 41,
+        "unit.HARVEST": 968,
+        "unit.PASS": 55,
+        "unit.PICKUP": 25,
+        "unit.PLACE": 4,
+        "unit.PLANT": 24,
+        "unit.WATER": 101,
+        "unit.move_random": 41,
+        "unit.move_toward": 73
+      },
+      "day_transitions": 29,
+      "fast_rewards": [
+        5.0,
+        5.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "official_rewards": [
+        5.0,
+        5.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 1,
+      "turns_executed": 719,
+      "wall_seconds": 3.47
+    },
+    {
+      "coverage": {
+        "hand.CARE": 29,
+        "hand.COLLECT_FERTILIZER": 31,
+        "hand.DIG": 8,
+        "hand.FEED": 34,
+        "hand.PASS": 229,
+        "hand.PICKUP": 34,
+        "hand.extra_slot": 44,
+        "hand.move_random": 398,
+        "hand.move_toward": 258,
+        "market.BUY_ANIMAL": 13,
+        "market.BUY_LAND": 66,
+        "market.BUY_PRODUCT": 139,
+        "market.BUY_SEED": 8,
+        "market.HIRE": 122,
+        "market.SELL": 306,
+        "market.malformed": 275,
+        "market.order_truncation": 79,
+        "unit.BUILD_COOP": 4,
+        "unit.BUILD_PASTURE": 3,
+        "unit.CARE": 25,
+        "unit.COLLECT_FERTILIZER": 20,
+        "unit.DIG": 43,
+        "unit.DROP": 17,
+        "unit.FEED": 7,
+        "unit.FERTILIZE": 174,
+        "unit.HARVEST": 254,
+        "unit.PASS": 84,
+        "unit.PICKUP": 85,
+        "unit.PLACE": 8,
+        "unit.PLANT": 89,
+        "unit.WATER": 198,
+        "unit.move_random": 135,
+        "unit.move_toward": 191
+      },
+      "day_transitions": 29,
+      "fast_rewards": [
+        11.0,
+        2.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "official_rewards": [
+        11.0,
+        2.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 2,
+      "turns_executed": 719,
+      "wall_seconds": 3.64
+    },
+    {
+      "coverage": {
+        "hand.CARE": 2,
+        "hand.COLLECT_FERTILIZER": 3,
+        "hand.DIG": 3,
+        "hand.FEED": 16,
+        "hand.PASS": 276,
+        "hand.PICKUP": 19,
+        "hand.extra_slot": 59,
+        "hand.move_random": 564,
+        "hand.move_toward": 190,
+        "market.BUY_ANIMAL": 5,
+        "market.BUY_LAND": 60,
+        "market.BUY_PRODUCT": 160,
+        "market.BUY_SEED": 8,
+        "market.HIRE": 119,
+        "market.SELL": 298,
+        "market.malformed": 283,
+        "market.order_truncation": 82,
+        "unit.BUILD_COOP": 3,
+        "unit.BUILD_PASTURE": 2,
+        "unit.CARE": 34,
+        "unit.COLLECT_FERTILIZER": 25,
+        "unit.DIG": 32,
+        "unit.DROP": 4,
+        "unit.FEED": 5,
+        "unit.FERTILIZE": 40,
+        "unit.HARVEST": 665,
+        "unit.PASS": 140,
+        "unit.PICKUP": 57,
+        "unit.PLACE": 6,
+        "unit.PLANT": 45,
+        "unit.WATER": 105,
+        "unit.move_random": 81,
+        "unit.move_toward": 142
+      },
+      "day_transitions": 29,
+      "fast_rewards": [
+        0.0,
+        6.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "official_rewards": [
+        0.0,
+        6.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 7,
+      "turns_executed": 719,
+      "wall_seconds": 3.5
+    },
+    {
+      "coverage": {
+        "hand.CARE": 34,
+        "hand.COLLECT_FERTILIZER": 31,
+        "hand.DIG": 10,
+        "hand.FEED": 27,
+        "hand.PASS": 291,
+        "hand.PICKUP": 36,
+        "hand.extra_slot": 54,
+        "hand.move_random": 528,
+        "hand.move_toward": 303,
+        "market.BUY_ANIMAL": 3,
+        "market.BUY_LAND": 51,
+        "market.BUY_PRODUCT": 163,
+        "market.BUY_SEED": 8,
+        "market.HIRE": 119,
+        "market.SELL": 268,
+        "market.malformed": 310,
+        "market.order_truncation": 90,
+        "unit.BUILD_PASTURE": 3,
+        "unit.CARE": 5,
+        "unit.COLLECT_FERTILIZER": 2,
+        "unit.DIG": 23,
+        "unit.DROP": 6,
+        "unit.FEED": 1,
+        "unit.FERTILIZE": 51,
+        "unit.HARVEST": 953,
+        "unit.PASS": 24,
+        "unit.PICKUP": 31,
+        "unit.PLACE": 3,
+        "unit.PLANT": 47,
+        "unit.WATER": 109,
+        "unit.move_random": 77,
+        "unit.move_toward": 62
+      },
+      "day_transitions": 29,
+      "fast_rewards": [
+        144.0,
+        0.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "official_rewards": [
+        144.0,
+        0.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 17,
+      "turns_executed": 719,
+      "wall_seconds": 3.55
+    },
+    {
+      "coverage": {
+        "hand.CARE": 9,
+        "hand.COLLECT_FERTILIZER": 9,
+        "hand.DIG": 9,
+        "hand.FEED": 16,
+        "hand.PASS": 233,
+        "hand.PICKUP": 18,
+        "hand.extra_slot": 55,
+        "hand.move_random": 679,
+        "hand.move_toward": 121,
+        "market.BUY_ANIMAL": 7,
+        "market.BUY_LAND": 52,
+        "market.BUY_PRODUCT": 142,
+        "market.BUY_SEED": 8,
+        "market.HIRE": 105,
+        "market.SELL": 285,
+        "market.malformed": 283,
+        "market.order_truncation": 55,
+        "unit.BUILD_COOP": 2,
+        "unit.BUILD_PASTURE": 1,
+        "unit.CARE": 20,
+        "unit.COLLECT_FERTILIZER": 14,
+        "unit.DIG": 23,
+        "unit.FEED": 4,
+        "unit.FERTILIZE": 18,
+        "unit.HARVEST": 1005,
+        "unit.PASS": 42,
+        "unit.PICKUP": 22,
+        "unit.PLACE": 5,
+        "unit.PLANT": 40,
+        "unit.WATER": 98,
+        "unit.move_random": 39,
+        "unit.move_toward": 79
+      },
+      "day_transitions": 29,
+      "fast_rewards": [
+        2.0,
+        115.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "official_rewards": [
+        2.0,
+        115.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 42,
+      "turns_executed": 719,
+      "wall_seconds": 3.38
+    },
+    {
+      "coverage": {
+        "hand.CARE": 14,
+        "hand.COLLECT_FERTILIZER": 13,
+        "hand.DIG": 2,
+        "hand.FEED": 28,
+        "hand.PASS": 280,
+        "hand.PICKUP": 22,
+        "hand.extra_slot": 52,
+        "hand.move_random": 483,
+        "hand.move_toward": 183,
+        "market.BUY_ANIMAL": 12,
+        "market.BUY_LAND": 50,
+        "market.BUY_PRODUCT": 146,
+        "market.BUY_SEED": 8,
+        "market.HIRE": 113,
+        "market.SELL": 284,
+        "market.malformed": 287,
+        "market.order_truncation": 79,
+        "unit.BUILD_COOP": 6,
+        "unit.BUILD_PASTURE": 3,
+        "unit.CARE": 45,
+        "unit.COLLECT_FERTILIZER": 34,
+        "unit.DIG": 27,
+        "unit.DROP": 6,
+        "unit.FEED": 13,
+        "unit.FERTILIZE": 67,
+        "unit.HARVEST": 583,
+        "unit.PASS": 108,
+        "unit.PICKUP": 51,
+        "unit.PLACE": 12,
+        "unit.PLANT": 54,
+        "unit.WATER": 125,
+        "unit.move_random": 102,
+        "unit.move_toward": 132
+      },
+      "day_transitions": 29,
+      "fast_rewards": [
+        2.0,
+        1.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "official_rewards": [
+        2.0,
+        1.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 123,
+      "turns_executed": 719,
+      "wall_seconds": 3.31
+    },
+    {
+      "coverage": {
+        "hand.CARE": 16,
+        "hand.COLLECT_FERTILIZER": 16,
+        "hand.DIG": 7,
+        "hand.FEED": 16,
+        "hand.PASS": 252,
+        "hand.PICKUP": 21,
+        "hand.extra_slot": 58,
+        "hand.move_random": 695,
+        "hand.move_toward": 187,
+        "market.BUY_ANIMAL": 12,
+        "market.BUY_LAND": 52,
+        "market.BUY_PRODUCT": 152,
+        "market.BUY_SEED": 8,
+        "market.HIRE": 124,
+        "market.SELL": 307,
+        "market.malformed": 277,
+        "market.order_truncation": 62,
+        "unit.BUILD_COOP": 4,
+        "unit.BUILD_PASTURE": 2,
+        "unit.CARE": 15,
+        "unit.COLLECT_FERTILIZER": 4,
+        "unit.DIG": 14,
+        "unit.DROP": 6,
+        "unit.FEED": 2,
+        "unit.FERTILIZE": 74,
+        "unit.HARVEST": 851,
+        "unit.PASS": 45,
+        "unit.PICKUP": 41,
+        "unit.PLACE": 10,
+        "unit.PLANT": 37,
+        "unit.WATER": 117,
+        "unit.move_random": 65,
+        "unit.move_toward": 99
+      },
+      "day_transitions": 29,
+      "fast_rewards": [
+        89.0,
+        4.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "official_rewards": [
+        89.0,
+        4.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 999,
+      "turns_executed": 719,
+      "wall_seconds": 3.14
+    }
+  ],
+  "schema_version": 1,
+  "seeds": [
+    0,
+    1,
+    2,
+    7,
+    17,
+    42,
+    123,
+    999
+  ],
+  "zero_divergence": true
+}

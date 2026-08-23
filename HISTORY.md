@@ -2,6 +2,52 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Full-Episode Same-Action Parity Corpus: Zero First Divergence on 8 Complete 720-Step Episodes
+
+Built the deterministic legal-ish corpus stage (decision D-022) and drove the
+differential oracle through complete default-configuration episodes. **Zero
+first divergence across all 8 fixed seeds** — no simulator/interface mismatch
+surfaced at full-episode scale; the earlier mechanic-cluster fixes held.
+
+- New `oracle/action_generator.py::LegalishActionGenerator`: fixed-RNG,
+  state-aware reflex policy; reads only the pre-transition fast observation
+  pair, emits ONE action pair per turn to BOTH engines (same-action gate
+  untouched). Deliberately covers the official silent-noop surface
+  (malformed market entries, unknown ops, bad quantities, >10-order
+  truncation bursts, extra hand slots, unaffordable orders).
+- New `scripts/run_parity_corpus.py`: runs complete episodes per seed,
+  counts day-boundary transitions via a fast-backend wrapper, writes the
+  JSON report (`research/parity_corpus_report.json`, schema_version 1), and
+  records a `(generator_seed, turn_index)` repro for any divergence.
+- Corpus result (seeds 0, 1, 2, 7, 17, 42, 123, 999): every episode ran the
+  full reset + 719 accepted primitive steps, terminal DONE/DONE at canonical
+  step 719 (day 29 hour 23) with official rewards == fast rewards for both
+  seats (e.g. seed 0 `[2.0, 0.0]`, seed 17 `[144.0, 0.0]`); exactly 29 day
+  transitions each; total 5,752 turn pairs, ~24.5 s wall. Coverage union:
+  33 action families, 28,508 attempted family instances (movement, pickup/
+  place/drop, plant/water/fertilize/harvest/dig, build coop/pasture,
+  feed/care/collect-fertilizer by farmer AND hands, BUY_SEED/BUY_PRODUCT/
+  BUY_ANIMAL/SELL/HIRE/BUY_LAND, malformed/no-op/truncation).
+- Primitive-turn accounting locked in docs/tests: "720-step episode" = one
+  reset observation + exactly 719 accepted `step` calls; DONE at canonical
+  step 719 = day 29 hour 23.
+- Repeatability locked: same generator seed reproduces an identical trace;
+  fast reset+replay on fresh engines reproduces identical canonical states,
+  rewards, and statuses per turn (`tests/test_action_generator.py`).
+- New tests: `tests/test_action_generator.py` (4 offline, always run) and
+  `tests/test_oracle_corpus.py` (4 official-gated: short legal-ish episode,
+  two full default episodes with terminal accounting, divergence
+  attributability under a corrupted fast state). Full repository suite with
+  the venv interpreter: **427 passed, 1 skipped** (by-design system-python
+  isolation skip). One flaky failure was observed once in the concurrent
+  UNTRACKED `tests/test_bc_manager_jax_parity.py` workstream when run inside
+  the full suite; it passes in isolation and passed in the final full-suite
+  rerun — left untouched as concurrent work, not owned here.
+- No Rust/native changes were needed; no maturin rebuild required.
+- Scope of claim: bounded — parity proven for the states these 8 episodes
+  reach (33 families, both seats, 30 days, terminal lifecycle). Not a
+  universal mathematical proof; closed-loop A/B remains the next gate.
+
 ## 2026-08-23 — MAX_HANDS=240 Exact-Layout Revision Closes the >16-Hired-Hands Deferral
 
 Replaced the fixed 16-slot fast-engine hand layout with the exact

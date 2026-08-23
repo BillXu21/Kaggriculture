@@ -202,3 +202,13 @@ This file records decisions that remain authoritative across chats and work sess
 - Scope: valid for the pinned default configuration only; non-default turnsPerDay/maxMarketOrdersPerTurn above defaults exceed the bound and stay unsupported (as does boardSize != 10). `bc_manager/constants.py::MAX_HANDS = 8` is a separate BC-manager head-slot constant and intentionally unchanged.
 - Evidence boundary: parity proven for exercised traces only (`tests/test_oracle_hands.py`, 5 real-official replays incl. exactly-16, 16->17 crossing, 23 hands + subsequent hand actions, day-end reset from 23 hands + rehire); no full-parity or training-safety claim until full 720-turn episodes pass through the oracle.
 - Revisit when: the official engine changes hiring/market-order/day mechanics, a non-default configuration must be supported, or oracle evidence shows an officially reachable state the bound excludes.
+
+## D-022 - Drive Broad Parity With a Deterministic State-Aware Legal-ISH Generator, Not Independent Policies
+
+- Date: 2026-08-23
+- Status: active
+- Decision: The full-episode parity corpus is driven by `oracle/action_generator.py::LegalishActionGenerator`: one fixed `random.Random(generator_seed)` stream reads ONLY the pre-transition fast-engine observation pair and emits exactly ONE action pair per turn, which `run_same_action_replay` submits to BOTH engines before any comparison. No policy ever runs independently after a divergence; any first divergence stays attributable and reproducible from `(generator_seed, turn_index)` alone because the generator is deterministic given seed + engine states.
+- "Legal-ish" deliberately includes the official silent-noop/partial-fill surface: malformed market entries, unknown ops, missing/non-integer quantities, order bursts beyond 10 (truncation), extra hand slots, and unaffordable orders are part of the covered contract, never rejected by the generator.
+- Coverage is measured, not assumed: every attempted family increments a histogram published in the corpus report (`research/parity_corpus_report.json`); families not naturally reached must be reached by generator bias/targeted prefixes, never by weakening same-action semantics.
+- Primitive-turn accounting (locked): a default "720-step episode" = ONE reset observation + exactly 719 accepted primitive `step` calls; terminal DONE lands at canonical step 719 = day 29 hour 23; 29 day-boundary transitions.
+- Evidence boundary: zero first divergence over the fixed 8-seed corpus proves parity only for states those episodes reach — bounded coverage, not universal mathematical proof. Training-safety claims must cite the exact corpus result.
