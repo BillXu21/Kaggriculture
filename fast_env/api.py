@@ -288,6 +288,17 @@ class FastKaggricultureEnv:
         if int(self.configuration["maxMarketOrdersPerTurn"]) != 10:
             raise ValueError("fast engine supports maxMarketOrdersPerTurn=10 only")
         self._seed = _as_int(self.configuration.get("seed", 0), "seed")
+        # Optional instance-local Rayon worker count for the Rust batch
+        # backend. None keeps the historical default (Rayon's global pool);
+        # an explicit positive count builds a private pool so several batch
+        # environments in one process never oversubscribe each other.
+        raw_num_threads = self.configuration.get("numThreads")
+        if raw_num_threads is None:
+            num_threads = None
+        else:
+            num_threads = _as_int(raw_num_threads, "numThreads")
+            if num_threads < 1:
+                raise ValueError("numThreads must be a positive integer")
         self._backend = RustBatchEnv(
             1,
             int(self.configuration["episodeSteps"]),
@@ -302,6 +313,7 @@ class FastKaggricultureEnv:
             json.dumps(self.configuration.get("marketParams", {}), sort_keys=True),
             int(self.configuration["farmHandCostMult"]),
             "",
+            num_threads,
         )
         self._observations: list[dict[str, Any]] = []
         self._statuses = ["ACTIVE", "ACTIVE"]

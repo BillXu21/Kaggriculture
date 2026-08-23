@@ -2,6 +2,35 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Issue #2 Throughput Seam: GIL Release + Optional Instance-Local Rayon Pool
+
+Implemented the throughput seam for the Rust batch backend (decision D-024).
+`reset`, `step`, `step_transition`, `observe_into`, `action_masks_into`, and
+`step_into` now validate inputs and extract exclusive raw buffer slices under
+the GIL, then run the whole native transition/observation pass with
+`py.allow_threads`. `RustBatchEnv` gained an optional instance-local Rayon
+pool (`num_threads=N`; `None` keeps the global-pool default; `0` invalid),
+exposed as `FastKaggricultureEnv(configuration={"numThreads": N})` and a
+`num_threads()` accessor. Parallel fan-out still engages only at >= 128
+environments; small-batch behavior is unchanged.
+
+- Evidence (`tests/test_batch_throughput_seam.py`, 5 passed, system Python
+  3.13): GIL spinner test observed ~84M Python-thread counter ticks during a
+  ~4.7 s 512-env native call; caller-owned buffers stayed byte-identical to a
+  quiet reference under concurrent Python-thread pressure; trajectories were
+  byte-identical across worker counts 1/2/4/default over 130 envs x 30 steps
+  including the day boundary.
+- Prior-session heavy evidence retained: cargo fmt/check clean, 16 Rust unit
+  tests green, fresh release build, full pytest 364 passed / 88 skipped,
+  official 96-turn and full seed-0 719-step parity both passing.
+- Docs updated: `fast_env/README.md` (API + semantics + safety boundary),
+  `CURRENT_STATE.md`, `DECISIONS.md` (D-024).
+- Not claimed: any throughput/speedup/scaling result — benchmarks are not run
+  yet. Fused executor/day-step batching and distributed rollout remain
+  deferred. Target measurement topology: Kaggle TPU v5 host (~96 vCPUs),
+  process-level parallelism x in-process batch environments.
+
+
 ## 2026-08-23 — Independent Stateful Closed-Loop Agent A/B: Zero Divergence
 
 Added the secondary policy-interface gate after the same-action parity corpus.

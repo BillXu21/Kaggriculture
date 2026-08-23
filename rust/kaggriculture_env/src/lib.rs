@@ -9,7 +9,7 @@ use numpy::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use rayon::prelude::*;
+use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 
 #[rustfmt::skip]
 mod generated_protocol;
@@ -2291,6 +2291,11 @@ impl GameState {
 
 const MONEY_EPSILON: f32 = 1.0e-5;
 
+// Batch work only pays for thread fan-out above this many environments;
+// below it the serial loop wins. The threshold applies identically to the
+// global pool and to instance-local pools.
+const PARALLEL_MIN_ENVS: usize = 128;
+
 #[pyclass]
 struct RustBatchEnv {
     states: Vec<GameState>,
@@ -2299,6 +2304,13 @@ struct RustBatchEnv {
     // in via `restore_states` to seed environments from reachable mid-game
     // states instead of only from a fresh `GameState::with_config` reset.
     bank: Vec<GameState>,
+    // Instance-local Rayon pool. `None` keeps the historical behavior of
+    // scheduling parallel batch work on the process-wide global pool. A
+    // configured pool never mutates global Rayon state or environment
+    // variables, so independent batch environments (e.g. several rollout
+    // workers in one process) can each pin their own thread count without
+    // oversubscribing each other.
+    pool: Option<ThreadPool>,
 }
 
 impl RustBatchEnv {
@@ -2306,10 +2318,9 @@ impl RustBatchEnv {
         self.config.clone()
     }
 
-    fn observe_all(&self, observation_data: &mut [f32]) {
-        const PARALLEL_MIN_ENVS: usize = 128;
-        if self.states.len() < PARALLEL_MIN_ENVS {
-            for (environment, state) in self.states.iter().enumerate() {
+    fn observe_all(pool: Option<&ThreadPool>, states: &[GameState], observation_data: &mut [f32]) {
+        if states.len() < PARALLEL_MIN_ENVS {
+            for (environment, state) in states.iter().enumerate() {
                 let start = environment * PLAYERS * OBSERVATION_SIZE;
                 let (first, rest) = observation_data[start..].split_at_mut(OBSERVATION_SIZE);
                 state.observe_pair(first, &mut rest[..OBSERVATION_SIZE]);
@@ -2317,19 +2328,24 @@ impl RustBatchEnv {
             return;
         }
 
-        self.states
-            .par_iter()
-            .zip(observation_data.par_chunks_mut(PLAYERS * OBSERVATION_SIZE))
-            .for_each(|(state, output)| {
-                let (first, rest) = output.split_at_mut(OBSERVATION_SIZE);
-                state.observe_pair(first, &mut rest[..OBSERVATION_SIZE]);
-            });
+        let mut parallel = || {
+            states
+                .par_iter()
+                .zip(observation_data.par_chunks_mut(PLAYERS * OBSERVATION_SIZE))
+                .for_each(|(state, output)| {
+                    let (first, rest) = output.split_at_mut(OBSERVATION_SIZE);
+                    state.observe_pair(first, &mut rest[..OBSERVATION_SIZE]);
+                });
+        };
+        match pool {
+            Some(pool) => pool.install(parallel),
+            None => parallel(),
+        }
     }
 
-    fn masks_all(&self, mask_data: &mut [u8]) {
-        const PARALLEL_MIN_ENVS: usize = 128;
-        if self.states.len() < PARALLEL_MIN_ENVS {
-            for (environment, state) in self.states.iter().enumerate() {
+    fn masks_all(pool: Option<&ThreadPool>, states: &[GameState], mask_data: &mut [u8]) {
+        if states.len() < PARALLEL_MIN_ENVS {
+            for (environment, state) in states.iter().enumerate() {
                 for player in 0..PLAYERS {
                     let start = (environment * PLAYERS + player) * MASK_SIZE;
                     state.write_action_masks(player, &mut mask_data[start..start + MASK_SIZE]);
@@ -2338,32 +2354,43 @@ impl RustBatchEnv {
             return;
         }
 
-        self.states
-            .par_iter()
-            .zip(mask_data.par_chunks_mut(PLAYERS * MASK_SIZE))
-            .for_each(|(state, output)| {
-                for player in 0..PLAYERS {
-                    let start = player * MASK_SIZE;
-                    state.write_action_masks(player, &mut output[start..start + MASK_SIZE]);
-                }
-            });
+        let mut parallel = || {
+            states
+                .par_iter()
+                .zip(mask_data.par_chunks_mut(PLAYERS * MASK_SIZE))
+                .for_each(|(state, output)| {
+                    for player in 0..PLAYERS {
+                        let start = player * MASK_SIZE;
+                        state.write_action_masks(player, &mut output[start..start + MASK_SIZE]);
+                    }
+                });
+        };
+        match pool {
+            Some(pool) => pool.install(parallel),
+            None => parallel(),
+        }
     }
 
-    fn advance(&mut self, actions: &[i64]) {
-        const PARALLEL_MIN_ENVS: usize = 128;
-        if self.states.len() < PARALLEL_MIN_ENVS {
-            for (environment, state) in self.states.iter_mut().enumerate() {
+    fn advance(pool: Option<&ThreadPool>, states: &mut [GameState], actions: &[i64]) {
+        if states.len() < PARALLEL_MIN_ENVS {
+            for (environment, state) in states.iter_mut().enumerate() {
                 Self::advance_state(state, environment, actions);
             }
             return;
         }
 
-        self.states
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(environment, state)| {
-                Self::advance_state(state, environment, actions);
-            });
+        let mut parallel = || {
+            states
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(environment, state)| {
+                    Self::advance_state(state, environment, actions);
+                });
+        };
+        match pool {
+            Some(pool) => pool.install(parallel),
+            None => parallel(),
+        }
     }
 
     fn advance_state(state: &mut GameState, environment: usize, actions: &[i64]) {
@@ -2582,7 +2609,8 @@ impl RustBatchEnv {
         shed_capacity=100,
         market_params="{}",
         farm_hand_cost_mult=1,
-        resolved_config_json=""
+        resolved_config_json="",
+        num_threads=None
     ))]
     // Keep these arguments for compatibility with the Python bridge.
     #[allow(clippy::too_many_arguments)]
@@ -2600,6 +2628,7 @@ impl RustBatchEnv {
         market_params: &str,
         farm_hand_cost_mult: i32,
         resolved_config_json: &str,
+        num_threads: Option<usize>,
     ) -> PyResult<Self> {
         if num_envs == 0 {
             return Err(PyValueError::new_err("num_envs must be positive"));
@@ -2721,6 +2750,31 @@ impl RustBatchEnv {
         }
         let market_config = MarketConfig::from_json(&market_params_text)?;
         let market_tables = Arc::new(MarketLookupTables::build(&market_config));
+        // Instance-local Rayon pool: `None` keeps the historical global-pool
+        // behavior; an explicit count builds a private pool so concurrent
+        // batch environments never oversubscribe each other. `num_threads=1`
+        // is the deterministic single-thread mode (Rayon executes the
+        // parallel iterators sequentially on a one-thread pool, so results
+        // are identical to every other thread count by construction).
+        let pool = match num_threads {
+            None => None,
+            Some(0) => {
+                return Err(PyValueError::new_err(
+                    "num_threads must be a positive integer",
+                ))
+            }
+            Some(threads) => Some(
+                ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .thread_name(|index| format!("kagg-batch-{index}"))
+                    .build()
+                    .map_err(|error| {
+                        PyRuntimeError::new_err(format!(
+                            "failed to build a {threads}-thread Rayon pool: {error}"
+                        ))
+                    })?,
+            ),
+        };
         let game_config = GameConfig {
             episode_steps,
             turns_per_day,
@@ -2742,6 +2796,7 @@ impl RustBatchEnv {
             states,
             config: game_config,
             bank: Vec::new(),
+            pool,
         })
     }
 
@@ -2755,10 +2810,16 @@ impl RustBatchEnv {
             return Err(PyValueError::new_err("seed count must equal num_envs"));
         }
         let game_config = self.game_config();
-        self.states = seeds
-            .iter()
-            .map(|seed| GameState::with_config(*seed, game_config.clone()))
-            .collect();
+        // Copy the tiny seed vector so the bulk state construction can run
+        // with the GIL released; per-env RNG/state stays fully isolated.
+        let seeds: Vec<u64> = seeds.to_vec();
+        let states = py.allow_threads(move || {
+            seeds
+                .iter()
+                .map(|&seed| GameState::with_config(seed, game_config.clone()))
+                .collect::<Vec<GameState>>()
+        });
+        self.states = states;
         self.outputs(py)
     }
 
@@ -2906,21 +2967,49 @@ impl RustBatchEnv {
         } else {
             Cow::Owned(actions.iter().copied().collect())
         };
-        let actions = action_data.as_ref();
-        self.advance(actions);
-        let (observations, statuses) = self.outputs(py)?;
+        // Allocate the owned output arrays while holding the GIL, run the
+        // whole native transition + observation + reward pass without it,
+        // then wrap the finished buffers into Python objects (zero copy).
+        let mut observations = Array3::<f32>::zeros((self.states.len(), PLAYERS, OBSERVATION_SIZE));
         let mut rewards = Array2::<f32>::zeros((self.states.len(), PLAYERS));
-        for (environment, state) in self.states.iter().enumerate() {
-            if state.done {
-                rewards[[environment, 0]] = state.money[0];
-                rewards[[environment, 1]] = state.money[1];
-            }
+        let mut statuses = Array2::<u8>::zeros((self.states.len(), PLAYERS));
+        {
+            let observation_data = observations
+                .as_slice_mut()
+                .ok_or_else(|| PyRuntimeError::new_err("observation buffer is not contiguous"))?;
+            let reward_data = rewards
+                .as_slice_mut()
+                .ok_or_else(|| PyRuntimeError::new_err("reward buffer is not contiguous"))?;
+            let status_data = statuses
+                .as_slice_mut()
+                .ok_or_else(|| PyRuntimeError::new_err("status buffer is not contiguous"))?;
+            let pool = self.pool.as_ref();
+            let states = &mut self.states;
+            let actions: &[i64] = action_data.as_ref();
+            py.allow_threads(|| {
+                Self::advance(pool, states, actions);
+                Self::observe_all(pool, states, observation_data);
+                for (environment, state) in states.iter().enumerate() {
+                    if state.done {
+                        reward_data[environment * PLAYERS] = state.money[0];
+                        reward_data[environment * PLAYERS + 1] = state.money[1];
+                        status_data[environment * PLAYERS] = 1;
+                        status_data[environment * PLAYERS + 1] = 1;
+                    }
+                }
+            });
         }
+        let observations = PyArray3::from_owned_array(py, observations);
         let rewards = PyArray2::from_owned_array(py, rewards);
+        let statuses = PyArray2::from_owned_array(py, statuses);
         Ok((observations, rewards, statuses))
     }
 
-    fn step_transition<'py>(&mut self, actions: PyReadonlyArray4<'py, i64>) -> PyResult<()> {
+    fn step_transition<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions: PyReadonlyArray4<'py, i64>,
+    ) -> PyResult<()> {
         if actions.shape() != [self.states.len(), PLAYERS, ACTION_SLOTS, ACTION_FIELDS] {
             return Err(PyValueError::new_err(format!(
                 "actions must have shape ({}, 2, {}, 3)",
@@ -2934,11 +3023,18 @@ impl RustBatchEnv {
         } else {
             Cow::Owned(actions.iter().copied().collect())
         };
-        self.advance(action_data.as_ref());
+        let pool = self.pool.as_ref();
+        let states = &mut self.states;
+        let actions: &[i64] = action_data.as_ref();
+        py.allow_threads(|| Self::advance(pool, states, actions));
         Ok(())
     }
 
-    fn observe_into<'py>(&self, mut observations: PyReadwriteArray3<'py, f32>) -> PyResult<()> {
+    fn observe_into<'py>(
+        &self,
+        py: Python<'py>,
+        mut observations: PyReadwriteArray3<'py, f32>,
+    ) -> PyResult<()> {
         if observations.shape() != [self.states.len(), PLAYERS, OBSERVATION_SIZE] {
             return Err(PyValueError::new_err(format!(
                 "observations must have shape ({}, 2, {})",
@@ -2949,11 +3045,20 @@ impl RustBatchEnv {
         let observation_data = observations
             .as_slice_mut()
             .map_err(|_| PyRuntimeError::new_err("observations must be contiguous"))?;
-        self.observe_all(observation_data);
+        // The mutable slice borrows the caller-owned NumPy buffer exclusively;
+        // no Python code can touch it while the GIL is released and the borrow
+        // keeps the array alive, so writing through the raw slice is sound.
+        let pool = self.pool.as_ref();
+        let states = &self.states;
+        py.allow_threads(|| Self::observe_all(pool, states, observation_data));
         Ok(())
     }
 
-    fn action_masks_into<'py>(&self, mut masks: PyReadwriteArray3<'py, u8>) -> PyResult<()> {
+    fn action_masks_into<'py>(
+        &self,
+        py: Python<'py>,
+        mut masks: PyReadwriteArray3<'py, u8>,
+    ) -> PyResult<()> {
         if masks.shape() != [self.states.len(), PLAYERS, MASK_SIZE] {
             return Err(PyValueError::new_err(format!(
                 "masks must have shape ({}, 2, {})",
@@ -2964,13 +3069,16 @@ impl RustBatchEnv {
         let mask_data = masks
             .as_slice_mut()
             .map_err(|_| PyRuntimeError::new_err("masks must be contiguous"))?;
-        self.masks_all(mask_data);
+        let pool = self.pool.as_ref();
+        let states = &self.states;
+        py.allow_threads(|| Self::masks_all(pool, states, mask_data));
         Ok(())
     }
 
     #[pyo3(signature=(actions, observations, rewards, statuses))]
     fn step_into<'py>(
         &mut self,
+        py: Python<'py>,
         actions: PyReadonlyArray4<'py, i64>,
         mut observations: PyReadwriteArray3<'py, f32>,
         mut rewards: PyReadwriteArray2<'py, f32>,
@@ -3008,29 +3116,46 @@ impl RustBatchEnv {
         } else {
             Cow::Owned(actions.iter().copied().collect())
         };
-        self.advance(action_data.as_ref());
-
+        // Extract every caller-owned buffer slice up front (validation and
+        // all Python-object work stays under the GIL), then run the whole
+        // native transition + observation + reward pass without the GIL.
+        // Each `PyReadwriteArray` borrow is exclusive for `'py`, so no other
+        // code can alias these buffers while the GIL is released.
         let observation_data = observations
             .as_slice_mut()
             .map_err(|_| PyRuntimeError::new_err("observations must be contiguous"))?;
-        self.observe_all(observation_data);
         let reward_data = rewards
             .as_slice_mut()
             .map_err(|_| PyRuntimeError::new_err("rewards must be contiguous"))?;
-        reward_data.fill(0.0);
         let status_data = statuses
             .as_slice_mut()
             .map_err(|_| PyRuntimeError::new_err("statuses must be contiguous"))?;
-        status_data.fill(0);
-        for (environment, state) in self.states.iter().enumerate() {
-            if state.done {
-                reward_data[environment * PLAYERS] = state.money[0];
-                reward_data[environment * PLAYERS + 1] = state.money[1];
-                status_data[environment * PLAYERS] = 1;
-                status_data[environment * PLAYERS + 1] = 1;
+        let pool = self.pool.as_ref();
+        let states = &mut self.states;
+        let actions: &[i64] = action_data.as_ref();
+        py.allow_threads(|| {
+            Self::advance(pool, states, actions);
+            Self::observe_all(pool, states, observation_data);
+            reward_data.fill(0.0);
+            status_data.fill(0);
+            for (environment, state) in states.iter().enumerate() {
+                if state.done {
+                    reward_data[environment * PLAYERS] = state.money[0];
+                    reward_data[environment * PLAYERS + 1] = state.money[1];
+                    status_data[environment * PLAYERS] = 1;
+                    status_data[environment * PLAYERS + 1] = 1;
+                }
             }
-        }
+        });
         Ok(())
+    }
+
+    /// Configured instance-local worker count; `0` means the historical
+    /// default (parallel batch work schedules on Rayon's global pool).
+    fn num_threads(&self) -> usize {
+        self.pool
+            .as_ref()
+            .map_or(0, |pool| pool.current_num_threads())
     }
 
     fn num_envs(&self) -> usize {
@@ -3070,7 +3195,7 @@ impl RustBatchEnv {
         let observation_data = observations
             .as_slice_mut()
             .ok_or_else(|| PyRuntimeError::new_err("observation buffer is not contiguous"))?;
-        self.observe_all(observation_data);
+        Self::observe_all(self.pool.as_ref(), &self.states, observation_data);
         let observation_array = PyArray3::from_owned_array(py, observations);
         let mut statuses = Array2::<u8>::zeros((self.states.len(), PLAYERS));
         for (environment, state) in self.states.iter().enumerate() {
