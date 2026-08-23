@@ -16,11 +16,11 @@ Do not rely on chat memory when these files provide a durable answer.
 
 ## Current Project Mode
 
-The project is presently in research and planning mode.
+The project is presently in a bounded implementation phase for the first closed-loop BC executor.
 
-Do not begin broad implementation, reinforcement learning, or expensive experiments unless the user explicitly changes this state. Engine and rules may still be moving.
+Broad implementation, reinforcement learning, expensive experiments, search/VRP optimization, opponent modeling, and BC architecture changes remain unauthorized unless the user explicitly expands scope.
 
-No Codex work is currently authorized. Use Codex only after explicit user approval for a bounded packet.
+**Codex authorization:** the user explicitly authorized the bounded implementation packet in GitHub issue #1, `Codex packet: minimal closed-loop BC executor V0`. Codex may implement exactly that packet and should stop at its acceptance criteria. No other speculative Codex work is authorized by this note.
 
 ## Core Technical Direction
 
