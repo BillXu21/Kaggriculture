@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "kaggriculture-fast"
+version = "0.1.0"
+description = "Exact scalar Kaggriculture 1.32.7 engine with a narrow Python API"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26"]
+
+[tool.maturin]
+manifest-path = "rust/kaggriculture_env/Cargo.toml"
+bindings = "pyo3"
+module-name = "fast_env._kaggriculture_env"
+python-source = "."

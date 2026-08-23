@@ -1,0 +1,20 @@
+[package]
+name = "kaggriculture_env"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_kaggriculture_env"
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[dependencies]
+ndarray = "0.16"
+numpy = "0.25"
+pyo3 = { version = "0.25", features = ["extension-module"] }
+rayon = "1.10"
+serde_json = "1"
+

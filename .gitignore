@@ -18,6 +18,9 @@ build/
 dist/
 *.egg-info/
 
+# Rust build artifacts
+target/
+
 # Editors and OS
 .vscode/
 .idea/
