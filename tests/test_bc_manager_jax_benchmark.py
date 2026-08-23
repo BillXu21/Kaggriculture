@@ -16,6 +16,7 @@ from bc_manager.model import DailyManagerTransformer, tiny_manager_config \
 from bc_manager.training import TrainingConfig, save_checkpoint as \
     torch_save_checkpoint
 from bc_manager_jax.benchmark import build_parser, main, run_benchmark
+from bc_manager_jax.model import tiny_manager_config
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,6 +35,18 @@ def _smoke_args(**overrides):
     args = build_parser().parse_args(_smoke_argv(**overrides))
     args.batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     return args
+
+
+INFERENCE_FIELDS = (
+    "inference_compile_seconds",
+    "inference_examples_per_second_mean",
+    "inference_examples_per_second_best",
+)
+TRAIN_FIELDS = (
+    "train_compile_seconds",
+    "train_examples_per_second_mean",
+    "train_examples_per_second_best",
+)
 
 
 def test_benchmark_smoke_metadata_and_results(tmp_path):
@@ -61,14 +74,53 @@ def test_benchmark_smoke_metadata_and_results(tmp_path):
         assert row["param_count"] > 0
         assert row["per_device_batch"] == row["global_batch"]
         assert row["dtype_mode"] == "f32"
-        assert row["compile_seconds"] > 0.0
-        assert row["steady_examples_per_second_mean"] > 0.0
         assert row["iterations"] == 2 and row["warmup"] == 1
+        # BOTH metric families present and positive on successful rows.
+        for field in INFERENCE_FIELDS + TRAIN_FIELDS:
+            assert field in row, field
+            assert row[field] > 0.0, (field, row[field])
+        # Inference must not be silently aliased to training: forward-only
+        # work is strictly cheaper per example than forward+backward+update.
+        assert (row["inference_examples_per_second_mean"]
+                > row["train_examples_per_second_mean"]), row
+        assert "mode" not in row  # no ambiguous single-mode field
 
+    # JSON round-trip preserves both metric families.
     payload = json.loads(json_path.read_text("utf-8"))
     assert len(payload["results"]) == len(report["results"])
-    csv_text = csv_path.read_text("utf-8")
-    assert csv_text.count("\n") >= len(report["results"]) + 1
+    for row in payload["results"]:
+        if row["status"] == "ok":
+            for field in INFERENCE_FIELDS + TRAIN_FIELDS:
+                assert field in row and row[field] > 0.0, field
+
+    # CSV round-trip carries both families as columns.
+    import csv as csv_module
+    with open(csv_path, newline="", encoding="utf-8") as handle:
+        csv_rows = list(csv_module.DictReader(handle))
+    assert len(csv_rows) == len(ok_rows)
+    for row in csv_rows:
+        assert row["status"] == "ok"
+        for field in INFERENCE_FIELDS + TRAIN_FIELDS:
+            assert field in row
+            assert float(row[field]) > 0.0, (field, row[field])
+        assert float(row["inference_examples_per_second_mean"]) > \
+            float(row["train_examples_per_second_mean"])
+
+
+def test_skipped_row_reports_null_metrics_and_reason():
+    from bc_manager_jax.benchmark import run_case
+
+    args = type("Args", (), {})()
+    args.dtype = "f32"
+    args.warmup = 0
+    args.iterations = 1
+    args.seed = 0
+    row = run_case("own", tiny_manager_config(), None, "random init",
+                   device_count=2, global_batch=3, args=args)
+    assert row["status"] == "skipped"
+    assert "not divisible" in row["reason"]
+    for field in INFERENCE_FIELDS + TRAIN_FIELDS:
+        assert field in row and row[field] is None, field
 
 
 def test_benchmark_checkpoint_mode_and_missing_checkpoint(tmp_path):

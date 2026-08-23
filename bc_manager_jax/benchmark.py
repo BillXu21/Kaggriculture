@@ -225,14 +225,18 @@ def _resolve_regime_configs(args) -> list[tuple[str, ManagerConfig, Any, str]]:
 
 def run_case(regime: str, config: ManagerConfig, params, source: str,
              device_count: int, global_batch: int, args) -> dict[str, Any]:
-    """One (regime, device-count, batch) cell; never raises."""
+    """One (regime, device-count, batch) cell; never raises.
+
+    Successful rows carry BOTH metric families under stable, unambiguous
+    field names (`inference_*` and `train_*`); failed/skipped rows keep
+    them as nulls plus an honest `reason`.
+    """
     row: dict[str, Any] = {
         "regime": regime,
         "token_count": config.token_count,
         "param_count": None,
         "source": source,
         "model_config": asdict(config),
-        "mode": None,
         "device_count": device_count,
         "global_batch": global_batch,
         "per_device_batch": global_batch // device_count
@@ -242,9 +246,12 @@ def run_case(regime: str, config: ManagerConfig, params, source: str,
         "iterations": args.iterations,
         "status": "ok",
         "reason": None,
-        "compile_seconds": None,
-        "steady_examples_per_second_mean": None,
-        "steady_examples_per_second_best": None,
+        "inference_compile_seconds": None,
+        "inference_examples_per_second_mean": None,
+        "inference_examples_per_second_best": None,
+        "train_compile_seconds": None,
+        "train_examples_per_second_mean": None,
+        "train_examples_per_second_best": None,
     }
     try:
         if global_batch % device_count != 0:
@@ -278,23 +285,20 @@ def run_case(regime: str, config: ManagerConfig, params, source: str,
         train_config = TrainConfig()
 
         # ---- inference
-        row["mode"] = "inference"
-
         def infer():
             return forward(live_params, sharded_inputs, config)
 
         compile_s, times = time_callable(infer, warmup=args.warmup,
                                          iterations=args.iterations)
-        row["compile_seconds"] = compile_s
-        row["steady_examples_per_second_mean"] = float(
+        row["inference_compile_seconds"] = compile_s
+        row["inference_examples_per_second_mean"] = float(
             global_batch / float(np.mean(times)))
-        row["steady_examples_per_second_best"] = float(
+        row["inference_examples_per_second_best"] = float(
             global_batch / min(times))
 
         # ---- train step
         opt_state = sharding.replicate_tree(
             init_opt_state(base_params, train_config), mesh)
-        row["mode"] = "train"
 
         def step():
             return train_step(live_params, opt_state, rng, sharded_inputs,
@@ -302,10 +306,10 @@ def run_case(regime: str, config: ManagerConfig, params, source: str,
 
         compile_s, times = time_callable(step, warmup=args.warmup,
                                          iterations=args.iterations)
-        row["compile_seconds"] = row["compile_seconds"] + compile_s
-        row["steady_examples_per_second_mean"] = float(
+        row["train_compile_seconds"] = compile_s
+        row["train_examples_per_second_mean"] = float(
             global_batch / float(np.mean(times)))
-        row["steady_examples_per_second_best"] = float(
+        row["train_examples_per_second_best"] = float(
             global_batch / min(times))
     except Exception as error:  # noqa: BLE001 - honesty: record, don't invent
         row["status"] = "skipped"
@@ -342,9 +346,14 @@ def run_benchmark(args) -> dict[str, Any]:
                                global_batch, args)
                 report["results"].append(row)
                 if row["status"] == "ok":
-                    print(f"    ok: {row['mode']} "
-                          f"{row['steady_examples_per_second_mean']:.1f} "
-                          f"ex/s (compile {row['compile_seconds']:.2f}s)")
+                    print(f"    ok: inference "
+                          f"{row['inference_examples_per_second_mean']:.1f} "
+                          f"ex/s (compile "
+                          f"{row['inference_compile_seconds']:.2f}s) | "
+                          f"train "
+                          f"{row['train_examples_per_second_mean']:.1f} "
+                          f"ex/s (compile "
+                          f"{row['train_compile_seconds']:.2f}s)")
                 else:
                     print(f"    skipped: {row['reason']}")
     return report
@@ -358,11 +367,15 @@ def _write_outputs(report: dict[str, Any], json_path: str | None,
                                    encoding="utf-8")
         print(f"[benchmark] JSON written to {json_path}")
     if csv_path:
-        fieldnames = ["regime", "token_count", "param_count", "mode",
+        fieldnames = ["regime", "token_count", "param_count",
                       "device_count", "global_batch", "per_device_batch",
-                      "dtype_mode", "status", "compile_seconds",
-                      "steady_examples_per_second_mean",
-                      "steady_examples_per_second_best", "reason"]
+                      "dtype_mode", "status",
+                      "inference_compile_seconds",
+                      "inference_examples_per_second_mean",
+                      "inference_examples_per_second_best",
+                      "train_compile_seconds",
+                      "train_examples_per_second_mean",
+                      "train_examples_per_second_best", "reason"]
         with open(csv_path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames,
                                     extrasaction="ignore")
