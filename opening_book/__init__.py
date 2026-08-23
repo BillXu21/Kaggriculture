@@ -5,6 +5,7 @@ runtime-readable validation/loading, and two committed identities generated
 from verified local raw replays. No runtime wrapper/handoff here (stage 2).
 """
 
+from .agent import OpeningAgent, make_opening_agent
 from .trace import (
     DEFAULT_IDENTITY,
     ENGINE_VERSION,
@@ -32,11 +33,13 @@ __all__ = [
     "MAX_MARKET_ORDERS",
     "TRACE_FORMAT_VERSION",
     "TURNS_PER_DAY",
+    "OpeningAgent",
     "TraceError",
     "action_for",
     "built_in_identities",
     "compute_content_digest",
     "load_built_in_trace",
+    "make_opening_agent",
     "validate_action",
     "validate_trace",
 ]
