@@ -4,21 +4,17 @@ Last updated: 2026-08-22
 
 ## Snapshot
 
-- Repository: `BillXu21/Kaggriculture`
-- Phase: **first full BC manager run completed successfully; held-out Aug-21 evaluation materially beats the train-only day baseline; next gate is a minimal deterministic executor and real closed-loop games**
-- Latest confirmed upstream package: `kaggle-environments 1.32.7`
-- Canonical replay schema: **v3**
-- Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**. Scratch PPO remains a useful later comparison because the manager horizon is only ~30 steps.
-- Primary project goal: demonstrate a refinement/self-play pipeline that measurably improves a competent starting policy across multiple promotions.
+- Phase: **first BC manager is trained and passes held-out/day-baseline diagnostics; next gate is the smallest complete deterministic executor and real closed-loop games**.
+- Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
+- Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
+- Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.
 
 ## Learned-Control Contract
 
-The learned policy is a **once-per-day farm manager**, not a primitive 720-turn controller.
+The policy is a **once-per-day farm manager**. V0 manager owns:
 
-V0 manager owns economic intent:
-
-- crop composition / planting allocation;
-- target animal counts;
+- crop composition;
+- animal target counts;
 - land expansion;
 - fertilizer allocation by crop type;
 - CARE allocation by animal type;
@@ -26,168 +22,154 @@ V0 manager owns economic intent:
 
 The deterministic executor owns mechanics:
 
-- exact worker assignment/routing/movement;
-- enough hiring to realize requested work;
-- watering and routine maintenance;
-- mechanical harvesting;
-- seed purchases implied by crop targets;
-- animal structures/purchases/placement implied by animal targets;
-- initial wheat/feed procurement;
-- exact tile/animal choice for fertilizer and CARE;
-- primitive execution of sell intent.
+- exact tile placement and minimum-change crop reconciliation;
+- animal structures/placement;
+- worker assignment/routing/loading;
+- hiring needed for the requested workload;
+- watering, feed, harvest, collection, and other routine maintenance;
+- seed/feed/fertilizer/animal purchases mechanically implied by the plan;
+- exact fertilizer/CARE targets;
+- primitive sell execution.
 
-The executor is a strategy compiler, not a substitute economic policy. See D-011, D-018, and D-019.
+The executor is a strategy compiler under D-011, not a hidden economic policy.
 
 ## Canonical Corpus
 
-Five elite post-patch 1.32.7 daily partitions were regenerated at schema v3:
+Five elite post-patch 1.32.7 partitions, 2026-08-17 through 2026-08-21:
 
-| date | episodes | seat-days |
-| --- | ---: | ---: |
-| 2026-08-17 | 699 | 41,940 |
-| 2026-08-18 | 697 | 41,820 |
-| 2026-08-19 | 695 | 41,700 |
-| 2026-08-20 | 698 | 41,880 |
-| 2026-08-21 | 697 | 41,820 |
-| **total** | **3,486** | **209,160** |
+- 3,486 episodes;
+- 6,972 seat trajectories;
+- 209,160 `(episode, seat, day)` rows;
+- schema versions exactly `{3}`.
 
-Key contracts:
+Important coordinate contract: simulator worker positions are `[x,y]`; canonical board/event coordinates are `[y,x]`; tile lookup is `tiles[y][x]` after unpacking `x,y`.
 
-- one row per `(episode, seat, day)`;
-- simulator positions `[x,y]`, canonical board/event coordinates `[y,x]`, tile lookup `tiles[y][x]`;
-- full own board/private resources plus opponent public state retained canonically;
-- crop/animal/land/fertilizer/CARE/sell labels retained;
-- nested Zstandard Parquet production format;
-- schema versions are fail-loud semantic boundaries.
-
-Full-corpus residual unknown attribution is small: CARE unknown 13,045 (~0.585%); fertilizer unknown 2,666. These are preserved honestly and are not a V0 blocker.
-
-Dataset is mounted for training at:
+Private Kaggle dataset mount used for BC:
 
 `/kaggle/input/datasets/billll/kaggriculture-canonical-daily-1327`
 
 See `research/FIVE_DAY_V3_CORPUS.md`.
 
-## First BC Manager (D-019)
+## First BC V0 Result
 
-Architecture:
+Reference model: D-019 default tile Transformer, 1,071,040 parameters.
 
-- stateless one-day-in / one-plan-out Transformer;
-- 100 own-board tile tokens;
-- MANAGER + SELF RESOURCE + MARKET + TOWN + LABOR + DAY context;
-- own private shed/seeds/inventory included;
-- opponent-public board optional and disabled in V0;
-- structured crop / animal / land / fertilizer / CARE / sell heads;
-- seven fixed-weight loss groups;
-- default 1,071,040 trainable parameters.
-
-The schema-v3 code path has 102 passing tests including forward/backward, tiny overfit, checkpoint reload, and CLI smoke.
-
-## First Full BC Run
-
-Reference run provenance:
+Reference run:
 
 - code at run start: `692bca50e8ba0b687e48fd970e67bbe17014f03f`;
-- train dates: Aug17-20;
-- held-out validation: Aug21;
+- train Aug17-20, validation Aug21;
 - `min_score >= 2950`;
-- train rows: 25,500;
-- validation rows: 5,700;
-- CUDA + AMP;
-- batch 256, AdamW lr 3e-4, weight decay 1e-2;
-- 30 epochs, dropout 0.1, no scheduler or tuning sweep;
-- best epoch: 29;
-- best validation total: **2.8889**;
-- full 30 epochs: ~237 s (~3.65k examples/s).
+- 25,500 train rows, 5,700 validation rows;
+- CUDA + AMP, batch 256, AdamW 3e-4;
+- 30 epochs, ~237 s;
+- best epoch 29;
+- best validation total **2.8889**.
 
-The validation curve continued improving through late training rather than immediately overfitting.
+Held-out Aug21 model vs train-only day baseline:
 
-### State-aware model vs train-only day baseline on Aug21
-
-| group | model | day baseline |
+| metric | model | day baseline |
 | --- | ---: | ---: |
 | crop exact accuracy | **0.7128** | 0.4752 |
-| crop whole-vector exact | **0.2930** | 0.0598 |
 | crop MAE | **1.2731** | 3.6217 |
 | animal exact accuracy | **0.8267** | 0.4540 |
-| animal whole-vector exact | **0.6619** | 0.1389 |
 | animal MAE | **0.2681** | 1.6936 |
 | fertilizer nonzero recall | **0.7522** | 0.4557 |
 | CARE whole-vector exact | **0.5998** | 0.1754 |
-| CARE MAE | **0.3296** | 1.6676 |
 | land accuracy | **0.9912** | 0.9089 |
 | sell presence accuracy | **0.9394** | 0.8923 |
 
-Rare/shifted branches also demonstrate state conditioning rather than pure calendar imitation:
+Rare state-conditioned branches also work materially better than the calendar baseline: tomato nonzero recall 83.8%, goose 96.8%, goose CARE 95.5%, wheat fertilizer 60.4%.
 
-- tomato nonzero recall: **83.8% model vs 0% day baseline**;
-- goose nonzero recall: **96.8% vs 0%**;
-- goose CARE nonzero recall: **95.5% vs 0%**;
-- wheat fertilizer nonzero recall: **60.4% vs 0%**;
-- strawberry fertilizer nonzero recall: **85.6% vs 66.6%**.
+Selling remains the clearest teacher-forced weakness: true positive rate 11.21%, predicted 9.38%, positive recall 64.84%.
 
-Selling remains the clearest teacher-forced weakness: true positive-cell rate 11.21%, predicted 9.38%, positive recall 64.84%, positive-cell quantity log-MAE 0.3529. Presence accuracy is therefore not sufficient by itself.
+Conclusion: **D-019 passes its intended representation diagnostic.** Do not spend the next cycle on model scaling/tuning before closed-loop evidence.
 
-Conclusion: **the D-019 representation experiment passes its intended diagnostic.** The state-aware model learns and materially beats a day-only calendar baseline. Do not immediately scale the network, add opponent features, rebalance losses, or sweep hyperparameters before closed-loop evaluation.
+Detailed run/eval: `research/FIRST_BC_V0_EVAL.md`.
 
-Detailed record: `research/FIRST_BC_V0_EVAL.md`.
+## BC V0 Simplification Backlog
 
-## Immediate Gate: Closed-Loop V0
+The BC design did already record many deferrals in D-019 and its implementation note, but they were spread across several files. `research/FIRST_BC_V0_EVAL.md` now contains one explicit backlog of V0 shortcuts and revisit triggers, including:
 
-Teacher-forced BC accuracy is no longer the dominant uncertainty. The next meaningful test is a complete actual-game loop:
+- stateless once-per-day policy;
+- opponent-public board disabled;
+- no opponent-private inference;
+- absolute counts rather than deltas/per-tile targets;
+- type-level fertilizer/CARE rather than tile-specific control;
+- factorized heads with no joint feasibility model;
+- six-bin selling and fixed 0.5 presence threshold;
+- equal loss weights and no sparse reweighting;
+- one ~1.07M architecture with no sweep/scheduler;
+- five-day `>=2950` elite corpus with no dedup/family weighting;
+- one held-out date rather than a broad rolling/generalization suite;
+- no DAgger/on-policy correction, value head, PPO, or uncertainty-aware execution.
 
-`live obs -> BC manager -> daily intent -> deterministic executor -> primitive 1.32.7 actions`
+Known weak points such as rare fertilizer recall and conservative selling remain explicitly listed so they are not forgotten after the first closed-loop success.
 
-The first executor should be deliberately simple and measurable rather than globally optimal.
+## Deterministic Executor V0
 
-### Initial executor direction
+The current first-draft algorithm is recorded in `research/EXECUTOR_V0_PLAN.md`.
 
-1. **Live observation adapter** matching the BC feature semantics exactly; call policy at hour 0 and cache the daily plan.
-2. **Stable layout preference** rather than daily relayout: service-heavy livestock near the shed, crops in the next compact slots, existing useful structures/plants sticky.
-3. **Mechanical task generator** translating manager targets into build/plant/dig/water/feed/CARE/fertilize/harvest/collect/sell work.
-4. **Simple worker foreman**: do useful work underfoot first, then assign workers to tasks by small Manhattan-cost matching, routing through the shed when inventory pickup is required; recompute each primitive turn.
-5. **Closed-loop harness** against one frozen competent opponent on fixed seeds in both seats before any population/self-play complexity.
+Core design:
 
-Do not begin with full multi-worker VRP, elaborate facility-location optimization, or strategic heuristics hidden inside the executor.
+1. Run the BC manager at hour 0 and preserve `requested -> feasible -> achieved` separately.
+2. Do **not** reserve near-shed tiles for future animals. Use productive crop space until animal targets actually require conversion.
+3. When making room for livestock, prefer legal empty tiles or the **least-invested nearby crop**: young/unfertilized plants are cheap to sacrifice; mature/fertilized/near-harvest crops are expensive.
+4. Keep established livestock infrastructure sticky; otherwise reconcile crop targets with minimum destruction/relayout.
+5. Generate explicit maintenance/transition/logistics tasks and revalidate them from the live observation every primitive turn.
+6. Use broad urgency/deadline tiers rather than a large hand-tuned strategic priority table.
+7. Use soft worker specialization from carried inventory. Prefer workers needing few item types; planned bundles should normally stay around <=2 types.
+8. Greedily load and dispatch workers. Never hold a ready worker at the shed merely to synchronize loading.
+9. Hour 0: farmer may take one useful bulk pickup; market stages supplies and hires hands. New hands act from hour 1 and begin greedy loading/dispatch.
+10. Recompute a simple deterministic greedy worker-task assignment every turn using Manhattan distance, shed detours, and inventory affinity.
+11. Purchase only shortages mechanically implied by the manager plan/maintenance; do not add a separate economic strategy.
+12. Execute six-bin sells literally as inventory becomes available within the requested bin.
 
-### Executor-compliance metrics
+## Executor V0 Simplification Backlog
 
-Log manager request separately from achieved mechanics:
+`research/EXECUTOR_V0_PLAN.md` explicitly marks these as temporary shortcuts rather than settled optimal choices:
 
-- next-day crop target MAE;
-- animal target MAE;
-- land target hit rate;
-- fertilizer requested/completed;
-- CARE requested/completed;
-- sell intent/submitted;
-- missed watering/feed/maintenance;
-- illegal/ineffective actions;
-- idle worker turns;
-- unfinished tasks at day boundary;
-- final banks and paired W/L/T.
+- no prediction/reservation for future animal onset;
+- crude crop-sacrifice value rather than exact marginal farm value;
+- no global layout/facility-location optimization;
+- greedy worker matching rather than Hungarian/min-cost-flow/search/VRP;
+- one-step Manhattan routing and no multi-turn route search;
+- soft inventory specialization rather than explicit optimized worker roles;
+- greedy shed staging rather than inventory-buffer optimization;
+- crude workload-based hiring;
+- basic wheat/feed procurement;
+- literal six-bin selling with no within-bin price reaction;
+- no opponent-aware executor economics;
+- no confidence-aware plan projection;
+- no search-based foreman yet.
 
-If compliance is poor, improve execution before blaming BC. If compliance is high and economic trajectories are poor, revisit the manager/action abstraction before adding RL complexity.
+Search/assignment/layout sophistication is a **later performance option**, not part of the first closed-loop build.
+
+Revisit these when traces show low intent compliance, missed maintenance despite sufficient labor, excessive movement/wait/reloading, shed stalls, destructive crop conversions, worker assignment thrashing, or high compliance but losses traceable to executor-owned simplifications.
+
+## Closed-Loop Success Criteria
+
+The first executor is successful when it can:
+
+- encode live observations with the same semantics as BC training;
+- make all 30 manager calls;
+- finish real 1.32.7 games without illegal-action cascades/deadlock;
+- track requested/feasible/achieved crop, animal, land, fertilizer, CARE, and selling;
+- report missed maintenance, pending tasks, movement/pickup/idle actions, and emergency purchases;
+- run a small fixed-seed, seat-swapped panel against one frozen competent opponent.
+
+If compliance is poor, improve execution before blaming BC. If compliance is high and economic trajectories are poor, revisit the manager/action abstraction before adding PPO complexity.
 
 ## Near-Term Sequence
 
-1. Plan and implement the smallest complete deterministic executor/foreman.
-2. Get `best.pt` through complete local 1.32.7 games without illegal-action cascades or deadlock.
-3. Run a small paired fixed-seed, seat-swapped panel against one frozen competent opponent and inspect executor compliance.
-4. Only then decide whether the next marginal improvement should be executor quality, BC retraining, opponent-public features, or PPO.
-5. Later compare BC-initialized PPO against scratch PPO under the same executor/opponents/budget.
-6. Expand to frozen opponent panels/cross-play before changing-population self-play.
-
-## Known Risks
-
-- closed-loop distribution shift may expose outputs that are individually plausible but compound poorly;
-- a weak executor can make a good manager look bad;
-- the executor can accidentally become the strategist if it overrides requested economic intent;
-- sparse sell/fertilizer decisions remain less reliable than core crop/animal/land behavior;
-- the daily abstraction may omit strategically important intra-day decisions; selling is already the first explicit higher-frequency exception;
-- non-transitive matchups can make simple Elo/latest-checkpoint promotion misleading.
+1. Turn `research/EXECUTOR_V0_PLAN.md` into a bounded implementation contract and build the smallest complete executor.
+2. Get the current `best.pt` through full local 1.32.7 games.
+3. Inspect compliance before optimizing score.
+4. Run a small paired fixed-seed/seat-swapped frozen-opponent panel.
+5. Use evidence to choose the next bottleneck: executor search/layout, BC refinement/data, opponent inputs, or PPO.
+6. Only after the stationary closed-loop problem is reliable, expand to broader opponent panels and changing-population/self-play.
 
 ## Do Not Forget
 
-Before substantial work, read `CURRENT_STATE.md`, `DECISIONS.md`, `MECHANICS.md`, the relevant implemented notes, `research/FIRST_BC_V0_EVAL.md`, and the latest history/research records.
+Before substantial work read `CURRENT_STATE.md`, `DECISIONS.md`, `MECHANICS.md`, relevant implemented notes, `research/FIRST_BC_V0_EVAL.md`, and `research/EXECUTOR_V0_PLAN.md`.
 
-Before expensive runs, record exact code/configuration, engine identity, data/version/filter, seeds/opponents, outputs, stop conditions, and recovery plan.
+Before expensive runs record exact code/configuration, engine identity, data/version/filter, seeds/opponents, outputs, stop conditions, and recovery plan.
