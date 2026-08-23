@@ -507,3 +507,11 @@ def previous_execution_of_day(
         cost += total_hire_cost(observed, hire_mult) - total_hire_cost(hired, hire_mult)
         hired = observed
     return {"workers_hired": hired, "hire_cost": cost}
+
+
+# Public aliases for live-observation encoding reuse (issue #1, stage 1).
+# Thin names only; behavior is the private implementations themselves, so the
+# canonical-record path and any live consumer cannot drift.
+self_state = _self_state
+opponent_public_state = _opponent_public_state
+shared_state = _shared_state

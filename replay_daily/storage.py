@@ -793,3 +793,11 @@ def read_parquet(path: str | Path) -> list[dict[str, Any]]:
         return table_to_records(table)
     except ValueError as exc:
         raise ValueError(f"{Path(path)}: {exc}") from exc
+
+
+# Public aliases for live-observation encoding reuse (issue #1, stage 1).
+# Thin names only; behavior is the private implementations themselves, so the
+# canonical-record path and any live consumer cannot drift.
+normalize_self_state = _norm_self
+normalize_public_state = _norm_public
+normalize_shared_state = _norm_shared

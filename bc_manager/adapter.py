@@ -328,18 +328,18 @@ def _worker_side_arrays(state: Mapping[str, Any]) -> tuple[np.ndarray, ...]:
     return unlocked, hands
 
 
-def table_to_arrays(
-    table: pa.Table, *, include_opponent: bool = False,
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], list[dict[str, Any]]]:
-    """Convert a filtered canonical table into compact NumPy arrays."""
-    _require_schema_version(table, "in-memory Arrow table")
-    n = table.num_rows
-    start_rows = _column_rows(table, "start")
-    target_rows = _column_rows(table, "targets")
-    sells_rows = _column_rows(table, "sells")
-    day_col = _column_rows(table, "day")
-    meta_rows = _column_rows(table, "metadata")
+def _input_arrays_from_starts(
+    start_rows: Sequence[Mapping[str, Any]],
+    day_col: Sequence[int],
+    include_opponent: bool = False,
+) -> dict[str, np.ndarray]:
+    """Model-facing input arrays from canonical `start` rows (one per record).
 
+    Single shared implementation for the Parquet batch path
+    (`table_to_arrays`) and the live single-observation path
+    (`bc_manager.live.encode_live_inputs`) so the two encodings cannot drift.
+    """
+    n = len(start_rows)
     inputs: dict[str, np.ndarray] = {}
     boards = _board_arrays([s["self"]["board"] for s in start_rows])
     inputs["board_kind"] = boards["kind"]
@@ -409,6 +409,22 @@ def table_to_arrays(
         inputs["opp_scalars"] = opp_scalars
         inputs["opp_unlocked"] = opp_unlocked
 
+    return inputs
+
+
+def table_to_arrays(
+    table: pa.Table, *, include_opponent: bool = False,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], list[dict[str, Any]]]:
+    """Convert a filtered canonical table into compact NumPy arrays."""
+    _require_schema_version(table, "in-memory Arrow table")
+    start_rows = _column_rows(table, "start")
+    target_rows = _column_rows(table, "targets")
+    sells_rows = _column_rows(table, "sells")
+    day_col = _column_rows(table, "day")
+    meta_rows = _column_rows(table, "metadata")
+
+    inputs = _input_arrays_from_starts(
+        start_rows, day_col, include_opponent=include_opponent)
     targets = build_targets(target_rows, sells_rows)
     meta = [_eval_metadata(m, d) for m, d in zip(meta_rows, day_col)]
     return inputs, targets, meta
