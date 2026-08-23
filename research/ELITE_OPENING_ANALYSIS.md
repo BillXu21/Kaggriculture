@@ -85,10 +85,18 @@ with hours; worker movement excluded):
 | 2 | 20 / 22 | `HIRE x4 @h0; BUY_PRODUCT WHEAT 2 @h2; BUY_PRODUCT WHEAT 2 @h8` |
 | 3 | 15–18 / 22 | `SELL FERTILIZER 4 @h0; BUY_ANIMAL COW 1; HIRE x5` (14/17 order COW before hires; 3/17 hire first, then COW + `BUY_SEED CARROT 1` @h1) |
 
-The two non-dominant seat-openings are ReCurSiON seat 0 in episodes 95055022
-and 95481731 (Section 5), plus one reordered micro-variant (95515912 seat 1:
-same quantities, MELON seeds bought before WHEAT seeds, resale before the
-WHEAT seed buy).
+The five non-dominant seat-openings (22 − 17) fall into three clusters:
+
+- **Pasture-heavy (support 2):** ReCurSiON seat 0 in episodes 95055022 and
+  95481731 — the distinct strategic variant of Section 5.
+- **Wheat-feed micro-variant (support 2):** 95004769 seat 1 and 95214822 seat 1
+  (James Holland) — identical to the dominant day-0 sequence except one extra
+  `BUY_PRODUCT WHEAT 3` at h1 immediately after the resale (12 WHEAT product
+  bought on day 0 instead of 9), plus an extra `SELL WHEAT 3` at day 1 h16
+  ahead of the fertilizer sale. A market-order quantity/timing difference only;
+  it stays within the standard-mixed archetype and is not a third strategy.
+- **Reordered micro-variant (support 1):** 95515912 seat 1 — same quantities,
+  MELON seeds bought before WHEAT seeds, resale before the WHEAT seed buy.
 
 **Determinism finding [OBS].** These elite agents are deterministic scripted
 bots:
