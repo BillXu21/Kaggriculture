@@ -2,6 +2,38 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Stage 2b slice 2: Crop/Seed/Tile Lifecycle Differential Parity
+
+Drove the crop/seed/tile lifecycle cluster to zero first divergence against
+the real pinned official 1.32.7 engine and committed the bounded result on
+`main` (no push).
+
+- **Probes:** new `tests/test_oracle_crops.py` — 16 focused tests over 15
+  real-official scenarios (2,136 turn pairs, 74 day boundaries) covering the
+  `CROPS` constants table, atomic PLANT seed consumption and fresh-tile fields
+  (`consecutive_unwatered=1`, ongoing vs single-harvest lifespans), silent
+  no-op invalid plants, group PLANT demand blocking including phantom hand
+  entries, WATER once-per-day with the single-harvest bonus window, FERTILIZE
+  active-day+2 expiry and yield caps, HARVEST pre-first-yield no-op and full
+  drain, carrot replant field resets, unwatered decay to WEED plus DIG
+  recovery, mature melon two-step unit decay to WEED, ongoing tomato/
+  strawberry interval accrual with gap days and end-of-life decay, DIG never
+  clearing a placed animal, and wrong-tile guards.
+- **Divergence found and fixed:** official `_decay_plants` decrements
+  `yield_units` unconditionally when the decay schedule fires and converts the
+  tile to WEED at `<= 0`; the fast engine gated on `yield > 0` and converted
+  at `== 0`, so an ongoing crop harvested down to exactly zero yield at its
+  production completion stayed alive as a zero-yield PLANT forever instead of
+  becoming a WEED at `max_lifespan_step`
+  (`rust/kaggriculture_env/src/lib.rs`, locked by
+  `test_ongoing_tomato_daily_interval_harvest_survival_and_zero_yield_decay`).
+- **Validation:** `cargo fmt --check` clean; focused
+  `pytest tests/test_oracle_crops.py` in the temp oracle venv: 16 passed;
+  prior-worker evidence on this exact tree: fresh maturin rebuild, focused
+  oracle set 66 passed / 1 skipped, full suite 266 passed / 50 skipped.
+- **Not claimed:** broad whole-engine parity and training safety remain open;
+  the >16 hired-hands observation deferral is preserved unchanged.
+
 ## 2026-08-23 — Stage 2b slice 1: Worker/Ordering/Hiring/Market Differential Parity
 
 Drove the first targeted mechanics cluster to zero first divergence against

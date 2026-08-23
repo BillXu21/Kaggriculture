@@ -1982,12 +1982,17 @@ impl GameState {
                 let Some(lifespan) = self.crop_lifespan_step(player, tile) else {
                     continue;
                 };
-                if self.step >= lifespan
-                    && (self.step - lifespan).is_multiple_of(2)
-                    && self.crop_yield[player][tile] > 0
-                {
+                if self.step >= lifespan && (self.step - lifespan).is_multiple_of(2) {
+                    // Python's `_decay_plants` decrements `yield_units`
+                    // UNCONDITIONALLY once the schedule fires and converts the
+                    // tile to WEED when the result is <= 0. Gating on
+                    // `yield > 0` (as this used to) skipped an ongoing crop
+                    // whose yield was harvested down to 0 exactly when its
+                    // production completed: Python turned that depleted plant
+                    // into a WEED at `max_lifespan_step`, this kept it alive
+                    // as a zero-yield PLANT forever.
                     self.crop_yield[player][tile] -= 1;
-                    if self.crop_yield[player][tile] == 0 {
+                    if self.crop_yield[player][tile] <= 0 {
                         self.crop_age[player][tile] = EMPTY_CROP_AGE;
                         self.crop_kind[player][tile] = EMPTY_KIND;
                         self.crop_decay_step[player][tile] = -1;

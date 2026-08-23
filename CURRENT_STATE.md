@@ -4,7 +4,7 @@ Last updated: 2026-08-23
 
 ## Snapshot
 
-- Phase: **Stage-2b slice 1 done: worker/ordering/hiring/market cluster at zero first divergence vs the real official 1.32.7 engine (27 focused scenarios); next gates are the remaining Stage-2b clusters (crops/animals/town/day-end/RNG), then random/legal-ish full 720-turn traces, closed-loop A/B, and benchmarks; also a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`)**.
+- Phase: **Stage-2b slices 1-2 done: worker/ordering/hiring/market cluster and crop/seed/tile lifecycle cluster each at zero first divergence vs the real official 1.32.7 engine (27 + 16 focused tests); next gates are the remaining Stage-2b clusters (animals/town/day-end/RNG), then random/legal-ish full 720-turn traces, closed-loop A/B, and benchmarks; also a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`)**.
 - Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
 - Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
 - Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.
@@ -24,7 +24,13 @@ a 28-turn pass-only day-boundary smoke, and — Stage-2b slice 1 — the worker-
 inventory / same-turn-ordering / hiring / market cluster at zero divergence
 (`tests/test_oracle_mechanics.py`, 27 scenarios; three exact fast-engine
 divergences found and fixed: money-decode f32 noise, MAX_QUANTITY=100 order
-clamps, ValueError-on-silent-noop wire translation; see `MECHANICS.md`).
+clamps, ValueError-on-silent-noop wire translation; see `MECHANICS.md`),
+and — Stage-2b slice 2 — the crop/seed/tile lifecycle cluster at zero
+divergence (`tests/test_oracle_crops.py`, 16 tests / 15 scenarios, 2,136 turn
+pairs, 74 day boundaries; one exact fast-engine divergence found and fixed:
+`_decay_plants` gated the yield decrement on `> 0` and converted at `== 0`
+where the official engine decrements unconditionally and converts at `<= 0`,
+letting a zero-yield ongoing crop survive forever; see `MECHANICS.md`).
 Known deferral: >16 simultaneous hired hands (fixed 16-slot observation
 block). **Remaining mechanic/full-episode parity is still open Stage-2b work;
 no full-parity or training-safety claim is made.**

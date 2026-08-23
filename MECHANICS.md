@@ -1,6 +1,6 @@
 # Kaggriculture Mechanics Ledger
 
-Last updated: 2026-08-16
+Last updated: 2026-08-23
 
 ## Purpose
 
@@ -395,6 +395,53 @@ observation block. Reaching >16 simultaneous hands requires ≥4180 money of
 Fibonacci hires inside one day (reachable in principle), so scenarios beyond
 16 hands are out of scope until an observation-schema revision; submitted
 hand-action lists beyond 16 entries truncate to the first 16.
+
+Confidence: `CONFIRMED_EXPERIMENT` (differential oracle, pinned 1.32.7).
+
+## Fast-Engine Differential Parity — Crop/Seed/Tile Lifecycle (2026-08-23)
+
+Second Stage-2b mechanics cluster proven against the real pinned official
+1.32.7 engine with same-action replay and full canonical compare after every
+turn (`tests/test_oracle_crops.py`, 16 tests over 15 scenarios, 2,136 turn
+pairs, 74 day boundaries; zero divergence). This proves fast-engine parity for
+the exercised crop mechanics only — not full parity.
+
+Confirmed exact behaviors (now `CONFIRMED_EXPERIMENT` via differential oracle,
+in addition to `CONFIRMED_SOURCE`):
+
+- `CROPS` table constants (seed cost / first_yield_day / max_yield_day /
+  interval / max_yield / ongoing per crop);
+- PLANT: tile must be empty and unlocked; the global seed pool is consumed
+  only on success; fresh tiles get `consecutive_unwatered=1` (planting day
+  counts as unwatered), 1 yield unit non-ongoing / 0 ongoing,
+  `max_lifespan_step = -1` ongoing else `(day+max_yield_day+1)*24`,
+  `fertilized_until_day=-1`, `watered_today=False`; invalid plants are silent
+  no-ops; group PLANT demand counts across farmer AND every submitted hands
+  entry (including entries beyond the hired-hand count) and blocks ALL of a
+  short-supplied crop's requests to PASS;
+- WATER: once per day; single-harvest bonus window
+  `(max_yield_day+1)//2 .. max_yield_day` pays 2 when fertilized else 1;
+- FERTILIZE: consumes 1 carried fertilizer; `fertilized_until_day =
+  max(old, day+2)` — active on the application day plus the following two;
+- HARVEST: silent no-op before `first_yield_day` even with positive yield;
+  drains all units; non-ongoing crops are removed from the tile;
+- `_daily_refresh_plants`: unwatered streak >=2 converts to WEED; ongoing
+  interval accrual doubles only on watered days; `max_lifespan_step` is set
+  when the production count reaches `max_yield`;
+- `_decay_plants`: at `step >= max_lifespan_step` with `(step-mls)%2==0`,
+  decrement yield UNCONDITIONALLY and convert to WEED when the result is <= 0;
+- DIG clears plants/weeds/structures but never a placed animal; wrong-tile
+  WATER/FERTILIZE/HARVEST are guarded no-ops.
+
+Exact divergence found and fixed in the fast engine (locked by
+`test_ongoing_tomato_daily_interval_harvest_survival_and_zero_yield_decay`):
+
+1. `_decay_plants` gated the decrement on `yield > 0` and converted at
+   `== 0`, while the official engine decrements unconditionally and converts
+   at `<= 0`. An ongoing crop harvested down to exactly zero yield when its
+   production completed stayed alive as a zero-yield PLANT forever instead of
+   becoming a WEED at `max_lifespan_step`
+   (`rust/kaggriculture_env/src/lib.rs`).
 
 Confidence: `CONFIRMED_EXPERIMENT` (differential oracle, pinned 1.32.7).
 
