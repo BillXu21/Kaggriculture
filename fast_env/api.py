@@ -7,7 +7,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from ._kaggriculture_env import RustBatchEnv
+from ._kaggriculture_env import ACTION_SLOTS, MAX_HANDS, RustBatchEnv
 
 PRODUCTS = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON", "EGG", "MILK", "WOOL", "FERTILIZER")
 CROPS = PRODUCTS[:5]
@@ -30,6 +30,25 @@ MARKET_IDS = {name: index for index, name in enumerate(("PASS", "BUY_SEED", "BUY
 # not by the configured episodeSteps; decoding must invert exactly that
 # constant or step/day/hour are wrong whenever episodeSteps != 720.
 SEASON_STEPS = 720
+# Exact default-contract hand capacity (generated_protocol::MAX_HANDS):
+# official HIRE is one hand per atomic market order, the market queue is
+# truncated to maxMarketOrdersPerTurn=10 per turn, a day lasts turnsPerDay=24
+# turns, and hands clear at every day reset -- so at most 10*24=240 hands can
+# ever exist simultaneously under the pinned default configuration.
+MARKET_ACTION_START = MAX_HANDS + 1
+# Fixed observation layout offsets (must mirror the Rust writer exactly; the
+# authoritative source is scripts/generate_fast_protocol.py). Only the two
+# MAX_HANDS-scaled blocks move; the reserved gaps are fixed paddings.
+OBS_FARM_BASE = 62
+OBS_HAND_POSITIONS = 5280
+OBS_SHED = OBS_HAND_POSITIONS + 2 * (MAX_HANDS + 1) + 5
+OBS_SEEDS = OBS_SHED + 12
+OBS_INVENTORY = OBS_SEEDS + 5
+OBS_ANIMAL_INVENTORY = OBS_INVENTORY + 9
+OBS_HAND_INVENTORY = OBS_ANIMAL_INVENTORY + 3
+OBS_MARKET_INVENTORY = OBS_HAND_INVENTORY + MAX_HANDS * 12
+OBS_MARKET_PRICES = OBS_MARKET_INVENTORY + 9
+OBS_SHOPS = OBS_MARKET_PRICES + 9 + 2
 DEFAULT_CONFIGURATION: dict[str, Any] = {
     "episodeSteps": 720,
     "boardSize": 10,
@@ -143,7 +162,7 @@ def _market_row(entry: Sequence[Any]) -> tuple[int, int, int]:
 def _encode_actions(actions: Sequence[Mapping[str, Any]]) -> np.ndarray:
     if len(actions) != 2:
         raise ValueError("actions must contain exactly two player action dictionaries")
-    encoded = np.zeros((1, 2, 27, 3), dtype=np.int64)
+    encoded = np.zeros((1, 2, ACTION_SLOTS, 3), dtype=np.int64)
     for player, action in enumerate(actions):
         # Official interpreter: a non-dict action is treated as {} and every
         # missing component defaults to PASS / [] / [].
@@ -151,17 +170,17 @@ def _encode_actions(actions: Sequence[Mapping[str, Any]]) -> np.ndarray:
             action = {}
         # Official defaults; a missing "farmer" acts as ["PASS"].
         farmer = action.get("farmer", ["PASS"])
-        # Extra submitted hand actions beyond the fixed 16 core slots are
-        # silent no-ops officially whenever the hired hand count is within
-        # the representable range (see docs note on the >16-hands deferral).
-        hands = action.get("hands", [])[:16]
+        # Extra submitted hand actions beyond the representable core slots are
+        # silent no-ops officially; MAX_HANDS=240 covers every hand count the
+        # default contract can reach (10 orders/turn * 24 turns/day).
+        hands = action.get("hands", [])[:MAX_HANDS]
         # Official truncates the market queue to maxMarketOrdersPerTurn (10).
         market = action.get("market", [])[:10]
         encoded[0, player, 0] = _unit_row(farmer)
         for index, hand in enumerate(hands, start=1):
             encoded[0, player, index] = _unit_row(hand)
         for index, order in enumerate(market):
-            encoded[0, player, 17 + index] = _market_row(order)
+            encoded[0, player, MARKET_ACTION_START + index] = _market_row(order)
     return encoded
 
 
@@ -213,8 +232,8 @@ def _decode_observation(raw: np.ndarray, player: int, configuration: Mapping[str
     farms: list[dict[str, Any]] = []
     for farm_index in range(2):
         position = 7 + farm_index * 6
-        hands_position = 5280 + farm_index * 17
-        hand_count = max(0, min(16, _round(raw[hands_position] * 16.0)))
+        hands_position = OBS_HAND_POSITIONS + farm_index * (MAX_HANDS + 1)
+        hand_count = max(0, min(MAX_HANDS, _round(raw[hands_position] * float(MAX_HANDS))))
         tiles = [
             _tile(raw[62 + farm_index * 2600 + index * 26:62 + farm_index * 2600 + index * 26 + 26], day)
             for index in range(100)
@@ -235,22 +254,21 @@ def _decode_observation(raw: np.ndarray, player: int, configuration: Mapping[str
                 name for index, name in enumerate(("NW", "NE", "SW", "SE"))
                 if raw[19 + farm_index * 4 + index] > 0.5
             ],
-            "hires_today": _round(raw[position + 3] * 16.0),
+            "hires_today": _round(raw[position + 3] * float(MAX_HANDS)),
         })
-    private_base = 5319
-    shed = _inventory(raw, private_base)
-    seeds = {name: _round(raw[5331 + index] * 100.0) for index, name in enumerate(CROPS)}
-    inventories = [_inventory(raw, 5336)]
+    shed = _inventory(raw, OBS_SHED)
+    seeds = {name: _round(raw[OBS_SEEDS + index] * 100.0) for index, name in enumerate(CROPS)}
+    inventories = [_inventory(raw, OBS_INVENTORY)]
     hand_count = len(farms[player]["hands"])
-    inventories.extend(_inventory(raw, 5348 + hand * 12) for hand in range(hand_count))
-    shops = [SHOPS[_round(raw[5560 + slot] * 8.0) - 1] for slot in range(8) if raw[5560 + slot] > 0.0]
+    inventories.extend(_inventory(raw, OBS_HAND_INVENTORY + hand * 12) for hand in range(hand_count))
+    shops = [SHOPS[_round(raw[OBS_SHOPS + slot] * 8.0) - 1] for slot in range(8) if raw[OBS_SHOPS + slot] > 0.0]
     return {
         "player": player,
         "farms": farms,
         "private": {"shed": shed, "seeds": seeds, "inventories": inventories},
         "market": {
-            "inventory": {name: _round(raw[5540 + index] * 10000.0) for index, name in enumerate(PRODUCTS)},
-            "prices": {name: _round(raw[5549 + index] * 1000.0) for index, name in enumerate(PRODUCTS)},
+            "inventory": {name: _round(raw[OBS_MARKET_INVENTORY + index] * 10000.0) for index, name in enumerate(PRODUCTS)},
+            "prices": {name: _round(raw[OBS_MARKET_PRICES + index] * 1000.0) for index, name in enumerate(PRODUCTS)},
         },
         "town": {"unlocked_shops": shops},
         "day": day, "hour": hour, "step": step,

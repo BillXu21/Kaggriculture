@@ -4,7 +4,7 @@ Last updated: 2026-08-23
 
 ## Snapshot
 
-- Phase: **Stage-2b slices 1-4 done: worker/ordering/hiring/market cluster, crop/seed/tile lifecycle cluster, animal/structure/fertilizer lifecycle cluster, and town/world/day-RNG/reset/terminal cluster each at zero first divergence vs the real official 1.32.7 engine (27 + 16 + 12 + 10 focused tests); next gates are the remaining Stage-2b clusters and random/legal-ish full 720-turn traces, then closed-loop A/B; plus issue #2 throughput gates (GIL release, configurable Rayon thread count, batched/multi-core/memory benchmarks — fused executor/day-step explicitly deferred) and a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`); issue #4 opening book implemented and officially validated (15/16 strict matrix passes, see below)**.
+- Phase: **Stage-2b slices 1-4 done: worker/ordering/hiring/market cluster, crop/seed/tile lifecycle cluster, animal/structure/fertilizer lifecycle cluster, and town/world/day-RNG/reset/terminal cluster each at zero first divergence vs the real official 1.32.7 engine (27 + 16 + 12 + 10 focused tests); the >16-hired-hands deferral is CLOSED by the MAX_HANDS=240 exact-layout revision (5 real-official hands parity tests green; see below); next gates are the remaining Stage-2b clusters and random/legal-ish full 720-turn traces, then closed-loop A/B; plus issue #2 throughput gates (GIL release, configurable Rayon thread count, batched/multi-core/memory benchmarks — fused executor/day-step explicitly deferred) and a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`); issue #4 opening book implemented and officially validated (15/16 strict matrix passes, see below)**.
 - Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
 - Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
 - Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.
@@ -66,9 +66,21 @@ consumption incl. step-0 fire and negative stock, shared per-day RNG stream
 with weed/shop draw ordering, day-boundary reset ordering, terminal
 rewards/statuses and no-post-terminal; no engine changes required; see
 `MECHANICS.md`).
-Known deferral: >16 simultaneous hired hands (fixed 16-slot observation
-block). **Remaining mechanic/full-episode parity is still open Stage-2b work;
-no full-parity or training-safety claim is made.**
+Former deferral CLOSED (2026-08-23): the fast engine now uses the exact
+default-contract hand capacity `MAX_HANDS = maxMarketOrdersPerTurn(10) *
+turnsPerDay(24) = 240` — one hand per atomic HIRE order, market queue
+truncated to 10 orders/turn, hands cleared at every day reset. Breaking wire
+layout: `OBS_SIZE` 5630→8766, `ACTION_SLOTS` 27→251 (market rows moved from
+slot 17 to slot 241), `MASK_SIZE` 3562→34026; derivation, offsets, buffer
+deltas, and the locked HIRE-mask gate are recorded in `MECHANICS.md`
+(MAX_HANDS=240 section) and decision D-021. Evidence:
+`tests/test_fast_env.py` (15 tests incl. 23-hand scalar API, hand actions to
+all hands, day-reset/rehire Fibonacci restart, mask formula both sides) and
+`tests/test_oracle_hands.py` (5 real-official same-action replays: exactly-16
+boundary, 17th–23rd crossing, 23-hand hires + subsequent hand actions,
+day-end reset from 23 hands + rehire parity, per-turn mask ==
+official-reachable gate) — all green. **Remaining mechanic/full-episode parity
+is still open Stage-2b work; no full-parity or training-safety claim is made.**
 
 ## Learned-Control Contract
 

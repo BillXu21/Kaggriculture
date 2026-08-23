@@ -22,12 +22,13 @@ const PRODUCTS: usize = generated_protocol::PRODUCTS.len();
 const CROP_TYPES: usize = generated_protocol::CROPS.len();
 const ANIMAL_TYPES: usize = generated_protocol::ANIMALS.len();
 const SHED_ITEMS: usize = PRODUCTS + ANIMAL_TYPES;
-const ACTION_SLOTS: usize = 27;
+// Unit slots are farmer + MAX_HANDS hands; market slots follow them.
+const MARKET_ACTION_START: usize = MAX_HANDS + 1;
+const ACTION_SLOTS: usize = MARKET_ACTION_START + MAX_MARKET_ORDERS;
 const ACTION_FIELDS: usize = 3;
 const UNIT_MASK_WIDTH: usize = UNIT_OPERATIONS.len() + 17 + 101;
 const MARKET_MASK_WIDTH: usize = MARKET_OPERATIONS.len() + 17 + 101;
 const MASK_SIZE: usize = (MAX_HANDS + 1) * UNIT_MASK_WIDTH + MAX_MARKET_ORDERS * MARKET_MASK_WIDTH;
-const MARKET_ACTION_START: usize = 17;
 const MAX_MARKET_ORDERS: usize = generated_protocol::MAX_MARKET_ORDERS;
 const MAX_QUANTITY: i64 = generated_protocol::MAX_QUANTITY;
 const MAX_MARKET_LOOKUP_INVENTORY: usize = 20_000;
@@ -2894,8 +2895,9 @@ impl RustBatchEnv {
         let shape = actions.shape();
         if shape != [self.states.len(), PLAYERS, ACTION_SLOTS, 3] {
             return Err(PyValueError::new_err(format!(
-                "actions must have shape ({}, 2, 27, 3)",
-                self.states.len()
+                "actions must have shape ({}, 2, {}, 3)",
+                self.states.len(),
+                ACTION_SLOTS
             )));
         }
         let actions = actions.as_array();
@@ -2921,8 +2923,9 @@ impl RustBatchEnv {
     fn step_transition<'py>(&mut self, actions: PyReadonlyArray4<'py, i64>) -> PyResult<()> {
         if actions.shape() != [self.states.len(), PLAYERS, ACTION_SLOTS, ACTION_FIELDS] {
             return Err(PyValueError::new_err(format!(
-                "actions must have shape ({}, 2, 27, 3)",
-                self.states.len()
+                "actions must have shape ({}, 2, {}, 3)",
+                self.states.len(),
+                ACTION_SLOTS
             )));
         }
         let actions = actions.as_array();
@@ -2975,8 +2978,9 @@ impl RustBatchEnv {
     ) -> PyResult<()> {
         if actions.shape() != [self.states.len(), PLAYERS, ACTION_SLOTS, ACTION_FIELDS] {
             return Err(PyValueError::new_err(format!(
-                "actions must have shape ({}, 2, 27, 3)",
-                self.states.len()
+                "actions must have shape ({}, 2, {}, 3)",
+                self.states.len(),
+                ACTION_SLOTS
             )));
         }
         if observations.shape() != [self.states.len(), PLAYERS, OBSERVATION_SIZE] {
@@ -3084,6 +3088,9 @@ impl RustBatchEnv {
 fn _kaggriculture_env(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustBatchEnv>()?;
     m.add("OBS_SIZE", OBSERVATION_SIZE)?;
+    m.add("MASK_SIZE", MASK_SIZE)?;
+    m.add("MAX_HANDS", MAX_HANDS)?;
+    m.add("ACTION_SLOTS", ACTION_SLOTS)?;
     Ok(())
 }
 

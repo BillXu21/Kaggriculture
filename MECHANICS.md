@@ -398,14 +398,68 @@ regression):
    quantity) — malformed actions now translate to no-op rows and hands/market
    lists truncate like the official interpreter (`fast_env/api.py`).
 
-Known bounded deferral: the official engine has no hired-hand cap, while the
-fast core fixes 16 hand slots and encodes hand positions in a fixed
-observation block. Reaching >16 simultaneous hands requires ≥4180 money of
-Fibonacci hires inside one day (reachable in principle), so scenarios beyond
-16 hands are out of scope until an observation-schema revision; submitted
-hand-action lists beyond 16 entries truncate to the first 16.
+Former bounded deferral, now CLOSED: the >16 simultaneous hired hands gap was
+removed by the exact-layout revision (MAX_HANDS=240; see the dedicated section
+below). Submitted hand-action lists now truncate at 240 entries, which covers
+every hand count the pinned default contract can reach.
 
 Confidence: `CONFIRMED_EXPERIMENT` (differential oracle, pinned 1.32.7).
+
+## Fast-Engine Exact Hand Capacity — MAX_HANDS=240 Layout Revision (2026-08-23)
+
+The old fixed 16-slot layout was replaced by the exact default-contract
+capacity. Derivation: official HIRE appends exactly one hand per atomic market
+order (`_do_hire`), the market queue is truncated to
+`maxMarketOrdersPerTurn = 10` orders per turn, `turnsPerDay = 24` turns make
+one day, and `farm["hands"] = []` clears at every day reset — so the maximum
+simultaneous hand count is exactly `10 * 24 = 240` under the pinned default
+configuration. The generator now derives `max_hands` from these two schema
+defaults (`scripts/generate_fast_protocol.py`); non-default configurations
+with larger turnsPerDay/maxMarketOrdersPerTurn exceed this bound and remain
+out of scope (fast engine supports boardSize=10 / maxMarketOrdersPerTurn=10
+only, as before).
+
+New constants and wire shapes (breaking layout change):
+
+- `MAX_HANDS` 16 → 240; `ACTION_SLOTS` 27 → 251 (= farmer + 240 hands + 10
+  market orders); market action rows moved from slot 17 to slot
+  `MAX_HANDS + 1 = 241`; all Rust loops parameterized;
+- `OBS_SIZE` 5630 → 8766 (+3136): only the two MAX_HANDS-scaled blocks move —
+  hand positions block `2*(MAX_HANDS+1)` wide after offset 5280, and the
+  per-hand inventory block `MAX_HANDS*12` wide; every other block and the
+  three reserved gaps keep their original widths. Offsets:
+  OBS_SHED 5319→5767, OBS_SEEDS 5331→5779, OBS_INVENTORY 5336→5784,
+  OBS_ANIMAL_INVENTORY 5345→5793, OBS_HAND_INVENTORY 5348→5796,
+  OBS_MARKET_INVENTORY 5540→8676, OBS_MARKET_PRICES 5549→8685,
+  OBS_SHOPS 5560→8696;
+- `MASK_SIZE` 3562 → 34026 (= `(MAX_HANDS+1)*136 + 10*125`);
+- per-env buffer deltas (f32 obs ×2 players, i64 actions ×2 players, u8 masks
+  ×2 players): observations 45,040 → 70,128 B (+25,088), actions 1,296 →
+  12,048 B (+10,752), masks 7,124 → 68,052 B (+60,928);
+- the extension module now exports `MAX_HANDS`, `ACTION_SLOTS`, `MASK_SIZE`
+  alongside `OBS_SIZE`; preallocated `*_into` calls reject stale shapes with
+  `ValueError`.
+
+HIRE mask semantics locked to the official gate: HIRE in market slot 0 is
+available iff `hand_count < MAX_HANDS AND money >= fib(hires_today)` with the
+engine Fibonacci `fib(0)=fib(1)=1, fib(2)=2, ...`. Regression
+(`tests/test_fast_env.py::test_hire_mask_matches_official_reachable_semantics`)
+proves both sides: open at reset, closed at 23 hands where 75,024 spent of
+100,000 leaves 24,976 < fib(23) = 46,368 for the next hire.
+
+Evidence vs the real official 1.32.7 engine (`tests/test_oracle_hands.py`,
+same-action replay with full canonical compare each turn, zero divergence):
+exactly 16 hands (old boundary) with subsequent hand actions; a
+startingMoney=100000 trace reaching 23 hands plus two turns of real hand
+actions over all 23 slots; the exact 16→17 crossing turn; day-end reset from
+23 hands with hires_today/inventory reset parity and next-day Fibonacci
+restart at cost 1; and the fast HIRE mask bit equal to the official-reachable
+gate evaluated from shared canonical state on every turn.
+
+Scope notes: `bc_manager/constants.py::MAX_HANDS = 8` is a separate BC-manager
+head-slot constant and intentionally unchanged. This revision proves parity
+for exercised traces only; no full-episode or training-safety claim is made
+until full 720-turn episodes pass through the oracle.
 
 ## Fast-Engine Differential Parity — Crop/Seed/Tile Lifecycle (2026-08-23)
 

@@ -74,11 +74,11 @@ see the Stage-2a HISTORY entry; the trace is
 ## Known limitations (bounded, deliberate)
 
 - Fast engine supports `boardSize=10` and `maxMarketOrdersPerTurn=10` only.
-- The official engine has no hired-hand cap; the fast core fixes 16 hand
-  slots and a fixed observation block, so scenarios with >16 simultaneous
-  hands (needs >=4180 money of Fibonacci hires inside one day) are deferred
-  until an observation-schema revision. Submitted hand-action lists beyond 16
-  entries truncate to the first 16.
+- Former >16-hired-hands deferral CLOSED (2026-08-23): the fast core now uses
+  the exact default-contract capacity `MAX_HANDS = 10 orders/turn * 24
+  turns/day = 240` (breaking wire layout: OBS_SIZE 8766, ACTION_SLOTS 251,
+  MASK_SIZE 34026; see `MECHANICS.md` and decision D-021). Scenarios beyond
+  240 hands are unreachable under the pinned default configuration.
 - Fast observation money is recovered by rounding the f32 normalize(10000)
   encoding; exact for the integer money values the official engine produces
   (verified to well beyond realistic ranges).

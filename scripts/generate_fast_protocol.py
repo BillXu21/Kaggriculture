@@ -75,6 +75,14 @@ def _rule_tables(source: Any, schema: dict[str, Any]) -> dict[str, Any]:
         [product_index[item] for item in shops[name]] + [-1] * (4 - len(shops[name]))
         for name in shop_engine_order
     ]
+    # Exact default-contract hand capacity: official HIRE appends exactly one
+    # hand per atomic market order (`_do_hire`), the market queue is truncated
+    # to `maxMarketOrdersPerTurn` orders per turn, `turnsPerDay` turns make up
+    # one day, and hands are cleared at every day reset (`farm["hands"] = []`).
+    # Maximum simultaneous hands is therefore exactly
+    # maxMarketOrdersPerTurn * turnsPerDay for the pinned default contract.
+    turns_per_day = _default(schema["configuration"], "turnsPerDay")
+    max_market_orders = _default(schema["configuration"], "maxMarketOrdersPerTurn")
     rule_tables = {
         "products": products,
         "unit_operations": unit_operations,
@@ -88,8 +96,8 @@ def _rule_tables(source: Any, schema: dict[str, Any]) -> dict[str, Any]:
         "town_center_products": list(source.TOWN_CENTER_PRODUCTS),
         "max_shop_instances": source.MAX_SHOP_INSTANCES,
         "town_center_demand_schedule": [[0, 1]],
-        "max_hands": 16,
-        "max_market_orders": _default(schema["configuration"], "maxMarketOrdersPerTurn"),
+        "max_hands": turns_per_day * max_market_orders,
+        "max_market_orders": max_market_orders,
         "max_quantity": 100,
         "board_size": _default(schema["configuration"], "boardSize"),
         "market_params": source.MARKET_PARAMS,
@@ -120,6 +128,24 @@ def render() -> str:
     config = schema["configuration"]
     market = source.MARKET_PARAMS
     market_order = data["products"]
+
+    # Fixed observation layout. The MAX_HANDS-scaled blocks (hand positions,
+    # hand inventories) size from `max_hands`; every other block and the three
+    # reserved gaps are fixed paddings inherited from the original packed
+    # layout and must not change with MAX_HANDS.
+    max_hands = tables["max_hands"]
+    obs_farm_base = 62
+    # 62 header + two 2600-wide farm blocks + 18 reserved floats.
+    obs_hand_positions = obs_farm_base + 2 * 2600 + 18
+    obs_shed = obs_hand_positions + 2 * (max_hands + 1) + 5
+    obs_seeds = obs_shed + 12
+    obs_inventory = obs_seeds + len(data["crop_names"])
+    obs_animal_inventory = obs_inventory + len(data["products"])
+    obs_hand_inventory = obs_animal_inventory + len(data["animal_names"])
+    obs_market_inventory = obs_hand_inventory + max_hands * 12
+    obs_market_prices = obs_market_inventory + len(data["products"])
+    obs_shops = obs_market_prices + len(data["products"]) + 2
+    obs_size = obs_shops + source.MAX_SHOP_INSTANCES + 62
 
     lines = [
         "// Generated from the installed Kaggriculture Conda environment. Do not edit by hand.",
@@ -170,16 +196,16 @@ def render() -> str:
         f"pub const MARKET_ABOVE_TARGET: [f64; {len(market_order)}] = {_rust_array([market[name]['above_target'] for name in market_order], _rust_float)};",
         f"pub const MARKET_BELOW_SHAPE: [u8; {len(market_order)}] = {_rust_array([{'linear': 0, 'sq': 1, 'sqrt': 2, 'log': 3, 'log10': 4, 'hinge': 5}[market[name]['below_func']] for name in market_order])};",
         f"pub const MARKET_ABOVE_SHAPE: [u8; {len(market_order)}] = {_rust_array([{'linear': 0, 'sq': 1, 'sqrt': 2, 'log': 3, 'log10': 4, 'hinge': 5}[market[name]['above_func']] for name in market_order])};",
-        "pub const OBS_SIZE: usize = 5630;",
-        "pub const OBS_MARKET_INVENTORY: usize = 5540;",
-        "pub const OBS_MARKET_PRICES: usize = 5549;",
-        "pub const OBS_SHOPS: usize = 5560;",
-        "pub const OBS_SHED: usize = 5319;",
-        "pub const OBS_SEEDS: usize = 5331;",
-        "pub const OBS_INVENTORY: usize = 5336;",
-        "pub const OBS_ANIMAL_INVENTORY: usize = 5345;",
-        "pub const OBS_HAND_INVENTORY: usize = 5348;",
-        "pub const OBS_HAND_POSITIONS: usize = 5280;",
+        f"pub const OBS_SIZE: usize = {obs_size};",
+        f"pub const OBS_MARKET_INVENTORY: usize = {obs_market_inventory};",
+        f"pub const OBS_MARKET_PRICES: usize = {obs_market_prices};",
+        f"pub const OBS_SHOPS: usize = {obs_shops};",
+        f"pub const OBS_SHED: usize = {obs_shed};",
+        f"pub const OBS_SEEDS: usize = {obs_seeds};",
+        f"pub const OBS_INVENTORY: usize = {obs_inventory};",
+        f"pub const OBS_ANIMAL_INVENTORY: usize = {obs_animal_inventory};",
+        f"pub const OBS_HAND_INVENTORY: usize = {obs_hand_inventory};",
+        f"pub const OBS_HAND_POSITIONS: usize = {obs_hand_positions};",
         "pub const OBS_TILE_WIDTH: usize = 26;",
         "pub const OBS_FARM_WIDTH: usize = 2600;",
         "pub const NORMALIZE_MONEY: f32 = 10000.0;",
