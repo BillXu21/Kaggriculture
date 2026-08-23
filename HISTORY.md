@@ -2,6 +2,47 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Stage 2b slice 4: Town/World Updates, Day RNG, Reset, and Terminal Differential Parity
+
+Probed the town/world cluster (shop unlock/consumption, global day-end RNG,
+daily reset ordering, terminal lifecycle) against the real pinned official
+1.32.7 engine and committed the bounded result on `main` (no push). The
+cluster was already at zero divergence: no engine changes were required.
+
+- **Probes:** new `tests/test_oracle_town_world.py` — 10 focused tests over
+  10 real-official same-action scenarios (~1,100 turn pairs including one
+  648-turn PASS-only season segment; full canonical compare every turn)
+  covering shop unlock timing at end-of-day `(day + 1) % interval == 0`
+  (canonical steps 72/144/216/...), draw-with-replacement multiplicity with
+  three duplicate FARMERS_MARKET instances and the 8-instance cap held
+  through day 27, per-turn market-inventory trajectory recomputed from the
+  official shop tables (every-4-step shop drain, single-product x2
+  multiplier, every-24-step town-center product set firing at step 0 on an
+  empty town), unconditional consumption driving WHEAT stock below −20,000
+  with prices tracking the scarcity branch and never breaching
+  `PRICE_FLOOR`, the shared per-day `Random((seed * 1_000_003) ^ day)`
+  stream across both farms (weed draws row-major farm 0 then farm 1, then
+  the shop choice; planted tiles shift stream position;
+  `weedSpawnChance` 0 / default / 0.5 all verified), same-seed
+  bit-identical repeatability across fresh backends vs different-seed
+  divergence wherever a draw occurs, day-boundary reset ordering (hands
+  removed, carried inventories dropped to shed, `hires_today` reset,
+  farmer returned to spawn, watering counters advanced — all before any
+  same-boundary shop unlock), and terminal lifecycle (DONE + reward =
+  final farm money exactly at step `episodeSteps - 1`; official wrapper
+  refuses post-terminal steps with `FailedPrecondition`; fast engine
+  transitions nothing further).
+- **Divergences found:** none — zero divergences across all scenarios.
+- **Validation:** focused venv run of `tests/test_oracle_town_world.py`:
+  10 passed. Prior implementation evidence: fresh maturin rebuild, exact
+  RNG/draw ordering checks, and the full venv suite at 390 passed /
+  1 justified skip.
+- **Not claimed:** whole-engine/full-episode parity, >16 simultaneous hands,
+  closed-loop A/B, benchmarks, training safety. New issue #2 throughput
+  gates (GIL release, configurable Rayon thread count, batched/multi-core/
+  memory benchmarks; fused executor/day-step explicitly deferred) are
+  recorded as future work only — not part of this parity slice.
+
 ## 2026-08-23 — Stage 2b slice 3: Animal/Structure/Fertilizer Lifecycle Differential Parity
 
 Probed the animal/structure/fertilizer lifecycle cluster against the real

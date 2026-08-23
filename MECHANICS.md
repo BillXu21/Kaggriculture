@@ -454,6 +454,61 @@ Exact divergence found and fixed in the fast engine (locked by
 
 Confidence: `CONFIRMED_EXPERIMENT` (differential oracle, pinned 1.32.7).
 
+## Fast-Engine Differential Parity — Town/World Updates, Day RNG, Reset, Terminal (2026-08-23)
+
+Fourth Stage-2b mechanics cluster proven against the real pinned official
+1.32.7 engine with same-action replay and full canonical compare after every
+turn (`tests/test_oracle_town_world.py`, 10 tests over 10 scenarios,
+~1,100 turn pairs including one 648-turn PASS-only season segment; zero
+divergence, no engine changes required). This proves fast-engine parity for
+the exercised town/world mechanics only — not full parity.
+
+Confirmed exact behaviors (now `CONFIRMED_EXPERIMENT` via differential oracle,
+in addition to `CONFIRMED_SOURCE`):
+
+- shop unlock timing: exactly at end-of-day when `(day + 1) %
+  townShopUnlockInterval == 0`, i.e. canonical steps 72/144/216/... for the
+  default 3-day interval; nothing unlocks before day 3;
+- draw-with-replacement multiplicity: seed 3 PASS-only draws BRUNCH_SPOT,
+  FARMERS_MARKET, PET_CAFE, YARN_STORE, PIZZA_SHOP, FARMERS_MARKET,
+  FARMERS_MARKET, BAKERY — three duplicate FARMERS_MARKET instances kept as
+  ordered multiplicity; the 8-instance cap holds (no ninth unlock through
+  day 27);
+- consumption: every `townShopSellInterval == 4` steps each instance drains
+  its product list once per unit of demand with multiplier 2 for
+  single-product shops (PET_CAFE, YARN_STORE); every
+  `townCenterSellInterval == 24` steps the town center drains one unit of
+  each non-FERTILIZER product, firing at step 0 while the town is still
+  empty; prices refresh visibly on the same transition;
+- insufficient market stock: BUY_PRODUCT has no stock check (money and shed
+  room only) and town consumption subtracts unconditionally, so configured
+  money/shed capacity drive WHEAT stock below −20,000 with prices tracking
+  the scarcity branch down there and never below `PRICE_FLOOR`; both engines
+  agree exactly at negative stock;
+- day-RNG stream: one `random.Random((seed * 1_000_003) ^ day)` per boundary
+  shared across both farms in player order — weed draws over empty unlocked
+  tiles row-major (farm 0 then farm 1), then the shop choice; a planted tile
+  shifts the stream position until it converts to a WEED, and both engines
+  keep identical boards and shop draws (`weedSpawnChance` 0 / default / 0.5
+  all verified; zero chance never spawns; high chance spawns only on empty
+  unlocked tiles);
+- determinism: same seed + same actions reproduce bit-identical canonical
+  state across fresh backend instances (reset-after-run repeatability); a
+  different seed diverges in weed layout and shop draws wherever a draw
+  occurs;
+- day-boundary reset ordering: hands removed, carried inventories dropped to
+  the shed (overflow discarded), `hires_today` reset (next hire costs
+  Fibonacci 1 again), farmer returned to spawn, plant watering counters
+  advanced — all before the new day's first action and before any shop
+  unlock fires on the same boundary;
+- terminal lifecycle: DONE + reward = final farm money land exactly at
+  canonical step `episodeSteps - 1` (day/hour consistent); the official
+  wrapper refuses post-terminal steps (`FailedPrecondition`) and the fast
+  engine transitions nothing further; pre-terminal status anomalies stay
+  invalid despite terminal DONE (offline status-history suite).
+
+Confidence: `CONFIRMED_EXPERIMENT` (differential oracle, pinned 1.32.7).
+
 ## Randomness and Determinism
 
 Current interpretation:

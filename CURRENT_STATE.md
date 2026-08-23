@@ -4,7 +4,7 @@ Last updated: 2026-08-23
 
 ## Snapshot
 
-- Phase: **Stage-2b slices 1-3 done: worker/ordering/hiring/market cluster, crop/seed/tile lifecycle cluster, and animal/structure/fertilizer lifecycle cluster each at zero first divergence vs the real official 1.32.7 engine (27 + 16 + 12 focused tests); next gates are the remaining Stage-2b clusters (town/shop consumption/unlock, global day-end/RNG sweeps), then random/legal-ish full 720-turn traces, closed-loop A/B, and benchmarks; also a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`)**.
+- Phase: **Stage-2b slices 1-4 done: worker/ordering/hiring/market cluster, crop/seed/tile lifecycle cluster, animal/structure/fertilizer lifecycle cluster, and town/world/day-RNG/reset/terminal cluster each at zero first divergence vs the real official 1.32.7 engine (27 + 16 + 12 + 10 focused tests); next gates are the remaining Stage-2b clusters and random/legal-ish full 720-turn traces, then closed-loop A/B; plus issue #2 throughput gates (GIL release, configurable Rayon thread count, batched/multi-core/memory benchmarks — fused executor/day-step explicitly deferred) and a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`)**.
 - Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
 - Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
 - Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.
@@ -30,7 +30,15 @@ divergence (`tests/test_oracle_crops.py`, 16 tests / 15 scenarios, 2,136 turn
 pairs, 74 day boundaries; one exact fast-engine divergence found and fixed:
 `_decay_plants` gated the yield decrement on `> 0` and converted at `== 0`
 where the official engine decrements unconditionally and converts at `<= 0`,
-letting a zero-yield ongoing crop survive forever; see `MECHANICS.md`).
+letting a zero-yield ongoing crop survive forever; see `MECHANICS.md`),
+and — Stage-2b slice 4 — the town/world/day-RNG/reset/terminal cluster at
+zero divergence (`tests/test_oracle_town_world.py`, 10 tests / 10 scenarios,
+~1,100 turn pairs including one 648-turn PASS-only season segment; shop
+unlock timing/duplicate multiplicity/8-instance cap, town + town-center
+consumption incl. step-0 fire and negative stock, shared per-day RNG stream
+with weed/shop draw ordering, day-boundary reset ordering, terminal
+rewards/statuses and no-post-terminal; no engine changes required; see
+`MECHANICS.md`).
 Known deferral: >16 simultaneous hired hands (fixed 16-slot observation
 block). **Remaining mechanic/full-episode parity is still open Stage-2b work;
 no full-parity or training-safety claim is made.**
