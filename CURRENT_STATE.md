@@ -4,7 +4,7 @@ Last updated: 2026-08-23
 
 ## Snapshot
 
-- Phase: **Stage-2b slices 1-2 done: worker/ordering/hiring/market cluster and crop/seed/tile lifecycle cluster each at zero first divergence vs the real official 1.32.7 engine (27 + 16 focused tests); next gates are the remaining Stage-2b clusters (animals/town/day-end/RNG), then random/legal-ish full 720-turn traces, closed-loop A/B, and benchmarks; also a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`)**.
+- Phase: **Stage-2b slices 1-3 done: worker/ordering/hiring/market cluster, crop/seed/tile lifecycle cluster, and animal/structure/fertilizer lifecycle cluster each at zero first divergence vs the real official 1.32.7 engine (27 + 16 + 12 focused tests); next gates are the remaining Stage-2b clusters (town/shop consumption/unlock, global day-end/RNG sweeps), then random/legal-ish full 720-turn traces, closed-loop A/B, and benchmarks; also a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`)**.
 - Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
 - Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
 - Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.

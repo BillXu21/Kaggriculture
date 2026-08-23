@@ -2,6 +2,45 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Stage 2b slice 3: Animal/Structure/Fertilizer Lifecycle Differential Parity
+
+Probed the animal/structure/fertilizer lifecycle cluster against the real
+pinned official 1.32.7 engine and committed the bounded result on `main`
+(no push). The cluster was already at zero first divergence: no engine
+changes were required, and the canonical compare was not weakened.
+
+- **Probes:** new `tests/test_oracle_animals.py` — 12 focused tests over 11
+  real-official same-action scenarios (1,320 turn pairs, 48 day boundaries;
+  every turn compared canonically) covering the `ANIMALS` constants table (GOOSE/COOP/EGG,
+  COW+SHEEP/PASTURE/MILK/WOOL with differing first-yield/interval/max-held
+  timings), free BUILD_COOP/BUILD_PASTURE on empty owned tiles only (blocked
+  by plant/structure/LOCKED), BUY_ANIMAL per-unit partial fills on
+  insufficient funds and shed capacity plus malformed-order skips, PLACE onto
+  matching unoccupied structures vs fall-through shed paths and mismatched
+  no-ops, FEED wheat consumption/once-per-day/no-wheat no-ops, CARE timing,
+  COLLECT_FERTILIZER placement-day unavailability/once-per-day/daily
+  regeneration, production timing and quantities including pending-care-bonus
+  accrual, consumption on fed production days, LOSS on unfed production days,
+  and max_held caps, exact escape timing at the second consecutive unfed
+  refresh with the bare structure remaining, DIG semantics (no-op on placed
+  animals, clears empty structures), HARVEST full drains, hired-hand chore
+  with its own inventory (hands never survive a day boundary), and day-end
+  inventory-drop insertion-order priority with animals carried under a tight
+  shedCapacity.
+- **Divergences found:** none — every scenario's first divergence count is
+  zero; all probe iterations were semantic-assert corrections in the test
+  file itself (both engines agreed at every compared field).
+- **Validation:** fresh maturin develop --release rebuild into the temp
+  oracle venv; `cargo fmt --check` clean; 16 Rust tests pass; focused oracle
+  set in the venv (`test_oracle_animals.py test_oracle_crops.py
+  test_oracle_mechanics.py test_oracle_replay.py test_oracle_offline.py
+  test_oracle_import_isolation.py test_fast_env.py`): 78 passed / 1 justified
+  skip; full repository suite under system Python: 266 passed / 62 skipped /
+  0 failures.
+- **Not claimed:** town/shop consumption-unlock parity, global RNG/day-end
+  sweeps beyond unavoidable weed observation, broad random/full episodes,
+  >16 hands, closed-loop A/B, benchmarks, training safety.
+
 ## 2026-08-23 — Stage 2b slice 2: Crop/Seed/Tile Lifecycle Differential Parity
 
 Drove the crop/seed/tile lifecycle cluster to zero first divergence against

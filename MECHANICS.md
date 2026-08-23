@@ -133,12 +133,21 @@ Confidence: `CONFIRMED_SOURCE`.
 
 Additional behavior:
 
-- animals consume wheat feed;
+- animals consume wheat feed (1 carried WHEAT per FEED, once per day);
 - two consecutive unfed daily refreshes cause escape while leaving the structure;
-- care plus feed creates a pending production bonus;
-- animals generate collectible fertilizer daily.
+- base +1 production accrues on schedule even on an unfed production day;
+- care plus feed creates a pending production bonus consumed only on a FED
+  production day (an unfed production day still resets the pending bonus to 0,
+  losing it); the total is capped at `max_held`;
+- animals generate collectible fertilizer daily (`COLLECT_FERTILIZER`, once
+  per day, unavailable on the placement day before the first refresh);
+- `DIG` never removes a placed animal but clears empty structures;
+- `BUY_ANIMAL` lands in the shed and partially fills when funds or shed
+  capacity run out mid-order.
 
-Confidence: `CONFIRMED_SOURCE`; exact care bonus still merits a local regression test.
+Confidence: `CONFIRMED_SOURCE`; locked to zero first divergence vs the pinned
+official engine by `tests/test_oracle_animals.py` (12 tests, real-official
+same-action replay).
 
 ## Labor and Logistics
 
