@@ -35,10 +35,14 @@ def detect_engine() -> dict[str, Any]:
     except ImportError as exc:
         return {"available": False, "version": None,
                 "reason": f"kaggle_environments not installed ({exc})"}
-    return {"available": True,
-            "version": getattr(kaggle_environments, "version", None)
-            or getattr(kaggle_environments, "__version__", "unknown"),
-            "reason": ""}
+    # 1.32.7 exposes the installed package version as ``__version__``.
+    # A module-level ``version`` name may also exist as the imported
+    # importlib.metadata function, so do not report that callable as the
+    # engine version.
+    version = getattr(kaggle_environments, "__version__", None)
+    if not isinstance(version, str) or not version:
+        version = "unknown"
+    return {"available": True, "version": version, "reason": ""}
 
 
 def build_fake_plan() -> DailyPlan:
@@ -80,13 +84,14 @@ def run_smoke_game(agent: ExecutorAgent, opponent: Any, seed: int) -> dict:
                                    configuration={"seed": seed})
     env.reset()
     steps = env.run([agent, opponent])
+    final_state = steps[-1]
     return {
         "env_id": _ENGINE_ENV_ID,
         "engine_version": detect_engine()["version"],
         "seed": seed,
         "steps": len(steps),
-        "rewards": list(env.rewards),
-        "statuses": [str(s) for s in env.statuses],
+        "rewards": [state.reward for state in final_state],
+        "statuses": [str(state.status) for state in final_state],
         "diagnostics": agent.diagnostics_json(),
     }
 
