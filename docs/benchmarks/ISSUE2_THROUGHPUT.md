@@ -26,7 +26,7 @@ old shapes) and is a PERFORMANCE reference only.
 | fast:fast_native:mixed | 0.004 | 0.004-0.008 | 188,365.8 | 261.619 | 719 |
 | reference:reference_native:mixed | 0.001 | 0.001-0.002 | 499,393.1 | 693.602 | 719 |
 
-**Scalar speedup vs official (mixed trace, full API incl. dict decode): 4.5x.** Step-call accounting: 719 accepted step calls per 720-step episode (720 competition turns incl. the reset position).
+**Scalar speedup vs official (mixed trace, full API incl. dict decode): 4.7x.** Step-call accounting: 719 accepted step calls per 720-step episode (720 competition turns incl. the reset position).
 
 ## Batch throughput (env-transitions/sec, steady step_into)
 

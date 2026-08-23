@@ -149,3 +149,43 @@ def test_render_report_validates_and_produces_markdown(tmp_path) -> None:
     bad_path.write_text(json.dumps(bad), encoding="utf-8")
     with pytest.raises(ValueError):
         bench.main(["report", "--results", str(bad_path), "--out", str(tmp_path / "bad.md")])
+
+
+def test_render_report_scalar_speedup_uses_mixed_rows() -> None:
+    def stats(median_s: float) -> dict:
+        return {
+            "median_s": median_s, "min_s": median_s, "max_s": median_s,
+            "turns_per_sec_median": 1.0 / median_s,
+            "episodes_per_sec_median": 1.0 / median_s,
+            "step_calls_per_episode": 719,
+        }
+
+    # pass_only medians would give 4.0x; mixed medians must give ~4.7x.
+    def engine(scalar_episodes: dict) -> dict:
+        return {
+            "environment": {"cpu": "test"},
+            "scalar_episodes": scalar_episodes,
+            "batch_throughput": {},
+            "phase_split_N512": None,
+            "memory": {"theoretical_per_env": {}, "samples": {}},
+            "profile_scalar": {},
+        }
+
+    results = {
+        "engines": {
+            "official": engine({
+                "official:pass_only": stats(2.0),
+                "official:mixed": stats(1.3024320999975316),
+            }),
+            "fast": engine({
+                "fast_api:pass_only": stats(0.5),
+                "fast_api:mixed": stats(0.2790222499752417),
+                "fast_native:mixed": stats(0.0038223500014282763),
+            }),
+        },
+    }
+    markdown = bench.render_report(results)
+    assert ("**Scalar speedup vs official (mixed trace, full API incl. dict decode): "
+            "4.7x.**") in markdown
+    assert ":mixed" in markdown
+    assert ":pass_only" in markdown

@@ -741,8 +741,8 @@ def render_report(results: Mapping) -> str:
                 f"{stats['step_calls_per_episode']} |"
             )
     add("")
-    official = next((v for k, v in scalar_rows.items() if k.startswith("official")), None)
-    fast_api = next((v for k, v in scalar_rows.items() if k.startswith("fast_api")), None)
+    official = scalar_rows.get("official:mixed")
+    fast_api = scalar_rows.get("fast_api:mixed")
     if official and fast_api:
         speedup = official["median_s"] / fast_api["median_s"]
         if not (math.isfinite(speedup) and speedup > 0):
