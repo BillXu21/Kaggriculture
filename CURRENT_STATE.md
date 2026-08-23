@@ -4,12 +4,12 @@ Last updated: 2026-08-23
 
 ## Snapshot
 
-- Phase: **Stage-2a official differential oracle is implemented, validated, and committed (273 tests); next gates are a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv now documented in `oracle/README.md`) and Stage-2b broad parity sweeps**.
+- Phase: **Stage-2b slice 1 done: worker/ordering/hiring/market cluster at zero first divergence vs the real official 1.32.7 engine (27 focused scenarios); next gates are the remaining Stage-2b clusters (crops/animals/town/day-end/RNG), then random/legal-ish full 720-turn traces, closed-loop A/B, and benchmarks; also a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`)**.
 - Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
 - Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
 - Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.
 
-## Differential Oracle (Stage 2a)
+## Differential Oracle (Stage 2a + 2b slice 1)
 
 `oracle/` provides a same-action replay harness: the exact same action pair is
 submitted to the pinned official 1.32.7 engine and the fast Rust engine each
@@ -20,9 +20,14 @@ first divergent field with seed/step/day/hour/path/values/actions context
 Validated so far: initial-state parity, short legal traces (BUY_SEED/PLANT/
 WATER), both-seat privacy comparison, deliberate-corruption first-divergence,
 terminal rewards/statuses at `episodeSteps=3`, provenance tamper rejection,
-and a 28-turn pass-only day-boundary smoke — all with zero divergence against
-the real official engine in the temp venv. **Broad mechanic/full-episode
-parity remains Stage 2b; no full-parity or training-safety claim is made.**
+a 28-turn pass-only day-boundary smoke, and — Stage-2b slice 1 — the worker-
+inventory / same-turn-ordering / hiring / market cluster at zero divergence
+(`tests/test_oracle_mechanics.py`, 27 scenarios; three exact fast-engine
+divergences found and fixed: money-decode f32 noise, MAX_QUANTITY=100 order
+clamps, ValueError-on-silent-noop wire translation; see `MECHANICS.md`).
+Known deferral: >16 simultaneous hired hands (fixed 16-slot observation
+block). **Remaining mechanic/full-episode parity is still open Stage-2b work;
+no full-parity or training-safety claim is made.**
 
 ## Learned-Control Contract
 

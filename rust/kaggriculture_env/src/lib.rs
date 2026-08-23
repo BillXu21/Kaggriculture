@@ -1362,8 +1362,15 @@ impl GameState {
                     self.animal_pending_care[player][tile] = 0;
                     self.animal_fertilizer_available[player][tile] = false;
                 } else if self.is_shed_adjacent_at(unit.position) {
+                    // Official PLACE shed fallback: n <= 0 is a silent no-op
+                    // (`if n <= 0 { return; }` in kaggriculture.py), and the
+                    // requested count is unbounded -- availability and shed
+                    // room are the only effective bounds.
+                    if quantity <= 0 {
+                        return;
+                    }
                     let room = self.shed_room(player);
-                    let requested = quantity.clamp(1, MAX_QUANTITY) as i32;
+                    let requested = quantity.clamp(1, i64::from(i32::MAX)) as i32;
                     let available = unit.animal_inventory[animal];
                     let moved =
                         self.move_to_shed(player, 9 + animal, available.min(room).min(requested));
@@ -1376,12 +1383,13 @@ impl GameState {
                 }
             }
             9 if (4..=12).contains(&target) && self.is_shed_adjacent_at(unit.position) => {
+                // Official PLACE shed path: n <= 0 is a silent no-op.
                 if quantity <= 0 {
                     return;
                 }
                 let item = (target - 4) as usize;
                 let room = self.shed_room(player);
-                let requested = quantity.min(MAX_QUANTITY) as i32;
+                let requested = quantity.clamp(1, i64::from(i32::MAX)) as i32;
                 let available = unit.inventory[item];
                 let moved = self.move_to_shed(player, item, available.min(room).min(requested));
                 unit.inventory[item] -= moved;
@@ -1391,7 +1399,9 @@ impl GameState {
                 if quantity <= 0 {
                     return;
                 }
-                let quantity = quantity.clamp(1, MAX_QUANTITY) as i32;
+                // Official PICKUP n is unbounded; shed stock is the only
+                // effective bound (`n = min(n, available)`).
+                let quantity = quantity.clamp(1, i64::from(i32::MAX)) as i32;
                 let moved = self.move_from_shed(player, 0, quantity);
                 self.mark_item_added(&mut unit.item_order, 0, unit.inventory[0], moved);
                 unit.inventory[0] += moved;
@@ -1401,7 +1411,7 @@ impl GameState {
                     return;
                 }
                 let animal = (target - 1) as usize;
-                let quantity = quantity.clamp(1, MAX_QUANTITY) as i32;
+                let quantity = quantity.clamp(1, i64::from(i32::MAX)) as i32;
                 let moved = self.move_from_shed(player, 9 + animal, quantity);
                 self.mark_item_added(
                     &mut unit.item_order,
@@ -1416,7 +1426,7 @@ impl GameState {
                     return;
                 }
                 let item = (target - 4) as usize;
-                let quantity = quantity.clamp(1, MAX_QUANTITY) as i32;
+                let quantity = quantity.clamp(1, i64::from(i32::MAX)) as i32;
                 let moved = self.move_from_shed(player, item, quantity);
                 self.mark_item_added(&mut unit.item_order, item, unit.inventory[item], moved);
                 unit.inventory[item] += moved;
@@ -1535,14 +1545,19 @@ impl GameState {
         quantity: i64,
         quoted_price: Option<i32>,
     ) {
-        let quantity = quantity.clamp(0, MAX_QUANTITY) as i32;
+        // Official order quantities are unbounded (`_parse_order` accepts any
+        // positive int); funds, shed room, and stock are the only bounds.
+        let quantity = quantity.clamp(0, i64::from(i32::MAX)) as i32;
         if quantity == 0 {
             return;
         }
         match operation {
             1 if (0..5).contains(&target) => {
                 let crop = target as usize;
-                let cost = CROP_SEED_COSTS[crop] * quantity;
+                // i64 product: seed cost * an unbounded quantity would
+                // overflow i32 (official Python uses bigints and simply
+                // fails the money check).
+                let cost = i64::from(CROP_SEED_COSTS[crop]) * i64::from(quantity);
                 if self.money[player] + MONEY_EPSILON >= cost as f32 {
                     self.money[player] = (self.money[player] - cost as f32).max(0.0);
                     self.seeds[player][crop] += quantity;
@@ -1611,7 +1626,9 @@ impl GameState {
     // Bulk processing applies only when the other player cannot act.
     // The interleaved path remains the reference path for two active players.
     fn apply_market_bulk(&mut self, player: usize, operation: i64, target: i64, quantity: i64) {
-        let quantity = quantity.clamp(0, MAX_QUANTITY) as i32;
+        // Unbounded like the official order quantity; every branch below
+        // bounds its work by shed room or stock.
+        let quantity = quantity.clamp(0, i64::from(i32::MAX)) as i32;
         if quantity == 0 {
             return;
         }
@@ -2436,8 +2453,8 @@ impl RustBatchEnv {
                 }
             }
             let quantities = [
-                action_value(actions, environment, 0, slot, 2).clamp(0, MAX_QUANTITY),
-                action_value(actions, environment, 1, slot, 2).clamp(0, MAX_QUANTITY),
+                action_value(actions, environment, 0, slot, 2).max(0),
+                action_value(actions, environment, 1, slot, 2).max(0),
             ];
             let max_quantity = quantities[0].max(quantities[1]);
             let mut active = [
@@ -2453,7 +2470,16 @@ impl RustBatchEnv {
                 state.apply_market_bulk(1, operations[1], targets[1], quantities[1]);
                 continue;
             }
+            // Official per-slot lockstep escape: the interpreter aborts the
+            // unit loop after 100k iterations (`idx_esc` guard in
+            // `_process_market`, kaggriculture.py). Unbounded order
+            // quantities make this reachable in principle; mirror it exactly.
+            let mut idx_esc: u64 = 0;
             for unit_index in 0..max_quantity {
+                idx_esc += 1;
+                if idx_esc >= 100_000 {
+                    break;
+                }
                 if !active[0] && !active[1] {
                     break;
                 }

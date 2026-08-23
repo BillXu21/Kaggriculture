@@ -2,6 +2,52 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Stage 2b slice 1: Worker/Ordering/Hiring/Market Differential Parity
+
+Drove the first targeted mechanics cluster to zero first divergence against
+the real pinned official 1.32.7 engine and committed the bounded result on
+`main` (no push).
+
+- **Probes:** new `tests/test_oracle_mechanics.py` — 27 focused scenarios
+  (~60 primitive turns total) covering worker inventory (unbounded PICKUP
+  subject to shed stock, item→quantity semantics, seeds never carried, day-end
+  drop with overflow discarded), same-turn ordering (workers before market:
+  pickup frees shed room before same-turn buy, same-turn buys not pickable,
+  deposit-then-sell), hiring (Fibonacci prices incl. `farmHandCostMult=3`,
+  hour-0 hire, no same-turn act, next-turn availability, unaffordable stop,
+  daily reset), and market (10-slot truncation, both-player per-slot lockstep
+  from the same pre-commit inventory, atomic HIRE/BUY_LAND, mid-order aborts
+  on funds/shed capacity, unbounded quantities, zero-net round-trip). Each
+  scenario replays identical action pairs through both engines with full
+  canonical compare every turn; key mechanics additionally pinned with exact
+  semantic assertions.
+- **Divergences found and fixed (each with a named regression):**
+  1. `fast_env/api.py` money decode: raw f32 normalize(10000) round-trip
+     produced spurious divergences on any money change (2993.0 vs
+     2992.999755859375); decode now rounds to the exact integer money.
+  2. `rust/.../lib.rs`: transition quantities were clamped to
+     `MAX_QUANTITY=100`; official order/PICKUP/PLACE quantities are unbounded
+     (first evidence: BUY_SEED WHEAT 150 → official 150 seeds/1500 money vs
+     fast 100/2000). Clamps replaced with resource bounds, BUY_SEED cost
+     computed in i64, official `_process_market` 100k per-slot lockstep escape
+     mirrored, and the PLACE shed path gained its official `n <= 0` no-op.
+  3. `fast_env/api.py`: malformed actions raised ValueError where the
+     official interpreter is a silent no-op (11th market order, unknown unit
+     op, seed-name PICKUP, unknown PLANT crop, non-dict action, missing
+     farmer, non-integer quantity); translation now emits no-op rows and
+     truncates hands/market lists like the official interpreter.
+- **Validation:** fresh GNU-toolchain maturin rebuild into the temp oracle
+  venv; `cargo fmt --check` clean; 15 Rust tests pass; focused oracle set in
+  the venv: 50 passed, 1 justified skip; full repository suite (system
+  Python): 266 passed, 34 skipped (official-engine live tests skip without
+  the venv), 0 failures — run with `--basetemp` under `Temp\opencode` because
+  the shared `pytest-of-liuyi` temp root is access-denied in this worktree
+  (pre-existing environmental issue, unrelated to these changes).
+- **Deferred with evidence:** >16 simultaneous hired hands (official has no
+  cap; fast core fixes 16 hand slots + fixed observation block; reaching 17
+  needs ≥4180 money of hires inside one day). Recorded in `MECHANICS.md`.
+  No full-parity or training-safety claim is made.
+
 ## 2026-08-23 — Stage 2a: Official Differential Oracle Implemented and Validated
 
 Completed, validated, documented, and committed the Stage-2a official

@@ -74,6 +74,14 @@ see the Stage-2a HISTORY entry; the trace is
 ## Known limitations (bounded, deliberate)
 
 - Fast engine supports `boardSize=10` and `maxMarketOrdersPerTurn=10` only.
+- The official engine has no hired-hand cap; the fast core fixes 16 hand
+  slots and a fixed observation block, so scenarios with >16 simultaneous
+  hands (needs >=4180 money of Fibonacci hires inside one day) are deferred
+  until an observation-schema revision. Submitted hand-action lists beyond 16
+  entries truncate to the first 16.
+- Fast observation money is recovered by rounding the f32 normalize(10000)
+  encoding; exact for the integer money values the official engine produces
+  (verified to well beyond realistic ranges).
 - Observation decoding inverts the FIXED season length
   (`generated_protocol::SEASON_STEPS = 720`), matching the Rust writer, NOT
   the configured `episodeSteps`; non-default `episodeSteps` therefore change

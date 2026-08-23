@@ -54,17 +54,24 @@ def _as_int(value: Any, label: str) -> int:
         raise ValueError(f"{label} must be an integer") from error
 
 
+NOOP_ROW = (0, 0, 0)
+
+
 def _unit_row(entry: Sequence[Any]) -> tuple[int, int, int]:
-    if not entry:
-        raise ValueError("unit action must not be empty")
+    # Official interpreter contract: any malformed / unknown unit action is a
+    # silent no-op (`_apply_unit_action` returns without mutating state), so
+    # the wire translation must never reject an action the official engine
+    # would quietly ignore -- it translates it to the no-op row instead.
+    if not isinstance(entry, (list, tuple)) or not entry:
+        return NOOP_ROW
     operation = str(entry[0])
     if operation not in UNIT_OP_CODES:
-        raise ValueError(f"unknown unit operation: {operation}")
+        return NOOP_ROW
     target = 0
     quantity = 0
     if operation == "PLANT":
         if len(entry) < 2 or entry[1] not in CROPS:
-            raise ValueError(f"invalid PLANT action: {entry!r}")
+            return NOOP_ROW
         target = CROPS.index(entry[1])
     elif operation == "BUILD_COOP":
         target = 0
@@ -72,51 +79,65 @@ def _unit_row(entry: Sequence[Any]) -> tuple[int, int, int]:
         target = 1
     elif operation == "PICKUP":
         if len(entry) < 2:
-            raise ValueError(f"invalid PICKUP action: {entry!r}")
+            return NOOP_ROW
         if entry[1] in ANIMALS:
             target = ANIMALS.index(entry[1]) + 1
         elif entry[1] in PRODUCTS:
             target = PRODUCTS.index(entry[1]) + 4
         else:
-            raise ValueError(f"unknown PICKUP item: {entry[1]}")
-        quantity = _as_int(entry[2], "PICKUP quantity") if len(entry) > 2 else 1
+            # Seed names and other non-shed items can never be carried
+            # (official PICKUP looks them up in the shed and finds nothing).
+            return NOOP_ROW
+        try:
+            quantity = _as_int(entry[2], "PICKUP quantity") if len(entry) > 2 else 1
+        except ValueError:
+            return NOOP_ROW
     elif operation == "PLACE":
         if len(entry) < 2:
-            raise ValueError(f"invalid PLACE action: {entry!r}")
+            return NOOP_ROW
         if entry[1] in ANIMALS:
             target = ANIMALS.index(entry[1])
         elif entry[1] in PRODUCTS:
             target = PRODUCTS.index(entry[1]) + 4
         else:
-            raise ValueError(f"unknown PLACE item: {entry[1]}")
-        quantity = _as_int(entry[2], "PLACE quantity") if len(entry) > 2 else 1
+            return NOOP_ROW
+        try:
+            quantity = _as_int(entry[2], "PLACE quantity") if len(entry) > 2 else 1
+        except ValueError:
+            return NOOP_ROW
     return UNIT_OP_CODES[operation], target, quantity
 
 
 def _market_row(entry: Sequence[Any]) -> tuple[int, int, int]:
-    if not entry or entry[0] == "PASS":
-        return 0, 0, 0
+    # Official `_parse_order` returns None (order skipped) for anything
+    # malformed, including non-integer or non-positive quantities.
+    if not isinstance(entry, (list, tuple)) or not entry or entry[0] == "PASS":
+        return NOOP_ROW
     operation = str(entry[0])
     if operation not in MARKET_IDS:
-        return 0, 0, 0
+        return NOOP_ROW
     if operation in {"HIRE", "BUY_LAND"}:
         return MARKET_IDS[operation], 0, 1
     if len(entry) < 3:
-        return 0, 0, 0
+        return NOOP_ROW
     target_name = entry[1]
     if operation == "BUY_ANIMAL":
         if target_name not in ANIMALS:
-            return 0, 0, 0
+            return NOOP_ROW
         target = ANIMALS.index(target_name)
     elif operation in {"BUY_SEED"}:
         if target_name not in CROPS:
-            return 0, 0, 0
+            return NOOP_ROW
         target = CROPS.index(target_name)
     elif target_name in PRODUCTS:
         target = PRODUCTS.index(target_name)
     else:
-        return 0, 0, 0
-    return MARKET_IDS[operation], target, _as_int(entry[2], f"{operation} quantity")
+        return NOOP_ROW
+    try:
+        quantity = _as_int(entry[2], f"{operation} quantity")
+    except ValueError:
+        return NOOP_ROW
+    return MARKET_IDS[operation], target, quantity
 
 
 def _encode_actions(actions: Sequence[Mapping[str, Any]]) -> np.ndarray:
@@ -124,17 +145,21 @@ def _encode_actions(actions: Sequence[Mapping[str, Any]]) -> np.ndarray:
         raise ValueError("actions must contain exactly two player action dictionaries")
     encoded = np.zeros((1, 2, 27, 3), dtype=np.int64)
     for player, action in enumerate(actions):
-        if not isinstance(action, Mapping) or "farmer" not in action:
-            raise ValueError(f"player {player} action must contain farmer")
-        encoded[0, player, 0] = _unit_row(action["farmer"])
-        hands = action.get("hands", [])
-        if len(hands) > 16:
-            raise ValueError("at most 16 hand actions are supported")
+        # Official interpreter: a non-dict action is treated as {} and every
+        # missing component defaults to PASS / [] / [].
+        if not isinstance(action, Mapping):
+            action = {}
+        # Official defaults; a missing "farmer" acts as ["PASS"].
+        farmer = action.get("farmer", ["PASS"])
+        # Extra submitted hand actions beyond the fixed 16 core slots are
+        # silent no-ops officially whenever the hired hand count is within
+        # the representable range (see docs note on the >16-hands deferral).
+        hands = action.get("hands", [])[:16]
+        # Official truncates the market queue to maxMarketOrdersPerTurn (10).
+        market = action.get("market", [])[:10]
+        encoded[0, player, 0] = _unit_row(farmer)
         for index, hand in enumerate(hands, start=1):
             encoded[0, player, index] = _unit_row(hand)
-        market = action.get("market", [])
-        if len(market) > 10:
-            raise ValueError("at most 10 market orders are supported")
         for index, order in enumerate(market):
             encoded[0, player, 17 + index] = _market_row(order)
     return encoded
@@ -195,7 +220,11 @@ def _decode_observation(raw: np.ndarray, player: int, configuration: Mapping[str
             for index in range(100)
         ]
         farms.append({
-            "money": float(raw[5 + farm_index] * 10000.0),
+            # Money is always an exact integer in the official engine
+            # (integer starting value, integer prices only); recovering it
+            # via rounding removes the f32 normalize(10000) round-trip noise
+            # that otherwise shows up as spurious canonical divergences.
+            "money": float(_round(raw[5 + farm_index] * 10000.0)),
             "tiles": [tiles[row * 10:(row + 1) * 10] for row in range(10)],
             "farmer": [_round(raw[position + 1] * 9.0), _round(raw[position + 2] * 9.0)],
             "hands": [[

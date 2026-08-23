@@ -345,6 +345,59 @@ Merged PR #1399:
 - glut-side curves remain unchanged;
 - intended to make carrot, tomato, and goose/egg production situationally viable under randomized shop demand.
 
+## Fast-Engine Differential Parity — Worker/Ordering/Hiring/Market (2026-08-23)
+
+First Stage-2b mechanics cluster proven against the real pinned official
+1.32.7 engine with same-action replay and full canonical compare after every
+turn (`tests/test_oracle_mechanics.py`, 27 scenarios; zero divergence). This
+proves fast-engine parity for the exercised actions only — not full parity.
+
+Confirmed exact behaviors (now `CONFIRMED_EXPERIMENT` via differential oracle,
+in addition to `CONFIRMED_SOURCE`):
+
+- worker inventory: no fixed slot count (item→quantity semantics); PICKUP n is
+  unbounded and clamped only by shed stock; seed names are never carried;
+  day-end carried inventories drop into the shed with overflow discarded;
+- same-turn ordering: workers act before the market — a PICKUP frees shed room
+  before a same-turn BUY, goods deposited this turn are sellable this turn,
+  and a same-turn market buy can never be picked up this turn;
+- hiring: Fibonacci prices 1, 1, 2, 3, 5, 8, ... scaled by `farmHandCostMult`;
+  hire works at hour 0; a new hand cannot act on its hire turn but acts the
+  next turn; unaffordable hires stop silently; `hires_today` resets at day end;
+- market: up to 10 ordered slots per player per turn with silent truncation of
+  extras; both players processed together per slot; HIRE/BUY_LAND are atomic
+  and ignore extra arguments; BUY/SELL commit per unit with both players
+  quoted from the same pre-commit inventory; orders abort mid-quantity on
+  insufficient funds or shed capacity while later slots still run; order
+  quantities are unbounded (resource-bounded only); a same-turn BUY 1 / SELL 1
+  round-trip nets exactly zero.
+
+Exact divergences found and fixed in the fast engine (each locked by a named
+regression):
+
+1. money observation decode trusted the raw f32 `normalize(10000)` round-trip,
+   so any money change produced spurious canonical divergences (official
+   2993.0 vs fast 2992.999755859375) — decode now rounds (`fast_env/api.py`);
+2. market/PICKUP/PLACE quantities were clamped to `MAX_QUANTITY = 100`
+   (BUY_SEED WHEAT 150 granted 100 seeds for 2000 money vs official 150 seeds
+   for 1500) — clamps removed in favor of resource bounds, BUY_SEED cost
+   widened to i64, and the official per-slot 100k lockstep iteration escape
+   mirrored (`rust/kaggriculture_env/src/lib.rs`);
+3. the wire translation raised ValueError for inputs the official engine
+   silently ignores (11th market order, unknown unit ops, seed-name PICKUP,
+   unknown PLANT crop, non-dict action, missing farmer, non-integer order
+   quantity) — malformed actions now translate to no-op rows and hands/market
+   lists truncate like the official interpreter (`fast_env/api.py`).
+
+Known bounded deferral: the official engine has no hired-hand cap, while the
+fast core fixes 16 hand slots and encodes hand positions in a fixed
+observation block. Reaching >16 simultaneous hands requires ≥4180 money of
+Fibonacci hires inside one day (reachable in principle), so scenarios beyond
+16 hands are out of scope until an observation-schema revision; submitted
+hand-action lists beyond 16 entries truncate to the first 16.
+
+Confidence: `CONFIRMED_EXPERIMENT` (differential oracle, pinned 1.32.7).
+
 ## Randomness and Determinism
 
 Current interpretation:
