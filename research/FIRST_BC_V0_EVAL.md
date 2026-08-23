@@ -155,3 +155,38 @@ Useful executor-compliance metrics:
 - final banks and paired W/L/T.
 
 If compliance is poor, improve execution before blaming the learned manager. If compliance is high and economic trajectories are still poor, then revisit manager targets/representation before adding PPO complexity.
+
+Detailed executor draft and its own deferred-optimization list now live in `research/EXECUTOR_V0_PLAN.md`.
+
+## Deliberate BC V0 simplifications and revisit backlog
+
+Earlier D-019 notes already recorded many of these choices under "explicitly deferred" and "alternatives considered," but they were spread across decision/implementation documents. This section is the explicit backlog so later work does not mistake V0 shortcuts for settled optimal choices.
+
+- **Stateless once-per-day policy.** No recurrence, previous hidden state, or explicit multi-day temporal model. Revisit if closed-loop errors depend on history not reconstructable from the current state or if PPO needs temporal credit/state.
+- **One manager call per day.** Only selling retains six intra-day bins. Revisit if strategically important crop/animal/resource decisions repeatedly need same-day reaction.
+- **Opponent-public board disabled in the first trained model.** The canonical data preserves it and the model supports it, but V0 did not use it. Revisit after the own-state closed loop works, especially for shared-market/opponent-production adaptation.
+- **No opponent-private inference.** Hidden shed/seeds/inventory are not estimated. Revisit only after public-state conditioning is proven useful and partial observability is an identified bottleneck.
+- **Absolute count targets rather than deltas or per-tile actions.** Crop/animal/land outputs are resulting counts; fertilizer/CARE are type-level daily totals. Revisit if the executor repeatedly faces ambiguous realization choices or if minimum-change deltas train/execute better.
+- **No tile-specific fertilizer/CARE control.** Exact target selection is delegated to the executor. Revisit if lifecycle heterogeneity makes type-level counts insufficient.
+- **Factorized output heads.** Crop, animal, land, fertilizer, CARE, sell-presence, and sell-quantity heads share the manager representation but do not enforce a joint feasibility distribution. Revisit if inconsistent combinations are common in closed loop.
+- **Fixed count vocabulary 0..100.** Convenient for current targets rather than a claim that categorical count prediction is optimal. Revisit if count resolution/scaling becomes a learning bottleneck.
+- **Six four-hour sell bins.** Exact event timing is preserved canonically, but V0 does not learn 24-turn reactive selling. Revisit because selling remains the clearest teacher-forced weakness.
+- **Per-event sell cap 100 in the BC adapter.** This removes sell-all sentinel scale before bin aggregation while preserving repeated events. Revisit if closed-loop sale intent systematically under/overstates desired liquidation.
+- **Fixed 0.5 sell-presence threshold.** No calibration or threshold tuning was performed. Revisit after measuring closed-loop precision/recall and economic cost of missed/extra sales.
+- **Seven equal loss-group weights.** No focal loss, class balancing, sparse-target reweighting, or learned uncertainty weighting. Rare fertilizer recall remains weak. Revisit only if those misses matter in games.
+- **Small default model chosen without architecture sweep.** The 1.071M Transformer is a deliberately boring reference, not an optimized size. No scheduler, width/depth sweep, or larger model was tested. Revisit after closed-loop behavior establishes that representation capacity is actually limiting.
+- **Five-day elite corpus and `min_score >= 2950`.** No cutoff sweep, later-date expansion, trajectory-family reweighting, or deduplication was used for the first run. The corpus contains substantial repeated strategy families. Revisit if later held-out dates/strategies reveal imitation-family overconcentration.
+- **Single held-out date protocol.** Aug-21 is a meaningful distribution shift but not a full generalization suite. Revisit with rolling dates, later partitions, held-out strategy families, and eventually closed-loop opponent/seed panels.
+- **No DAgger / on-policy correction.** Training is pure teacher-forced BC from replay states. Revisit if closed-loop state drift creates compounding errors that held-out replay metrics cannot predict.
+- **No value head or PPO objective.** BC only initializes strategy. Revisit after the deterministic executor and fixed-opponent closed-loop problem are stable.
+- **No confidence-aware execution.** Argmax/count and thresholded sell predictions are treated as actions without using model uncertainty. Revisit if low-confidence outputs correlate with destructive executor choices.
+
+### Current known weak points to retain
+
+- crop counts are often close but not exact, especially wheat/strawberry;
+- rare tomato/carrot fertilizer recall is weak;
+- sell presence recall is ~64.8% and predictions are conservative;
+- teacher-forced metrics cannot establish closed-loop competence;
+- date-held-out success does not prove strategy-family or opponent generalization.
+
+These are deferred questions, not reasons to delay the first real game loop. The next evidence should determine which backlog items deserve complexity.
