@@ -1,11 +1,14 @@
 """V0 deterministic executor package (issue #1).
 
-Stage 2 surface only: typed daily plan, daily manager wrapper with injection
-seam and once-per-day caching, and mechanical requested->feasible projection.
-Layout/reconciliation, task generation, foreman, agent runtime, hiring,
-purchasing, and primitive sell execution arrive in later stages.
+Complete closed-loop surface: typed daily plan, daily manager wrapper with
+injection seam and once-per-day caching, mechanical requested->feasible
+projection, layout/reconciliation, per-turn task generation, greedy foreman,
+and the stateful `ExecutorAgent` with hiring, shortage purchasing, bin sells,
+JSON diagnostics, deterministic PASS fallback, plus the optional engine smoke
+harness (`python -m executor_v0.smoke`).
 """
 
+from .agent import AgentConfig, ExecutorAgent, make_agent
 from .manager import (
     CachingPlanProvider,
     CheckpointPlanProvider,
@@ -32,4 +35,7 @@ __all__ = [
     "Priority",
     "GenerationResult",
     "generate_tasks",
+    "AgentConfig",
+    "ExecutorAgent",
+    "make_agent",
 ]

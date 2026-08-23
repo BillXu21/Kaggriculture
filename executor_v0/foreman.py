@@ -5,11 +5,13 @@ assignment, soft inventory specialization, and exactly one legal Manhattan
 step or interaction per worker. No search/VRP/pathfinder; routes are
 recomputed by the caller every turn.
 
-Shed access mechanic — replay-verified evidence: in elite 1.32.7 replays
-(local sample episode 94735084), every observed PICKUP/DROP (269 events,
-both seats) occurs at one of the four center tiles ``[x,y] in
+Shed access mechanic — replay-derived evidence: in elite 1.32.7 replays
+(local sample episode 94735084), all 269 observed PICKUP/DROP events (both
+seats) occur at one of the four center tiles ``[x,y] in
 {(4,4),(5,4),(4,5),(5,5)}``, i.e. ``[y,x]`` coords
-``{(4,4),(4,5),(5,4),(5,5)}``. These are exposed as `SHED_ACCESS_TILES` and
+``{(4,4),(4,5),(5,4),(5,5)}``. These tiles are therefore overwhelmingly
+observed to be valid pickup/drop locations; the sample does not prove they
+are the *only* legal ones. They are exposed as `SHED_ACCESS_TILES` and
 configurable via `ForemanConfig.shed_access_tiles`.
 
 Worker op encoding — replay-verified: every worker action is a list;
@@ -17,6 +19,11 @@ bare ops are single-element lists (`["WATER"]`, `["NORTH"]`, `["PASS"]`);
 argument ops append strings/ints (`["PLANT","WHEAT"]`,
 `["PICKUP","FERTILIZER",3]`, `["PLACE","COW",1]`). Movement deltas:
 NORTH dy=-1, SOUTH dy=+1, EAST dx=+1, WEST dx=-1.
+
+Intentional V0 backlog (not an engine rule): movement only considers steps
+that reduce Manhattan distance and conservatively avoids locked tiles; when
+both reducing steps are illegal the worker PASSes instead of sidestepping.
+A one-step lookahead/sidestep is deferred to the post-V0 upgrade backlog.
 """
 
 from collections.abc import Mapping, Sequence

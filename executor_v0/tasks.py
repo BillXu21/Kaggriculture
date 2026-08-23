@@ -198,6 +198,15 @@ def generate_tasks(
     unresolved: list[str] = []
     tasks: list[Task] = []
 
+    # Existing on-board animals always count toward the feasible targets;
+    # the layout planner slots positive deficits only (never duplicates).
+    current_animals = {name: 0 for name in ANIMAL_ORDER}
+    for row in board:
+        for tile in row:
+            if isinstance(tile, Mapping) and tile.get("animal") \
+                    in current_animals:
+                current_animals[tile["animal"]] += 1
+
     if reconcile_result is None:
         reconcile_result = reconcile_crops(
             board, unlocked_quadrants=unlocked,
@@ -206,7 +215,8 @@ def generate_tasks(
         animal_layout_result = plan_animal_layout(
             board, unlocked_quadrants=unlocked,
             animals_needed={
-                name: max(0, feasible_plan.animal_targets_dict[name])
+                name: max(0, feasible_plan.animal_targets_dict[name]
+                          - current_animals[name])
                 for name in ANIMAL_ORDER
             },
             anchor=anchor)
