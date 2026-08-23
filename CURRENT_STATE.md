@@ -4,10 +4,25 @@ Last updated: 2026-08-23
 
 ## Snapshot
 
-- Phase: **issue #1 deterministic executor V0 is implemented and locally validated (249 tests); next gate is a real `best.pt` game through local `kaggle_environments` 1.32.7, which is not installed in this worktree**.
+- Phase: **Stage-2a official differential oracle is implemented, validated, and committed (273 tests); next gates are a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv now documented in `oracle/README.md`) and Stage-2b broad parity sweeps**.
 - Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
 - Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
 - Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.
+
+## Differential Oracle (Stage 2a)
+
+`oracle/` provides a same-action replay harness: the exact same action pair is
+submitted to the pinned official 1.32.7 engine and the fast Rust engine each
+turn BEFORE an immediate canonical full-state compare; the run stops at the
+first divergent field with seed/step/day/hour/path/values/actions context
+(usage + temp-official setup: `oracle/README.md`, decision D-020).
+
+Validated so far: initial-state parity, short legal traces (BUY_SEED/PLANT/
+WATER), both-seat privacy comparison, deliberate-corruption first-divergence,
+terminal rewards/statuses at `episodeSteps=3`, provenance tamper rejection,
+and a 28-turn pass-only day-boundary smoke — all with zero divergence against
+the real official engine in the temp venv. **Broad mechanic/full-episode
+parity remains Stage 2b; no full-parity or training-safety claim is made.**
 
 ## Learned-Control Contract
 

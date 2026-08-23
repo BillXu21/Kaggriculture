@@ -14,7 +14,22 @@ CROPS = PRODUCTS[:5]
 ANIMALS = ("GOOSE", "COW", "SHEEP")
 SHOPS = ("BAKERY", "BRUNCH_SPOT", "FARMERS_MARKET", "ICE_CREAM_SHOP", "PET_CAFE", "PIZZA_SHOP", "SMOOTHIE_SHOP", "YARN_STORE")
 UNIT_IDS = {name: index for index, name in enumerate(("PASS", "NORTH", "SOUTH", "EAST", "WEST", "PICKUP", "PLACE", "DROP", "PLANT", "WATER", "HARVEST", "FERTILIZE", "BUILD_COOP", "BUILD_PASTURE", "FEED", "COLLECT_FERTILIZER", "CARE", "DIG"))}
+# Operation codes the Rust core's `apply_unit_action` actually dispatches on
+# (rust/kaggriculture_env/src/lib.rs). These intentionally differ from the
+# wire vocabulary order in `UNIT_IDS`; sending wire ids untranslated made
+# e.g. "PLANT" (wire 8) land in the core's BUILD-structure arm (internal 8).
+UNIT_OP_CODES = {
+    "PASS": 0, "NORTH": 1, "SOUTH": 2, "EAST": 3, "WEST": 4,
+    "PICKUP": 11, "PLACE": 9, "DROP": 15, "PLANT": 5, "WATER": 10,
+    "HARVEST": 6, "FERTILIZE": 12, "BUILD_COOP": 8, "BUILD_PASTURE": 8,
+    "FEED": 7, "COLLECT_FERTILIZER": 14, "CARE": 13, "DIG": 17,
+}
 MARKET_IDS = {name: index for index, name in enumerate(("PASS", "BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "SELL", "HIRE", "BUY_LAND"))}
+# The Rust observation writer normalizes the primitive step and plant
+# lifespan by this FIXED season length (generated_protocol::SEASON_STEPS),
+# not by the configured episodeSteps; decoding must invert exactly that
+# constant or step/day/hour are wrong whenever episodeSteps != 720.
+SEASON_STEPS = 720
 DEFAULT_CONFIGURATION: dict[str, Any] = {
     "episodeSteps": 720,
     "boardSize": 10,
@@ -43,7 +58,7 @@ def _unit_row(entry: Sequence[Any]) -> tuple[int, int, int]:
     if not entry:
         raise ValueError("unit action must not be empty")
     operation = str(entry[0])
-    if operation not in UNIT_IDS:
+    if operation not in UNIT_OP_CODES:
         raise ValueError(f"unknown unit operation: {operation}")
     target = 0
     quantity = 0
@@ -51,6 +66,10 @@ def _unit_row(entry: Sequence[Any]) -> tuple[int, int, int]:
         if len(entry) < 2 or entry[1] not in CROPS:
             raise ValueError(f"invalid PLANT action: {entry!r}")
         target = CROPS.index(entry[1])
+    elif operation == "BUILD_COOP":
+        target = 0
+    elif operation == "BUILD_PASTURE":
+        target = 1
     elif operation == "PICKUP":
         if len(entry) < 2:
             raise ValueError(f"invalid PICKUP action: {entry!r}")
@@ -71,7 +90,7 @@ def _unit_row(entry: Sequence[Any]) -> tuple[int, int, int]:
         else:
             raise ValueError(f"unknown PLACE item: {entry[1]}")
         quantity = _as_int(entry[2], "PLACE quantity") if len(entry) > 2 else 1
-    return UNIT_IDS[operation], target, quantity
+    return UNIT_OP_CODES[operation], target, quantity
 
 
 def _market_row(entry: Sequence[Any]) -> tuple[int, int, int]:
@@ -125,7 +144,7 @@ def _round(value: float) -> int:
     return int(round(float(value)))
 
 
-def _tile(raw: np.ndarray, day: int, episode_steps: int) -> Any:
+def _tile(raw: np.ndarray, day: int) -> Any:
     if raw[1] > 0.5:
         return "LOCKED"
     if raw[2] > 0.5:
@@ -133,7 +152,7 @@ def _tile(raw: np.ndarray, day: int, episode_steps: int) -> Any:
         age = _round(raw[14] * 30.0)
         return {
             "kind": "PLANT", "crop": crop, "age": age, "planted_day": day - age,
-            "max_lifespan_step": _round(raw[16] * episode_steps),
+            "max_lifespan_step": _round(raw[16] * SEASON_STEPS),
             "yield_units": _round(raw[15] * 100.0),
             "watered_today": bool(raw[17] > 0.5),
             "consecutive_unwatered": _round(raw[18] * 2.0),
@@ -162,9 +181,8 @@ def _inventory(raw: np.ndarray, start: int) -> dict[str, int]:
 
 
 def _decode_observation(raw: np.ndarray, player: int, configuration: Mapping[str, Any]) -> dict[str, Any]:
-    episode_steps = int(configuration["episodeSteps"])
     turns_per_day = int(configuration["turnsPerDay"])
-    step = _round(raw[0] * episode_steps)
+    step = _round(raw[0] * SEASON_STEPS)
     day = step // turns_per_day
     hour = step % turns_per_day
     farms: list[dict[str, Any]] = []
@@ -173,7 +191,7 @@ def _decode_observation(raw: np.ndarray, player: int, configuration: Mapping[str
         hands_position = 5280 + farm_index * 17
         hand_count = max(0, min(16, _round(raw[hands_position] * 16.0)))
         tiles = [
-            _tile(raw[62 + farm_index * 2600 + index * 26:62 + farm_index * 2600 + index * 26 + 26], day, episode_steps)
+            _tile(raw[62 + farm_index * 2600 + index * 26:62 + farm_index * 2600 + index * 26 + 26], day)
             for index in range(100)
         ]
         farms.append({

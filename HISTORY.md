@@ -2,6 +2,49 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Stage 2a: Official Differential Oracle Implemented and Validated
+
+Completed, validated, documented, and committed the Stage-2a official
+differential-oracle infrastructure (decision D-020). Single bounded commit on
+`main`; no push.
+
+- **New modules (`oracle/`):** `provenance.py` (exact-pin guard:
+  `kaggle-environments==1.32.7`, wheel SHA256 `2a1bb862...c4c8f`, interpreter
+  files byte-matching upstream commit `28b6d8af...ab8c`); `backend.py`
+  (official/fast engine seam, lazy official imports); `official_backend.py`
+  (raw same-pair submission, full status-history anomaly detection so terminal
+  DONE cannot mask ERROR/INVALID/TIMEOUT); `canonical.py` (one canonical
+  schema: step/day/hour, both farms with full board + crop/animal lifecycle,
+  per-seat private shed/seeds/inventories, market inventory/prices/params,
+  town shops with duplicate multiplicity, rewards, statuses; field-path deep
+  diff); `replay.py` (same-action turn-by-turn replay, first-divergence report
+  with seed/step/day/hour/path/values/actions, deliberate-corruption mutator
+  seam). Usage + temp-official setup: `oracle/README.md`.
+- **Fast API fixes (`fast_env/api.py`, regression-tested):** wire unit
+  operation ids now translate to the Rust core's internal op codes via
+  `UNIT_OP_CODES` (previously e.g. PLANT wire 8 landed in the build-structure
+  arm internal 8); observation decoding inverts the FIXED
+  `generated_protocol::SEASON_STEPS = 720` instead of the configurable
+  `episodeSteps`.
+- **Validation:** fresh GNU-toolchain rebuild of the extension into the temp
+  oracle venv (`Temp\opencode\kagg_oracle_venv`, rustup/cargo homes under
+  `Temp\opencode`), then focused run against the REAL official engine:
+  23 passed, 1 justified skip (in-process Kaggle-import assertion is vacuous
+  when the oracle legitimately imported it; fresh-process isolation tests own
+  that guarantee) — covering initial-state parity, short legal traces,
+  both-seat privacy, deliberate corruption at exact turn/path, terminal
+  rewards at `episodeSteps=3`, provenance tamper rejection, and fresh-process
+  import isolation. New regressions added to `tests/test_fast_env.py` for
+  wire-op translation (+ behavioral PLANT-arm proof) and fixed-720 decode with
+  `episodeSteps=5`. Day-boundary smoke: 28 pass-only turns across day 0 -> 1,
+  zero divergence, ~0.9 s. Full repository suite (system Python, no official):
+  266 passed, 7 skipped (official-dependent oracle tests skip via provenance
+  guard); an unrelated pre-existing `PermissionError` on the stale
+  `Temp\pytest-of-liuyi` pytest root required `--basetemp` under the temp root.
+- **Explicitly NOT done (Stage 2b):** broad mechanic probes, random/legal-ish
+  corpus, multiple full 720-turn episodes, closed-loop A/B, benchmark report.
+  No full-parity or training-safety claim is made.
+
 ## 2026-08-23 — Issue #1 Implemented: Deterministic Closed-Loop BC Executor V0
 
 Implemented the complete issue #1 packet (`Codex packet: minimal closed-loop

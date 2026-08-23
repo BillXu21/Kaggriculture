@@ -180,3 +180,14 @@ This file records decisions that remain authoritative across chats and work sess
 - CARE attribution remains a canonical-schema correction under D-018 (`targets.care_by_animal`); this decision consumes it as one head and does not re-decide it.
 - Detailed contract and alternatives: `.agents/notes/implemented/2026-08-22-use-configurable-tile-transformer-for-initial-bc-manager.md`.
 - Revisit when: closed-loop evaluation shows the daily abstraction or output parameterization loses strategically necessary control, the state-aware model fails to beat the train-only day baseline, or PPO refinement requires value/temporal extensions.
+
+## D-020 - Use a Pinned Official Same-Action Differential Oracle Before Broad Parity Work
+
+- Date: 2026-08-23
+- Status: active
+- Decision: All fast-engine correctness claims route through `oracle/`: the official engine is exactly `kaggle-environments==1.32.7` (wheel SHA256 `2a1bb862ad2d6463080f80f6a766f46d94b53fd57168cfeddb9857fc3dbc4c8f`, interpreter files byte-matching upstream commit `28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c`) enforced by a provenance guard that refuses to run otherwise. Replay submits the exact same action pair to both engines each turn BEFORE an immediate canonical full-state compare and stops at the first divergent field with seed/step/day/hour/path/values/actions context. The official backend imports `kaggle_environments` lazily; the fast hot path never imports Kaggle/OpenSpiel (fresh-process tested). Validity requires the FULL per-step status history to stay within {ACTIVE, DONE}; terminal DONE never masks earlier anomalies.
+- Canonical comparison is exact, not shallow: step/day/hour; both farms (money, full 10x10 board incl. crop AND animal lifecycle, farmer/hand positions, hires_today, unlocked quadrants); both seats' private shed/seeds/farmer+hand inventories; market inventory/prices plus exact `params` when present; town shops with duplicate multiplicity; rewards; statuses.
+- Fast API contract corrections folded in: wire unit operation ids translate to the Rust core's internal op codes (`UNIT_OP_CODES`), and observation decoding inverts the FIXED `generated_protocol::SEASON_STEPS = 720`, never the configurable `episodeSteps`.
+- Rationale: Stage 2b broad mechanic/full-episode parity is only trustworthy on top of a reusable turn-level oracle with exact provenance; untranslated wire ops and wrong decode scale silently corrupted fast-vs-official comparisons.
+- Scope boundary: passing traces prove parity only for exercised actions. Broad probes, random corpora, full 720-turn episodes, closed-loop A/B, and benchmarks remain Stage 2b; no full-parity or training-safety claim follows from this decision.
+- Revisit when: the official pin moves (new engine version), the canonical schema needs fields the official observation does not expose, or Stage 2b evidence demands richer first-divergence context.
