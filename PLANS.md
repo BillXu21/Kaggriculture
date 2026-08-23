@@ -1,14 +1,16 @@
 # Kaggriculture Plans
 
-Last updated: 2026-08-16
+Last updated: 2026-08-23
 
 ## Strategic Objective
 
 Build a competitive Kaggriculture agent in which **reinforcement learning owns meaningful farm and market decisions**, while deterministic infrastructure handles exact mechanics that are poor uses of learning capacity: legality, pathfinding, task execution, state bookkeeping, and prevention of meaningless invalid-action cascades.
 
-The immediate phase remains design and measurement rather than expensive training. The host has stated that 1.32.7 should be the last balance change except game-breaking bugs, so the project can now prepare to freeze the engine contract while still checking for bug-fix releases.
+The immediate phase is now **closed-loop BC/executor validation plus implementation of reusable RL infrastructure**. The host has stated that 1.32.7 should be the last balance change except game-breaking bugs, so the project can prepare to freeze the engine contract while still checking for bug-fix releases.
 
 Detailed RL design lives in [`research/RL_DESIGN.md`](research/RL_DESIGN.md).
+
+A temporary high local coding-agent-usage window is being used for large, mechanically testable infrastructure packets that are likely to be needed regardless of later strategy choices. The bounded sprint plan is in [`research/CODING_AGENT_SPRINT.md`](research/CODING_AGENT_SPRINT.md). This does **not** supersede the staged learning gates: infrastructure may be prepared early, but PPO/self-play complexity is not activated before the simpler stationary problems work.
 
 ## Phase 0 — Freeze 1.32.7, Rules, RNG, and Provenance
 
@@ -328,18 +330,18 @@ Do not start here before a functioning RL baseline.
 
 ## Immediate Planning Agenda
 
-1. freeze 1.32.7 source/spec/hash;
-2. implement/verify hinge regression tests once coding begins;
-3. map RNG and reveal timing;
-4. design action grammar/candidate generation;
-5. choose market quantity representation;
-6. version observation schema with curve/knee features;
-7. formalize reward/potential and mark-to-market safeguards;
-8. define BC weighting/data schema;
-9. define PPO/self-play/evaluation gates;
-10. run scarcity/pivot/opponent-suppression studies;
-11. benchmark simulator throughput;
-12. recheck upstream for bug fixes immediately before training.
+1. finish the real engine-executed BC-manager + executor smoke and require non-empty per-day diagnostics/compliance;
+2. implement the common official-engine evaluation/match runner from `research/CODING_AGENT_SPRINT.md`;
+3. implement the scalar exact fast engine and differential oracle against pinned 1.32.7;
+4. implement population/league infrastructure with deterministic paired scheduling and explicit promotion gates;
+5. implement algorithm-neutral rollout storage, returns/GAE, and deterministic minibatching;
+6. prove self-play orchestration with fake/frozen policies before attaching a learner;
+7. only then add the PPO-specific value/log-prob/loss interface after the executor compliance gate;
+8. freeze 1.32.7 source/spec/hash and keep upstream bug-fix watch;
+9. map remaining RNG/reveal timing and maintain engine differential tests;
+10. benchmark official and fast simulator throughput;
+11. build frozen competent-opponent panels and strategy-family cross-play;
+12. recheck upstream immediately before substantive training.
 
 ## Deferred Until Evidence Supports Them
 
@@ -349,7 +351,10 @@ Do not start here before a functioning RL baseline.
 - neural pathfinding;
 - hard-coded fixed product ranking;
 - large architecture sweeps before interface/reward contracts are stable;
-- expensive training before engine lock and throughput measurements.
+- expensive training before engine lock and throughput measurements;
+- sophisticated PFSP/league matchmaking before fixed-mixture self-play works;
+- distributed rollout infrastructure before local throughput is profiled;
+- approximate/vectorized custom simulation before scalar differential parity.
 
 ## Rejected or Unsupported Assumptions
 
