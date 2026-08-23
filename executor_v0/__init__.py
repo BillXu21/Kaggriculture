@@ -15,6 +15,7 @@ from .manager import (
 )
 from .plan import SELL_BIN_ANCHORS, DailyPlan
 from .projection import ProjectionResult, clip_sell, project_plan
+from .tasks import GenerationResult, Priority, Task, generate_tasks
 
 __all__ = [
     "DailyPlan",
@@ -27,4 +28,8 @@ __all__ = [
     "ProjectionResult",
     "project_plan",
     "clip_sell",
+    "Task",
+    "Priority",
+    "GenerationResult",
+    "generate_tasks",
 ]
