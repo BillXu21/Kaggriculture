@@ -2,6 +2,67 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Issue #1 Implemented: Deterministic Closed-Loop BC Executor V0
+
+Implemented the complete issue #1 packet (`Codex packet: minimal closed-loop
+BC executor V0`) in staged local commits on `main`, all validated before
+acceptance. No push occurred until the docs commit of this date.
+
+- **Commit chain:** `11e85fa` live observation encoder with exact BC adapter
+  parity; `b998eb4` immutable `DailyPlan`, manager wrapper (injection seam,
+  checkpoint/fake providers, once-per-day caching), mechanical feasibility
+  projection; `cef81fa` deterministic animal layout + minimum-change crop
+  reconciliation; `6c5b7fe`+`a8709d0` explicit per-turn task records and
+  generation (COLLECT_FERTILIZER gated on canonical raw
+  `fertilizer_available`); `01dbf0a` greedy foreman dispatch; `fb01ab6`
+  stateful agent integration (hiring, purchases, land, six-bin sells,
+  diagnostics, safe-mode fallback, smoke harness); `ed1685a` correctness
+  repairs (global seed legality/reservation, honest market-cap bookkeeping,
+  continuously current achieved diagnostics, non-tautological privacy test).
+- **Closed loop per turn:** live schema-v3 obs -> once-per-day manager call
+  with previous-day realized-labor feedback (observed `hires_today`
+  progression priced by the exact Fibonacci hire cost) -> requested/feasible
+  plan projection -> layout/reconciliation -> task regeneration ->
+  foreman dispatch -> bounded deterministic market queue (SELL in the active
+  four-hour bin clipped to actual shed inventory via `clip_sell`; hour-0-only
+  crude workload hiring; exact-shortage BUY_SEED/BUY_PRODUCT/BUY_ANIMAL and
+  single BUY_LAND) -> legal-shaped action dict + JSON diagnostics +
+  deterministic all-PASS fallback on any runtime failure.
+- **Seed mechanic (1.32.7):** `PLANT <crop>` consumes the global own
+  `private.seeds[crop]` pool atomically at the engine; seeds are never
+  picked up or carried. The foreman reserves global seeds per crop within
+  each turn (deterministic across workers); blocked plants stay unassigned
+  with an honest `no_global_seeds` reason; shortages surface as BUY_SEED.
+- **Validation:** full suite grew 102 -> 249 tests, all passing (authorized
+  pytest basetemp required on this worktree). Live encoder parity verified on
+  synthetic and real replay observations. Determinism coverage at every
+  layer. A 719/720-turn replay-observation plumbing smoke exercised the full
+  agent with zero illegal shapes and zero fallback errors; counterfactual
+  actions were NOT executed by an engine, so this proves shape/state
+  robustness only, not game legality or quality. A real
+  `kaggle_environments` 1.32.7 game was NOT run because the package is not
+  installed in this worktree; the smoke harness detection/skip path
+  (`SKIP:` message, exit code 3) is verified and nothing was installed or
+  vendored.
+- **Deliberate V0 simplifications preserved** (see
+  `research/EXECUTOR_V0_PLAN.md`): no reserved animal zone/future onset
+  prediction; centralized lifecycle-proxy sacrifice score; sticky layout, no
+  facility optimization; greedy assignment without search/VRP; one-step
+  Manhattan movement without sidestep/pathfinder; soft inventory
+  specialization; crude hour-0 hiring (`tasks_per_worker=10` provisional);
+  mechanical feed/resource procurement without emergency-feed safety buys;
+  literal six-bin selling with no price timing; market cap can defer
+  lower-priority hires/buys to next-turn recomputation; no opponent strategy,
+  learned executor, or PPO.
+- **Newly recorded assumptions/backlog:** shed access uses the four center
+  tiles as overwhelmingly observed valid locations from elite replays, not a
+  source-locked universal rule; movement conservatively avoids LOCKED tiles
+  even though the engine may permit stepping there; worker interaction
+  requiring the current tile needs engine-smoke confirmation; pickup batch 5
+  is provisional; the farmer-anchored layout can thrash before the first
+  build commits (documented revisit, intentionally not repaired in this
+  packet).
+
 ## 2026-08-22 — Canonical Schema v3: Official Worker `[x,y]` Tile-Lookup Correction
 
 Correctness fix under D-018 (commit `e67f1b7`; no architecture change; D-019

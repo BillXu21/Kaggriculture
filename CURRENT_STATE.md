@@ -1,10 +1,10 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-22
+Last updated: 2026-08-23
 
 ## Snapshot
 
-- Phase: **first BC manager is trained and passes held-out/day-baseline diagnostics; next gate is the smallest complete deterministic executor and real closed-loop games**.
+- Phase: **issue #1 deterministic executor V0 is implemented and locally validated (249 tests); next gate is a real `best.pt` game through local `kaggle_environments` 1.32.7, which is not installed in this worktree**.
 - Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
 - Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
 - Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.
@@ -107,6 +107,30 @@ Known weak points such as rare fertilizer recall and conservative selling remain
 
 ## Deterministic Executor V0
 
+**Implemented (issue #1, commits `11e85fa`..`ed1685a`).** The complete
+closed loop lives in `executor_v0/` (usage: `executor_v0/README.md`):
+
+live schema-v3 observation encoding (exact BC adapter parity) ->
+once-per-day manager (`CheckpointPlanProvider` or injected fake) ->
+immutable `DailyPlan` -> mechanical feasibility projection ->
+deterministic animal layout / minimum-change crop reconciliation ->
+per-turn explicit task generation -> greedy foreman dispatch ->
+hour-0 crude hiring, exact-shortage purchases, BUY_LAND, six-bin sells ->
+legal-shaped `{"farmer", "hands", "market"}` action dict plus JSON
+diagnostics (requested/feasible/achieved/submitted/observed) and a
+deterministic all-PASS safe-mode fallback.
+
+Key mechanic: `PLANT <crop>` consumes the global own `private.seeds[crop]`
+pool atomically at the engine; seeds are never picked up or carried, and the
+foreman reserves global seeds per crop within each turn.
+
+Validation so far: 249 tests pass; live encoder parity (synthetic + real);
+determinism coverage; a 719/720-turn replay-observation plumbing smoke
+(shape/state robustness only — counterfactual actions were never executed by
+the engine). A real 1.32.7 game has NOT been run because
+`kaggle_environments` is not installed here; the smoke harness skip path
+(exit 3) is verified.
+
 The current first-draft algorithm is recorded in `research/EXECUTOR_V0_PLAN.md`.
 
 Core design:
@@ -161,8 +185,8 @@ If compliance is poor, improve execution before blaming BC. If compliance is hig
 
 ## Near-Term Sequence
 
-1. Turn `research/EXECUTOR_V0_PLAN.md` into a bounded implementation contract and build the smallest complete executor.
-2. Get the current `best.pt` through full local 1.32.7 games.
+1. ~~Turn `research/EXECUTOR_V0_PLAN.md` into a bounded implementation contract and build the smallest complete executor.~~ Done (issue #1).
+2. Get the current `best.pt` through full local 1.32.7 games (`python -m executor_v0.smoke --manager checkpoint --checkpoint best.pt`).
 3. Inspect compliance before optimizing score.
 4. Run a small paired fixed-seed/seat-swapped frozen-opponent panel.
 5. Use evidence to choose the next bottleneck: executor search/layout, BC refinement/data, opponent inputs, or PPO.

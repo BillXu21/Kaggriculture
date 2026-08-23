@@ -2,6 +2,14 @@
 
 Date: 2026-08-22
 
+> **Status update 2026-08-23:** the deterministic executor that consumes this
+> checkpoint now exists (`executor_v0/`, issue #1, commits `11e85fa`..
+> `ed1685a`) and is locally validated (249 tests; replay-observation plumbing
+> smoke). **No real `best.pt` engine evaluation has happened yet** —
+> `kaggle_environments` is not installed in the implementation worktree, so
+> the "Next gate: closed-loop V0" section below remains entirely open. The
+> first real game command is documented in `executor_v0/README.md`.
+
 This note records the first full behavior-cloning run over the five-day canonical schema-v3 corpus and the held-out Aug-21 evaluation that followed it.
 
 ## Provenance

@@ -3,6 +3,40 @@
 Date: 2026-08-22
 Status: first implementation draft; intentionally simple
 
+## Implementation status (2026-08-23)
+
+Sections 1–11 are **implemented** in `executor_v0/` (commits `11e85fa`..
+`ed1685a`, issue #1) exactly as simple first drafts — nothing here is
+optimized. Usage: `executor_v0/README.md`. Validation: 249 tests; live
+encoder parity; determinism coverage; a 719/720-turn replay-observation
+plumbing smoke (shape/state robustness only — no engine executed the
+counterfactual actions). A real `kaggle_environments` 1.32.7 game is still
+pending because the package is absent locally.
+
+Mechanics locked during implementation (verified against canonical replay
+data and the repo's established 1.32.7 facts):
+
+- `PLANT <crop>` consumes the **global own `private.seeds[crop]` pool
+  atomically at the engine**; seeds are never picked up or carried, crop
+  items in inventories are products, not seeds. The foreman reserves global
+  seeds per crop within each turn; BUY_SEED shortage = task demand minus
+  global seeds.
+- Shed pickup/drop uses the four center tiles `[y,x]
+  {(4,4),(4,5),(5,4),(5,5)}` as **overwhelmingly observed valid locations**
+  in elite replays — evidence-backed configuration, not a source-locked
+  universal rule.
+- Market queue order is SELL -> HIRE -> BUY under the 10-order cap;
+  lower-priority candidates that do not fit are deferred and recomputed next
+  turn (never counted as submitted).
+
+Additional backlog discovered during implementation (in addition to the
+simplifications below): conservative LOCKED-tile avoidance though the engine
+may permit stepping there; worker interaction/current-tile legality pending
+engine-smoke confirmation; `tasks_per_worker=10` and pickup batch 5 are
+provisional constants; no emergency-feed safety buy or affordability
+sophistication; the farmer-anchored layout can thrash before the first build
+commits (revisit trigger below).
+
 ## Purpose
 
 Build the smallest deterministic executor that can turn one daily BC-manager
