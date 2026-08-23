@@ -310,10 +310,14 @@ def generate_tasks(
         depends = []
         if any(d.coord == intent.coord for d in reconcile_result.digs):
             depends.append(f"DIG:{intent.coord[0]},{intent.coord[1]}")
+        # Planting consumes the GLOBAL own seed pool (`private.seeds[crop]`)
+        # atomically at the engine; seeds are never picked up or carried.
+        # Seed sufficiency is enforced/reserved by the foreman per turn and
+        # shortages surface as BUY_SEED logistics tasks below.
         tasks.append(Task(
             key=f"PLANT:{intent.crop}:{intent.coord[0]},{intent.coord[1]}",
             kind="PLANT", priority=Priority.MANAGER, tile=intent.coord,
-            crop=intent.crop, required_item=intent.crop,
+            crop=intent.crop,
             depends_on=tuple(depends),
             source="manager_reconciliation"))
     for crop, count in reconcile_result.unresolved_deficits:

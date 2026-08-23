@@ -211,13 +211,66 @@ def test_missing_item_routes_via_shed_then_bulk_pickup():
     assert at_access.counts["pickup"] == 1
 
 
-def test_seeds_pickup_from_seed_store():
+def test_plant_uses_global_seeds_without_pickup_or_carry():
+    # Seeds are a global pool; a worker far from the tile moves toward it
+    # instead of routing to the shed for a PICKUP.
     obs = make_obs(farmer=(4, 5), seeds={"TOMATO": 3})
     tasks = [task("PLANT:TOMATO:6,6", "PLANT", (6, 6),
-                  priority=Priority.MANAGER, crop="TOMATO",
-                  item="TOMATO")]
+                  priority=Priority.MANAGER, crop="TOMATO")]
     result = run_foreman(obs, 0, tasks=tasks)
-    assert result.farmer_action == ("PICKUP", "TOMATO", 3)
+    assert result.farmer_action[0] in ("SOUTH", "EAST")
+    assert result.counts["pickup"] == 0
+
+
+def test_seeds_present_plants_immediately_without_carried_crop():
+    obs = make_obs(farmer=(2, 2), seeds={"WHEAT": 1},
+                   inventories=[{"WHEAT": 9}])  # carried product is NOT seed
+    tasks = [task("PLANT:WHEAT:2,2", "PLANT", (2, 2),
+                  priority=Priority.MANAGER, crop="WHEAT")]
+    result = run_foreman(obs, 0, tasks=tasks)
+    assert result.farmer_action == ("PLANT", "WHEAT")
+    assert result.counts["interaction"] == 1
+
+
+def test_zero_seeds_blocks_plant_despite_carried_crop_product():
+    # Carried WHEAT product cannot substitute for the global seed pool.
+    obs = make_obs(farmer=(2, 2), seeds={}, inventories=[{"WHEAT": 5}])
+    tasks = [task("PLANT:WHEAT:2,2", "PLANT", (2, 2),
+                  priority=Priority.MANAGER, crop="WHEAT")]
+    result = run_foreman(obs, 0, tasks=tasks)
+    assert result.farmer_action == ("PASS",)
+    assert result.counts["interaction"] == 0
+    assert result.counts["pickup"] == 0
+    assert [t.key for t in result.unassigned_tile_tasks] == \
+        ["PLANT:WHEAT:2,2"]
+    assert result.unassigned_reasons["PLANT:WHEAT:2,2"] == "no_global_seeds"
+
+
+def test_seed_reservation_atomic_across_workers_deterministic():
+    # One global TOMATO seed and two plantable tiles: exactly one PLANT op
+    # is emitted; the second task stays unassigned with an honest reason.
+    obs = make_obs(farmer=(1, 1), hands=[[8, 8]], seeds={"TOMATO": 1},
+                   inventories=[{}, {}])
+    tasks = [
+        task("PLANT:TOMATO:1,1", "PLANT", (1, 1),
+             priority=Priority.MANAGER, crop="TOMATO"),
+        task("PLANT:TOMATO:8,8", "PLANT", (8, 8),
+             priority=Priority.MANAGER, crop="TOMATO"),
+        task("WATER:4,4", "WATER", (4, 4), priority=Priority.MAINTENANCE),
+    ]
+    result = run_foreman(obs, 0, tasks=tasks)
+    plant_ops = [a.action for a in result.assignments
+                 if a.action and a.action[0] == "PLANT"]
+    assert len(plant_ops) == 1
+    unassigned_keys = {t.key for t in result.unassigned_tile_tasks}
+    assert "PLANT:TOMATO:8,8" in unassigned_keys or \
+        "PLANT:TOMATO:1,1" in unassigned_keys
+    blocked = [k for k, reason in result.unassigned_reasons.items()
+               if reason == "no_global_seeds"]
+    assert len(blocked) == 1
+    # Determinism: identical inputs produce identical outputs.
+    again = run_foreman(copy.deepcopy(obs), 0, copy.deepcopy(tasks))
+    assert again.to_json_dict() == result.to_json_dict()
 
 
 def test_shed_lacks_item_no_illegal_pickup_pass_and_unassigned():
@@ -300,27 +353,29 @@ def test_out_of_bounds_target_never_stepped_into():
 
 def test_exact_opcode_mapping_for_all_tile_kinds():
     cases = [
-        ("WATER", dict(crop="WHEAT"), ("WATER",), {}),
-        ("HARVEST", dict(animal="COW"), ("HARVEST",), {}),
-        ("DIG", dict(crop="WHEAT"), ("DIG",), {}),
-        ("BUILD_COOP", {}, ("BUILD_COOP",), {}),
-        ("BUILD_PASTURE", {}, ("BUILD_PASTURE",), {}),
+        # (kind, extra, expected op, carried inventory, global seeds)
+        ("WATER", dict(crop="WHEAT"), ("WATER",), {}, {}),
+        ("HARVEST", dict(animal="COW"), ("HARVEST",), {}, {}),
+        ("DIG", dict(crop="WHEAT"), ("DIG",), {}, {}),
+        ("BUILD_COOP", {}, ("BUILD_COOP",), {}, {}),
+        ("BUILD_PASTURE", {}, ("BUILD_PASTURE",), {}, {}),
         ("FEED", dict(item="WHEAT", animal="GOOSE"), ("FEED",),
-         {"WHEAT": 1}),
-        ("CARE", dict(animal="GOOSE"), ("CARE",), {}),
+         {"WHEAT": 1}, {}),
+        ("CARE", dict(animal="GOOSE"), ("CARE",), {}, {}),
         ("FERTILIZE", dict(item="FERTILIZER", crop="WHEAT"),
-         ("FERTILIZE",), {"FERTILIZER": 1}),
+         ("FERTILIZE",), {"FERTILIZER": 1}, {}),
         ("COLLECT_FERTILIZER", dict(animal="GOOSE"),
-         ("COLLECT_FERTILIZER",), {}),
+         ("COLLECT_FERTILIZER",), {}, {}),
         ("PLACE", dict(animal="COW", quantity=1), ("PLACE", "COW", 1),
-         {"COW": 1}),
-        ("PLANT", dict(crop="MELON", item="MELON"), ("PLANT", "MELON"),
+         {"COW": 1}, {}),
+        # Planting consumes the GLOBAL seed pool; nothing is carried.
+        ("PLANT", dict(crop="MELON"), ("PLANT", "MELON"), {},
          {"MELON": 1}),
     ]
-    for index, (kind, extra, expected, carry) in enumerate(cases):
+    for index, (kind, extra, expected, carry, seeds) in enumerate(cases):
         coord = (index, 9)               # canonical [y, x]
         obs = make_obs(farmer=(coord[1], coord[0]),  # official [x, y]
-                       inventories=[carry])
+                       inventories=[carry], seeds=seeds)
         t = task(f"{kind}:{index}", kind, coord, **extra)
         result = run_foreman(obs, 0, tasks=[t])
         assert result.farmer_action == expected, kind
@@ -339,7 +394,7 @@ def test_malformed_metadata_omitted_safely():
 
 
 def test_dependency_blocks_until_predecessor_absent():
-    obs = make_obs(farmer=(2, 2))
+    obs = make_obs(farmer=(2, 2), seeds={"TOMATO": 1})
     dig = task("DIG:2,2", "DIG", (2, 2), priority=Priority.MANAGER)
     plant = task("PLANT:TOMATO:2,2", "PLANT", (2, 2),
                  priority=Priority.MANAGER, crop="TOMATO",
@@ -348,6 +403,8 @@ def test_dependency_blocks_until_predecessor_absent():
     assert blocked.assignments[0].task_key == "DIG:2,2"
     keys = {t.key for t in blocked.unassigned_tile_tasks}
     assert "PLANT:TOMATO:2,2" in keys  # predecessor still present
+    assert blocked.unassigned_reasons["PLANT:TOMATO:2,2"] == \
+        "dependency_blocked:DIG:2,2"
     # Predecessor completed/absent -> plant becomes executable.
     after = run_foreman(obs, 0, tasks=[plant])
     assert after.farmer_action == ("PLANT", "TOMATO")

@@ -308,6 +308,72 @@ def test_shortage_buys_are_exact_and_capped_deterministically():
     assert_legal_shape(action, obs)
 
 
+def test_carried_crop_product_does_not_reduce_seed_shortage():
+    # Seeds are a global pool; carried WHEAT product must not count.
+    plan = simple_plan(crop_targets={"WHEAT": 4, "CARROT": 0, "TOMATO": 0,
+                                     "STRAWBERRY": 0, "MELON": 0})
+    provider = recording_provider(plan)
+    agent = ExecutorAgent(provider, seat=0)
+    tiles = empty_tiles()
+    for i in range(4):
+        tiles[1][i] = None
+
+    obs = make_obs(day=3, hour=2, seeds={}, shed={},
+                   inventories=[{"WHEAT": 9}], tiles=tiles)
+    action = agent(obs)
+    assert [["BUY_SEED", "WHEAT", 4]] == \
+        [o for o in action["market"] if o[0] == "BUY_SEED"]
+    # And with global seeds present, no BUY_SEED is emitted at all.
+    obs_seeded = make_obs(day=3, hour=2, seeds={"WHEAT": 4}, shed={},
+                          inventories=[{}], tiles=tiles)
+    action_seeded = agent(obs_seeded)
+    assert [o for o in action_seeded["market"]
+            if o[0] == "BUY_SEED"] == []
+
+
+def test_over_cap_candidates_not_counted_or_decremented():
+    # 9 sell products + 2 wanted hires + several buys > cap of 10: only the
+    # first 10 candidates are submitted; ledgers/diagnostics stay honest.
+    rows = {product: {anchor: (1 if anchor == 0 else 0)
+                      for anchor in (0, 4, 8, 12, 16, 20)}
+            for product in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY",
+                            "MELON", "EGG", "MILK", "WOOL", "FERTILIZER")}
+    plan = simple_plan(
+        crop_targets={"WHEAT": 30, "CARROT": 0, "TOMATO": 0,
+                      "STRAWBERRY": 0, "MELON": 0},
+        animal_targets={"GOOSE": 1, "COW": 0, "SHEEP": 0},
+        sell_quantities=rows)
+    provider = recording_provider(plan)
+    config = AgentConfig(tasks_per_worker=5, max_hires_per_day=2)
+    agent = ExecutorAgent(provider, seat=0, config=config)
+    tiles = empty_tiles()
+    for y in range(5):
+        for x in range(6):      # 30 empty tiles -> big seed shortage
+            tiles[y][x] = None
+
+    obs = make_obs(day=3, hour=0, shed={p: 3 for p in
+                                        ("WHEAT", "CARROT", "TOMATO",
+                                         "STRAWBERRY", "MELON", "EGG",
+                                         "MILK", "WOOL", "FERTILIZER")},
+                   seeds={}, tiles=tiles, money=3000.0)
+    action = agent(obs)
+    assert len(action["market"]) == 10
+    sells_in_action = [o for o in action["market"] if o[0] == "SELL"]
+    hires_in_action = [o for o in action["market"] if o[0] == "HIRE"]
+    assert len(sells_in_action) == 9       # all sells fit
+    assert len(hires_in_action) == 1       # only 1 of 2 wanted hires fits
+
+    diag = agent.diagnostics_json()["days"]["3"]
+    # Every submitted sell decremented exactly its own product ledger...
+    for product in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON",
+                    "EGG", "MILK", "WOOL", "FERTILIZER"):
+        entry = diag["sells"]["0"][product]
+        assert entry == {"requested": 1, "submitted": 1, "remaining": 0}
+    # ...and the dropped hire is requested but NOT submitted.
+    assert diag["hires"] == {"requested": 2, "submitted": 1,
+                             "observed_max": 0}
+
+
 def test_market_order_cap_enforced():
     plan = simple_plan(
         crop_targets={"WHEAT": 30, "CARROT": 0, "TOMATO": 0,
@@ -441,24 +507,70 @@ def test_make_agent_requires_exactly_one_source(tmp_path):
         make_agent(checkpoint=tmp_path / "missing.pt")
 
 
-def test_agent_reads_no_opponent_private_state(monkeypatch):
+def test_opponent_state_never_affects_own_actions_or_diagnostics():
+    """Non-tautological isolation: two observations identical on own-seat
+    data but wildly different in opponent public/private-like fields must
+    produce byte-identical actions and diagnostics."""
+    def build(opponent_variant):
+        obs = make_obs(day=3, hour=2, hands=[(1, 1)],
+                       inventories=[{"WHEAT": 1}, {}],
+                       shed={"WHEAT": 2}, seeds={"WHEAT": 1})
+        other = obs["farms"][1]
+        other["farmer"] = list(opponent_variant["farmer"])
+        other["hands"] = [list(h) for h in opponent_variant["hands"]]
+        other["money"] = opponent_variant["money"]
+        # Opponent-private-like sentinels planted where own private state
+        # would live for seat 1; the agent must never read them.
+        obs["farms"][1]["private"] = {
+            "shed": {"WOOL": 999}, "seeds": {"MELON": 999},
+            "inventories": [{"EGG": 999}],
+        }
+        obs["opponent_private_sentinel"] = opponent_variant["sentinel"]
+        return obs
+
+    variant_a = {"farmer": (0, 0), "hands": [], "money": 1.0,
+                 "sentinel": {"shed": {"FERTILIZER": 1}}}
+    variant_b = {"farmer": (9, 9), "hands": [(5, 5), (6, 6)],
+                 "money": 99999.0,
+                 "sentinel": {"shed": {}, "inventories": [{"MILK": 7}]}}
+
+    def run(obs):
+        agent = ExecutorAgent(recording_provider(simple_plan()), seat=0)
+        action = agent(obs)
+        return json.dumps({"action": action,
+                           "diagnostics": agent.diagnostics_json()},
+                          sort_keys=True)
+
+    assert run(build(variant_a)) == run(build(variant_b))
+
+
+def test_achieved_current_updated_every_turn_including_latest_day():
+    """achieved diagnostics stay continuously current, so the latest day
+    (e.g. day 29) has valid values without needing a following boundary."""
+    tiles = empty_tiles()
+    tiles[2][2] = plant_tile("WHEAT")
+    tiles[4][4] = pasture_tile("GOOSE", cared_today=True)
     provider = recording_provider(simple_plan())
     agent = ExecutorAgent(provider, seat=0)
-    obs = make_obs(day=3, hour=2)
-    seen = {}
+    agent(make_obs(day=29, hour=5, tiles=tiles))
+    day = agent.diagnostics_json()["days"]["29"]
+    assert day["achieved_current"] == {
+        "crops": {name: (1 if name == "WHEAT" else 0)
+                  for name in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY",
+                               "MELON")},
+        "animals": {name: (1 if name == "GOOSE" else 0)
+                    for name in ("GOOSE", "COW", "SHEEP")},
+        "land_count": 4,
+    }
+    assert day["care_completed_observed"]["GOOSE"] == 1
 
-    original_generate = __import__("executor_v0.agent",
-                                   fromlist=["generate_tasks"]) \
-        .generate_tasks
-
-    def spy_generate(obs_arg, seat_arg, **kwargs):
-        seen["opp_private_touched"] = False
-        return original_generate(obs_arg, seat_arg, **kwargs)
-
-    monkeypatch.setattr("executor_v0.agent.generate_tasks", spy_generate)
-    agent(obs)
-    # Only own seat's farm/private are ever addressed by index below.
-    assert seen["opp_private_touched"] is False
+    # Board change is reflected on the very next turn of the same day.
+    tiles2 = empty_tiles()
+    tiles2[0][0] = plant_tile("CARROT")
+    agent(make_obs(day=29, hour=6, tiles=tiles2))
+    day = agent.diagnostics_json()["days"]["29"]
+    assert day["achieved_current"]["crops"]["CARROT"] == 1
+    assert day["achieved_current"]["crops"]["WHEAT"] == 0
 
 
 # ------------------------------------------------------------- replay smoke

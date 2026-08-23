@@ -246,26 +246,42 @@ class ExecutorAgent:
             for product in PRODUCTS
         }
 
-    def _sell_orders(self, obs: Mapping, seat: int) -> list[list]:
-        """SELL clipped to actually available shed inventory, active bin only."""
+    def _sell_candidates(self, obs: Mapping, seat: int) -> list[dict]:
+        """Clip sells to available shed inventory WITHOUT mutating state.
+
+        Each candidate is ``{"order": [...], "product": p, "executed": n}``;
+        the caller commits only candidates that survive the market-order
+        cap via `_commit_sells`, so dropped orders never decrement the
+        remaining ledger or inflate submitted diagnostics.
+        """
         shed = (obs.get("private") or {}).get("shed") or {}
-        orders: list[list] = []
-        record = self._day_records[int(obs["day"])]
-        bin_log = record["sells"][str(self._bin_anchor)]
+        candidates: list[dict] = []
         for product in PRODUCTS:
             remaining = self._remaining_sells.get(product, 0)
             if remaining <= 0:
                 continue
             available = int(shed.get(product, 0))
-            executed, remaining_after = clip_sell(product, remaining,
-                                                  available)
-            self._remaining_sells[product] = remaining_after
+            executed, _remaining_after = clip_sell(product, remaining,
+                                                   available)
+            if executed > 0:
+                candidates.append({"order": ["SELL", product, executed],
+                                   "product": product,
+                                   "executed": executed})
+        return candidates
+
+    def _commit_sells(self, obs: Mapping, day: int,
+                      committed: list[dict]) -> None:
+        """Apply only actually-submitted sell orders to ledgers/logs."""
+        record = self._day_records[day]
+        bin_log = record["sells"][str(self._bin_anchor)]
+        for item in committed:
+            product = item["product"]
+            executed = item["executed"]
+            self._remaining_sells[product] = \
+                self._remaining_sells.get(product, 0) - executed
             entry = bin_log[product]
             entry["submitted"] += executed
-            entry["remaining"] = remaining_after
-            if executed > 0:
-                orders.append(["SELL", product, executed])
-        return orders
+            entry["remaining"] = self._remaining_sells[product]
 
     def _hire_orders(self, obs: Mapping, seat: int,
                      tile_task_count: int) -> tuple[list[list], int]:
@@ -332,25 +348,36 @@ class ExecutorAgent:
                                      config=self.config.foreman)
 
         # ---- market queue: sells -> hires -> shortage buys --------------
-        orders: list[list] = []
-        orders.extend(self._sell_orders(obs, seat))
+        # Candidates are built WITHOUT mutating any ledger or diagnostic;
+        # only orders that survive the engine cap are committed below, so
+        # dropped lower-priority candidates (deferred/recomputed next turn)
+        # are never counted as submitted.
+        sell_candidates = self._sell_candidates(obs, seat)
         tile_task_count = sum(1 for t in tasks if t.tile is not None)
         hire_orders, hires_requested = self._hire_orders(obs, seat,
                                                          tile_task_count)
-        orders.extend(hire_orders)
         buy_tasks = sorted(
             (t for t in foreman_result.market_tasks
              if t.kind in ("BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL",
                            "BUY_LAND")),
             key=lambda t: t.sort_key)
-        for buy_task in buy_tasks:
-            if len(orders) >= self.config.max_market_orders:
-                break
-            op = self._buy_op(buy_task)
-            if op is not None:
-                orders.append(op)
+        buy_ops = [op for op in (self._buy_op(t) for t in buy_tasks)
+                   if op is not None]
+
+        candidates: list[tuple[str, object]] = \
+            [("sell", c) for c in sell_candidates] + \
+            [("hire", o) for o in hire_orders] + \
+            [("buy", op) for op in buy_ops]
+        included = candidates[:self.config.max_market_orders]
+        orders = [payload["order"] if kind == "sell" else payload
+                  for kind, payload in included]
 
         record = self._day_records[day]
+        self._commit_sells(obs, day,
+                           [payload for kind, payload in included
+                            if kind == "sell"])
+        submitted_hires = sum(1 for kind, _ in included if kind == "hire")
+
         for key in ("movement", "interaction", "pickup", "pass"):
             record["foreman_counts"][key] += foreman_result.counts[key]
         unfinished = [t.key for t in foreman_result.unassigned_tile_tasks]
@@ -360,9 +387,22 @@ class ExecutorAgent:
                 ("WATER:", "FEED:", "COLLECT_FERTILIZER:"))]
         record["hires"]["requested"] = max(record["hires"]["requested"],
                                            hires_requested)
-        record["hires"]["submitted"] += len(hire_orders)
+        record["hires"]["submitted"] += submitted_hires
         record["hires"]["observed_max"] = self._max_hires_today
         record["unresolved_generator"] = list(generation.unresolved)
+
+        # Continuously current achieved state from every processed
+        # observation, so the latest day (e.g. day 29) always carries valid
+        # current/final-seen values even without a following day boundary.
+        crops, animals, care_done, fert_done = _board_counts(
+            canonical_board(obs["farms"][seat]["tiles"], day,
+                            int(obs.get("step", 0))))
+        record["achieved_current"] = {
+            "crops": crops, "animals": animals,
+            "land_count": len(obs["farms"][seat]["unlocked_quadrants"]),
+        }
+        record["care_completed_observed"] = care_done
+        record["fertilizer_completed_observed"] = fert_done
 
         return {
             "farmer": list(foreman_result.farmer_action),

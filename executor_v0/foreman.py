@@ -20,6 +20,15 @@ argument ops append strings/ints (`["PLANT","WHEAT"]`,
 `["PICKUP","FERTILIZER",3]`, `["PLACE","COW",1]`). Movement deltas:
 NORTH dy=-1, SOUTH dy=+1, EAST dx=+1, WEST dx=-1.
 
+Seed mechanic (1.32.7): `PLANT <crop>` consumes the GLOBAL own
+``private.seeds[crop]`` pool atomically at the engine; seeds are never
+picked up or carried, and crop items in worker inventories are products,
+not seeds. The foreman therefore never routes PLANT work through the shed:
+it checks and reserves global seeds per crop within the turn (deterministic
+across workers), and blocked PLANT tasks stay unassigned with an honest
+``no_global_seeds`` reason. Seed shortages surface as BUY_SEED market tasks
+generated upstream.
+
 Intentional V0 backlog (not an engine rule): movement only considers steps
 that reduce Manhattan distance and conservatively avoids locked tiles; when
 both reducing steps are illegal the worker PASSes instead of sidestepping.
@@ -27,10 +36,9 @@ A one-step lookahead/sidestep is deferred to the post-V0 upgrade backlog.
 """
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from bc_manager.constants import CROP_ORDER
 from executor_v0.layout import tile_role
 from executor_v0.tasks import Task
 
@@ -102,6 +110,7 @@ class ForemanResult:
     unassigned_tile_tasks: tuple[Task, ...]
     market_tasks: tuple[Task, ...]
     counts: dict[str, int]
+    unassigned_reasons: dict[str, str] = field(default_factory=dict)
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -112,6 +121,7 @@ class ForemanResult:
                                       for t in self.unassigned_tile_tasks],
             "market_tasks": [t.to_json_dict() for t in self.market_tasks],
             "counts": dict(self.counts),
+            "unassigned_reasons": dict(self.unassigned_reasons),
         }
 
 
@@ -145,12 +155,10 @@ def _carried(worker: WorkerView, item: str | None) -> bool:
 
 
 def _shed_available(obs: Mapping, seat: int, item: str) -> int:
-    """Pickupable stock for one item; seeds live in their own shed store."""
+    """Pickupable shed stock for one carried item (never seeds: planting
+    consumes the global ``private.seeds`` pool atomically at the engine)."""
     private = obs.get("private") or {}
-    available = int((private.get("shed") or {}).get(item, 0))
-    if item in CROP_ORDER:
-        available += int((private.get("seeds") or {}).get(item, 0))
-    return max(0, available)
+    return max(0, int((private.get("shed") or {}).get(item, 0)))
 
 
 def _legal_step(board, unlocked_quadrants, frm: tuple[int, int],
@@ -243,20 +251,48 @@ def run_foreman(
     tile_tasks = []
     market_tasks = []
     unassigned: list[Task] = []
+    unassigned_reasons: dict[str, str] = {}
     for t in all_tasks:
         if t.kind in _MARKET_TASK_KINDS:
             market_tasks.append(t)
         elif t.kind in _TILE_TASK_KINDS:
             # A dependency still present in this turn's set blocks the task;
             # it is surfaced as unassigned for diagnostics.
-            if any(dep in dep_keys for dep in t.depends_on):
+            blocked_by = next((dep for dep in t.depends_on
+                               if dep in dep_keys), None)
+            if blocked_by is not None:
                 unassigned.append(t)
+                unassigned_reasons.setdefault(
+                    t.key, f"dependency_blocked:{blocked_by}")
                 continue
             tile_tasks.append(t)
         else:
             continue  # unknown kinds are never dispatched
     tile_tasks.sort(key=lambda t: t.sort_key)
     market_tasks.sort(key=lambda t: t.sort_key)
+
+    # Global own seed pool: planting consumes `private.seeds[crop]`
+    # atomically at the engine. Workers never PICKUP or carry seeds; this
+    # per-turn budget reserves seeds deterministically across workers so we
+    # never emit more PLANT actions for a crop than the global stock.
+    private = obs.get("private") or {}
+    seed_budget = {str(k): int(v)
+                   for k, v in (private.get("seeds") or {}).items()}
+
+    def seeds_available(task_: Task) -> bool:
+        if task_.kind != "PLANT":
+            return True
+        if not task_.crop:
+            return True  # malformed metadata is handled at execution time
+        return seed_budget.get(task_.crop, 0) > 0
+
+    def reserve_seeds(task_: Task) -> None:
+        if task_.kind == "PLANT" and task_.crop:
+            seed_budget[task_.crop] = seed_budget.get(task_.crop, 0) - 1
+
+    def refund_seeds(task_: Task) -> None:
+        if task_.kind == "PLANT" and task_.crop:
+            seed_budget[task_.crop] = seed_budget.get(task_.crop, 0) + 1
 
     claimed: set[str] = set()
     assignments: list[Assignment] = []
@@ -265,6 +301,7 @@ def run_foreman(
 
     def release(task_: Task) -> None:
         """Return a claimed task to the unassigned pool exactly once."""
+        refund_seeds(task_)
         claimed.discard(task_.key)
         if all(u.key != task_.key for u in unassigned):
             unassigned.append(task_)
@@ -279,6 +316,9 @@ def run_foreman(
                 continue
             if not _carried(worker, task.required_item):
                 continue
+            if not seeds_available(task):
+                unassigned_reasons.setdefault(task.key, "no_global_seeds")
+                continue
             op = _interaction_op(task)
             if op is None:
                 continue
@@ -290,6 +330,10 @@ def run_foreman(
             best_score = None
             for task in tile_tasks:
                 if task.key in claimed or task.tile is None:
+                    continue
+                if not seeds_available(task):
+                    unassigned_reasons.setdefault(task.key,
+                                                  "no_global_seeds")
                     continue
                 carried_ok = _carried(worker, task.required_item)
                 if not carried_ok:
@@ -327,6 +371,7 @@ def run_foreman(
             continue
 
         claimed.add(chosen.key)
+        reserve_seeds(chosen)
         needs_pickup = (chosen.required_item is not None
                         and not _carried(worker, chosen.required_item))
 
@@ -395,4 +440,5 @@ def run_foreman(
         unassigned_tile_tasks=tuple(unassigned),
         market_tasks=tuple(market_tasks),
         counts=counts,
+        unassigned_reasons=unassigned_reasons,
     )
