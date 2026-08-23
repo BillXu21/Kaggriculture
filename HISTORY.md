@@ -2,6 +2,59 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Issue #4 Implemented: Elite Opening Book with Official 1.32.7 Validation
+
+Implemented the V0 opening book in three bounded commits on `main` and
+validated it through the pinned official engine. No BC, executor, or engine
+code changed.
+
+- **Stage 1 (`1cbda01`) — trace/provenance artifact.** New `opening_book/`
+  package: deterministic single-replay extractor
+  (`python -m opening_book.extract`), fail-closed trace validation/loading,
+  and two committed compact identities of exactly 96 literal submitted
+  primitive actions (days 0-3, d0h0..d3h23; d4h0 excluded) with full
+  provenance (episode/seat/seed/player/source-replay SHA256/content digest):
+  `standard_mixed` from episode 95515912 seat 0 (dominant cluster, market
+  signature verified hour-identical to the research note) and `pasture_heavy`
+  from episode 95055022 seat 0 (ReCurSiON; byte-identical opening re-verified
+  across episodes 95055022/95481731). Trace regeneration is byte-identical.
+- **Stage 2 (`ccad132`) — runtime wrapper.** `make_opening_agent(opening,
+  downstream, seat)` replays the literal trace for days 0-3 under minimal
+  one-way guards (phase cursor equality, observed hand cardinality vs trace
+  hands, Stage 1 action-shape/market-cap reuse), then delegates unchanged to
+  the injected downstream agent starting exactly at day 4 hour 0. Any guard
+  failure records one divergence reason/turn plus a best-effort farm summary
+  and permanently delegates; the script never rejoins. Deterministic JSON
+  diagnostics expose identity/source provenance/turns replayed/handoff.
+- **Stage 3 (`2705bf3`) — official evaluator.** `python -m opening_book.eval`
+  runs opening-only and paired BC-handoff games behind
+  `oracle.provenance.verify_official_provenance()` (pinned wheel
+  `2a1bb862...`, upstream `28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c`),
+  with strict handoff envelopes derived from the source replays and a
+  documented paired mode requiring the real checkpoint. The module docstring
+  carries the exact Kaggle command/cell for the paired comparison with
+  `/kaggle/working/bc-v0-score2950/best.pt`.
+- **Validation.** 53 focused offline tests (20 trace + 18 wrapper + 15
+  evaluator) pass under default Python. Official matrix in the repo-local
+  ignored venv (2 seeds x 2 seats x PASS/mirror x both identities = 16 full
+  720-turn games): standard_mixed **8/8** and pasture_heavy **7/8** strict
+  envelope passes; every passing cell also showed exactly 96 scripted turns,
+  zero divergence/fallback, clean d4h0 handoff, and zero official status
+  anomalies.
+- **Known failure (kept strict by decision).** pasture_heavy seed 1146601720
+  seat 1 vs PASS ended with STRAWBERRY 2 instead of 3: the official engine's
+  weed spawn placed WEEDs on tiles `[y=2][x=1]`/`[y=4][x=1]` by d3 h10
+  (empty in the source episode), so the literal d3h11 `PLANT STRAWBERRY`
+  was silently ignored. Worker positions match the source replay every hour;
+  all 96 turns replayed with no divergence/anomalies and a clean handoff.
+  Same seed passes under the mirror opponent. This is environment variance,
+  not wrapper behavior; per decision the envelope stays exact and no
+  heuristic weed repair was added.
+- **BC limitation.** The real `best.pt` is absent locally; paired BC
+  evaluation has not run and the tiny smoke checkpoint was not substituted.
+  No end-to-end BC gain is claimed. The evaluator fails clearly (exit 2) and
+  documents the exact Kaggle command for later execution.
+
 ## 2026-08-23 — Stage 2b slice 4: Town/World Updates, Day RNG, Reset, and Terminal Differential Parity
 
 Probed the town/world cluster (shop unlock/consumption, global day-end RNG,

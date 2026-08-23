@@ -4,10 +4,37 @@ Last updated: 2026-08-23
 
 ## Snapshot
 
-- Phase: **Stage-2b slices 1-4 done: worker/ordering/hiring/market cluster, crop/seed/tile lifecycle cluster, animal/structure/fertilizer lifecycle cluster, and town/world/day-RNG/reset/terminal cluster each at zero first divergence vs the real official 1.32.7 engine (27 + 16 + 12 + 10 focused tests); next gates are the remaining Stage-2b clusters and random/legal-ish full 720-turn traces, then closed-loop A/B; plus issue #2 throughput gates (GIL release, configurable Rayon thread count, batched/multi-core/memory benchmarks — fused executor/day-step explicitly deferred) and a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`)**.
+- Phase: **Stage-2b slices 1-4 done: worker/ordering/hiring/market cluster, crop/seed/tile lifecycle cluster, animal/structure/fertilizer lifecycle cluster, and town/world/day-RNG/reset/terminal cluster each at zero first divergence vs the real official 1.32.7 engine (27 + 16 + 12 + 10 focused tests); next gates are the remaining Stage-2b clusters and random/legal-ish full 720-turn traces, then closed-loop A/B; plus issue #2 throughput gates (GIL release, configurable Rayon thread count, batched/multi-core/memory benchmarks — fused executor/day-step explicitly deferred) and a real `best.pt` game through local `kaggle_environments` 1.32.7 (temp venv documented in `oracle/README.md`); issue #4 opening book implemented and officially validated (15/16 strict matrix passes, see below)**.
 - Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
 - Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
 - Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.
+
+## Opening Book (Issue #4)
+
+`opening_book/` provides literal replay-derived elite openings plus the
+runtime wrapper and official evaluator:
+
+- Two committed 96-turn identities (days 0-3, d0h0..d3h23), extracted
+  deterministically from verified raw replays with full provenance/digests:
+  `standard_mixed` (episode 95515912 seat 0, dominant cluster) and
+  `pasture_heavy` (episode 95055022 seat 0, ReCurSiON). Handoff at day 4
+  hour 0 delegates unchanged to an injected downstream agent.
+- Runtime wrapper (`opening_book/agent.py`, `make_opening_agent`) replays
+  literal actions under minimal one-way guards (phase cursor, hand
+  cardinality, action shape/market cap); any guard failure permanently
+  delegates and records deterministic JSON diagnostics.
+- Official evaluator (`python -m opening_book.eval`) runs opening-only and
+  paired BC-handoff games behind the pinned provenance guard; module
+  docstring carries the exact Kaggle command for the real-checkpoint paired
+  comparison.
+- Validation: 53 focused tests; official 1.32.7 matrix (2 seeds x 2 seats x
+  PASS/mirror x both identities) = standard_mixed 8/8, pasture_heavy 7/8
+  strict envelope passes. The one failure is environment variance, not code:
+  seed 1146601720 seat1 vs PASS spawned WEEDs on the d3h11 strawberry target;
+  all 96 turns replayed, zero divergence/anomalies, clean handoff. Strict
+  envelope kept by decision; no heuristic weed repair.
+- Limitation: real `/kaggle/working/bc-v0-score2950/best.pt` absent locally,
+  so paired BC evaluation has not run; no end-to-end BC gain is claimed.
 
 ## Differential Oracle (Stage 2a + 2b slice 1)
 
