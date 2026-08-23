@@ -1,0 +1,10 @@
+# bc_manager_jax stage-2 dependencies (local development).
+#
+# IMPORTANT (Kaggle TPU): do NOT install jax/jaxlib on Kaggle TPU runtimes —
+# the preinstalled JAX/JAXLIB versions match the TPU runtime and must remain
+# untouched. Only ensure a compatible Optax is present (it usually already
+# is on Kaggle images).
+#
+# Local CPU: install any current JAX CPU wheel, e.g. `pip install jax` —
+# intentionally unpinned here so TPU environments are never disturbed.
+optax>=0.2.0,<0.4

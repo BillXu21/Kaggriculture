@@ -142,7 +142,10 @@ def convert_torch_state_dict(state_dict: Mapping[str, Any],
             raise ValueError(
                 f"state dict dtype for {key!r} must be float32, got "
                 f"{value.dtype}")
-        return value.astype(np.float32, copy=False)
+        # ALWAYS copy: np.asarray can alias torch CPU storage, and later
+        # in-place torch updates (e.g. optimizer.step) would otherwise
+        # silently mutate the converted JAX parameters.
+        return np.array(value, dtype=np.float32, copy=True)
 
     def linear(prefix: str) -> dict[str, np.ndarray]:
         # torch nn.Linear computes x @ W.T; store kernel [in, out] = W.T.

@@ -60,31 +60,31 @@ def _validate_count_target(name: str, target: object, batch: int,
     return long_target
 
 
-def validate_targets(outputs: Mapping[str, jax.Array],
-                     targets: Mapping[str, object]) -> dict[str, np.ndarray]:
-    """Eager target validation mirroring `bc_manager.loss`; returns the
-    validated integer/float host arrays used by `manager_loss`."""
-    crop_logits = np.asarray(outputs["crop_logits"])
-    b = crop_logits.shape[0]
-    count_classes = crop_logits.shape[-1]
+def validate_target_shapes(targets: Mapping[str, object], batch: int,
+                           count_classes: int) -> dict[str, np.ndarray]:
+    """Validate target shapes/ranges without needing model outputs.
 
+    Mirrors `bc_manager.loss` semantics; returns validated host arrays
+    (integer labels with land already shifted to 0-based, float presence
+    and quantity). Usable before any forward pass (e.g. train step).
+    """
     crop_target = _validate_count_target(
         "crop_target", _require_key(targets, "crop_target"),
-        b, NUM_CROPS, count_classes)
+        batch, NUM_CROPS, count_classes)
     animal_target = _validate_count_target(
         "animal_target", _require_key(targets, "animal_target"),
-        b, NUM_ANIMALS, count_classes)
+        batch, NUM_ANIMALS, count_classes)
     fertilizer_target = _validate_count_target(
         "fertilizer_target", _require_key(targets, "fertilizer_target"),
-        b, NUM_CROPS, count_classes)
+        batch, NUM_CROPS, count_classes)
     care_target = _validate_count_target(
         "care_target", _require_key(targets, "care_target"),
-        b, NUM_ANIMALS, count_classes)
+        batch, NUM_ANIMALS, count_classes)
 
     land_array = np.asarray(_require_key(targets, "land_count"))
-    if land_array.shape != (b,):
+    if land_array.shape != (batch,):
         raise ValueError(
-            f"land_count must have shape ({b},), got {land_array.shape}")
+            f"land_count must have shape ({batch},), got {land_array.shape}")
     land_long = land_array.astype(np.int64)
     if int(land_long.min()) < 1 or int(land_long.max()) > NUM_LAND_CLASSES:
         raise ValueError(
@@ -92,7 +92,7 @@ def validate_targets(outputs: Mapping[str, jax.Array],
             f"got min={int(land_long.min())}, max={int(land_long.max())}; "
             f"refusing to clip")
 
-    expected_presence = (b, NUM_PRODUCTS, SELL_BIN_COUNT)
+    expected_presence = (batch, NUM_PRODUCTS, SELL_BIN_COUNT)
     presence = np.asarray(_require_key(targets, "sell_presence"),
                           dtype=np.float32)
     if presence.shape != expected_presence:
@@ -123,6 +123,16 @@ def validate_targets(outputs: Mapping[str, jax.Array],
     }
 
 
+def validate_targets(outputs: Mapping[str, jax.Array],
+                     targets: Mapping[str, object]) -> dict[str, np.ndarray]:
+    """Eager target validation mirroring `bc_manager.loss`; returns the
+    validated integer/float host arrays used by `manager_loss`."""
+    crop_logits = np.asarray(outputs["crop_logits"])
+    b = crop_logits.shape[0]
+    count_classes = crop_logits.shape[-1]
+    return validate_target_shapes(targets, b, count_classes)
+
+
 def manager_loss(
     outputs: Mapping[str, jax.Array],
     targets: Mapping[str, object],
@@ -131,6 +141,21 @@ def manager_loss(
     """Weighted sum of seven group means; returns (total, named groups)."""
     config = config if config is not None else ManagerLossConfig()
     validated = validate_targets(outputs, targets)
+    _, groups = loss_from_validated(outputs, validated)
+    weighted = sum(config.weight(name) * groups[name] for name in GROUP_NAMES)
+    return weighted, groups
+
+
+def loss_from_validated(
+    outputs: Mapping[str, jax.Array],
+    validated: Mapping[str, np.ndarray],
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """JIT-safe core loss over pre-validated targets (unit weights).
+
+    `validated` is the mapping returned by `validate_targets` /
+    `validate_target_shapes`. No host-side validation happens here, so this
+    is safe to call inside jitted train steps.
+    """
 
     def count_group(logits_key: str, target: np.ndarray) -> jax.Array:
         logits = jnp.asarray(outputs[logits_key], dtype=jnp.float32)
@@ -162,7 +187,7 @@ def manager_loss(
     groups["sell_quantity"] = jnp.sum(pair * mask.astype(pair.dtype)) / \
         jnp.maximum(jnp.sum(mask.astype(pair.dtype)), 1.0)
 
-    total = sum(config.weight(name) * groups[name] for name in GROUP_NAMES)
+    total = sum(groups[name] for name in GROUP_NAMES)
     return total, groups
 
 
