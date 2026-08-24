@@ -2,6 +2,68 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-24 — Issue #9 Stage A Implemented: RL Self-Play Rollout/Trajectory Harness (`rl_manager`)
+
+Added the new `rl_manager` package (11 modules) and 7 test files on `main`
+as pure RL harness infrastructure around the frozen components. No PPO,
+no executor/opening-book/oracle/fast-env/Rust/BC changes; frozen components
+are consumed through public interfaces only (farm canonicalization goes
+through the public `EngineBackend.canonical_state()` seam, never a private
+helper).
+
+- **Batched policy seam:** framework-neutral `BatchedPlanPolicy` protocol
+  with immutable `PolicyIdentity` (name/version/fingerprint; equality on
+  all three fields) and PPO-ready logprob-group/logprob-total/value slots.
+  `JaxEPlanPolicy` wraps `bc_manager_jax.forward(..., model_variant="E")`
+  — exactly ONE call per contiguous request batch, own-only E contract
+  enforced loudly at the wrapper seam, deterministic issue-#8 decode in
+  pure NumPy (`decode.py`, torch parity enforced by test), parameter
+  fingerprint = sha256 over sorted leaf paths + raw bytes.
+- **Runner:** lockstep N-env self-play over `oracle.backend` engines;
+  every day-boundary manager request across all envs/seats is grouped by
+  policy identity and answered with ONE batched policy call per
+  (identity, day). Per-episode/per-seat opening agent (`standard_mixed`
+  literal d0-d3 playback, clean d4h0 handoff), unmodified executor agent
+  via an injectable factory (`executor_v0.make_agent(strict=True)
+  @stage-a-v1`; issue #7 swaps the factory), queued-plan provider (missing/
+  double consumption fail loudly), and runner-owned daily-start `(day,
+  cash)` state feeding the exact stateless `economic_prev_start` E path;
+  realized labor from observed `hires_today`, never HIRE intents.
+- **Trajectory schema v1:** preallocated compact buffer (append fails loud
+  on overflow); one row per manager decision/day/seat d4..d29; scalars +
+  six logprob groups + seven action tensors + 32-byte sealed per-day
+  joint-action trace digest + model-facing inputs pinned EXACTLY to the
+  canonical E encoder spec derived by calling `encode_live_inputs` itself.
+  Strict NPZ serialization (schema/count validation, `allow_pickle=False`)
+  plus a JSON-safe sidecar (policy/opponent identities, plan JSON, compact
+  executor diagnostics). Terminal-only rewards (+1/0/-1 on the final
+  manager row; both zero on tie).
+- **Seeds/provenance:** episode/policy/environment seeds are pure
+  functions of `(master_seed, tag, index)` via `SeedSequence`; runs record
+  opening digest + source-replay provenance, backend configuration/engine
+  module, executor factory version, master seed.
+- **Parity seam:** official-vs-fast comparison of the identical stack —
+  opening handoff -> manager input digests -> plans -> primitive actions ->
+  banks/statuses — with first-divergence reports carrying seed/backend/
+  seat/day/hour/turn/path/values/actions. Honest gating when the official
+  dependency is absent.
+- **Local evidence:** 47 passed + 1 skipped across the 7 rl_manager test
+  files (skip = `kaggle_environments` absent in this interpreter, Python
+  3.13.1; rerun command recorded in the skip message). Focused seams green:
+  JAX parity/opening handoff/executor agent/oracle replay+isolation =
+  72 passed + 8 skipped. Two deterministic complete fast games
+  (numThreads=1, tiny random-init E): DONE/DONE, exactly 52 transitions
+  each, byte-equal rerun (`equal_nan=True` for the board NaN sentinel),
+  episode digest `fd910f3d8f5a6a8f864b5d76daad87c477611c75742ab44f959c0d946dd88a10`,
+  final banks [0.0, 0.0] bankruptcy tie — PLUMBING only, no quality claim.
+  N=2 batching proof: E-vs-E one policy call/day (contiguous batch 4),
+  candidate/frozen two calls/day (batch 2 each).
+- **Not done / not claimed:** no PPO/optimizer/value loss; no real-
+  checkpoint rollout (`artifacts/local/bc-v1-E/best.pt` absent); no
+  official-engine parity run locally; eventual many-CPU-worker topology is
+  design only and UNMEASURED. Serious training blocked on issue #7
+  executor selection. Details: `research/RL_SELFPLAY_V0.md`.
+
 ## 2026-08-24 — Issue #8 Implemented: Promoted BC-E Manager Ported to JAX (V0+E Only)
 
 Extended `bc_manager_jax` with model variants **V0** and **E** on `main`.
