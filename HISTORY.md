@@ -1022,3 +1022,13 @@ The project will not rely on redistribution-license concerns as a reason to avoi
 3. Catalog major strategy families.
 4. Define the initial fixed-seed, seat-swapped evaluation protocol.
 5. Delay competitive implementation until those contracts are recorded.
+
+## 2026-08-24 - Issue #7 executor V0.5 overnight pass (worktree branch executor-v05-overnight)
+
+- Base `32fef4ac295e9addaf01cd339eee60a0ad14eaca`; final `885adadda351a39e2797058fe3c4c8cb5f506bac`; no merge to main.
+- Validated full-game fast-engine reconstruction of four official replay JSONs (719 turns each, both seats) - exact state parity modulo cosmetic field names; fixed `derive_animal` KeyError on fast-engine age-only animal tiles.
+- Built replay manifest (19 episodes; 98178196 classified failure_specimen, rewards [42,42]) and canonical expert daily-plan extraction; built isolated one-day slice harness with boundary verification (38/38 verified on expanded set).
+- Accepted fixes: movement legality (locked quadrants walkable), mechanics-derived water urgency classes, hub-anchored coordinated layouts with weed reclamation, build prerequisite gating, plan-implied CARE/FERTILIZE eligibility, sequential same-turn SELL->HIRE accounting, any-hour workload hiring (3-hire cap removed), exact-cost buy gates, accumulated diagnostics.
+- Rejected experiments: persistent task ownership hint (wealth 894->864 regardless of bonus size); travel-aware hiring over all tasks (+5.5%->+1.5%); both reverted with evidence.
+- Expanded paired result: mean one-day wealth delta 1879 -> 1981 (+5.4%), candidate better on 24/38 slices, day-end weeds 53 -> 22, harvestable leftovers 1 -> 0. Worst regression traced to genuinely saturated single days (crew capacity < interaction+travel demand).
+- Tests: 461 passed / 108 skipped locally (full suite incl. jax train/parity/benchmark). Artifacts: research/EXECUTOR_V05_OVERNIGHT.md + three paired day-slice JSONs.
