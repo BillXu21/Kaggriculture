@@ -26,13 +26,16 @@ from typing import Any
 
 from bc_manager.constants import ANIMAL_ORDER, CROP_ORDER
 from executor_v0.layout import (
+    SHED_HUB_ANCHOR,
     AnimalLayoutResult,
     CropReconciliationResult,
+    DayLayoutResult,
     plan_animal_layout,
+    plan_day_layouts,
     reconcile_crops,
 )
 from executor_v0.plan import DailyPlan
-from replay_daily.constants import ANIMALS, LAND_ORDER, PRODUCTS
+from replay_daily.constants import ANIMALS, CROPS, LAND_ORDER, PRODUCTS
 from replay_daily.lifecycle import canonical_board
 
 __all__ = [
@@ -165,6 +168,52 @@ def _tile_at(board, coord):
     return board[y][x]
 
 
+def _water_urgency(tile: Mapping) -> str | None:
+    """Exact-mechanics watering class for one PLANT tile.
+
+    Pinned 1.32.7 semantics (rust engine ``apply_unit_action`` op 10 +
+    ``_daily_refresh_plants``; MECHANICS.md section 7):
+
+    - planting day counts as unwatered (fresh tiles get
+      ``consecutive_unwatered=1``);
+    - a second consecutive unwatered daily refresh converts the plant to a
+      WEED (crop destroyed);
+    - WATER on a single-harvest crop (interval 0) inside its late growth
+      window adds +1 yield (+2 when fertilized) up to ``max_yield``;
+    - ongoing-crop production at the next morning refresh yields +2 instead
+      of +1 only when the plant was watered today AND fertilizer is active;
+    - every other unwatered plant loses nothing observable today.
+
+    Returns ``"must"`` (weed boundary), ``"yield"`` (measurable production
+    gain), or ``None`` (safe to defer -- watering it would only reset the
+    drought counter, which must not starve harvest/maintenance labor).
+    """
+    if tile.get("watered_today") is True:
+        return None
+    if int(tile.get("consecutive_unwatered") or 0) >= 1:
+        return "must"
+    data = CROPS.get(tile.get("crop"))
+    derived = tile.get("derived") or {}
+    if data is None:
+        return None
+    age = int(derived.get("age_days") or 0)
+    if data["interval"] == 0:
+        window_start = (data["max_yield_day"] + 1) // 2
+        if (window_start <= age <= data["max_yield_day"]
+                and int(tile.get("yield_units") or 0) < data["max_yield"]):
+            return "yield"
+        return None
+    # Ongoing crop: watering matters tomorrow only when tomorrow's refresh is
+    # a production day AND fertilizer is active (+2 vs +1); age increments
+    # before the production check at the refresh.
+    if not derived.get("fertilizer_active"):
+        return None
+    dsf = (age + 1) - data["first_yield_day"]
+    if dsf >= 0 and dsf % data["interval"] == 0             and dsf // data["interval"] + 1 <= data["max_yield"]:
+        return "yield"
+    return None
+
+
 # --------------------------------------------------------------- generation
 
 
@@ -193,7 +242,12 @@ def generate_tasks(
     state = _canonical_own_state(obs, seat)
     board = state["board"]
     unlocked = state["unlocked_quadrants"]
-    anchor = tuple(state["farmer"])
+    # Layout/proximity anchor is the persistent central logistics hub, never
+    # the moving farmer: raw farmer coordinates are [x, y] while canonical
+    # task tiles are [y, x] (the old transposition skewed every proximity
+    # ordering), and anchoring layouts to the farmer made target slots churn
+    # all day as workers walked around (issue #7).
+    anchor = SHED_HUB_ANCHOR
     hour = int(obs["hour"])
     unresolved: list[str] = []
     tasks: list[Task] = []
@@ -207,22 +261,37 @@ def generate_tasks(
                     in current_animals:
                 current_animals[tile["animal"]] += 1
 
-    if reconcile_result is None:
-        reconcile_result = reconcile_crops(
+    if reconcile_result is None and animal_layout_result is None:
+        day_layout: DayLayoutResult | None = plan_day_layouts(
             board, unlocked_quadrants=unlocked,
-            crop_targets=feasible_plan.crop_targets_dict, anchor=anchor)
-    if animal_layout_result is None:
-        animal_layout_result = plan_animal_layout(
-            board, unlocked_quadrants=unlocked,
+            crop_targets=feasible_plan.crop_targets_dict,
             animals_needed={
                 name: max(0, feasible_plan.animal_targets_dict[name]
                           - current_animals[name])
                 for name in ANIMAL_ORDER
             },
             anchor=anchor)
+        assert day_layout is not None
+        reconcile_result = day_layout.crops
+        animal_layout_result = day_layout.animals
+    else:
+        if reconcile_result is None:
+            reconcile_result = reconcile_crops(
+                board, unlocked_quadrants=unlocked,
+                crop_targets=feasible_plan.crop_targets_dict, anchor=anchor)
+        if animal_layout_result is None:
+            animal_layout_result = plan_animal_layout(
+                board, unlocked_quadrants=unlocked,
+                animals_needed={
+                    name: max(0, feasible_plan.animal_targets_dict[name]
+                              - current_animals[name])
+                    for name in ANIMAL_ORDER
+                },
+                anchor=anchor)
 
     # ---- scan the canonical board once -------------------------------
-    water_targets: list[tuple[int, int]] = []
+    water_must_targets: list[tuple[int, int]] = []
+    water_yield_targets: list[tuple[int, int]] = []
     harvest_plant_targets: list[tuple[int, int]] = []
     harvest_animal_targets: list[tuple[int, int]] = []
     feed_targets: list[tuple[int, int]] = []
@@ -252,8 +321,11 @@ def generate_tasks(
                         and tile.get("cared_today") is not True:
                     care_eligible[species].append(coord)
             elif tile.get("kind") == "PLANT":
-                if tile.get("watered_today") is not True:
-                    water_targets.append(coord)
+                urgency = _water_urgency(tile)
+                if urgency == "must":
+                    water_must_targets.append(coord)
+                elif urgency == "yield":
+                    water_yield_targets.append(coord)
                 derived = tile.get("derived") or {}
                 if derived.get("currently_harvestable"):
                     harvest_plant_targets.append(coord)
@@ -270,11 +342,19 @@ def generate_tasks(
                                      c[0], c[1]))
 
     # ---- MAINTENANCE --------------------------------------------------
-    for coord in by_proximity(water_targets):
+    # Only weed-boundary watering is hard-deadline maintenance; yield-window
+    # watering is productive work; all other unwatered plants are safely
+    # deferred (blanket daily WATER was a major labor sink, issue #7).
+    for coord in by_proximity(water_must_targets):
         tasks.append(Task(key=f"WATER:{coord[0]},{coord[1]}", kind="WATER",
                           priority=Priority.MAINTENANCE, tile=coord,
                           crop=_tile_at(board, coord)["crop"],
-                          source="mechanical"))
+                          source="water_must_weed_boundary"))
+    for coord in by_proximity(water_yield_targets):
+        tasks.append(Task(key=f"WATER:{coord[0]},{coord[1]}", kind="WATER",
+                          priority=Priority.PRODUCTIVE, tile=coord,
+                          crop=_tile_at(board, coord)["crop"],
+                          source="water_yield_window"))
     for coord in by_proximity(feed_targets):
         tasks.append(Task(key=f"FEED:{coord[0]},{coord[1]}", kind="FEED",
                           priority=Priority.MAINTENANCE, tile=coord,
@@ -324,6 +404,11 @@ def generate_tasks(
         unresolved.append(f"crop_deficit_unresolved:{crop}:{count}")
 
     # ---- MANAGER: animal deficits --------------------------------------
+    # Prerequisite gating (issue #7): a BUILD is only emitted when its PLACE
+    # can plausibly execute today -- the animal is already owned (shed or
+    # carried) or affordable at current cash. Otherwise the structure would
+    # sit empty; the deficit resurfaces automatically once cash/animals
+    # change because tasks regenerate every turn.
     place_keys_by_animal: dict[str, list[str]] = {}
     for slot in animal_layout_result.placements:
         if slot.source == "empty_structure":
@@ -333,22 +418,39 @@ def generate_tasks(
                               animal=slot.animal, required_item=slot.animal,
                               quantity=1, source="manager_target"))
             place_keys_by_animal.setdefault(slot.animal, []).append(place_key)
-        else:
-            build_kind = ("BUILD_COOP" if slot.structure == "COOP"
-                          else "BUILD_PASTURE")
-            build_key = f"{build_kind}:{slot.coord[0]},{slot.coord[1]}"
-            tasks.append(Task(key=build_key, kind=build_kind,
+            continue
+        animal_owned = _available(state, slot.animal) > 0
+        animal_affordable = float(state["money"])             >= float(ANIMALS[slot.animal]["cost"])
+        if not (animal_owned or animal_affordable):
+            unresolved.append(
+                f"build_deferred_no_animal:{slot.animal}:"
+                f"{slot.coord[0]},{slot.coord[1]}")
+            continue
+        build_deps: list[str] = []
+        if slot.source == "weed_reclaim":
+            dig_key = f"DIG:{slot.coord[0]},{slot.coord[1]}"
+            tasks.append(Task(key=dig_key, kind="DIG",
                               priority=Priority.MANAGER, tile=slot.coord,
-                              source=("manager_layout_conversion"
-                                      if slot.source == "crop_sacrifice"
-                                      else "manager_layout")))
-            place_key = f"PLACE:{slot.animal}:{slot.coord[0]},{slot.coord[1]}"
-            tasks.append(Task(key=place_key, kind="PLACE",
-                              priority=Priority.MANAGER, tile=slot.coord,
-                              animal=slot.animal, required_item=slot.animal,
-                              quantity=1, depends_on=(build_key,),
-                              source="manager_target"))
-            place_keys_by_animal.setdefault(slot.animal, []).append(place_key)
+                              crop="WEED", source="weed_reclaim"))
+            build_deps.append(dig_key)
+        build_kind = ("BUILD_COOP" if slot.structure == "COOP"
+                      else "BUILD_PASTURE")
+        build_key = f"{build_kind}:{slot.coord[0]},{slot.coord[1]}"
+        tasks.append(Task(key=build_key, kind=build_kind,
+                          priority=Priority.MANAGER, tile=slot.coord,
+                          depends_on=tuple(build_deps),
+                          source=("manager_layout_conversion"
+                                  if slot.source == "crop_sacrifice"
+                                  else ("weed_reclaim"
+                                        if slot.source == "weed_reclaim"
+                                        else "manager_layout"))))
+        place_key = f"PLACE:{slot.animal}:{slot.coord[0]},{slot.coord[1]}"
+        tasks.append(Task(key=place_key, kind="PLACE",
+                          priority=Priority.MANAGER, tile=slot.coord,
+                          animal=slot.animal, required_item=slot.animal,
+                          quantity=1, depends_on=(build_key,),
+                          source="manager_target"))
+        place_keys_by_animal.setdefault(slot.animal, []).append(place_key)
     for animal, count in animal_layout_result.unresolved:
         unresolved.append(f"animal_deficit_unresolved:{animal}:{count}")
 
