@@ -7,6 +7,9 @@ data-parallel helpers (`sharding`), and the throughput benchmark CLI
 (`benchmark`, runnable as `python -m bc_manager_jax.benchmark`).
 Issue #8 additions: model variants V0 and E (the promoted economic-context
 variant); J/JE are deliberately unsupported.
+Issue #9 addition: `manager_representation` / `forward_with_representation`
+expose the final manager token for RL value heads without duplicating the
+Transformer; forward outputs/numerics are unchanged.
 """
 
 from bc_manager_jax.checkpoint import (
@@ -29,7 +32,9 @@ from bc_manager_jax.model import (
     ManagerConfig,
     empty_params,
     forward,
+    forward_with_representation,
     init_params,
+    manager_representation,
     predict_counts,
     predict_land,
     predict_sells,
@@ -52,6 +57,7 @@ __all__ = [
     "empty_params",
     "expected_torch_state_shapes",
     "forward",
+    "forward_with_representation",
     "init_opt_state",
     "init_params",
     "load_native",
@@ -59,6 +65,7 @@ __all__ = [
     "loss_from_validated",
     "make_optimizer",
     "manager_loss",
+    "manager_representation",
     "predict_counts",
     "predict_land",
     "predict_sells",

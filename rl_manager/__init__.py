@@ -17,9 +17,12 @@ This package owns ONLY the RL harness seams around the frozen components:
   (policy/opponent/executor-factory/opening/backend/engine);
 - official-vs-fast comparison seam with first-divergence reports.
 
-Stage B (PPO updates) is deliberately NOT here yet. The executor, opening
-book, oracle, fast env, bc_manager, and bc_manager_jax are consumed through
-their public interfaces only — never modified.
+Stage B (PPO V0 core) lives in `rl_manager.ppo_policy` / `rl_manager.gae` /
+`rl_manager.ppo` / `rl_manager.ppo_checkpoint`: a PPO policy over the
+mutable E trunk + small value head with an immutable frozen-E snapshot,
+frozen sell quantities, GAE, and a strict RL-native checkpoint format. The
+executor, opening book, oracle, fast env, bc_manager, and bc_manager_jax
+are consumed through their public interfaces only — never modified.
 """
 
 from rl_manager.decode import (
@@ -33,6 +36,20 @@ from rl_manager.executor_factory import (
     EXECUTOR_FACTORY_VERSION,
     make_default_executor_factory,
 )
+from rl_manager.gae import advantage_stats, compute_gae
+from rl_manager.ppo import (
+    PPOBatch,
+    PPOTrainState,
+    build_ppo_batch,
+    init_train_state,
+    ppo_update,
+)
+from rl_manager.ppo_checkpoint import (
+    RL_PPO_CHECKPOINT_FORMAT,
+    load_ppo_checkpoint,
+    save_ppo_checkpoint,
+)
+from rl_manager.ppo_policy import PPOConfig, PPOPolicy
 from rl_manager.policy import JaxEPlanPolicy, params_fingerprint
 from rl_manager.provider import QueuedPlanProvider
 from rl_manager.runner import (
@@ -73,12 +90,17 @@ __all__ = [
     "GAME_TURNS",
     "LOGPROB_GROUPS",
     "MANAGER_START_DAY",
+    "RL_PPO_CHECKPOINT_FORMAT",
     "TOTAL_MANAGER_DAYS",
     "TRAJECTORY_SCHEMA_VERSION",
     "BatchedPlanPolicy",
     "EpisodeResult",
     "EpisodeSpec",
     "JaxEPlanPolicy",
+    "PPOBatch",
+    "PPOConfig",
+    "PPOPolicy",
+    "PPOTrainState",
     "PolicyIdentity",
     "PolicyOutputs",
     "QueuedPlanProvider",
@@ -86,13 +108,20 @@ __all__ = [
     "SeedStream",
     "SelfPlayRunner",
     "TrajectoryBuffer",
+    "advantage_stats",
     "build_artifact_metadata",
     "build_episode_spec",
+    "build_ppo_batch",
+    "compute_gae",
     "decode_outputs_to_action_tensors",
     "decode_outputs_to_plans",
+    "init_train_state",
+    "load_ppo_checkpoint",
     "load_trajectory",
     "make_default_executor_factory",
     "params_fingerprint",
     "plans_from_action_tensors",
+    "ppo_update",
+    "save_ppo_checkpoint",
     "seat_policies",
 ]

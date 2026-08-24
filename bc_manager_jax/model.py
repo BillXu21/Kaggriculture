@@ -476,9 +476,15 @@ def _prepare_inputs(inputs: Mapping[str, object]) -> dict[str, jax.Array]:
 # ---------------------------------------------------------------- forward
 
 
-def _forward_core(params: Mapping, inputs: Mapping[str, jax.Array],
-                  config: ManagerConfig, dropout: _Dropout,
-                  model_variant: str = "V0") -> dict[str, jax.Array]:
+def _manager_representation(params: Mapping, inputs: Mapping[str, jax.Array],
+                            config: ManagerConfig, dropout: _Dropout,
+                            model_variant: str = "V0") -> jax.Array:
+    """Final normalized manager token [B, d_model] (issue #9 B1 seam).
+
+    Extracted ONCE from `_forward_core`; the op sequence is byte-identical
+    to the pre-refactor forward path, so existing outputs/numerics and all
+    issue-#8 parity tests are unchanged. Heads are NOT applied here.
+    """
     variant = resolve_model_variant(model_variant)
     b = inputs["board_kind"].shape[0]
     role_vectors = params["role_embedding"]
@@ -507,16 +513,25 @@ def _forward_core(params: Mapping, inputs: Mapping[str, jax.Array],
     hidden = jnp.concatenate(parts, axis=1)
     for layer in params["encoder"]["layers"]:
         hidden = _encoder_layer(layer, hidden, config, dropout)
-    manager = _layer_norm(hidden[:, 0], params["encoder_norm"]["weight"],
-                          params["encoder_norm"]["bias"])
+    return _layer_norm(hidden[:, 0], params["encoder_norm"]["weight"],
+                       params["encoder_norm"]["bias"])
 
+
+def _forward_core_with_representation(
+        params: Mapping, inputs: Mapping[str, jax.Array],
+        config: ManagerConfig, dropout: _Dropout,
+        model_variant: str = "V0") -> tuple[dict[str, jax.Array], jax.Array]:
+    """Head outputs plus the final manager representation [B, d_model]."""
+    manager = _manager_representation(params, inputs, config, dropout,
+                                      model_variant)
+    b = inputs["board_kind"].shape[0]
     c = config.count_classes
     heads = params["heads"]
 
     def head(name: str) -> jax.Array:
         return _linear_apply(manager, heads[name])
 
-    return {
+    outputs = {
         "crop_logits": head("crop").reshape(b, NUM_CROPS, c),
         "animal_logits": head("animal").reshape(b, NUM_ANIMALS, c),
         "land_logits": head("land"),
@@ -527,6 +542,14 @@ def _forward_core(params: Mapping, inputs: Mapping[str, jax.Array],
         "sell_quantity_log1p":
             head("sell_quantity").reshape(b, NUM_PRODUCTS, SELL_BIN_COUNT),
     }
+    return outputs, manager
+
+
+def _forward_core(params: Mapping, inputs: Mapping[str, jax.Array],
+                  config: ManagerConfig, dropout: _Dropout,
+                  model_variant: str = "V0") -> dict[str, jax.Array]:
+    return _forward_core_with_representation(params, inputs, config, dropout,
+                                             model_variant)[0]
 
 
 def _forward_eval(params: Mapping, inputs: Mapping[str, jax.Array],
@@ -565,6 +588,75 @@ def forward(params: Mapping, inputs: Mapping[str, object],
         return _forward_core(params, prepared, config, _Dropout(
             config.dropout, rng), variant)
     return _forward_jit(params, prepared, config, variant)
+
+
+# ------------------------------------------------- representation seam (#9)
+
+def _forward_eval_with_representation(
+        params: Mapping, inputs: Mapping[str, jax.Array],
+        config: ManagerConfig,
+        model_variant: str = "V0") -> tuple[dict[str, jax.Array], jax.Array]:
+    return _forward_core_with_representation(params, inputs, config,
+                                             _Dropout(config.dropout, None),
+                                             model_variant)
+
+
+def _representation_eval(params: Mapping, inputs: Mapping[str, jax.Array],
+                         config: ManagerConfig,
+                         model_variant: str = "V0") -> jax.Array:
+    return _manager_representation(params, inputs, config,
+                                   _Dropout(config.dropout, None),
+                                   model_variant)
+
+
+_forward_with_repr_jit = jax.jit(_forward_eval_with_representation,
+                                 static_argnames=("config", "model_variant"))
+
+_representation_jit = jax.jit(_representation_eval,
+                              static_argnames=("config", "model_variant"))
+
+
+def forward_with_representation(
+        params: Mapping, inputs: Mapping[str, object],
+        config: ManagerConfig, *, training: bool = False,
+        rng: jax.Array | None = None,
+        model_variant: str = "V0") -> tuple[dict[str, jax.Array], jax.Array]:
+    """`forward(...)` outputs PLUS the final manager representation.
+
+    Additive issue-#9 B1 seam for RL value heads: identical validation,
+    identical numerics, no Transformer duplication. Returns
+    `(outputs, representation)` where representation is `[B, d_model]`.
+    """
+    variant = resolve_model_variant(model_variant)
+    validate_inputs(inputs, config, variant)
+    if training and rng is None:
+        raise ValueError("training=True requires an explicit rng key")
+    if training and config.dropout == 0.0:
+        training = False
+    prepared = _prepare_inputs(inputs)
+    if training:
+        return _forward_core_with_representation(params, prepared, config,
+                                                 _Dropout(config.dropout,
+                                                          rng), variant)
+    return _forward_with_repr_jit(params, prepared, config, variant)
+
+
+def manager_representation(params: Mapping, inputs: Mapping[str, object],
+                           config: ManagerConfig, *, training: bool = False,
+                           rng: jax.Array | None = None,
+                           model_variant: str = "V0") -> jax.Array:
+    """Final normalized manager token [B, d_model] without applying heads."""
+    variant = resolve_model_variant(model_variant)
+    validate_inputs(inputs, config, variant)
+    if training and rng is None:
+        raise ValueError("training=True requires an explicit rng key")
+    if training and config.dropout == 0.0:
+        training = False
+    prepared = _prepare_inputs(inputs)
+    if training:
+        return _manager_representation(params, prepared, config, _Dropout(
+            config.dropout, rng), variant)
+    return _representation_jit(params, prepared, config, variant)
 
 
 # ------------------------------------------------------- inference helpers
