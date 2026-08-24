@@ -5,6 +5,80 @@ exact copy-paste Kaggle notebook cell. **No real TPU measurements exist
 yet**; every number currently recorded for this package is local tiny-CPU
 plumbing evidence and must not be quoted as TPU throughput.
 
+## Issue #8 update (2026-08-24) — promoted BC-E variant ported; primary target is now E
+
+Issue #8 extended `bc_manager_jax` with model variants **V0** and **E**
+(the four-way closed-loop ablation winner, median bank 25,873 vs V0
+9,251.5). **J/JE are deliberately NOT ported** and fail loudly as
+unsupported (`'J' is not supported by bc_manager_jax`). The variant lives
+OUTSIDE the frozen seven-field `ManagerConfig`, mirroring the torch
+checkpoint's top-level `model_variant`.
+
+Exact E contract:
+
+- input: `economic_context` float32 `[B, 14]`, finite, built ONLY by the
+  authoritative `bc_manager.economics` functions (`economic_context`,
+  `derive_economic_context`, `EconomicHistory`) — never re-derived;
+- architecture delta: the 14 channels are concatenated after the six
+  self-resource feature blocks, before the SAME two-layer self-resource
+  MLP (first-layer input 35 -> 49). Trunk/tokens/heads/loss/decode are
+  byte-identical to V0;
+- parameters: default V0 1,071,040 / E 1,072,832 (+1,792 = 14 x 128);
+  tiny V0 37,008 / E 37,232 (+224 = 14 x 16);
+- API: `forward(params, inputs, config, model_variant="E")`,
+  `train_step(..., model_variant="E")`,
+  `convert_torch_state_dict(state, config, "E")`,
+  `load_torch_checkpoint(path, config, model_variant="E")` (strict
+  expected-variant checks; never inferred from weight shapes),
+  `save_native/load_native(..., model_variant=...)`; all old calls remain
+  valid with the V0 default;
+- native NPZ stores `model_variant` top-level in the JSON metadata
+  (outside `model_config`); pre-variant native files load as V0.
+
+Local CPU-only evidence (tiny configs, this host):
+
+- deterministic PyTorch E -> JAX E strict conversion forward parity, all
+  seven output groups: worst max abs diff 6.855e-07, worst mean abs diff
+  1.101e-07 (tolerances max <= 2e-6, mean <= 5e-7);
+- decoded counts/land exact (`array_equal`); total + per-group loss parity
+  within 9.5e-7;
+- economic feature cases proven against the authoritative path: day-0
+  invalid, adjacent-day join, gap invalidation, episode reset/backwards
+  day, all-land-unlocked saturation (channel 10 = 8.0, flag 0), zero and
+  negative cash, exact seed/animal/land channel order;
+- single-device JIT E forward + train step finite; N=4 logical-CPU
+  NamedSharding subprocess: 1-vs-4 total loss diff 1.9e-6, group diff
+  2.4e-7, updated-param diff 3.7e-9, batch spec `P('data', None)`;
+  N=8 logical-CPU smoke: one tiny sharded E step, finite, same spec.
+  **N=4/N=8 are logical multi-device validation on forced host CPUs only —
+  not throughput or scaling evidence of any kind.**
+
+Real checkpoint status: `artifacts/local/bc-v1-E/best.pt` is ABSENT
+locally; no real-checkpoint conversion/parity has run. A bounded
+skip-if-absent test exists. Exact rerun once the file is copied in place:
+
+```bash
+python -m pytest tests/test_bc_manager_jax_parity.py::test_real_e_checkpoint_parity_if_present -q
+```
+
+Exact eventual Kaggle TPU command (UNMEASURED — run only when TPU capacity
+exists; do not quote any local number as its expected result):
+
+```bash
+python -m bc_manager_jax.benchmark \
+  --device-counts 8 \
+  --dtype f32 \
+  --checkpoint /kaggle/working/bc-v1-E/best.pt \
+  --batch-sizes 256,512,1024,2048,4096 \
+  --warmup 3 \
+  --iterations 10 \
+  --output-json /kaggle/working/bc_e_jax_benchmark.json \
+  --output-csv /kaggle/working/bc_e_jax_benchmark.csv
+```
+
+The benchmark records `model_variant` additively per row (backward
+compatible); checkpoint mode always uses the stored variant.
+
 ## Scope / non-goals reminder
 
 Faithful JAX mirror of the BC manager only: no PPO/value heads/self-play,

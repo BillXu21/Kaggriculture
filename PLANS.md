@@ -1,6 +1,6 @@
 # Kaggriculture Plans
 
-Last updated: 2026-08-23
+Last updated: 2026-08-24
 
 ## Strategic Objective
 
@@ -11,6 +11,8 @@ The immediate phase is now **closed-loop BC/executor validation plus implementat
 Detailed RL design lives in [`research/RL_DESIGN.md`](research/RL_DESIGN.md).
 
 A temporary high local coding-agent-usage window is being used for large, mechanically testable infrastructure packets that are likely to be needed regardless of later strategy choices. The bounded sprint plan is in [`research/CODING_AGENT_SPRINT.md`](research/CODING_AGENT_SPRINT.md). This does **not** supersede the staged learning gates: infrastructure may be prepared early, but PPO/self-play complexity is not activated before the simpler stationary problems work.
+
+Current active packet (issue #8, 2026-08-24): the promoted BC-E manager is ported to `bc_manager_jax` (variants V0+E only; J/JE deliberately unsupported) with strict variant-metadata checkpoint conversion, authoritative economic-feature parity tests, tiny CPU parity evidence, and logical-only N=4/N=8 sharding validation. Next gates: real-checkpoint parity once `artifacts/local/bc-v1-E/best.pt` is copied from Kaggle, then the (unmeasured) 8-device TPU benchmark per `research/JAX_TPU_V5_RUN.md` when hardware exists. The JAX E trunk stays a plain-array, explicit-params seam for a later RL policy/value wrapper — no PPO/value/self-play in this packet.
 
 ## Phase 0 — Freeze 1.32.7, Rules, RNG, and Provenance
 

@@ -2,6 +2,56 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-24 — Issue #8 Implemented: Promoted BC-E Manager Ported to JAX (V0+E Only)
+
+Extended `bc_manager_jax` with model variants **V0** and **E** on `main`.
+E is the four-way closed-loop ablation winner (median bank 25,873 vs V0
+9,251.5), so it is the only new architecture/input ported; **J/JE are
+deliberately unsupported** in JAX and fail loudly
+(`'J' is not supported by bc_manager_jax`). No executor, opening-book,
+fast-env, or Rust code changed.
+
+- **Variant seam outside the frozen config:** the seven-field serialized
+  `ManagerConfig` is unchanged; the variant mirrors the torch checkpoint's
+  top-level `model_variant` (absent -> V0). Native NPZ stores
+  `model_variant` top-level in its JSON metadata; pre-variant native files
+  load as V0. Expected variants are checked strictly — never inferred from
+  weight shapes.
+- **Exact E contract:** `economic_context` float32 `[B, 14]`, finite,
+  concatenated after the six self-resource feature blocks and before the
+  SAME two-layer MLP (first-layer input 35 -> 49). Trunk/tokens/heads/
+  loss/decode byte-identical to V0; V0 rejects `economic_context` as an
+  unknown input. Parameters: default V0 1,071,040 / E 1,072,832; tiny V0
+  37,008 / E 37,232.
+- **Authoritative features only:** tests build every economic row via
+  `bc_manager.economics` (`economic_context`, `EconomicHistory`) covering
+  day-0 invalid, adjacent join, gap invalidation, reset/backwards day,
+  all-land saturation, zero/negative cash, and exact channel order; no
+  formula is re-derived anywhere.
+- **Local CPU evidence (tiny):** deterministic PyTorch E -> JAX E strict
+  conversion parity across all seven output groups: worst max abs
+  6.855e-07, worst mean abs 1.101e-07 (gates: 2e-6 / 5e-7). Decoded
+  counts/land exact; total+per-group loss parity within 9.5e-7. Single-
+  device JIT E forward + train step finite. N=4 logical-CPU NamedSharding
+  subprocess: 1-vs-4 total diff 1.9e-6, group diff 2.4e-7, param diff
+  3.7e-9, batch spec `P('data', None)`; one bounded N=8 logical smoke
+  finite. N=4/N=8 are forced host-CPU logical validation ONLY — no
+  throughput/scaling claim.
+- **Benchmark:** rows record `model_variant` additively; random mode gains
+  `--variant {V0,E}`; checkpoint mode uses the stored variant; synthetic E
+  batches come from the authoritative `economic_context`. The exact
+  eventual Kaggle 8-device command targets `/kaggle/working/bc-v1-E/best.pt`
+  and is explicitly UNMEASURED (`research/JAX_TPU_V5_RUN.md`).
+- **Not done / not claimed:** the real BC-E checkpoint is absent locally
+  (`artifacts/local/bc-v1-E/best.pt`), so no real-checkpoint conversion or
+  parity has run; a bounded skip-if-absent test records the exact rerun
+  command. No TPU measurement exists.
+- **Tests:** `tests/test_bc_manager_jax_parity.py` (31 incl. 1 skip),
+  `tests/test_bc_manager_jax_train.py` (11),
+  `tests/test_bc_manager_jax_benchmark.py` (6) — 47 passed + 1 skip; all
+  pre-existing issue-#5 V0 tests unchanged and green; PyTorch BC
+  regressions 114 passed.
+
 ## 2026-08-23 — Issue #6 Implemented: BC V1 Four-Variant Ablation (V0/J/E/JE) With Fixed Closed-Loop Panel Gate
 
 Implemented the complete BC V1 ablation in four bounded commits on `main`
