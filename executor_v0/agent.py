@@ -31,7 +31,11 @@ from typing import Any, Callable
 
 from bc_manager.constants import ANIMAL_ORDER, CROP_ORDER
 from replay_daily.constants import (
+    ANIMALS,
+    CROPS,
     FARM_HAND_COST_MULT_DEFAULT,
+    LAND_ORDER,
+    LAND_PRICES,
     PRODUCTS,
     hire_cost,
     total_hire_cost,
@@ -47,6 +51,9 @@ from .tasks import GenerationResult, generate_tasks
 __all__ = ["AgentConfig", "ExecutorAgent", "make_agent"]
 
 _DIAGNOSTICS_SCHEMA_VERSION = 1
+# The engine accepts an order when money + epsilon covers it
+# (``money[player] + MONEY_EPSILON >= cost`` in the rust core).
+_MONEY_EPSILON = 1e-6
 
 
 def _sell_bin_index(hour: int) -> int:
@@ -59,7 +66,6 @@ class AgentConfig:
     """Provisional V0 constants; calibrate later from closed-loop traces."""
 
     tasks_per_worker: int = 10          # crude workload divisor for hiring
-    max_hires_per_day: int = 3          # daily safety cap on HIRE orders
     hire_cost_mult: int = FARM_HAND_COST_MULT_DEFAULT
     max_market_orders: int = 10         # engine maxMarketOrdersPerTurn
     foreman: ForemanConfig = field(default_factory=ForemanConfig)
@@ -114,8 +120,6 @@ class ExecutorAgent:
         self.config = config or AgentConfig()
         _require_positive_int(self.config.tasks_per_worker,
                               "config.tasks_per_worker")
-        _require_positive_int(self.config.max_hires_per_day,
-                              "config.max_hires_per_day")
         _require_positive_int(self.config.max_market_orders,
                               "config.max_market_orders")
         # ---- per-game state -------------------------------------------
@@ -283,31 +287,88 @@ class ExecutorAgent:
             entry["submitted"] += executed
             entry["remaining"] = self._remaining_sells[product]
 
-    def _hire_orders(self, obs: Mapping, seat: int,
-                     tile_task_count: int) -> tuple[list[list], int]:
-        """Hour-0-only crude workload hiring; returns (orders, requested)."""
-        if int(obs["hour"]) != 0:
-            return [], 0
+    def _hire_orders(self, obs: Mapping, seat: int, tile_task_count: int,
+                     available_cash: float) -> tuple[list[list], int]:
+        """Workload-derived hiring; returns (orders, requested).
+
+        Exact mechanics (issue #7):
+
+        - Hiring is useful at ANY hour (hands are cleared at every day
+          boundary and cost only a tiny Fibonacci schedule), so the old
+          hour-0-only gate no longer starves days that open with sells.
+        - The old hard ``max 3 hires/day`` cap is replaced by the executable
+          workload estimate plus exact sequential affordability.
+        - ``available_cash`` is current money PLUS the revenue of sell orders
+          already queued earlier this same turn: the engine applies market
+          orders sequentially, so same-turn SELL -> HIRE funding is real and
+          was previously ignored.
+        """
         farm = obs["farms"][seat]
         current_hands = len(farm.get("hands") or [])
         desired = 0
         if tile_task_count > 0:
             desired = int(math.ceil(tile_task_count /
                                     self.config.tasks_per_worker))
-        wanted = min(max(desired - current_hands, 0),
-                     self.config.max_hires_per_day)
-        # Respect money only enough to avoid obviously impossible orders.
+        wanted = max(desired - current_hands, 0)
         already_today = int(farm.get("hires_today", 0))
-        money = float(farm.get("money", 0.0))
-        spent = total_hire_cost(already_today, self.config.hire_cost_mult)
+        cash = available_cash
         affordable = 0
         for k in range(wanted):
             cost = hire_cost(already_today + k, self.config.hire_cost_mult)
-            if spent + cost > money:
+            if cash + _MONEY_EPSILON < cost:
                 break
-            spent += cost
+            cash -= cost
             affordable += 1
         return [["HIRE"]] * affordable, wanted
+
+    @staticmethod
+    def _sell_proceeds(obs: Mapping, committed_sells: list[dict]) -> float:
+        """Revenue of the sell candidates already queued this turn.
+
+        The engine's interleaved market path pays the current per-unit price
+        for each SELL order; observation prices are exactly those prices.
+        """
+        prices = (obs.get("market") or {}).get("prices") or {}
+        total = 0.0
+        for item in committed_sells:
+            total += float(prices.get(item["product"], 0)) * \
+                float(item["executed"])
+        return total
+
+    @staticmethod
+    def _buy_order_cost(obs: Mapping, task, unlocked_count: int) \
+            -> float | None:
+        """Conservative whole-order cost of one shortage buy; None = malformed.
+
+        BUY_SEED / BUY_ANIMAL / BUY_LAND have exact fixed costs. BUY_PRODUCT
+        prices rise as the shared market depletes, so the whole-order cost is
+        estimated unit-by-unit from the official price model at depleting
+        inventory levels (the engine accepts an order only if money covers
+        the entire quantity at once).
+        """
+        kind = task.kind
+        quantity = int(task.quantity)
+        if quantity <= 0:
+            return None
+        if kind == "BUY_SEED" and task.crop in CROPS:
+            return float(CROPS[task.crop]["seed"] * quantity)
+        if kind == "BUY_ANIMAL" and task.animal in ANIMALS:
+            return float(ANIMALS[task.animal]["cost"] * quantity)
+        if kind == "BUY_LAND":
+            index = unlocked_count - 1
+            if 0 <= index < len(LAND_PRICES):
+                return float(LAND_PRICES[index])
+            return None
+        if kind == "BUY_PRODUCT" and task.product in PRODUCTS:
+            from fast_env.market import market_price
+            inventory = int(((obs.get("market") or {}).get("inventory")
+                             or {}).get(task.product, 0))
+            total = 0.0
+            for k in range(quantity):
+                level = inventory - k - 1
+                total += float(market_price(task.product, max(level, 0)))
+            return total
+        return None
 
     @staticmethod
     def _buy_op(task) -> list | None:
@@ -352,22 +413,44 @@ class ExecutorAgent:
         # only orders that survive the engine cap are committed below, so
         # dropped lower-priority candidates (deferred/recomputed next turn)
         # are never counted as submitted.
+        #
+        # Sequential within-turn accounting (issue #7): the engine applies
+        # market orders in queue order, so earlier SELL revenue funds later
+        # HIRE/BUY orders. Every candidate is gated against the running cash
+        # it would see at execution time; unaffordable candidates are skipped
+        # this turn instead of being resubmitted unchanged every hour.
         sell_candidates = self._sell_candidates(obs, seat)
         tile_task_count = sum(1 for t in tasks if t.tile is not None)
-        hire_orders, hires_requested = self._hire_orders(obs, seat,
-                                                         tile_task_count)
+        money = float(obs["farms"][seat].get("money", 0.0))
+        cash_after_sells = money + self._sell_proceeds(obs, sell_candidates)
+        hire_orders, hires_requested = self._hire_orders(
+            obs, seat, tile_task_count, cash_after_sells)
+        unlocked_count = len(obs["farms"][seat]["unlocked_quadrants"])
         buy_tasks = sorted(
             (t for t in foreman_result.market_tasks
              if t.kind in ("BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL",
                            "BUY_LAND")),
             key=lambda t: t.sort_key)
-        buy_ops = [op for op in (self._buy_op(t) for t in buy_tasks)
-                   if op is not None]
 
         candidates: list[tuple[str, object]] = \
             [("sell", c) for c in sell_candidates] + \
-            [("hire", o) for o in hire_orders] + \
-            [("buy", op) for op in buy_ops]
+            [("hire", o) for o in hire_orders]
+        running_cash = cash_after_sells
+        unaffordable_orders: list[dict[str, Any]] = []
+        for task in buy_tasks:
+            op = self._buy_op(task)
+            if op is None:
+                continue
+            cost = self._buy_order_cost(obs, task, unlocked_count)
+            if cost is None:
+                continue
+            if running_cash + _MONEY_EPSILON < cost:
+                unaffordable_orders.append({
+                    "task": task.key, "cost": cost,
+                    "cash_available": running_cash})
+                continue
+            running_cash -= cost
+            candidates.append(("buy", op))
         included = candidates[:self.config.max_market_orders]
         orders = [payload["order"] if kind == "sell" else payload
                   for kind, payload in included]
@@ -381,10 +464,26 @@ class ExecutorAgent:
         for key in ("movement", "interaction", "pickup", "pass"):
             record["foreman_counts"][key] += foreman_result.counts[key]
         unfinished = [t.key for t in foreman_result.unassigned_tile_tasks]
-        record["unfinished_tasks"] = unfinished
-        record["missed_maintenance"] = [
+        # Accumulate per-key turn counts across the day instead of keeping
+        # only the last turn's snapshot: a task that churned/unassigned all
+        # day must stay visible even when the final turn looked clean
+        # (issue #7 diagnostics overwrite bug).
+        unfinished_turns: dict[str, int] = record.setdefault(
+            "unfinished_task_turns", {})
+        for key in unfinished:
+            unfinished_turns[key] = unfinished_turns.get(key, 0) + 1
+        missed_now = [
             key for key in unfinished if key.startswith(
                 ("WATER:", "FEED:", "COLLECT_FERTILIZER:"))]
+        missed_turns: dict[str, int] = record.setdefault(
+            "missed_maintenance_turns", {})
+        for key in missed_now:
+            missed_turns[key] = missed_turns.get(key, 0) + 1
+        record["unfinished_tasks"] = unfinished
+        record["missed_maintenance"] = missed_now
+        if unaffordable_orders:
+            record.setdefault("unaffordable_market_orders", []).extend(
+                unaffordable_orders)
         record["hires"]["requested"] = max(record["hires"]["requested"],
                                            hires_requested)
         record["hires"]["submitted"] += submitted_hires

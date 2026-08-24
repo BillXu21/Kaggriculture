@@ -254,9 +254,15 @@ def workload_plan():
     return simple_plan()
 
 
-def test_hire_only_at_hour0_within_workload_and_caps():
+def test_hire_follows_workload_any_hour_within_affordability():
+    """Workload-derived hiring at any hour; no arbitrary daily cap (issue #7).
+
+    Hands are cleared at every engine day boundary, so a day that opens with
+    zero hands must be able to hire mid-day whenever executable work and
+    cash exist.
+    """
     provider = recording_provider(workload_plan())
-    config = AgentConfig(tasks_per_worker=10, max_hires_per_day=2)
+    config = AgentConfig(tasks_per_worker=10)
     agent = ExecutorAgent(provider, seat=0, config=config)
     tiles = empty_tiles()
     for y in range(5):          # 10 water targets -> desired 1 extra hand
@@ -266,27 +272,67 @@ def test_hire_only_at_hour0_within_workload_and_caps():
     action = agent(obs_h0)
     assert action["market"] == [["HIRE"]]
 
-    # Hour 1: never hire again, even with more work.
+    # Hour 1 with the same workload: still understaffed (hands list is still
+    # empty in this synthetic obs), so hiring remains available beyond h0.
     obs_h1 = make_obs(day=3, hour=1, tiles=tiles, money=3000.0)
-    assert agent(obs_h1)["market"] == []
+    assert agent(obs_h1)["market"] == [["HIRE"]]
     assert agent.diagnostics_json()["days"]["3"]["hires"] == \
-        {"requested": 1, "submitted": 1, "observed_max": 0}
+        {"requested": 1, "submitted": 2, "observed_max": 0}
+
+    # Fully staffed: no more hires.
+    obs_staffed = make_obs(day=3, hour=2, tiles=tiles, money=3000.0,
+                           hands=[(4, 4)])
+    assert agent(obs_staffed)["market"] == []
 
 
-def test_hire_respects_daily_cap_and_money():
+def test_hire_respects_workload_and_money_without_arbitrary_cap():
     provider = recording_provider(workload_plan())
-    config = AgentConfig(tasks_per_worker=2, max_hires_per_day=5)
+    config = AgentConfig(tasks_per_worker=2)
     agent = ExecutorAgent(provider, seat=0, config=config)
     tiles = empty_tiles()
     for y in range(5):
-        for x in range(4):      # 20 targets -> desired 10 -> capped at 5
+        for x in range(4):      # 20 targets -> desired 10 hands
             tiles[y][x] = plant_tile()
 
     broke = make_obs(day=3, hour=0, tiles=tiles, money=0.0)
     assert agent(broke)["market"] == []          # cannot afford even fib(0)=1
 
     rich = make_obs(day=3, hour=0, tiles=tiles, money=3000.0)
-    assert agent(rich)["market"].count(["HIRE"]) == 5
+    # fib costs 1+1+2+3+5+8+13+21+34+55 = 143 <= 3000: all 10 wanted hires
+    # are submitted (the old hard cap of 5 is gone).
+    assert agent(rich)["market"].count(["HIRE"]) == 10
+
+
+def test_same_turn_sell_proceeds_fund_hires():
+    """Sequential within-turn accounting: queued SELL revenue funds HIRE.
+
+    Engine market orders apply in queue order, so hour-0 sells executed
+    before hires make otherwise-unaffordable hiring mechanically possible
+    (issue #7 pathology 1).
+    """
+    rows = {product: {anchor: (2 if anchor == 0 and product == "WHEAT"
+                              else 0)
+                      for anchor in (0, 4, 8, 12, 16, 20)}
+            for product in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY",
+                            "MELON", "EGG", "MILK", "WOOL", "FERTILIZER")}
+    provider = recording_provider(simple_plan(
+        crop_targets={"WHEAT": 10, "CARROT": 0, "TOMATO": 0,
+                      "STRAWBERRY": 0, "MELON": 0},
+        animal_targets={"GOOSE": 0, "COW": 0, "SHEEP": 0},
+        sell_quantities=rows))
+    config = AgentConfig(tasks_per_worker=10)
+    agent = ExecutorAgent(provider, seat=0, config=config)
+    tiles = empty_tiles()
+    for i in range(10):         # 10 empty tiles -> desired ceil(10/10)=1 hand
+        tiles[1][i] = None
+
+    # No cash at all -- but shed holds WHEAT to sell this turn.
+    obs = make_obs(day=3, hour=0, tiles=tiles, money=0.0,
+                   shed={"WHEAT": 2})
+    obs["market"]["prices"] = {"WHEAT": 25}
+    action = agent(obs)
+    assert ["SELL", "WHEAT", 2] in action["market"]
+    assert ["HIRE"] in action["market"]
 
 
 # -------------------------------------------------------- shortage purchases
@@ -344,7 +390,7 @@ def test_over_cap_candidates_not_counted_or_decremented():
         animal_targets={"GOOSE": 1, "COW": 0, "SHEEP": 0},
         sell_quantities=rows)
     provider = recording_provider(plan)
-    config = AgentConfig(tasks_per_worker=5, max_hires_per_day=2)
+    config = AgentConfig(tasks_per_worker=5)
     agent = ExecutorAgent(provider, seat=0, config=config)
     tiles = empty_tiles()
     for y in range(5):
@@ -369,8 +415,8 @@ def test_over_cap_candidates_not_counted_or_decremented():
                     "EGG", "MILK", "WOOL", "FERTILIZER"):
         entry = diag["sells"]["0"][product]
         assert entry == {"requested": 1, "submitted": 1, "remaining": 0}
-    # ...and the dropped hire is requested but NOT submitted.
-    assert diag["hires"] == {"requested": 2, "submitted": 1,
+    # ...and the dropped hires are requested but NOT submitted.
+    assert diag["hires"] == {"requested": 7, "submitted": 1,
                              "observed_max": 0}
 
 
