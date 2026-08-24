@@ -10,9 +10,17 @@ One class, `ExecutorAgent`, closes the loop every primitive turn:
   (`generate_tasks`), dispatch workers with the greedy foreman
   (`run_foreman`), and emit a bounded deterministic market queue:
   sells in the active four-hour bin only (clipped to actually available shed
-  inventory via `clip_sell`, remainder carried within the bin), hour-0-only
-  crude workload hiring, and exact-shortage BUY_SEED / BUY_PRODUCT /
-  BUY_ANIMAL / BUY_LAND orders implied by the active task generator;
+  inventory via `clip_sell`, remainder carried within the bin), workload
+  hiring, and exact-shortage BUY_SEED / BUY_PRODUCT / BUY_ANIMAL / BUY_LAND
+  orders implied by the active task generator;
+- hard survival guardrails keep existing animals ahead of discretionary
+  expansion: current-day feed is protected from WHEAT sells, starvation
+  boundary FEED work preempts non-survival tile work, feed-shortage purchases
+  execute before hiring/discretionary buys, and new animal/land commitments
+  pause while current survival or prior-day work debt is unresolved;
+- end-of-day work debt is measured from tasks still requiring work after the
+  final primitive action, so temporary dependency/travel waiting that resolves
+  during the day is not mislabeled as unfinished work;
 - accumulate JSON-serializable per-day/game diagnostics distinguishing
   requested vs feasible vs achieved vs submitted vs observed completion;
 - on any runtime failure in safe mode (default), return a legal-shaped all
@@ -52,26 +60,28 @@ from .tasks import GenerationResult, generate_tasks
 
 __all__ = ["AgentConfig", "ExecutorAgent", "make_agent"]
 
-_DIAGNOSTICS_SCHEMA_VERSION = 1
-# The engine accepts an order when money + epsilon covers it
-# (``money[player] + MONEY_EPSILON >= cost`` in the rust core).
+_DIAGNOSTICS_SCHEMA_VERSION = 2
 _MONEY_EPSILON = 1e-6
+_INTERACTION_OPS = frozenset({
+    "WATER", "HARVEST", "DIG", "PLANT", "BUILD_COOP", "BUILD_PASTURE",
+    "PLACE", "FEED", "CARE", "FERTILIZE", "COLLECT_FERTILIZER",
+})
+_EXPANSION_TASK_KINDS = frozenset({
+    "BUILD_COOP", "BUILD_PASTURE", "PLACE", "BUY_ANIMAL", "BUY_LAND",
+})
 
 
 def _sell_bin_index(hour: int) -> int:
-    """Active four-hour sell bin anchor: floor(hour/4)*4."""
     return (int(hour) // 4) * 4
 
 
 @dataclass(frozen=True)
 class AgentConfig:
-    """Provisional V0 constants; calibrate later from closed-loop traces."""
-
-    tasks_per_worker: int = 10          # crude workload divisor for hiring
+    tasks_per_worker: int = 10
     hire_cost_mult: int = FARM_HAND_COST_MULT_DEFAULT
-    max_market_orders: int = 10         # engine maxMarketOrdersPerTurn
+    max_market_orders: int = 10
     foreman: ForemanConfig = field(default_factory=ForemanConfig)
-    strict: bool = False                # True re-raises instead of PASSing
+    strict: bool = False
 
 
 def _require_positive_int(value: Any, what: str) -> int:
@@ -80,9 +90,7 @@ def _require_positive_int(value: Any, what: str) -> int:
     return value
 
 
-def _board_counts(board) -> tuple[dict[str, int], dict[str, int],
-                                 dict[str, int], dict[str, int]]:
-    """Current crops/animals by type plus observed CARE/FERTILIZER completions."""
+def _board_counts(board) -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
     crops = {name: 0 for name in CROP_ORDER}
     animals = {name: 0 for name in ANIMAL_ORDER}
     care_done = {name: 0 for name in ANIMAL_ORDER}
@@ -110,9 +118,40 @@ def _board_counts(board) -> tuple[dict[str, int], dict[str, int],
     return crops, animals, care_done, fert_done
 
 
-class ExecutorAgent:
-    """Kaggle-compatible callable closing the issue #1 V0 loop."""
+def _animal_feed_state(obs: Mapping, seat: int) -> dict[str, int]:
+    farm = obs["farms"][seat]
+    board = canonical_board(farm["tiles"], int(obs["day"]), int(obs.get("step", 0)))
+    unfed = 0
+    starving = 0
+    for row in board:
+        for tile in row:
+            if not isinstance(tile, Mapping) or "animal" not in tile:
+                continue
+            if tile.get("fed_today") is True:
+                continue
+            unfed += 1
+            if int(tile.get("consecutive_unfed") or 0) >= 1:
+                starving += 1
+    private = obs.get("private") or {}
+    carried_wheat = sum(
+        int(inv.get("WHEAT", 0) or 0)
+        for inv in (private.get("inventories") or [])
+        if isinstance(inv, Mapping)
+    )
+    shed_wheat = int((private.get("shed") or {}).get("WHEAT", 0) or 0)
+    available_wheat = carried_wheat + shed_wheat
+    return {
+        "unfed": unfed,
+        "starving": starving,
+        "carried_wheat": carried_wheat,
+        "shed_wheat": shed_wheat,
+        "available_wheat": available_wheat,
+        "shed_reserve": max(0, unfed - carried_wheat),
+        "shortage": max(0, unfed - available_wheat),
+    }
 
+
+class ExecutorAgent:
     def __init__(self, provider: PlanProvider, *, seat: int | None = None,
                  config: AgentConfig | None = None) -> None:
         self.provider = provider
@@ -120,80 +159,64 @@ class ExecutorAgent:
         if seat is not None and seat not in (0, 1):
             raise ValueError(f"seat must be None, 0, or 1, got {seat!r}")
         self.config = config or AgentConfig()
-        _require_positive_int(self.config.tasks_per_worker,
-                              "config.tasks_per_worker")
-        _require_positive_int(self.config.max_market_orders,
-                              "config.max_market_orders")
-        # ---- per-game state -------------------------------------------
+        _require_positive_int(self.config.tasks_per_worker, "config.tasks_per_worker")
+        _require_positive_int(self.config.max_market_orders, "config.max_market_orders")
         self._day: int | None = None
         self._requested: DailyPlan | None = None
         self._feasible: DailyPlan | None = None
         self._projection_diagnostics: dict[str, Any] = {}
         self._bin_anchor: int | None = None
         self._remaining_sells: dict[str, int] = {}
-        self._previous_execution: dict[str, int] = {
-            "workers_hired": 0, "hire_cost": 0}
+        self._previous_execution: dict[str, int] = {"workers_hired": 0, "hire_cost": 0}
         self._max_hires_today: int = 0
         self._day_records: dict[int, dict[str, Any]] = {}
         self._errors: list[dict[str, Any]] = []
+        self._suppress_expansion_today: bool = False
 
-    # ------------------------------------------------------------- kaggle
     def __call__(self, obs: Mapping) -> dict[str, Any]:
         try:
             return self._act(obs)
-        except Exception as exc:  # noqa: BLE001 - deliberate safe mode
+        except Exception as exc:
             if self.config.strict:
                 raise
             self._errors.append({
                 "step": obs.get("step") if isinstance(obs, Mapping) else None,
-                "error_type": type(exc).__name__,
-                "message": str(exc),
+                "error_type": type(exc).__name__, "message": str(exc),
             })
             return self._fallback_action(obs)
 
-    # -------------------------------------------------------------- core
     def _resolve_seat(self, obs: Mapping) -> int:
         observed = obs.get("player")
         if self.seat is not None:
             if observed is not None and int(observed) != self.seat:
-                raise ValueError(
-                    f"obs player {observed!r} contradicts explicit agent seat "
-                    f"{self.seat}")
+                raise ValueError(f"obs player {observed!r} contradicts explicit agent seat {self.seat}")
             return self.seat
         if observed is None:
-            raise ValueError(
-                "obs carries no 'player' field; construct the agent with an "
-                "explicit seat")
+            raise ValueError("obs carries no 'player' field; construct the agent with an explicit seat")
         seat = int(observed)
         if seat not in (0, 1):
             raise ValueError(f"obs player must be 0 or 1, got {seat!r}")
         return seat
 
     def _fallback_action(self, obs: Mapping) -> dict[str, Any]:
-        """Legal-shaped all-PASS action; never raises."""
-        hands: int = 0
+        hands = 0
         try:
             seat = self._resolve_seat(obs)
             hands = len(obs["farms"][seat].get("hands") or [])
-        except Exception:  # noqa: BLE001 - fallback must not raise
+        except Exception:
             hands = 0
-        return {"farmer": ["PASS"], "hands": [["PASS"]] * hands,
-                "market": []}
+        return {"farmer": ["PASS"], "hands": [["PASS"]] * hands, "market": []}
 
     def _new_day(self, obs: Mapping, seat: int) -> None:
-        """Finalize prior labor, call the manager once, project the plan."""
         farm = obs["farms"][seat]
-        board = canonical_board(farm["tiles"], int(obs["day"]),
-                                int(obs.get("step", 0)))
+        board = canonical_board(farm["tiles"], int(obs["day"]), int(obs.get("step", 0)))
         crops, animals, care_done, fert_done = _board_counts(board)
+        prior_debt = False
         if self._day is not None:
-            # Realized hires of the finished day come from the observed
-            # hires_today progression, never from submitted HIRE intents.
             hires = self._max_hires_today
             self._previous_execution = {
                 "workers_hired": hires,
-                "hire_cost": total_hire_cost(hires,
-                                             self.config.hire_cost_mult),
+                "hire_cost": total_hire_cost(hires, self.config.hire_cost_mult),
             }
             record = self._day_records[self._day]
             record["achieved_final"] = {
@@ -202,13 +225,13 @@ class ExecutorAgent:
             }
             record["care_completed_observed"] = care_done
             record["fertilizer_completed_observed"] = fert_done
-        # The engine resets hires_today at the day boundary; start fresh.
+            debt = record.get("end_of_day_work_debt") or {}
+            prior_debt = bool(debt.get("all"))
+            record["next_day_expansion_suppressed"] = prior_debt
+        self._suppress_expansion_today = prior_debt
         raw_hires = farm.get("hires_today", 0)
-        self._max_hires_today = raw_hires \
-            if isinstance(raw_hires, int) and not isinstance(raw_hires, bool) \
-            else 0
-        self._requested = self.provider.daily_plan(
-            obs, seat, dict(self._previous_execution))
+        self._max_hires_today = raw_hires if isinstance(raw_hires, int) and not isinstance(raw_hires, bool) else 0
+        self._requested = self.provider.daily_plan(obs, seat, dict(self._previous_execution))
         result = project_plan(
             self._requested,
             current_land_count=len(farm["unlocked_quadrants"]),
@@ -223,21 +246,29 @@ class ExecutorAgent:
             "requested": self._requested.to_json_dict(),
             "feasible": self._feasible.to_json_dict(),
             "projection_changes": self._projection_diagnostics,
-            "foreman_counts": {"movement": 0, "interaction": 0,
-                               "pickup": 0, "pass": 0},
+            "foreman_counts": {"movement": 0, "interaction": 0, "pickup": 0, "pass": 0},
             "unfinished_tasks": [],
             "missed_maintenance": [],
+            "end_of_day_work_debt": {"all": [], "survival": [], "maintenance": [], "productive": [], "manager": []},
+            "pending_task_turns": {},
+            "pending_maintenance_turns": {},
             "sells": {},
-            "hires": {"requested": 0, "submitted": 0,
-                      "observed_max": self._max_hires_today},
+            "hires": {"requested": 0, "submitted": 0, "observed_max": self._max_hires_today},
             "previous_labor": dict(self._previous_execution),
             "unresolved_generator": [],
+            "survival": {
+                "expansion_suppressed_from_prior_debt": self._suppress_expansion_today,
+                "expansion_suppressed_current": False,
+                "starvation_preemption_turns": 0,
+                "feed_reserve_protected_units": 0,
+                "feed_shortage_turns": 0,
+                "partial_feed_buys": 0,
+            },
             "errors": [],
         }
         self._day = int(obs["day"])
 
     def _refresh_sell_ledger(self, obs: Mapping, bin_anchor: int) -> None:
-        """Reset remaining sells at each new four-hour bin from the plan."""
         bin_index = SELL_BIN_ANCHORS.index(bin_anchor)
         self._remaining_sells = {
             product: self._feasible.sell_quantities[product_index][bin_index]
@@ -246,71 +277,42 @@ class ExecutorAgent:
         self._bin_anchor = bin_anchor
         record = self._day_records[int(obs["day"])]
         record["sells"][str(bin_anchor)] = {
-            product: {"requested": self._remaining_sells[product],
-                      "submitted": 0,
-                      "remaining": self._remaining_sells[product]}
+            product: {"requested": self._remaining_sells[product], "submitted": 0, "remaining": self._remaining_sells[product]}
             for product in PRODUCTS
         }
 
     def _sell_candidates(self, obs: Mapping, seat: int) -> list[dict]:
-        """Clip sells to available shed inventory WITHOUT mutating state.
-
-        Each candidate is ``{"order": [...], "product": p, "executed": n}``;
-        the caller commits only candidates that survive the market-order
-        cap via `_commit_sells`, so dropped orders never decrement the
-        remaining ledger or inflate submitted diagnostics.
-        """
         shed = (obs.get("private") or {}).get("shed") or {}
-        candidates: list[dict] = []
+        feed = _animal_feed_state(obs, seat)
+        candidates = []
         for product in PRODUCTS:
             remaining = self._remaining_sells.get(product, 0)
             if remaining <= 0:
                 continue
             available = int(shed.get(product, 0))
-            executed, _remaining_after = clip_sell(product, remaining,
-                                                   available)
+            if product == "WHEAT":
+                protected = min(available, feed["shed_reserve"])
+                available -= protected
+                survival = self._day_records[int(obs["day"])]["survival"]
+                survival["feed_reserve_protected_units"] = max(
+                    int(survival["feed_reserve_protected_units"]), protected)
+            executed, _ = clip_sell(product, remaining, available)
             if executed > 0:
-                candidates.append({"order": ["SELL", product, executed],
-                                   "product": product,
-                                   "executed": executed})
+                candidates.append({"order": ["SELL", product, executed], "product": product, "executed": executed})
         return candidates
 
-    def _commit_sells(self, obs: Mapping, day: int,
-                      committed: list[dict]) -> None:
-        """Apply only actually-submitted sell orders to ledgers/logs."""
+    def _commit_sells(self, obs: Mapping, day: int, committed: list[dict]) -> None:
         record = self._day_records[day]
         bin_log = record["sells"][str(self._bin_anchor)]
         for item in committed:
             product = item["product"]
             executed = item["executed"]
-            self._remaining_sells[product] = \
-                self._remaining_sells.get(product, 0) - executed
+            self._remaining_sells[product] = self._remaining_sells.get(product, 0) - executed
             entry = bin_log[product]
             entry["submitted"] += executed
             entry["remaining"] = self._remaining_sells[product]
 
-    def _hire_orders(self, obs: Mapping, seat: int,
-                     tile_tasks: list[Task],
-                     available_cash: float) -> tuple[list[list], int]:
-        """Travel-aware workload hiring; returns (orders, requested).
-
-        Exact mechanics (issue #7):
-
-        - Hiring is useful at ANY hour (hands are cleared at every day
-          boundary and cost only a tiny Fibonacci schedule), so the old
-          hour-0-only gate no longer starves days that open with sells.
-        - The old hard ``max 3 hires/day`` cap is replaced by an executable
-          workload estimate plus exact sequential affordability.
-        - Workload includes TRAVEL: one tile task costs roughly its
-          Manhattan distance from the nearest current worker plus one
-          interaction turn. Ignoring travel made ``tasks_per_worker``
-          chronically under-hire on scattered boards and let deadline
-          maintenance die in queues.
-        - ``available_cash`` is current money PLUS the revenue of sell orders
-          already queued earlier this same turn: the engine applies market
-          orders sequentially, so same-turn SELL -> HIRE funding is real and
-          was previously ignored.
-        """
+    def _hire_orders(self, obs: Mapping, seat: int, tile_tasks: list[Task], available_cash: float) -> tuple[list[list], int]:
         farm = obs["farms"][seat]
         current_hands = len(farm.get("hands") or [])
         positions = [farm.get("farmer") or [0, 0]]
@@ -318,36 +320,26 @@ class ExecutorAgent:
         anchors = []
         for pos in positions:
             if isinstance(pos, (list, tuple)) and len(pos) == 2:
-                anchors.append((int(pos[1]), int(pos[0])))  # [x,y] -> (y,x)
+                anchors.append((int(pos[1]), int(pos[0])))
         if not anchors:
             anchors = [(4, 4)]
         turns_left = max(24 - int(obs["hour"]), 1)
 
-        def _turns_needed(tasks_: list[Task]) -> int:
+        def turns_needed(tasks_):
             total = 0
             for t in tasks_:
                 if t.tile is None:
                     continue
-                travel = min(abs(t.tile[0] - ay) + abs(t.tile[1] - ax)
-                             for ay, ax in anchors)
+                travel = min(abs(t.tile[0] - ay) + abs(t.tile[1] - ax) for ay, ax in anchors)
                 total += travel + 1
             return total
 
-        # General load uses the crude per-worker divisor; the travel-aware
-        # term is reserved for hard-deadline maintenance (weed-boundary
-        # watering, starving-animal feeding): missing those destroys assets,
-        # while blanket travel-aware hiring over the whole task set just
-        # burns Fibonacci hire fees on low-priority work (issue #7).
-        maintenance = [t for t in tile_tasks
-                       if t.priority == Priority.MAINTENANCE]
-        crude = math.ceil(len(tile_tasks) / self.config.tasks_per_worker) \
-            if tile_tasks else 0
+        maintenance = [t for t in tile_tasks if t.priority == Priority.MAINTENANCE or t.kind == "FEED"]
+        crude = math.ceil(len(tile_tasks) / self.config.tasks_per_worker) if tile_tasks else 0
         desired = crude
         if maintenance:
-            maint_turns = _turns_needed(maintenance)
-            maint_workers = math.ceil(maint_turns / max(turns_left, 1))
-            desired = max(desired, min(maint_workers, current_hands + 1
-                                       + len(maintenance)))
+            maint_workers = math.ceil(turns_needed(maintenance) / max(turns_left, 1))
+            desired = max(desired, min(maint_workers, current_hands + 1 + len(maintenance)))
         wanted = max(desired - current_hands, 0)
         already_today = int(farm.get("hires_today", 0))
         cash = available_cash
@@ -362,31 +354,13 @@ class ExecutorAgent:
 
     @staticmethod
     def _sell_proceeds(obs: Mapping, committed_sells: list[dict]) -> float:
-        """Revenue of the sell candidates already queued this turn.
-
-        The engine's interleaved market path pays the current per-unit price
-        for each SELL order; observation prices are exactly those prices.
-        """
         prices = (obs.get("market") or {}).get("prices") or {}
-        total = 0.0
-        for item in committed_sells:
-            total += float(prices.get(item["product"], 0)) * \
-                float(item["executed"])
-        return total
+        return sum(float(prices.get(item["product"], 0)) * float(item["executed"]) for item in committed_sells)
 
     @staticmethod
-    def _buy_order_cost(obs: Mapping, task, unlocked_count: int) \
-            -> float | None:
-        """Conservative whole-order cost of one shortage buy; None = malformed.
-
-        BUY_SEED / BUY_ANIMAL / BUY_LAND have exact fixed costs. BUY_PRODUCT
-        prices rise as the shared market depletes, so the whole-order cost is
-        estimated unit-by-unit from the official price model at depleting
-        inventory levels (the engine accepts an order only if money covers
-        the entire quantity at once).
-        """
+    def _buy_order_cost(obs: Mapping, task, unlocked_count: int, quantity: int | None = None) -> float | None:
         kind = task.kind
-        quantity = int(task.quantity)
+        quantity = int(task.quantity if quantity is None else quantity)
         if quantity <= 0:
             return None
         if kind == "BUY_SEED" and task.crop in CROPS:
@@ -400,8 +374,7 @@ class ExecutorAgent:
             return None
         if kind == "BUY_PRODUCT" and task.product in PRODUCTS:
             from fast_env.market import market_price
-            inventory = int(((obs.get("market") or {}).get("inventory")
-                             or {}).get(task.product, 0))
+            inventory = int(((obs.get("market") or {}).get("inventory") or {}).get(task.product, 0))
             total = 0.0
             for k in range(quantity):
                 level = inventory - k - 1
@@ -410,9 +383,8 @@ class ExecutorAgent:
         return None
 
     @staticmethod
-    def _buy_op(task) -> list | None:
-        """Exact market op list for one shortage task; None if malformed."""
-        quantity = int(task.quantity)
+    def _buy_op(task, quantity: int | None = None) -> list | None:
+        quantity = int(task.quantity if quantity is None else quantity)
         if quantity <= 0:
             return None
         if task.kind == "BUY_SEED" and task.crop:
@@ -424,6 +396,35 @@ class ExecutorAgent:
         if task.kind == "BUY_LAND":
             return ["BUY_LAND"]
         return None
+
+    def _affordable_survival_feed_buy(self, obs: Mapping, task: Task, unlocked_count: int, available_cash: float):
+        for quantity in range(int(task.quantity), 0, -1):
+            cost = self._buy_order_cost(obs, task, unlocked_count, quantity=quantity)
+            if cost is not None and available_cash + _MONEY_EPSILON >= cost:
+                return self._buy_op(task, quantity=quantity), cost, quantity
+        return None, 0.0, 0
+
+    @staticmethod
+    def _end_of_day_debt(tasks: tuple[Task, ...], foreman_result: Any) -> dict[str, list[str]]:
+        completed_last_turn = {
+            a.task_key for a in foreman_result.assignments
+            if a.task_key is not None and a.action and a.action[0] in _INTERACTION_OPS
+        }
+        remaining = [t for t in tasks if t.tile is not None and t.key not in completed_last_turn]
+        survival = [
+            t.key for t in remaining
+            if t.kind == "FEED" or (t.kind == "WATER" and t.source == "water_must_weed_boundary")
+        ]
+        maintenance = [t.key for t in remaining if t.priority == Priority.MAINTENANCE and t.key not in survival]
+        productive = [t.key for t in remaining if t.priority == Priority.PRODUCTIVE]
+        manager = [t.key for t in remaining if t.priority == Priority.MANAGER]
+        return {
+            "all": [t.key for t in remaining],
+            "survival": survival,
+            "maintenance": maintenance,
+            "productive": productive,
+            "manager": manager,
+        }
 
     def _act(self, obs: Mapping) -> dict[str, Any]:
         seat = self._resolve_seat(obs)
@@ -440,46 +441,74 @@ class ExecutorAgent:
         if bin_anchor != self._bin_anchor:
             self._refresh_sell_ledger(obs, bin_anchor)
 
-        generation: GenerationResult = generate_tasks(
-            obs, seat, feasible_plan=self._feasible,
-            remaining_sells=self._remaining_sells)
+        generation = generate_tasks(obs, seat, feasible_plan=self._feasible, remaining_sells=self._remaining_sells)
         tasks = generation.sorted_tasks()
-        foreman_result = run_foreman(obs, seat, tasks,
-                                     config=self.config.foreman)
+        feed = _animal_feed_state(obs, seat)
+        current_survival_pressure = bool(feed["starving"] or feed["shortage"])
+        expansion_suppressed = self._suppress_expansion_today or current_survival_pressure
+        if expansion_suppressed:
+            tasks = tuple(t for t in tasks if t.kind not in _EXPANSION_TASK_KINDS)
 
-        # ---- market queue: sells -> hires -> shortage buys --------------
-        # Candidates are built WITHOUT mutating any ledger or diagnostic;
-        # only orders that survive the engine cap are committed below, so
-        # dropped lower-priority candidates (deferred/recomputed next turn)
-        # are never counted as submitted.
-        #
-        # Sequential within-turn accounting (issue #7): the engine applies
-        # market orders in queue order, so earlier SELL revenue funds later
-        # HIRE/BUY orders. Every candidate is gated against the running cash
-        # it would see at execution time; unaffordable candidates are skipped
-        # this turn instead of being resubmitted unchanged every hour.
+        dispatch_tasks = tasks
+        if feed["starving"]:
+            dispatch_tasks = tuple(t for t in tasks if t.tile is None or t.kind == "FEED")
+
+        foreman_result = run_foreman(obs, seat, dispatch_tasks, config=self.config.foreman)
+
+        record = self._day_records[day]
+        survival_record = record["survival"]
+        survival_record["expansion_suppressed_current"] = bool(
+            survival_record["expansion_suppressed_current"] or expansion_suppressed)
+        if feed["starving"]:
+            survival_record["starvation_preemption_turns"] += 1
+        if feed["shortage"]:
+            survival_record["feed_shortage_turns"] += 1
+
         sell_candidates = self._sell_candidates(obs, seat)
         money = float(obs["farms"][seat].get("money", 0.0))
-        cash_after_sells = money + self._sell_proceeds(obs, sell_candidates)
+        running_cash = money + self._sell_proceeds(obs, sell_candidates)
+        unlocked_count = len(obs["farms"][seat]["unlocked_quadrants"])
+
         from executor_v0 import foreman as _foreman_mod
+        all_market_tasks = sorted(
+            (t for t in tasks if t.kind in _foreman_mod._MARKET_TASK_KINDS),
+            key=lambda t: t.sort_key)
+        survival_feed_buys = [
+            t for t in all_market_tasks
+            if t.kind == "BUY_PRODUCT" and t.product == "WHEAT" and feed["shortage"] > 0
+        ]
+        other_buys = [
+            t for t in all_market_tasks
+            if t.kind in ("BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "BUY_LAND")
+            and t not in survival_feed_buys
+        ]
+
+        candidates = [("sell", c) for c in sell_candidates]
+        unaffordable_orders = []
+        for task in survival_feed_buys:
+            op, cost, quantity = self._affordable_survival_feed_buy(obs, task, unlocked_count, running_cash)
+            if op is None:
+                unaffordable_orders.append({
+                    "task": task.key, "cost": self._buy_order_cost(obs, task, unlocked_count),
+                    "cash_available": running_cash, "survival": True,
+                })
+                continue
+            if quantity < int(task.quantity):
+                survival_record["partial_feed_buys"] += 1
+            running_cash -= cost
+            candidates.append(("buy", op))
+
         hire_orders, hires_requested = self._hire_orders(
             obs, seat,
-            [t for t in tasks if t.tile is not None
-             and t.kind in _foreman_mod._TILE_TASK_KINDS],
-            cash_after_sells)
-        unlocked_count = len(obs["farms"][seat]["unlocked_quadrants"])
-        buy_tasks = sorted(
-            (t for t in foreman_result.market_tasks
-             if t.kind in ("BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL",
-                           "BUY_LAND")),
-            key=lambda t: t.sort_key)
+            [t for t in dispatch_tasks if t.tile is not None and t.kind in _foreman_mod._TILE_TASK_KINDS],
+            running_cash,
+        )
+        already_today = int(obs["farms"][seat].get("hires_today", 0))
+        for k, order in enumerate(hire_orders):
+            running_cash -= hire_cost(already_today + k, self.config.hire_cost_mult)
+            candidates.append(("hire", order))
 
-        candidates: list[tuple[str, object]] = \
-            [("sell", c) for c in sell_candidates] + \
-            [("hire", o) for o in hire_orders]
-        running_cash = cash_after_sells
-        unaffordable_orders: list[dict[str, Any]] = []
-        for task in buy_tasks:
+        for task in other_buys:
             op = self._buy_op(task)
             if op is None:
                 continue
@@ -488,56 +517,45 @@ class ExecutorAgent:
                 continue
             if running_cash + _MONEY_EPSILON < cost:
                 unaffordable_orders.append({
-                    "task": task.key, "cost": cost,
-                    "cash_available": running_cash})
+                    "task": task.key, "cost": cost, "cash_available": running_cash, "survival": False,
+                })
                 continue
             running_cash -= cost
             candidates.append(("buy", op))
-        included = candidates[:self.config.max_market_orders]
-        orders = [payload["order"] if kind == "sell" else payload
-                  for kind, payload in included]
 
-        record = self._day_records[day]
-        self._commit_sells(obs, day,
-                           [payload for kind, payload in included
-                            if kind == "sell"])
+        included = candidates[:self.config.max_market_orders]
+        orders = [payload["order"] if kind == "sell" else payload for kind, payload in included]
+
+        self._commit_sells(obs, day, [payload for kind, payload in included if kind == "sell"])
         submitted_hires = sum(1 for kind, _ in included if kind == "hire")
 
         for key in ("movement", "interaction", "pickup", "pass"):
             record["foreman_counts"][key] += foreman_result.counts[key]
-        unfinished = [t.key for t in foreman_result.unassigned_tile_tasks]
-        # Accumulate per-key turn counts across the day instead of keeping
-        # only the last turn's snapshot: a task that churned/unassigned all
-        # day must stay visible even when the final turn looked clean
-        # (issue #7 diagnostics overwrite bug).
-        unfinished_turns: dict[str, int] = record.setdefault(
-            "unfinished_task_turns", {})
-        for key in unfinished:
-            unfinished_turns[key] = unfinished_turns.get(key, 0) + 1
-        missed_now = [
-            key for key in unfinished if key.startswith(
-                ("WATER:", "FEED:", "COLLECT_FERTILIZER:"))]
-        missed_turns: dict[str, int] = record.setdefault(
-            "missed_maintenance_turns", {})
-        for key in missed_now:
-            missed_turns[key] = missed_turns.get(key, 0) + 1
-        record["unfinished_tasks"] = unfinished
-        record["missed_maintenance"] = missed_now
+
+        pending = [t.key for t in foreman_result.unassigned_tile_tasks]
+        for key in pending:
+            record["pending_task_turns"][key] = record["pending_task_turns"].get(key, 0) + 1
+        pending_maintenance = [key for key in pending if key.startswith(("WATER:", "FEED:", "COLLECT_FERTILIZER:"))]
+        for key in pending_maintenance:
+            record["pending_maintenance_turns"][key] = record["pending_maintenance_turns"].get(key, 0) + 1
+
+        if hour == 23:
+            debt = self._end_of_day_debt(tasks, foreman_result)
+            record["end_of_day_work_debt"] = debt
+            record["unfinished_tasks"] = list(debt["all"])
+            record["missed_maintenance"] = list(debt["survival"]) + list(debt["maintenance"])
+            record["unfinished_task_turns"] = {key: 1 for key in debt["all"]}
+            record["missed_maintenance_turns"] = {key: 1 for key in record["missed_maintenance"]}
+
         if unaffordable_orders:
-            record.setdefault("unaffordable_market_orders", []).extend(
-                unaffordable_orders)
-        record["hires"]["requested"] = max(record["hires"]["requested"],
-                                           hires_requested)
+            record.setdefault("unaffordable_market_orders", []).extend(unaffordable_orders)
+        record["hires"]["requested"] = max(record["hires"]["requested"], hires_requested)
         record["hires"]["submitted"] += submitted_hires
         record["hires"]["observed_max"] = self._max_hires_today
         record["unresolved_generator"] = list(generation.unresolved)
 
-        # Continuously current achieved state from every processed
-        # observation, so the latest day (e.g. day 29) always carries valid
-        # current/final-seen values even without a following day boundary.
         crops, animals, care_done, fert_done = _board_counts(
-            canonical_board(obs["farms"][seat]["tiles"], day,
-                            int(obs.get("step", 0))))
+            canonical_board(obs["farms"][seat]["tiles"], day, int(obs.get("step", 0))))
         record["achieved_current"] = {
             "crops": crops, "animals": animals,
             "land_count": len(obs["farms"][seat]["unlocked_quadrants"]),
@@ -551,25 +569,14 @@ class ExecutorAgent:
             "market": orders[:self.config.max_market_orders],
         }
 
-    # ------------------------------------------------------------ diagnostics
     def diagnostics_json(self) -> dict[str, Any]:
-        """JSON-serializable per-day/game diagnostics accumulated so far.
-
-        Additive issue #6 key: when the injected provider exposes its own
-        ``diagnostics_json`` (e.g. CheckpointPlanProvider closed-loop
-        coherence), it is embedded under ``provider_diagnostics``. Purely
-        additive — action generation never consults this method.
-        """
-        diagnostics: dict[str, Any] = {
+        diagnostics = {
             "schema_version": _DIAGNOSTICS_SCHEMA_VERSION,
             "seat": self.seat,
-            "days": {str(day): record
-                     for day, record in sorted(self._day_records.items())},
+            "days": {str(day): record for day, record in sorted(self._day_records.items())},
             "illegal_actions": {
                 "available": False,
-                "reason": ("the 1.32.7 observation does not expose per-action "
-                           "validity; illegal/ineffective detection requires "
-                           "engine-source instrumentation"),
+                "reason": "the 1.32.7 observation does not expose per-action validity; illegal/ineffective detection requires engine-source instrumentation",
                 "count": 0,
             },
             "fallback_errors": [dict(e) for e in self._errors],
@@ -584,18 +591,11 @@ def make_agent(*, provider: PlanProvider | None = None,
                checkpoint: str | None = None, device: str = "cpu",
                seat: int | None = None,
                config: AgentConfig | None = None) -> ExecutorAgent:
-    """Build an `ExecutorAgent` from an injected provider or explicit path.
-
-    Exactly one of ``provider`` / ``checkpoint`` must be given; a missing or
-    invalid checkpoint file raises immediately (nothing is ever fabricated).
-    """
     if (provider is None) == (checkpoint is None):
-        raise ValueError(
-            "provide exactly one of provider= or checkpoint=")
+        raise ValueError("provide exactly one of provider= or checkpoint=")
     if checkpoint is not None:
         provider = CheckpointPlanProvider(checkpoint, device=device)
     return ExecutorAgent(provider, seat=seat, config=config)
 
 
-# Type alias documenting the Kaggle callable shape.
 AgentCallable = Callable[[Mapping], dict[str, Any]]
