@@ -44,11 +44,11 @@ jobs:
           manylinux: "2014"
           sccache: "true"
 
-      - name: Install built wheel
+      - name: Install built wheel with runtime dependencies
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --force-reinstall --no-deps dist/*.whl
+          python -m pip install --force-reinstall dist/*.whl
 
       - name: Fast-engine import/reset smoke
         shell: bash
