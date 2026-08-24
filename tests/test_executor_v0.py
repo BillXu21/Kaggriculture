@@ -333,20 +333,22 @@ def test_projection_fertilizer_care_clip_to_eligible_with_shortfall():
                           current_crops={"WHEAT": 4})
     fert = result.feasible_plan.fertilizer_by_crop_dict
     care = result.feasible_plan.care_by_animal_dict
-    assert fert["WHEAT"] == 4      # clipped to 4 actual wheat crops
-    assert fert["CARROT"] == 0     # no carrot planted: honest zero
-    assert fert["TOMATO"] == 0     # requested 2 but zero eligible tomatoes
-    assert care["GOOSE"] == 1      # one goose exists
-    assert care["COW"] == 0        # no cow: shortfall, never fabricated
-    assert care["SHEEP"] == 0
+    # Eligibility counts assets the plan itself establishes today
+    # (max(current, requested target)), not just the start-of-day snapshot:
+    # clipping against hour-0 animals/crops made requests for same-day
+    # purchases/plantings permanently infeasible (issue #7).
+    assert fert["WHEAT"] == 4      # clipped to planned total max(4, 3) = 4
+    assert fert["CARROT"] == 0     # no carrot current or planned: honest zero
+    assert fert["TOMATO"] == 2     # plan plants 2 tomatoes today -> eligible
+    assert care["GOOSE"] == 2      # plan raises geese to 2 -> eligible 2
+    assert care["COW"] == 1        # plan buys 1 cow today -> eligible 1
+    assert care["SHEEP"] == 0      # no sheep current or planned
     assert result.diagnostics["fertilizer"]["WHEAT"] == {
         "requested": 5, "eligible": 4, "feasible": 4, "shortfall": 1}
-    assert result.diagnostics["fertilizer"]["CARROT"] == {
-        "requested": 1, "eligible": 0, "feasible": 0, "shortfall": 1}
     assert result.diagnostics["fertilizer"]["TOMATO"] == {
-        "requested": 2, "eligible": 0, "feasible": 0, "shortfall": 2}
-    assert result.diagnostics["care"]["COW"] == {
-        "requested": 1, "eligible": 0, "feasible": 0, "shortfall": 1}
+        "requested": 2, "eligible": 2, "feasible": 2, "shortfall": 0}
+    assert result.diagnostics["care"]["GOOSE"] == {
+        "requested": 3, "eligible": 2, "feasible": 2, "shortfall": 1}
 
 
 def test_projection_keeps_sell_schedule_and_reports_requested_totals():
