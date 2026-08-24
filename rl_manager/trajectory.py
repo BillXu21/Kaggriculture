@@ -286,8 +286,12 @@ class TrajectoryBuffer:
             "transitions": [record.to_json_dict()
                             for record in self.sidecar_records],
         }
+        # allow_nan=False: the sidecar must stay strictly JSON-safe; any
+        # NaN/Inf leak fails loudly at write time instead of poisoning the
+        # artifact for downstream JSON consumers.
         Path(str(base) + ".json").write_text(
-            json.dumps(sidecar, sort_keys=True, indent=1), encoding="utf-8")
+            json.dumps(sidecar, sort_keys=True, indent=1, allow_nan=False),
+            encoding="utf-8")
         return base
 
     @classmethod

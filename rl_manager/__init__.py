@@ -36,6 +36,7 @@ from rl_manager.executor_factory import (
 from rl_manager.policy import JaxEPlanPolicy, params_fingerprint
 from rl_manager.provider import QueuedPlanProvider
 from rl_manager.runner import (
+    ARTIFACT_METADATA_SCHEMA_VERSION,
     GAME_TURNS,
     MANAGER_START_DAY,
     TOTAL_MANAGER_DAYS,
@@ -43,6 +44,7 @@ from rl_manager.runner import (
     EpisodeSpec,
     RunnerConfig,
     SelfPlayRunner,
+    build_artifact_metadata,
     build_episode_spec,
 )
 from rl_manager.seeds import SeedStream
@@ -63,6 +65,7 @@ from rl_manager.types import (
 
 __all__ = [
     "ACTION_TENSOR_SHAPES",
+    "ARTIFACT_METADATA_SCHEMA_VERSION",
     "CANDIDATE_VS_FROZEN",
     "E_VS_E",
     "EXECUTOR_FACTORY_VERSION",
@@ -83,6 +86,7 @@ __all__ = [
     "SeedStream",
     "SelfPlayRunner",
     "TrajectoryBuffer",
+    "build_artifact_metadata",
     "build_episode_spec",
     "decode_outputs_to_action_tensors",
     "decode_outputs_to_plans",

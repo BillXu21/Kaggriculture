@@ -19,6 +19,7 @@ deterministic rerun-equality requirement, numThreads=1):
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -26,8 +27,11 @@ import pytest
 
 from bc_manager_jax.model import init_params, tiny_manager_config
 from rl_manager.decode import ACTION_TENSOR_SHAPES
+from rl_manager.executor_factory import EXECUTOR_FACTORY_VERSION
 from rl_manager.policy import JaxEPlanPolicy, params_fingerprint
+from rl_manager.provenance import sha256_hex
 from rl_manager.runner import (
+    ARTIFACT_METADATA_SCHEMA_VERSION,
     GAME_TURNS,
     MANAGER_START_DAY,
     RunnerConfig,
@@ -141,7 +145,7 @@ def full_game_pair():
         buffers.append(buffer)
     _GAME_CACHE["pair"] = {
         "results": results, "buffers": buffers, "params": params,
-        "config": config, "policy": policy,
+        "config": config, "policy": policy, "runner": runner,
         "provenance": dict(runner.provenance),
     }
     return _GAME_CACHE["pair"]
@@ -233,10 +237,11 @@ def test_full_game_rerun_equality_equal_nan(tmp_path: Path, tiny_e):
         assert np.array_equal(arrays_a[key], arrays_b[key],
                               equal_nan=True), key
 
-    # NPZ + JSON sidecar round-trip preserves the episode exactly.
+    # NPZ + JSON sidecar round-trip preserves the episode exactly, via the
+    # normal runner artifact path (no caller-side run_metadata assembly).
     base = tmp_path / "full_game_traj"
-    assert buffer_a.save(base, run_metadata={
-        "master_seed": MASTER_SEED, "composition": E_VS_E}) == base
+    assert game["runner"].save_trajectory_artifact(
+        base, buffer_a, result_a) == base
     loaded, sidecar = load_trajectory(base)
     assert sidecar["run_metadata"]["master_seed"] == MASTER_SEED
     assert len(loaded) == TOTAL_TRANSITIONS
@@ -257,6 +262,77 @@ def test_full_game_opening_handoff_and_episode_digest(tiny_e):
         diagnostics = result.opening_diagnostics[seat]
         assert isinstance(diagnostics, dict)
     assert result.trace_digest == game["results"][1].trace_digest
+
+
+def test_artifact_save_load_records_mandatory_provenance_automatically(
+        tmp_path: Path, tiny_e):
+    """Issue #9 A1 correction: `save_trajectory_artifact` merges episode
+    outcome + runner provenance + policy/opponent identities into the JSON
+    sidecar automatically (reuses the cached complete tiny-E game; no caller
+    assembly anywhere in this test)."""
+    game = full_game_pair()
+    result, buffer, runner = (
+        game["results"][0], game["buffers"][0], game["runner"])
+    base = tmp_path / "artifact_traj"
+    assert runner.save_trajectory_artifact(base, buffer, result) == base
+    loaded, sidecar = load_trajectory(base)
+    meta = sidecar["run_metadata"]
+
+    # Schema/version + run-level provenance.
+    assert meta["artifact_schema_version"] == ARTIFACT_METADATA_SCHEMA_VERSION
+    assert meta["master_seed"] == MASTER_SEED
+    assert meta["manager_start_day"] == MANAGER_START_DAY
+
+    # Exact per-episode outcome values.
+    episode = meta["episode"]
+    assert episode["episode_index"] == result.episode_index == 0
+    assert episode["seed"] == result.seed
+    assert episode["composition"] == E_VS_E
+    assert episode["final_banks"] == result.final_banks
+    assert episode["margin"] == result.margin
+    assert episode["winner_seat"] == result.winner_seat
+    assert episode["rewards"] == result.rewards
+    assert episode["statuses"] == ["DONE", "DONE"]
+    assert episode["terminated"] is True
+    assert episode["transitions"] == TOTAL_TRANSITIONS
+    assert episode["trace_digest"] == result.trace_digest
+    assert episode["rollout_recorded"] is True  # trace ref, not a giant copy
+    assert set(episode["timing_seconds"]) == {
+        "manager_inference", "agent_actions", "env_step", "orchestration"}
+
+    # Opening identity/digest + backend/engine provenance.
+    assert meta["opening"]["name"] == "standard_mixed"
+    assert meta["opening"]["digest"]
+    assert meta["backend"]["backend"] == "fast"
+    assert meta["backend"]["configuration"]["numThreads"] == 1
+
+    # Executor factory version/hash/identifier.
+    factory = meta["executor_factory"]
+    assert factory["name"] == "executor_v0"
+    assert factory["version"] == EXECUTOR_FACTORY_VERSION
+    assert factory["identifier"] == f"executor_v0@{EXECUTOR_FACTORY_VERSION}"
+    assert factory["version_sha256"] == sha256_hex(factory["identifier"])
+
+    # Per-seat policy/opponent identities/versions/fingerprints.
+    fingerprint = params_fingerprint(game["params"])
+    identity = game["policy"].identity
+    assert [record["seat"] for record in meta["policies"]] == [0, 1]
+    for record in meta["policies"]:
+        assert record["policy"]["identity_id"] == identity.identity_id()
+        assert record["policy"]["name"] == identity.name
+        assert record["policy"]["version"] == identity.version
+        assert record["policy"]["fingerprint"] == fingerprint
+        assert record["opponent"]["identity_id"] == identity.identity_id()
+        assert record["opponent"]["fingerprint"] == fingerprint
+        assert record["trainable"] is False  # E-vs-E baseline
+
+    # Round-trip preserves rows exactly; sidecar is strictly JSON-safe with
+    # deterministic key ordering.
+    assert len(loaded) == TOTAL_TRANSITIONS
+    text = (tmp_path / "artifact_traj.json").read_text(encoding="utf-8")
+    parsed = json.loads(text)
+    json.dumps(parsed, allow_nan=False, sort_keys=True)
+    assert list(parsed["run_metadata"]) == sorted(parsed["run_metadata"])
 
 
 # --------------------------------------------------------------------------

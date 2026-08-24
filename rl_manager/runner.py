@@ -29,6 +29,7 @@ import hashlib
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -46,6 +47,7 @@ from rl_manager.provenance import (
     backend_provenance,
     canonical_json,
     opening_provenance,
+    sha256_hex,
 )
 from rl_manager.provider import QueuedPlanProvider
 from rl_manager.trajectory import TrajectoryBuffer, Transition, \
@@ -61,6 +63,11 @@ from rl_manager.types import (
 MANAGER_START_DAY = 4
 TOTAL_MANAGER_DAYS = TOTAL_DAYS - MANAGER_START_DAY  # 26 decisions/seat
 GAME_TURNS = 719  # post-reset primitive turns in one 720-step game
+
+# Artifact provenance sidecar schema (issue #9 A1 correction): the
+# `run_metadata` block written by `build_artifact_metadata` carries its own
+# version so consumers can pin against exactly these mandatory fields.
+ARTIFACT_METADATA_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -147,6 +154,70 @@ class EpisodeResult:
     trace_digest: str
     rollout: RolloutRecord | None
     timing_seconds: dict[str, float]
+    # Per-seat JSON-safe policy/opponent snapshot identities (issue #9 A1):
+    # [{"seat", "policy": {name, version, fingerprint, identity_id},
+    #   "opponent": {...}, "trainable"} x 2] — recorded at finalize time so
+    # artifact metadata never depends on caller-side policy bookkeeping.
+    policy_identities: tuple[dict[str, Any], ...]
+
+
+def _executor_factory_provenance(factory: Any) -> dict[str, Any]:
+    """JSON-safe executor factory identity: name/version/identifier/hash."""
+    name = str(getattr(factory, "name", "unknown"))
+    version = str(getattr(factory, "version", "unknown"))
+    identifier = f"{name}@{version}"
+    return {
+        "name": name,
+        "version": version,
+        "identifier": identifier,
+        "version_sha256": sha256_hex(identifier),
+    }
+
+
+def build_artifact_metadata(
+    provenance: Mapping[str, Any],
+    result: EpisodeResult,
+) -> dict[str, Any]:
+    """Typed automatic artifact metadata for one episode's trajectory save.
+
+    Merges the runner provenance snapshot (opening identity/digest, backend/
+    engine provenance, executor factory version/hash/identifier, master seed,
+    manager start day) with the exact per-episode outcome (final banks,
+    margin, winner, rewards, terminal statuses, episode trace digest, trace
+    reference) and per-seat policy/opponent identities into ONE JSON-safe,
+    deterministically ordered dict for
+    `TrajectoryBuffer.save(run_metadata=...)`. Callers never assemble this by
+    hand; the full primitive trace stays in `result.rollout` and is never
+    duplicated into the training core.
+    """
+    return {
+        "artifact_schema_version": ARTIFACT_METADATA_SCHEMA_VERSION,
+        "episode": {
+            "episode_index": int(result.episode_index),
+            "seed": int(result.seed),
+            "composition": str(result.composition),
+            "final_banks": [float(bank) for bank in result.final_banks],
+            "margin": float(result.margin),
+            "winner_seat": int(result.winner_seat),
+            "rewards": [float(reward) for reward in result.rewards],
+            "statuses": [str(status) for status in result.statuses],
+            "transitions": int(result.transitions),
+            "terminated": bool(result.terminated),
+            "trace_digest": str(result.trace_digest),
+            "rollout_recorded": result.rollout is not None,
+            "timing_seconds": {
+                key: float(result.timing_seconds[key])
+                for key in sorted(result.timing_seconds)},
+        },
+        "opening": copy.deepcopy(dict(provenance["opening"])),
+        "backend": copy.deepcopy(dict(provenance["backend"])),
+        "executor_factory": _executor_factory_provenance(
+            provenance["executor_factory"]),
+        "policies": [copy.deepcopy(record)
+                     for record in result.policy_identities],
+        "master_seed": provenance["master_seed"],
+        "manager_start_day": int(provenance["manager_start_day"]),
+    }
 
 
 class _EpisodeState:
@@ -561,7 +632,36 @@ class SelfPlayRunner:
             trace_digest=episode_digest.hexdigest(),
             rollout=state.rollout,
             timing_seconds=dict(self.timing_totals),
+            policy_identities=tuple(
+                {
+                    "seat": seat,
+                    "policy": state.spec.policies[seat].identity
+                        .to_json_dict(),
+                    "opponent": state.spec.policies[1 - seat].identity
+                        .to_json_dict(),
+                    "trainable": seat in state.spec.trainable_seats,
+                }
+                for seat in range(2)),
         )
+
+    # ------------------------------------------------------------- artifact
+    def build_artifact_metadata(self, result: EpisodeResult) -> dict[str, Any]:
+        """Automatic artifact metadata: episode outcome + runner provenance.
+
+        The normal artifact path — callers never hand-assemble `run_metadata`.
+        """
+        return build_artifact_metadata(self.provenance, result)
+
+    def save_trajectory_artifact(
+        self,
+        path: str | Path,
+        buffer: TrajectoryBuffer,
+        result: EpisodeResult,
+    ) -> Path:
+        """Persist `<path>.npz` + `<path>.json` with full provenance merged
+        automatically (low-level `TrajectoryBuffer.save` stays unchanged)."""
+        return buffer.save(
+            path, run_metadata=self.build_artifact_metadata(result))
 
     def _patch_executor_diagnostics(self, state: _EpisodeState) -> None:
         """Compact per-day executor diagnostics into sidecar metadata."""

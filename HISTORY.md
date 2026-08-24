@@ -2,6 +2,31 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-24 — Issue #9 Stage A Correction: Automatic Artifact Provenance (A1)
+
+Small correction commit on top of the Stage A harness: trajectory artifacts
+now record full provenance automatically instead of requiring callers to
+hand-assemble `run_metadata`.
+
+- `rl_manager/runner.py`: new `build_artifact_metadata` +
+  `SelfPlayRunner.save_trajectory_artifact(path, buffer, result)` — merges
+  per-episode outcome (final banks/margin/winner/rewards/statuses/
+  transitions/terminated/episode trace digest/rollout trace ref/timing),
+  opening name+digest, backend/engine provenance, executor factory
+  name/version/identifier/version_sha256, per-seat policy/opponent
+  identities (recorded at finalize time via the new `EpisodeResult.
+  policy_identities`), master seed, composition, and manager start day into
+  the sidecar `run_metadata` under `artifact_schema_version = 1`. The full
+  primitive trace is never duplicated into the training core.
+- `rl_manager/trajectory.py`: sidecar JSON now written with
+  `allow_nan=False` (strict JSON safety at write time);
+  `TrajectoryBuffer.save(run_metadata=...)` API unchanged for backcompat.
+- Tests: `tests/test_rl_manager_runner.py` proves a complete cached tiny-E
+  rollout save/load carries all mandatory provenance automatically with
+  exact episode values; rl_manager suite green (48 passed, 1 skipped —
+  official-engine skip unchanged). See `research/RL_SELFPLAY_V0.md`
+  "Trajectory Schema" / "Provenance and Reproducibility".
+
 ## 2026-08-24 — Issue #9 Stage A Implemented: RL Self-Play Rollout/Trajectory Harness (`rl_manager`)
 
 Added the new `rl_manager` package (11 modules) and 7 test files on `main`

@@ -74,8 +74,23 @@ JSON sidecar (aligned 1:1 with buffer rows, never model input):
 `run_metadata`, and per-transition JSON-safe records (index, episode_index,
 seed, seat, day, policy_id/policy_version/policy_fingerprint, opponent_id,
 trainable, plan_json, compact executor_day_diagnostics, trace_digest_hex).
-Serialization is `json.dumps(sort_keys=True)`; NPZ loads with
-`allow_pickle=False`.
+Serialization is `json.dumps(sort_keys=True, allow_nan=False)` (strict
+JSON safety enforced at write time); NPZ loads with `allow_pickle=False`.
+
+Automatic artifact provenance (issue #9 A1 correction): the normal save
+path is `SelfPlayRunner.save_trajectory_artifact(path, buffer, result)`,
+which builds `run_metadata` via `build_artifact_metadata` — callers never
+assemble it by hand. The block carries `artifact_schema_version = 1` plus:
+per-episode outcome (episode_index, seed, composition, final_banks, margin,
+winner_seat, rewards, statuses, transitions, terminated, episode
+trace_digest, rollout_recorded trace reference, timing_seconds), opening
+name + digest + source provenance, backend/engine name/configuration/module,
+executor factory name/version/identifier/version_sha256, per-seat
+policy/opponent identities (name/version/fingerprint/identity_id +
+trainable), master seed, and manager start day. The low-level
+`TrajectoryBuffer.save(run_metadata=...)` API is unchanged for backcompat;
+the full primitive trace stays in `EpisodeResult.rollout` and is never
+duplicated into the training core.
 
 ## Handoff and EconomicHistory Semantics (exact)
 
@@ -112,8 +127,11 @@ parameter fingerprint (sha256 over the full param pytree); opening name +
 digest + source-replay provenance; backend name/configuration/engine
 module path; executor factory version; manager start day. Episode-level
 trace digest = sha256 over the sorted sealed per-day joint-action digests.
-Determinism is test-enforced: two independent full-game runs produce
-byte-equal buffers (`equal_nan=True` for the NaN sentinel in
+All of this is persisted automatically into the trajectory sidecar's
+`run_metadata` by `SelfPlayRunner.save_trajectory_artifact` /
+`build_artifact_metadata` (`artifact_schema_version = 1`) — no caller-side
+assembly. Determinism is test-enforced: two independent full-game runs
+produce byte-equal buffers (`equal_nan=True` for the NaN sentinel in
 `board_numeric`) and equal episode digests.
 
 ## Backend / Executor Factory Seams
