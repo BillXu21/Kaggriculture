@@ -304,31 +304,26 @@ def test_one_legal_step_axis_selection(delta, expected):
     assert result.counts["movement"] == 1
 
 
-def test_movement_avoids_locked_tile_falls_back_to_other_axis():
-    tiles = [[None] * 10 for _ in range(10)]
-    tiles[1][0] = "LOCKED"  # blocks the vertical-first step from (0,0)
-    obs = make_obs(farmer=(0, 0), tiles=tiles)
-    # Horizontal step still reduces distance -> deterministic fallback.
-    tasks = [task("WATER:3,2", "WATER", (3, 2),
-                  priority=Priority.MAINTENANCE)]
-    result = run_foreman(obs, 0, tasks=tasks)
-    assert result.farmer_action == ("EAST",)
-    assert result.counts["movement"] == 1
+def test_movement_through_locked_tiles_is_legal_engine_semantics():
+    """Engine ops 1..=4 move unconditionally; LOCKED tiles never block walking.
 
-
-def test_blocked_only_reducing_step_emits_pass():
+    Pinned from rust/kaggriculture_env/src/lib.rs ``apply_unit_action``:
+    only non-movement operations are silenced on tiles outside unlocked
+    quadrants. The foreman must therefore walk straight through locked
+    quadrants/tiles instead of dead-ending into PASS (issue #7).
+    """
     tiles = [[None] * 10 for _ in range(10)]
     tiles[1][0] = "LOCKED"
     obs = make_obs(farmer=(0, 0), tiles=tiles)
     tasks = [task("WATER:3,0", "WATER", (3, 0),
                   priority=Priority.MAINTENANCE)]
     result = run_foreman(obs, 0, tasks=tasks)
-    # No reducing step remains legal; V0 passes rather than sidestepping.
-    assert result.farmer_action == ("PASS",)
-    assert assignment_for(result, 0).reason == "movement_blocked"
+    # Vertical-first step onto the LOCKED tile is taken, not refused.
+    assert result.farmer_action == ("SOUTH",)
+    assert result.counts["movement"] == 1
 
 
-def test_blocked_both_axes_emits_pass_with_reason():
+def test_locked_quadrant_crossing_reaches_far_target():
     tiles = [[None] * 10 for _ in range(10)]
     tiles[0][1] = "LOCKED"
     tiles[1][0] = "LOCKED"
@@ -336,8 +331,21 @@ def test_blocked_both_axes_emits_pass_with_reason():
     tasks = [task("WATER:5,5", "WATER", (5, 5),
                   priority=Priority.MAINTENANCE)]
     result = run_foreman(obs, 0, tasks=tasks)
-    assert result.farmer_action == ("PASS",)
-    assert assignment_for(result, 0).reason == "movement_blocked"
+    # Both reducing steps cross locked tiles; movement is legal either way.
+    assert result.farmer_action in (("SOUTH",), ("EAST",))
+    assert result.counts["movement"] == 1
+
+
+def test_weed_and_structure_tiles_never_block_movement():
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[1][0] = {"kind": "WEED"}
+    tiles[2][0] = {"kind": "PASTURE"}
+    obs = make_obs(farmer=(0, 0), tiles=tiles)
+    tasks = [task("WATER:3,0", "WATER", (3, 0),
+                  priority=Priority.MAINTENANCE)]
+    result = run_foreman(obs, 0, tasks=tasks)
+    assert result.farmer_action == ("SOUTH",)
+    assert result.counts["movement"] == 1
 
 
 def test_out_of_bounds_target_never_stepped_into():
