@@ -146,6 +146,23 @@ def test_feed_shortage_buy_precedes_hiring_and_blocks_expansion():
     assert survival["feed_shortage_turns"] == 1
 
 
+def test_partial_affordable_feed_buy_is_submitted():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("GOOSE")
+    tiles[4][5] = pasture_tile("GOOSE")
+    agent = agent_for(plan(animal_targets={"GOOSE": 2, "COW": 0,
+                                           "SHEEP": 0}))
+
+    # At this market inventory one WHEAT costs 125; the full two-unit order
+    # costs more than the available cash, but one unit is affordable.
+    action = agent(make_obs(tiles=tiles, money=125.0, shed={},
+                            inventories=[{}]))
+
+    assert action["market"] == [["BUY_PRODUCT", "WHEAT", 1]]
+    assert agent.diagnostics_json()["days"]["3"]["survival"][
+        "partial_feed_buys"] == 1
+
+
 def test_temporary_waiting_that_finishes_on_hour23_is_not_work_debt():
     tiles = empty_tiles()
     tiles[2][2] = plant_tile("WHEAT", yield_units=3)
@@ -163,7 +180,7 @@ def test_temporary_waiting_that_finishes_on_hour23_is_not_work_debt():
     assert action["farmer"] == ["HARVEST"]
 
     day = agent.diagnostics_json()["days"]["3"]
-    assert day["pending_task_turns"]
+    assert day["pending_task_turns"] == {"HARVEST:2,2": 1}
     assert day["end_of_day_work_debt"]["all"] == []
     assert day["unfinished_tasks"] == []
     assert day["unfinished_task_turns"] == {}

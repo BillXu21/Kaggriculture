@@ -426,6 +426,26 @@ class ExecutorAgent:
             "manager": manager,
         }
 
+    @staticmethod
+    def _pending_task_keys(foreman_result: Any) -> list[str]:
+        """Include assigned movement/pickup work in the debug churn metric."""
+        pending: list[str] = []
+        seen: set[str] = set()
+
+        for task in foreman_result.unassigned_tile_tasks:
+            if task.key not in seen:
+                pending.append(task.key)
+                seen.add(task.key)
+        for assignment in foreman_result.assignments:
+            task_key = assignment.task_key
+            if task_key is None or task_key in seen:
+                continue
+            if not assignment.action \
+                    or assignment.action[0] not in _INTERACTION_OPS:
+                pending.append(task_key)
+                seen.add(task_key)
+        return pending
+
     def _act(self, obs: Mapping) -> dict[str, Any]:
         seat = self._resolve_seat(obs)
         day, hour = int(obs["day"]), int(obs["hour"])
@@ -532,7 +552,7 @@ class ExecutorAgent:
         for key in ("movement", "interaction", "pickup", "pass"):
             record["foreman_counts"][key] += foreman_result.counts[key]
 
-        pending = [t.key for t in foreman_result.unassigned_tile_tasks]
+        pending = self._pending_task_keys(foreman_result)
         for key in pending:
             record["pending_task_turns"][key] = record["pending_task_turns"].get(key, 0) + 1
         pending_maintenance = [key for key in pending if key.startswith(("WATER:", "FEED:", "COLLECT_FERTILIZER:"))]
