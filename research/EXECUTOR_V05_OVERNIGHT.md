@@ -1,6 +1,6 @@
 # Executor V0.5 overnight optimization (issue #7)
 
-Branch: `executor-v05-overnight`  |  Base SHA: `32fef4ac295e9addaf01cd339eee60a0ad14eaca`  |  Final SHA: `885adadda351a39e2797058fe3c4c8cb5f506bac`
+Branch: `executor-v05-overnight`  |  Base SHA: `32fef4ac295e9addaf01cd339eee60a0ad14eaca`  |  Final SHA: `7319f31` (report/evidence commits follow `885adad`; see git log)
 
 Scope discipline: executor-only mechanical compiler work under the frozen
 manager. No manager/opening/BC changes. The BC-E checkpoint was **not used**
