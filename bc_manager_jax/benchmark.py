@@ -17,15 +17,20 @@ Honesty rules enforced here:
 
 Checkpoint mode strictly converts an existing PyTorch
 `bc_manager_checkpoint_v1` file; its stored config determines the token
-regime (a missing checkpoint is a hard error, never silently ignored).
-Random-model mode benchmarks both regimes separately.
+regime and its stored top-level `model_variant` (V0/E only; J/JE are
+rejected loudly) determines the input contract. Every row records
+`model_variant` additively. A missing checkpoint is a hard error, never
+silently ignored. Random-model mode benchmarks both regimes separately.
 
-Example Kaggle TPU command (8 devices, f32, real BC checkpoint):
+Example Kaggle TPU command (8 devices, f32, real promoted BC-E checkpoint):
 
     python -m bc_manager_jax.benchmark \
         --device-counts 8 --dtype f32 \
-        --checkpoint /kaggle/working/bc-v0-score2950/best.pt \
-        --output-json /kaggle/working/bc_jax_benchmark.json
+        --checkpoint /kaggle/working/bc-v1-E/best.pt \
+        --batch-sizes 256,512,1024,2048,4096 \
+        --warmup 3 --iterations 10 \
+        --output-json /kaggle/working/bc_e_jax_benchmark.json \
+        --output-csv /kaggle/working/bc_e_jax_benchmark.csv
 
 Because a checkpoint fixes one regime, cover both token regimes with
 random models via a second run:
@@ -51,11 +56,14 @@ from typing import Any, Mapping
 import jax
 import numpy as np
 
+from bc_manager.economics import ECONOMIC_DIM, economic_context
 from bc_manager_jax.checkpoint import load_torch_checkpoint
 from bc_manager_jax.model import (
+    ECONOMIC_CONTEXT_KEY,
     forward,
     init_params,
     ManagerConfig,
+    resolve_model_variant,
     tiny_manager_config,
 )
 from bc_manager_jax.train import TrainConfig, init_opt_state, train_step
@@ -96,9 +104,16 @@ def describe_environment(requested_device_counts: list[Any]) -> dict[str, Any]:
 
 
 def synthetic_batch(config: ManagerConfig, global_batch: int,
-                    seed: int = 0) -> tuple[dict[str, np.ndarray],
-                                           dict[str, np.ndarray]]:
-    """Deterministic shape-correct NumPy batch (adapter-array layout)."""
+                    seed: int = 0,
+                    model_variant: str = "V0") -> tuple[dict[str, np.ndarray],
+                                                        dict[str, np.ndarray]]:
+    """Deterministic shape-correct NumPy batch (adapter-array layout).
+
+    Variant E rows carry an `economic_context` [B, 14] block built from the
+    authoritative `bc_manager.economics.economic_context` function (never a
+    re-derived formula).
+    """
+    variant = resolve_model_variant(model_variant)
     rng = np.random.default_rng(seed)
     b = global_batch
 
@@ -139,6 +154,18 @@ def synthetic_batch(config: ManagerConfig, global_batch: int,
             }[key]
         inputs["opp_scalars"] = (rng.random((b, 2)) * 500).astype(np.float32)
         inputs["opp_unlocked"] = ints((b, 4), 0, 2, np.uint8)
+
+    if variant == "E":
+        money = inputs["scalars"][:, 0].astype(np.float64)
+        unlocked_counts = np.clip(
+            inputs["unlocked"].sum(axis=1), 1, 4).astype(int)
+        rows = np.zeros((b, ECONOMIC_DIM), dtype=np.float32)
+        for i in range(b):
+            # Deterministic mix of valid/invalid previous-cash channels.
+            prev = float(money[i] - 100.0) if i % 2 == 0 else None
+            rows[i] = economic_context(float(money[i]),
+                                       int(unlocked_counts[i]), prev)
+        inputs[ECONOMIC_CONTEXT_KEY] = rows
 
     c = config.count_classes
     presence = np.zeros((b, 9, 6), dtype=np.float32)
@@ -194,8 +221,8 @@ def time_callable(fn, *, warmup: int, iterations: int) -> tuple[float, list[floa
 # ------------------------------------------------------------- benchmark
 
 
-def _resolve_regime_configs(args) -> list[tuple[str, ManagerConfig, Any, str]]:
-    """Returns [(regime_label, config, params_or_None, source)]."""
+def _resolve_regime_configs(args) -> list[tuple[str, ManagerConfig, Any, str, str]]:
+    """Returns [(regime_label, config, params_or_None, source, variant)]."""
     if args.checkpoint:
         path = Path(args.checkpoint)
         if not path.exists():
@@ -204,12 +231,14 @@ def _resolve_regime_configs(args) -> list[tuple[str, ManagerConfig, Any, str]]:
                 f"to benchmark anything else silently")
         params, meta = load_torch_checkpoint(path)
         config = ManagerConfig(**meta["model_config"])
+        variant = meta.get("model_variant", "V0")
         regime = "opponent" if config.include_opponent_board else "own"
         return [(regime, config, params,
                  f"torch checkpoint {path} (bc_manager_checkpoint_v1, "
-                 f"epoch={meta.get('epoch')})")]
+                 f"variant={variant}, epoch={meta.get('epoch')})", variant)]
     base = tiny_manager_config() if args.model_config == "tiny" \
         else ManagerConfig()
+    variant = resolve_model_variant(getattr(args, "variant", "V0"))
     configs = []
     regimes = {"own": ("own", False), "opponent": ("opponent", True)}
     if args.regimes == "own":
@@ -219,20 +248,23 @@ def _resolve_regime_configs(args) -> list[tuple[str, ManagerConfig, Any, str]]:
     for label, include_opp in regimes.values():
         config = dataclasses.replace(base, include_opponent_board=include_opp)
         configs.append((label, config, None,
-                        f"random init ({args.model_config})"))
+                        f"random init ({args.model_config})", variant))
     return configs
 
 
 def run_case(regime: str, config: ManagerConfig, params, source: str,
-             device_count: int, global_batch: int, args) -> dict[str, Any]:
+             device_count: int, global_batch: int, args,
+             model_variant: str = "V0") -> dict[str, Any]:
     """One (regime, device-count, batch) cell; never raises.
 
     Successful rows carry BOTH metric families under stable, unambiguous
     field names (`inference_*` and `train_*`); failed/skipped rows keep
     them as nulls plus an honest `reason`.
     """
+    variant = resolve_model_variant(model_variant)
     row: dict[str, Any] = {
         "regime": regime,
+        "model_variant": variant,
         "token_count": config.token_count,
         "param_count": None,
         "source": source,
@@ -260,7 +292,7 @@ def run_case(regime: str, config: ManagerConfig, params, source: str,
                 f"{device_count} devices")
         mesh = sharding.create_data_mesh(device_count)
         base_params = params if params is not None \
-            else init_params(config, seed=args.seed)
+            else init_params(config, seed=args.seed, model_variant=variant)
         row["param_count"] = param_count(base_params)
 
         dtype = jax.numpy.bfloat16 if args.dtype == "bf16" \
@@ -270,7 +302,8 @@ def run_case(regime: str, config: ManagerConfig, params, source: str,
         live_params = sharding.replicate_tree(base_params, mesh)
 
         inputs_np, targets_np = synthetic_batch(config, global_batch,
-                                                seed=args.seed)
+                                                seed=args.seed,
+                                                model_variant=variant)
         if args.dtype == "bf16":
             inputs_np = {k: (v.astype(np.dtype(dtype))
                              if v.dtype.kind == "f" else v)
@@ -286,7 +319,8 @@ def run_case(regime: str, config: ManagerConfig, params, source: str,
 
         # ---- inference
         def infer():
-            return forward(live_params, sharded_inputs, config)
+            return forward(live_params, sharded_inputs, config,
+                           model_variant=variant)
 
         compile_s, times = time_callable(infer, warmup=args.warmup,
                                          iterations=args.iterations)
@@ -302,7 +336,8 @@ def run_case(regime: str, config: ManagerConfig, params, source: str,
 
         def step():
             return train_step(live_params, opt_state, rng, sharded_inputs,
-                              sharded_targets, config, train_config)
+                              sharded_targets, config, train_config,
+                              variant)
 
         compile_s, times = time_callable(step, warmup=args.warmup,
                                          iterations=args.iterations)
@@ -337,13 +372,14 @@ def run_benchmark(args) -> dict[str, Any]:
         "results": [],
     }
     cases = _resolve_regime_configs(args)
-    for regime, config, params, source in cases:
+    for regime, config, params, source, variant in cases:
         for device_count in sorted(set(device_counts)):
             for global_batch in args.batch_sizes:
-                print(f"[benchmark] regime={regime} devices={device_count} "
+                print(f"[benchmark] regime={regime} variant={variant} "
+                      f"devices={device_count} "
                       f"batch={global_batch} ...", flush=True)
                 row = run_case(regime, config, params, source, device_count,
-                               global_batch, args)
+                               global_batch, args, model_variant=variant)
                 report["results"].append(row)
                 if row["status"] == "ok":
                     print(f"    ok: inference "
@@ -367,7 +403,8 @@ def _write_outputs(report: dict[str, Any], json_path: str | None,
                                    encoding="utf-8")
         print(f"[benchmark] JSON written to {json_path}")
     if csv_path:
-        fieldnames = ["regime", "token_count", "param_count",
+        fieldnames = ["regime", "model_variant", "token_count",
+                      "param_count",
                       "device_count", "global_batch", "per_device_batch",
                       "dtype_mode", "status",
                       "inference_compile_seconds",
@@ -393,10 +430,13 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Kaggle TPU examples (f32, 8 devices):
 
-  # Real BC checkpoint (its stored config fixes ONE token regime):
+  # Real promoted BC-E checkpoint (issue #8 target; its stored config fixes
+  # ONE token regime and its stored variant must be E or V0):
   python -m bc_manager_jax.benchmark --device-counts 8 --dtype f32 \\
-      --checkpoint /kaggle/working/bc-v0-score2950/best.pt \\
-      --output-json /kaggle/working/bc_jax_benchmark.json
+      --checkpoint /kaggle/working/bc-v1-E/best.pt \\
+      --batch-sizes 256,512,1024,2048,4096 --warmup 3 --iterations 10 \\
+      --output-json /kaggle/working/bc_e_jax_benchmark.json \\
+      --output-csv /kaggle/working/bc_e_jax_benchmark.csv
 
   # Random-model coverage of BOTH regimes separately:
   python -m bc_manager_jax.benchmark --device-counts 8 \\
@@ -410,6 +450,10 @@ Local CPU smoke (plumbing only, NOT representative throughput):
     parser.add_argument("--model-config", choices=("tiny", "default"),
                         default="default",
                         help="random-model architecture (default: %(default)s)")
+    parser.add_argument("--variant", choices=("V0", "E"), default="V0",
+                        help="random-model model_variant; checkpoint mode "
+                             "always uses the stored variant instead "
+                             "(default: %(default)s)")
     parser.add_argument("--regimes", choices=("own", "opponent", "both"),
                         default="both",
                         help="token regimes for random models "
@@ -446,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
     report = run_benchmark(args)
     report["metadata"]["cli_args"] = {
         "model_config": args.model_config,
+        "variant": args.variant,
         "regimes": args.regimes,
         "checkpoint": args.checkpoint,
         "batch_sizes": args.batch_sizes,

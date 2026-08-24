@@ -18,6 +18,13 @@ shape from the config and rejects missing keys, unexpected keys, shape
 mismatches, non-float32 tensors, and incompatible model configs (including
 own-only vs include_opponent_board) loudly.
 
+Variant handling (issue #8): the torch payload's top-level `model_variant`
+(absent -> "V0") selects the expected shapes; exactly V0 and E are
+supported, J/JE are rejected with an explicit unsupported-variant message.
+The variant is persisted OUTSIDE `model_config` in the native NPZ metadata
+and is checked strictly against any requested variant — never inferred from
+weight shapes.
+
 Native format `bc_manager_jax_checkpoint_v1`: one .npz archive with
 flattened parameter arrays plus a JSON metadata record. No pickle.
 """
@@ -33,7 +40,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from bc_manager_jax.model import ManagerConfig, empty_params
+from bc_manager.economics import normalize_model_variant
+from bc_manager_jax.model import (
+    ECONOMIC_DIM,
+    ManagerConfig,
+    empty_params,
+    resolve_model_variant,
+)
 
 TORCH_CHECKPOINT_FORMAT = "bc_manager_checkpoint_v1"
 NATIVE_CHECKPOINT_FORMAT = "bc_manager_jax_checkpoint_v1"
@@ -42,11 +55,14 @@ NATIVE_CHECKPOINT_FORMAT = "bc_manager_jax_checkpoint_v1"
 # ------------------------------------------------- expected torch state
 
 
-def expected_torch_state_shapes(config: ManagerConfig) -> dict[str, tuple[int, ...]]:
+def expected_torch_state_shapes(config: ManagerConfig,
+                                model_variant: str = "V0") -> dict[str, tuple[int, ...]]:
     """Every expected `DailyManagerTransformer.state_dict()` key and shape."""
+    variant = resolve_model_variant(model_variant)
     d = config.d_model
     c = config.count_classes
     feature_dim = 5 * d + 11 + 2 + 8 + 4  # embeddings + numeric + NaN ind + bool + mask
+    self_resource_dim = 35 + (ECONOMIC_DIM if variant == "E" else 0)
     shapes: dict[str, tuple[int, ...]] = {
         "manager_token": (1, 1, d),
         "role_embedding.weight": (2, d),
@@ -60,7 +76,7 @@ def expected_torch_state_shapes(config: ManagerConfig) -> dict[str, tuple[int, .
         "tile_encoder.project.3.weight": (d, d),
         "tile_encoder.project.3.bias": (d,),
         "global_encoders.day_embedding.weight": (30, d),
-        "global_encoders.self_resource.0.weight": (d, 35),
+        "global_encoders.self_resource.0.weight": (d, self_resource_dim),
         "global_encoders.self_resource.0.bias": (d,),
         "global_encoders.self_resource.3.weight": (d, d),
         "global_encoders.self_resource.3.bias": (d,),
@@ -127,9 +143,17 @@ def _check_exact(actual: set[str], expected: set[str], what: str) -> None:
 
 
 def convert_torch_state_dict(state_dict: Mapping[str, Any],
-                             config: ManagerConfig) -> dict:
-    """Convert a torch state dict into the JAX params pytree, strictly."""
-    expected = expected_torch_state_shapes(config)
+                             config: ManagerConfig,
+                             model_variant: str = "V0") -> dict:
+    """Convert a torch state dict into the JAX params pytree, strictly.
+
+    `model_variant` must be V0 or E; J/JE fail loudly as unsupported. The
+    variant is NEVER inferred from weight shapes — the caller (or
+    `load_torch_checkpoint`, from the payload metadata) supplies it and the
+    expected shapes are checked exactly.
+    """
+    variant = resolve_model_variant(model_variant)
+    expected = expected_torch_state_shapes(config, variant)
     _check_exact(set(state_dict.keys()), set(expected.keys()), "keys")
 
     def tensor(key: str) -> np.ndarray:
@@ -210,7 +234,7 @@ def convert_torch_state_dict(state_dict: Mapping[str, Any],
             "norm2_bias": tensor(f"{prefix}.norm2.bias"),
         })
 
-    spec = empty_params(config)
+    spec = empty_params(config, variant)
     expected_tree, actual_tree = (
         jax.tree_util.tree_structure(spec),
         jax.tree_util.tree_structure(params))
@@ -240,12 +264,31 @@ def _require_matching_config(payload_config: Mapping[str, Any],
     return restored
 
 
+def _payload_model_variant(payload: Mapping[str, Any]) -> str:
+    """Top-level torch `model_variant`; absent -> "V0" (old checkpoints)."""
+    raw = payload.get("model_variant", "V0")
+    try:
+        return normalize_model_variant(raw)
+    except ValueError as error:
+        raise ValueError(
+            f"checkpoint carries an invalid top-level model_variant "
+            f"{raw!r}: {error}") from error
+
+
 def load_torch_checkpoint(
     source: str | Path | Mapping[str, Any],
     config: ManagerConfig | None = None,
+    *,
+    model_variant: str | None = None,
 ) -> tuple[dict, dict[str, Any]]:
     """Load a `bc_manager_checkpoint_v1` payload from a path or dict and
-    convert its state dict strictly. Returns (params, metadata)."""
+    convert its state dict strictly. Returns (params, metadata).
+
+    The payload's top-level `model_variant` (absent -> "V0") selects the
+    conversion contract; exactly V0 and E are supported and J/JE are
+    rejected loudly. When `model_variant` is given it must match the stored
+    variant exactly — the variant is never inferred from weight shapes.
+    """
     if isinstance(source, Mapping):
         payload = dict(source)
     else:
@@ -267,10 +310,19 @@ def load_torch_checkpoint(
             f"{TORCH_CHECKPOINT_FORMAT!r}")
 
     resolved = _require_matching_config(payload["model_config"], config)
-    params = convert_torch_state_dict(payload["model_state_dict"], resolved)
+    stored_variant = _payload_model_variant(payload)
+    if model_variant is not None and \
+            resolve_model_variant(model_variant) != stored_variant:
+        raise ValueError(
+            f"checkpoint stores model_variant {stored_variant!r} but the "
+            f"requested variant is "
+            f"{resolve_model_variant(model_variant)!r}; refusing to guess")
+    params = convert_torch_state_dict(payload["model_state_dict"], resolved,
+                                      stored_variant)
     metadata = {
         "format": payload["format"],
         "model_config": dict(payload["model_config"]),
+        "model_variant": stored_variant,
         "epoch": payload.get("epoch"),
         "kind": payload.get("kind"),
         "training_config": payload.get("training_config"),
@@ -283,8 +335,15 @@ def load_torch_checkpoint(
 
 
 def save_native(path: str | Path, params: Mapping, config: ManagerConfig,
-                metadata: Mapping[str, Any] | None = None) -> None:
-    """Save params/config/metadata as a small pickle-free .npz archive."""
+                metadata: Mapping[str, Any] | None = None,
+                model_variant: str = "V0") -> None:
+    """Save params/config/metadata as a small pickle-free .npz archive.
+
+    The resolved variant is stored as a top-level `model_variant` record in
+    the JSON metadata — OUTSIDE `model_config`, mirroring the torch
+    checkpoint layout.
+    """
+    variant = resolve_model_variant(model_variant)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     flat: dict[str, np.ndarray] = {}
@@ -297,6 +356,7 @@ def save_native(path: str | Path, params: Mapping, config: ManagerConfig,
     meta = {
         "format": NATIVE_CHECKPOINT_FORMAT,
         "model_config": dataclasses.asdict(config),
+        "model_variant": variant,
         "metadata": dict(metadata) if metadata else {},
     }
     flat["__meta__"] = np.frombuffer(
@@ -310,9 +370,15 @@ def save_native(path: str | Path, params: Mapping, config: ManagerConfig,
 
 
 def load_native(path: str | Path,
-                config: ManagerConfig | None = None) -> tuple[dict, dict]:
+                config: ManagerConfig | None = None,
+                *,
+                model_variant: str | None = None) -> tuple[dict, dict]:
     """Load a native .npz checkpoint; fail loudly on corruption or any
-    config/structure incompatibility."""
+    config/structure incompatibility.
+
+    Old native files written before variant metadata existed load as V0.
+    When `model_variant` is given it must match the stored variant exactly.
+    """
     path = Path(path)
     try:
         with np.load(path, allow_pickle=False) as archive:
@@ -329,8 +395,16 @@ def load_native(path: str | Path,
             f"{path}: unrecognized native checkpoint format "
             f"{meta.get('format')!r}; expected {NATIVE_CHECKPOINT_FORMAT!r}")
     resolved = _require_matching_config(meta["model_config"], config)
+    stored_variant = _payload_model_variant(meta)
+    if model_variant is not None and \
+            resolve_model_variant(model_variant) != stored_variant:
+        raise ValueError(
+            f"{path}: native checkpoint stores model_variant "
+            f"{stored_variant!r} but the requested variant is "
+            f"{resolve_model_variant(model_variant)!r}")
+    meta["model_variant"] = stored_variant
 
-    spec = empty_params(resolved)
+    spec = empty_params(resolved, stored_variant)
     treedef = jax.tree_util.tree_structure(spec)
     leaves_meta = jax.tree_util.tree_flatten_with_path(spec)[0]
     params_leaves: list[jnp.ndarray] = []

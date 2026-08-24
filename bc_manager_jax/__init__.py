@@ -5,6 +5,8 @@ PyTorch->JAX checkpoint conversion, and native save/load.
 Stage-2 additions: AdamW+global-clip train step (`train`), replicated
 data-parallel helpers (`sharding`), and the throughput benchmark CLI
 (`benchmark`, runnable as `python -m bc_manager_jax.benchmark`).
+Issue #8 additions: model variants V0 and E (the promoted economic-context
+variant); J/JE are deliberately unsupported.
 """
 
 from bc_manager_jax.checkpoint import (
@@ -23,6 +25,7 @@ from bc_manager_jax.loss import (
     validate_target_shapes,
 )
 from bc_manager_jax.model import (
+    SUPPORTED_MODEL_VARIANTS,
     ManagerConfig,
     empty_params,
     forward,
@@ -30,6 +33,7 @@ from bc_manager_jax.model import (
     predict_counts,
     predict_land,
     predict_sells,
+    resolve_model_variant,
     tiny_manager_config,
     validate_inputs,
 )
@@ -40,6 +44,7 @@ __all__ = [
     "NATIVE_CHECKPOINT_FORMAT",
     "TORCH_CHECKPOINT_FORMAT",
     "GROUP_NAMES",
+    "SUPPORTED_MODEL_VARIANTS",
     "ManagerConfig",
     "TrainConfig",
     "convert_torch_state_dict",
@@ -57,6 +62,7 @@ __all__ = [
     "predict_counts",
     "predict_land",
     "predict_sells",
+    "resolve_model_variant",
     "save_native",
     "shard_batch",
     "tiny_manager_config",

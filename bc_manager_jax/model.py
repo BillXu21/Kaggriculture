@@ -5,6 +5,14 @@ Transformer: shared tile encoder over the own 100-tile board (plus optional
 opponent PUBLIC board with role embeddings), five compact global tokens, a
 norm-first GELU Transformer encoder, and seven structured output heads.
 
+Model variants (issue #8): exactly `V0` (baseline, byte-compatible with all
+pre-V1 checkpoints; `economic_context` is rejected as an unknown input) and
+`E` (requires the audited 14-channel `economic_context` float32 [B, 14],
+concatenated after the six self-resource feature blocks and before the same
+two-layer self-resource MLP). The variant lives OUTSIDE the frozen
+`ManagerConfig`, mirroring the PyTorch top-level checkpoint `model_variant`.
+J/JE are deliberately unsupported here.
+
 Parameter mapping contract (PyTorch -> JAX):
 
 - Every `nn.Linear` weight `[out, in]` becomes a JAX `kernel [in, out]`
@@ -43,6 +51,11 @@ from bc_manager.constants import (
     SHOP_VOCAB,
     TOTAL_DAYS,
 )
+from bc_manager.economics import (
+    ECONOMIC_CONTEXT_KEY,
+    ECONOMIC_DIM,
+    normalize_model_variant,
+)
 from bc_manager.model import (
     BOARD_NUMERIC_SCALES,
     BOARD_SIDE,
@@ -66,6 +79,26 @@ from bc_manager.model import (
 )
 
 _LAYER_NORM_EPS = 1e-5  # torch.nn.LayerNorm default; must match source
+
+# Variants ported to JAX (issue #8): the V0 baseline and the promoted E
+# economic-context variant only. J/JE stay a deliberate PyTorch-only RL
+# research idea and are rejected loudly here, never accidentally.
+SUPPORTED_MODEL_VARIANTS = ("V0", "E")
+
+
+def resolve_model_variant(value: str) -> str:
+    """Normalize/validate a model variant for the JAX mirror.
+
+    V0 and E are supported; J/JE fail with an explicit unsupported-variant
+    message (never a downstream key/shape error).
+    """
+    variant = normalize_model_variant(value)
+    if variant not in SUPPORTED_MODEL_VARIANTS:
+        raise ValueError(
+            f"model_variant {variant!r} is not supported by bc_manager_jax "
+            f"(supported: {list(SUPPORTED_MODEL_VARIANTS)}); the J/JE joint "
+            f"plan decoder is deliberately not ported")
+    return variant
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,8 +153,14 @@ def _linear(in_dim: int, out_dim: int) -> dict[str, jax.Array]:
             "bias": jnp.zeros((out_dim,), dtype=jnp.float32)}
 
 
-def empty_params(config: ManagerConfig) -> dict:
-    """Zero-initialized parameter pytree; also the canonical shape spec."""
+def empty_params(config: ManagerConfig,
+                 model_variant: str = "V0") -> dict:
+    """Zero-initialized parameter pytree; also the canonical shape spec.
+
+    Variant E widens ONLY the self-resource first-layer input by the audited
+    14 economic channels (35 -> 49), exactly like the PyTorch model.
+    """
+    variant = resolve_model_variant(model_variant)
     d = config.d_model
     feature_dim = (
         5 * d  # kind + crop + animal + row + col embeddings
@@ -129,6 +168,8 @@ def empty_params(config: ManagerConfig) -> dict:
         + len(BOARD_BOOL_FIELDS)
         + 4  # presence mask channels
     )
+    self_resource_dim = SELF_RESOURCE_DIM + (
+        ECONOMIC_DIM if variant == "E" else 0)
 
     def mlp(in_dim: int) -> dict[str, dict[str, jax.Array]]:
         return {"0": _linear(in_dim, d), "3": _linear(d, d)}
@@ -162,7 +203,7 @@ def empty_params(config: ManagerConfig) -> dict:
         },
         "global_encoders": {
             "day_embedding": jnp.zeros((TOTAL_DAYS, d), jnp.float32),
-            "self_resource": mlp(SELF_RESOURCE_DIM),
+            "self_resource": mlp(self_resource_dim),
             "market": mlp(MARKET_DIM),
             "town": mlp(TOWN_DIM),
             "labor": mlp(LABOR_DIM),
@@ -185,10 +226,11 @@ def empty_params(config: ManagerConfig) -> dict:
     }
 
 
-def init_params(config: ManagerConfig, seed: int) -> dict:
+def init_params(config: ManagerConfig, seed: int,
+                model_variant: str = "V0") -> dict:
     """Random parameter init (N(0, 0.02^2)); NOT matching torch's exact
     initialization distributions — use checkpoint conversion for parity."""
-    spec = empty_params(config)
+    spec = empty_params(config, model_variant)
     flat, treedef = jax.tree_util.tree_flatten(spec)
     key = jax.random.PRNGKey(seed)
     keys = jax.random.split(key, len(flat))
@@ -277,7 +319,8 @@ def _encode_tiles(tile_params: Mapping, dropout: _Dropout,
 
 
 def _global_tokens(global_params: Mapping, dropout: _Dropout,
-                   batch: Mapping[str, jax.Array]) -> dict[str, jax.Array]:
+                   batch: Mapping[str, jax.Array],
+                   use_economic_context: bool = False) -> dict[str, jax.Array]:
     scalars = batch["scalars"].astype(jnp.float32)
     money = jnp.clip(_sign_log1p(scalars[:, 0:1] * 1e-4), -8.0, 8.0)
     hires_today = scalars[:, 1:2] / float(MAX_HANDS)
@@ -287,6 +330,13 @@ def _global_tokens(global_params: Mapping, dropout: _Dropout,
     unlocked = batch["unlocked"].astype(jnp.float32)
     self_features = jnp.concatenate(
         [money, shed, seeds, carried, unlocked, hires_today], axis=-1)
+    if use_economic_context:
+        # Variant E: the audited 14 channels are appended AFTER the six
+        # self-resource blocks and BEFORE the same two-layer MLP — the
+        # exact PyTorch concatenation point.
+        self_features = jnp.concatenate(
+            [self_features,
+             batch[ECONOMIC_CONTEXT_KEY].astype(jnp.float32)], axis=-1)
 
     market_inventory = _sign_log1p(
         batch["market_inventory"].astype(jnp.float32))
@@ -359,17 +409,28 @@ def _encoder_layer(layer: Mapping, x: jax.Array, config: ManagerConfig,
 
 
 def validate_inputs(inputs: Mapping[str, object],
-                    config: ManagerConfig) -> None:
+                    config: ManagerConfig,
+                    model_variant: str = "V0") -> None:
     """Reject missing/unexpected adapter-array keys loudly (metadata can
-    never leak into features). Non-jitted boundary; call before forward."""
+    never leak into features). Non-jitted boundary; call before forward.
+
+    Variant E additionally requires `economic_context` float32 [B, 14],
+    finite; variant V0 rejects it as an unknown key (exact PyTorch
+    semantics — V0 can never silently consume E features).
+    """
+    variant = resolve_model_variant(model_variant)
     keys = set(inputs.keys())
-    unknown = sorted(keys - OWN_INPUT_KEYS - OPPONENT_PUBLIC_INPUT_KEYS)
+    allowed = set(OWN_INPUT_KEYS)
+    if variant == "E":
+        allowed |= {ECONOMIC_CONTEXT_KEY}
+    # Opponent arrays stay accepted-but-ignored when the board config
+    # disables them (same semantics as the PyTorch model).
+    unknown = sorted(keys - allowed - OPPONENT_PUBLIC_INPUT_KEYS)
     if unknown:
         raise ValueError(
             f"unknown input keys {unknown}; only adapter predictive arrays "
             f"are accepted — result metadata (names/scores/banks/partition/"
             f"source) must never reach the model")
-    allowed = set(OWN_INPUT_KEYS)
     if config.include_opponent_board:
         allowed |= OPPONENT_PUBLIC_INPUT_KEYS
     missing = sorted(allowed - keys)
@@ -377,6 +438,16 @@ def validate_inputs(inputs: Mapping[str, object],
         raise ValueError(
             f"missing required input keys {missing}; expected adapter "
             f"arrays {sorted(allowed)}")
+    if variant == "E":
+        econ = jnp.asarray(inputs[ECONOMIC_CONTEXT_KEY])
+        expected_shape = (int(inputs["board_kind"].shape[0]), ECONOMIC_DIM)
+        if econ.shape != expected_shape:
+            raise ValueError(
+                f"{ECONOMIC_CONTEXT_KEY} must have shape {expected_shape}, "
+                f"got {tuple(econ.shape)}")
+        if not bool(jnp.all(jnp.isfinite(econ))):
+            raise ValueError(
+                f"{ECONOMIC_CONTEXT_KEY} contains non-finite values")
 
 
 def _as_float(array: object) -> jax.Array:
@@ -406,7 +477,9 @@ def _prepare_inputs(inputs: Mapping[str, object]) -> dict[str, jax.Array]:
 
 
 def _forward_core(params: Mapping, inputs: Mapping[str, jax.Array],
-                  config: ManagerConfig, dropout: _Dropout) -> dict[str, jax.Array]:
+                  config: ManagerConfig, dropout: _Dropout,
+                  model_variant: str = "V0") -> dict[str, jax.Array]:
+    variant = resolve_model_variant(model_variant)
     b = inputs["board_kind"].shape[0]
     role_vectors = params["role_embedding"]
 
@@ -427,7 +500,8 @@ def _forward_core(params: Mapping, inputs: Mapping[str, jax.Array],
             inputs["opp_board_bool"], inputs["opp_board_mask"],
             role_vectors[1])
         parts.append(opp_tiles)
-    globals_ = _global_tokens(params["global_encoders"], dropout, inputs)
+    globals_ = _global_tokens(params["global_encoders"], dropout, inputs,
+                              use_economic_context=(variant == "E"))
     parts.extend(globals_[name][:, None, :] for name in GLOBAL_TOKEN_NAMES)
 
     hidden = jnp.concatenate(parts, axis=1)
@@ -456,25 +530,32 @@ def _forward_core(params: Mapping, inputs: Mapping[str, jax.Array],
 
 
 def _forward_eval(params: Mapping, inputs: Mapping[str, jax.Array],
-                  config: ManagerConfig) -> dict[str, jax.Array]:
+                  config: ManagerConfig,
+                  model_variant: str = "V0") -> dict[str, jax.Array]:
     return _forward_core(params, inputs, config,
-                         _Dropout(config.dropout, None))
+                         _Dropout(config.dropout, None), model_variant)
 
 
-# ManagerConfig is a frozen (hashable) dataclass; passing it as a static
-# argument retraces only when the architecture actually changes.
-_forward_jit = jax.jit(_forward_eval, static_argnames="config")
+# ManagerConfig is a frozen (hashable) dataclass and the variant a small
+# string; both are static jit arguments so retracing happens only when the
+# architecture/variant actually changes.
+_forward_jit = jax.jit(_forward_eval,
+                       static_argnames=("config", "model_variant"))
 
 
 def forward(params: Mapping, inputs: Mapping[str, object],
             config: ManagerConfig, *, training: bool = False,
-            rng: jax.Array | None = None) -> dict[str, jax.Array]:
+            rng: jax.Array | None = None,
+            model_variant: str = "V0") -> dict[str, jax.Array]:
     """Eval-exact forward pass over adapter predictive arrays.
 
     `training=True` enables the torch-placed dropout sites and requires
     `rng`. Input-key validation happens eagerly at this non-jitted boundary.
+    Variant E requires the audited `economic_context` float32 [B, 14];
+    variant V0 rejects it as an unknown key.
     """
-    validate_inputs(inputs, config)
+    variant = resolve_model_variant(model_variant)
+    validate_inputs(inputs, config, variant)
     if training and rng is None:
         raise ValueError("training=True requires an explicit rng key")
     if training and config.dropout == 0.0:
@@ -482,8 +563,8 @@ def forward(params: Mapping, inputs: Mapping[str, object],
     prepared = _prepare_inputs(inputs)
     if training:
         return _forward_core(params, prepared, config, _Dropout(
-            config.dropout, rng))
-    return _forward_jit(params, prepared, config)
+            config.dropout, rng), variant)
+    return _forward_jit(params, prepared, config, variant)
 
 
 # ------------------------------------------------------- inference helpers

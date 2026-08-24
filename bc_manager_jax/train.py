@@ -40,6 +40,7 @@ from bc_manager_jax.model import (
     _Dropout,
     _forward_core,
     _prepare_inputs,
+    resolve_model_variant,
     validate_inputs,
 )
 
@@ -92,14 +93,15 @@ def _prepare_targets(validated: Mapping[str, np.ndarray]) -> dict[str, jax.Array
 
 @functools.lru_cache(maxsize=None)
 def _compiled_train_step(model_config: ManagerConfig,
-                         train_config: TrainConfig):
+                         train_config: TrainConfig,
+                         model_variant: str = "V0"):
     optimizer = make_optimizer(train_config)
 
     def core(params, opt_state, drop_rng, inputs, targets):
         def loss_fn(p):
             outputs = _forward_core(
                 p, inputs, model_config,
-                _Dropout(model_config.dropout, drop_rng))
+                _Dropout(model_config.dropout, drop_rng), model_variant)
             return loss_from_validated(outputs, targets)
 
         (total, groups), grads = jax.value_and_grad(
@@ -115,20 +117,23 @@ def _compiled_train_step(model_config: ManagerConfig,
 def train_step(params, opt_state, rng: jax.Array,
                inputs: Mapping[str, object], targets: Mapping[str, object],
                model_config: ManagerConfig,
-               train_config: TrainConfig = TrainConfig()):
+               train_config: TrainConfig = TrainConfig(),
+               model_variant: str = "V0"):
     """One BC optimization step; returns
     (new_params, new_opt_state, next_rng, total_loss, group_losses).
 
     Inputs/targets are validated eagerly outside jit. `rng` must be a
     PRNGKey; it is split so dropout masks never repeat across steps.
+    Variant E requires `economic_context` in `inputs`; V0 rejects it.
     """
-    validate_inputs(inputs, model_config)
+    variant = resolve_model_variant(model_variant)
+    validate_inputs(inputs, model_config, variant)
     batch = int(np.asarray(inputs["board_kind"]).shape[0])
     validated = validate_target_shapes(targets, batch,
                                        model_config.count_classes)
     prepared_inputs = _prepare_inputs(inputs)
     prepared_targets = _prepare_targets(validated)
-    core = _compiled_train_step(model_config, train_config)
+    core = _compiled_train_step(model_config, train_config, variant)
     new_params, new_opt_state, next_rng, total, groups = core(
         params, opt_state, rng, prepared_inputs, prepared_targets)
     return new_params, new_opt_state, next_rng, total, groups
@@ -137,16 +142,18 @@ def train_step(params, opt_state, rng: jax.Array,
 def loss_and_groups(params, inputs: Mapping[str, object],
                     targets: Mapping[str, object],
                     model_config: ManagerConfig,
-                    rng: jax.Array | None = None):
+                    rng: jax.Array | None = None,
+                    model_variant: str = "V0"):
     """Un-jitted helper computing (total, groups) for tests/diagnostics.
 
     With `rng=None` and zero dropout this equals the eval forward loss.
     """
-    validate_inputs(inputs, model_config)
+    variant = resolve_model_variant(model_variant)
+    validate_inputs(inputs, model_config, variant)
     batch = int(np.asarray(inputs["board_kind"]).shape[0])
     validated = validate_target_shapes(targets, batch,
                                        model_config.count_classes)
     outputs = _forward_core(
         params, _prepare_inputs(inputs), model_config,
-        _Dropout(model_config.dropout, rng))
+        _Dropout(model_config.dropout, rng), variant)
     return loss_from_validated(outputs, validated)

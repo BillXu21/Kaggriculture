@@ -156,6 +156,69 @@ def test_cli_help_documents_kaggle_command():
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=300)
     assert completed.returncode == 0
     help_text = completed.stdout
-    assert "/kaggle/working/bc-v0-score2950/best.pt" in help_text
+    # Issue #8: the documented Kaggle command targets the promoted BC-E
+    # checkpoint.
+    assert "/kaggle/working/bc-v1-E/best.pt" in help_text
     assert "--device-counts 8" in help_text
     assert "--output-json" in help_text
+
+
+# --------------------------------------------------- issue #8: E variant
+
+
+def test_synthetic_e_batch_economic_context_is_authoritative_and_finite():
+    import numpy as np
+
+    from bc_manager.economics import economic_context
+    from bc_manager_jax.benchmark import synthetic_batch
+    from bc_manager_jax.model import ECONOMIC_CONTEXT_KEY
+
+    config = tiny_manager_config()
+    inputs, _ = synthetic_batch(config, 6, seed=3, model_variant="E")
+    econ = inputs[ECONOMIC_CONTEXT_KEY]
+    assert econ.shape == (6, 14) and econ.dtype == np.float32
+    assert np.isfinite(econ).all()
+    # Rows come from the authoritative function, not a re-derived formula:
+    # rebuild row 0 from the same scalars/unlocked columns.
+    money = float(inputs["scalars"][0, 0])
+    unlocked = int(np.clip(inputs["unlocked"][0].sum(), 1, 4))
+    prev = money - 100.0 if 0 % 2 == 0 else None
+    np.testing.assert_array_equal(econ[0], economic_context(
+        money, unlocked, prev))
+    # V0 batches carry no economic_context at all.
+    inputs_v0, _ = synthetic_batch(config, 6, seed=3)
+    assert ECONOMIC_CONTEXT_KEY not in inputs_v0
+
+
+def test_benchmark_records_model_variant_for_checkpoint_and_random_mode(
+        tmp_path):
+    torch.manual_seed(1)
+    model = DailyManagerTransformer(torch_tiny_config(),
+                                    model_variant="E")
+    checkpoint = tmp_path / "best.pt"
+    torch_save_checkpoint(checkpoint, kind="best", epoch=2, model=model,
+                          model_config=torch_tiny_config(),
+                          training_config=TrainingConfig(),
+                          validation_metrics={"total": 1.0},
+                          model_variant="E")
+
+    args = _smoke_args(extra=["--checkpoint", str(checkpoint)])
+    report = run_benchmark(args)
+    rows = [r for r in report["results"] if r["status"] == "ok"]
+    assert rows
+    assert {r["model_variant"] for r in rows} == {"E"}
+    assert all("variant=E" in r["source"] for r in rows)
+
+    # Random-model mode selects the variant explicitly via --variant.
+    args = _smoke_args(extra=["--variant", "E", "--regimes", "own"])
+    report = run_benchmark(args)
+    rows = [r for r in report["results"] if r["status"] == "ok"]
+    assert rows
+    assert {r["model_variant"] for r in rows} == {"E"}
+
+    # Default stays V0 (backward-compatible rows).
+    args = _smoke_args(extra=["--regimes", "own"])
+    report = run_benchmark(args)
+    rows = [r for r in report["results"] if r["status"] == "ok"]
+    assert rows
+    assert {r["model_variant"] for r in rows} == {"V0"}

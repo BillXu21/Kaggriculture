@@ -310,3 +310,129 @@ def test_non_divisible_global_batch_rejected_in_benchmark_case():
                    device_count=2, global_batch=3, args=args)
     assert row["status"] == "skipped"
     assert "not divisible" in row["reason"]
+
+
+# --------------------------------------------------- issue #8: E variant
+
+
+def test_e_variant_single_device_jit_forward_and_train_step():
+    """Tiny JIT E forward + one train step on one device; finite, updates."""
+    config = tiny_manager_config(dropout=0.1)
+    params = init_params(config, seed=70, model_variant="E")
+    opt_state = init_opt_state(params, TrainConfig())
+    inputs_np, targets_np = synthetic_batch(config, 4, seed=71,
+                                            model_variant="E")
+    econ = np.asarray(inputs_np["economic_context"])
+    assert econ.shape == (4, 14) and np.isfinite(econ).all()
+
+    outputs = _forward_core(params, _prepare_inputs(inputs_np), config,
+                            _Dropout(0.0, None), "E")
+    assert all(np.isfinite(np.asarray(leaf)).all()
+               for leaf in jax.tree_util.tree_leaves(outputs))
+
+    rng = jax.random.PRNGKey(0)
+    new_params, new_opt, next_rng, total, groups = train_step(
+        params, opt_state, rng, inputs_np, targets_np, config,
+        model_variant="E")
+    assert set(groups) == {"crop", "animal", "land", "fertilizer",
+                           "care", "sell_presence", "sell_quantity"}
+    assert np.isfinite(float(total))
+    assert all(np.isfinite(float(v)) for v in groups.values())
+    leaves_before = jax.tree_util.tree_leaves(params)
+    leaves_after = jax.tree_util.tree_leaves(new_params)
+    assert any(not np.array_equal(np.asarray(a), np.asarray(b))
+               for a, b in zip(leaves_before, leaves_after))
+
+
+E_MULTI_DEVICE_SCRIPT = r"""
+import json, os, sys
+sys.path.insert(0, os.environ["REPO_ROOT"])
+expected_devices = int(os.environ["EXPECTED_DEVICES"])
+compare_single = os.environ["COMPARE_SINGLE"] == "1"
+variant = os.environ.get("MODEL_VARIANT", "E")
+import numpy as np, jax
+assert jax.device_count() == expected_devices, jax.device_count()
+from bc_manager_jax.benchmark import synthetic_batch
+from bc_manager_jax.model import init_params, tiny_manager_config
+from bc_manager_jax.sharding import (create_data_mesh, replicate_tree,
+                                     shard_batch)
+from bc_manager_jax.train import TrainConfig, init_opt_state, train_step
+
+config = tiny_manager_config(dropout=0.1)
+params = init_params(config, seed=0, model_variant=variant)
+inputs_np, targets_np = synthetic_batch(config, 8, seed=1,
+                                        model_variant=variant)
+rng = jax.random.PRNGKey(0)
+
+result = {"devices": expected_devices, "variant": variant}
+if compare_single:
+    opt_state_1 = init_opt_state(params, TrainConfig())
+    p1, _, _, total1, groups1 = train_step(params, opt_state_1, rng,
+                                           inputs_np, targets_np, config,
+                                           model_variant=variant)
+
+mesh = create_data_mesh(expected_devices)
+sharded_inputs = shard_batch(inputs_np, mesh)
+sharded_targets = shard_batch(targets_np, mesh)
+in_spec = str(next(iter(sharded_inputs.values())).sharding.spec)
+p_n, _, _, total_n, groups_n = train_step(
+    replicate_tree(params, mesh),
+    replicate_tree(init_opt_state(params, TrainConfig()), mesh),
+    rng, sharded_inputs, sharded_targets, config, model_variant=variant)
+
+if compare_single:
+    param_close = max(float(np.abs(np.asarray(a) - np.asarray(b)).max())
+                      for a, b in zip(jax.tree_util.tree_leaves(p1),
+                                      jax.tree_util.tree_leaves(p_n)))
+    result.update({
+        "total_abs_diff": abs(float(total1) - float(total_n)),
+        "group_max_abs_diff": max(abs(float(groups1[k]) - float(groups_n[k]))
+                                  for k in groups1),
+        "param_max_abs_diff": param_close,
+    })
+result["total_finite"] = bool(np.isfinite(float(total_n)))
+result["batch_sharding_spec"] = in_spec
+print("RESULT:" + json.dumps(result))
+"""
+
+
+def _run_e_multi_device_script(tmp_path, expected_devices: int,
+                               compare_single: bool) -> dict:
+    env = dict(os.environ)
+    env["XLA_FLAGS"] = \
+        f"--xla_force_host_platform_device_count={expected_devices}"
+    env["REPO_ROOT"] = str(REPO_ROOT)
+    env["JAX_PLATFORMS"] = "cpu"
+    env["EXPECTED_DEVICES"] = str(expected_devices)
+    env["COMPARE_SINGLE"] = "1" if compare_single else "0"
+    env["MODEL_VARIANT"] = "E"
+    script = tmp_path / f"e_multi_device_{expected_devices}.py"
+    script.write_text(E_MULTI_DEVICE_SCRIPT, encoding="utf-8")
+    completed = subprocess.run([sys.executable, str(script)], env=env,
+                               capture_output=True, text=True, timeout=600)
+    assert completed.returncode == 0, completed.stderr[-4000:]
+    result_line = next(line for line in completed.stdout.splitlines()
+                       if line.startswith("RESULT:"))
+    result = json.loads(result_line[len("RESULT:"):])
+    print(json.dumps(result, indent=2))
+    return result
+
+
+def test_four_device_e_replicated_step_matches_single_device(tmp_path):
+    """Routine N=4 logical-CPU NamedSharding train-path check for E."""
+    result = _run_e_multi_device_script(tmp_path, 4, compare_single=True)
+    assert result["total_finite"]
+    assert result["total_abs_diff"] < 1e-4
+    assert result["group_max_abs_diff"] < 1e-4
+    assert result["param_max_abs_diff"] < 1e-5
+    assert "'data'" in result["batch_sharding_spec"]
+
+
+def test_eight_device_e_logical_smoke(tmp_path):
+    """One bounded N=8 logical-CPU smoke (tiny batch, single step).
+
+    Logical multi-device validation ONLY — not a throughput/scaling claim.
+    """
+    result = _run_e_multi_device_script(tmp_path, 8, compare_single=False)
+    assert result["total_finite"]
+    assert "'data'" in result["batch_sharding_spec"]
