@@ -32,6 +32,11 @@ from rl_manager.decode import (
     decode_outputs_to_plans,
     plans_from_action_tensors,
 )
+from rl_manager.diagnostics import (
+    DIAGNOSTICS_SCHEMA_VERSION,
+    build_integration_diagnostics,
+    write_diagnostics,
+)
 from rl_manager.executor_factory import (
     EXECUTOR_FACTORY_VERSION,
     make_default_executor_factory,
@@ -43,6 +48,12 @@ from rl_manager.ppo import (
     build_ppo_batch,
     init_train_state,
     ppo_update,
+)
+from rl_manager.ppo_adapter import (
+    PPOBatchedPolicy,
+    ppo_batched_policy_from_state,
+    prng_key_from_id,
+    select_ppo_subset,
 )
 from rl_manager.ppo_checkpoint import (
     RL_PPO_CHECKPOINT_FORMAT,
@@ -84,6 +95,7 @@ __all__ = [
     "ACTION_TENSOR_SHAPES",
     "ARTIFACT_METADATA_SCHEMA_VERSION",
     "CANDIDATE_VS_FROZEN",
+    "DIAGNOSTICS_SCHEMA_VERSION",
     "E_VS_E",
     "EXECUTOR_FACTORY_VERSION",
     "FROZEN_VS_CANDIDATE",
@@ -98,6 +110,7 @@ __all__ = [
     "EpisodeSpec",
     "JaxEPlanPolicy",
     "PPOBatch",
+    "PPOBatchedPolicy",
     "PPOConfig",
     "PPOPolicy",
     "PPOTrainState",
@@ -111,6 +124,7 @@ __all__ = [
     "advantage_stats",
     "build_artifact_metadata",
     "build_episode_spec",
+    "build_integration_diagnostics",
     "build_ppo_batch",
     "compute_gae",
     "decode_outputs_to_action_tensors",
@@ -121,7 +135,11 @@ __all__ = [
     "make_default_executor_factory",
     "params_fingerprint",
     "plans_from_action_tensors",
+    "ppo_batched_policy_from_state",
     "ppo_update",
+    "prng_key_from_id",
     "save_ppo_checkpoint",
     "seat_policies",
+    "select_ppo_subset",
+    "write_diagnostics",
 ]
