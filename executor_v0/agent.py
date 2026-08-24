@@ -30,6 +30,7 @@ import math
 from typing import Any, Callable
 
 from bc_manager.constants import ANIMAL_ORDER, CROP_ORDER
+from executor_v0.tasks import Priority
 from replay_daily.constants import (
     ANIMALS,
     CROPS,
@@ -43,6 +44,7 @@ from replay_daily.constants import (
 from replay_daily.lifecycle import canonical_board
 
 from .foreman import ForemanConfig, run_foreman
+from .tasks import Task
 from .manager import CheckpointPlanProvider, PlanProvider
 from .plan import SELL_BIN_ANCHORS, DailyPlan
 from .projection import clip_sell, project_plan
@@ -287,17 +289,23 @@ class ExecutorAgent:
             entry["submitted"] += executed
             entry["remaining"] = self._remaining_sells[product]
 
-    def _hire_orders(self, obs: Mapping, seat: int, tile_task_count: int,
+    def _hire_orders(self, obs: Mapping, seat: int,
+                     tile_tasks: list[Task],
                      available_cash: float) -> tuple[list[list], int]:
-        """Workload-derived hiring; returns (orders, requested).
+        """Travel-aware workload hiring; returns (orders, requested).
 
         Exact mechanics (issue #7):
 
         - Hiring is useful at ANY hour (hands are cleared at every day
           boundary and cost only a tiny Fibonacci schedule), so the old
           hour-0-only gate no longer starves days that open with sells.
-        - The old hard ``max 3 hires/day`` cap is replaced by the executable
+        - The old hard ``max 3 hires/day`` cap is replaced by an executable
           workload estimate plus exact sequential affordability.
+        - Workload includes TRAVEL: one tile task costs roughly its
+          Manhattan distance from the nearest current worker plus one
+          interaction turn. Ignoring travel made ``tasks_per_worker``
+          chronically under-hire on scattered boards and let deadline
+          maintenance die in queues.
         - ``available_cash`` is current money PLUS the revenue of sell orders
           already queued earlier this same turn: the engine applies market
           orders sequentially, so same-turn SELL -> HIRE funding is real and
@@ -305,10 +313,41 @@ class ExecutorAgent:
         """
         farm = obs["farms"][seat]
         current_hands = len(farm.get("hands") or [])
-        desired = 0
-        if tile_task_count > 0:
-            desired = int(math.ceil(tile_task_count /
-                                    self.config.tasks_per_worker))
+        positions = [farm.get("farmer") or [0, 0]]
+        positions.extend(farm.get("hands") or [])
+        anchors = []
+        for pos in positions:
+            if isinstance(pos, (list, tuple)) and len(pos) == 2:
+                anchors.append((int(pos[1]), int(pos[0])))  # [x,y] -> (y,x)
+        if not anchors:
+            anchors = [(4, 4)]
+        turns_left = max(24 - int(obs["hour"]), 1)
+
+        def _turns_needed(tasks_: list[Task]) -> int:
+            total = 0
+            for t in tasks_:
+                if t.tile is None:
+                    continue
+                travel = min(abs(t.tile[0] - ay) + abs(t.tile[1] - ax)
+                             for ay, ax in anchors)
+                total += travel + 1
+            return total
+
+        # General load uses the crude per-worker divisor; the travel-aware
+        # term is reserved for hard-deadline maintenance (weed-boundary
+        # watering, starving-animal feeding): missing those destroys assets,
+        # while blanket travel-aware hiring over the whole task set just
+        # burns Fibonacci hire fees on low-priority work (issue #7).
+        maintenance = [t for t in tile_tasks
+                       if t.priority == Priority.MAINTENANCE]
+        crude = math.ceil(len(tile_tasks) / self.config.tasks_per_worker) \
+            if tile_tasks else 0
+        desired = crude
+        if maintenance:
+            maint_turns = _turns_needed(maintenance)
+            maint_workers = math.ceil(maint_turns / max(turns_left, 1))
+            desired = max(desired, min(maint_workers, current_hands + 1
+                                       + len(maintenance)))
         wanted = max(desired - current_hands, 0)
         already_today = int(farm.get("hires_today", 0))
         cash = available_cash
@@ -420,11 +459,14 @@ class ExecutorAgent:
         # it would see at execution time; unaffordable candidates are skipped
         # this turn instead of being resubmitted unchanged every hour.
         sell_candidates = self._sell_candidates(obs, seat)
-        tile_task_count = sum(1 for t in tasks if t.tile is not None)
         money = float(obs["farms"][seat].get("money", 0.0))
         cash_after_sells = money + self._sell_proceeds(obs, sell_candidates)
+        from executor_v0 import foreman as _foreman_mod
         hire_orders, hires_requested = self._hire_orders(
-            obs, seat, tile_task_count, cash_after_sells)
+            obs, seat,
+            [t for t in tasks if t.tile is not None
+             and t.kind in _foreman_mod._TILE_TASK_KINDS],
+            cash_after_sells)
         unlocked_count = len(obs["farms"][seat]["unlocked_quadrants"])
         buy_tasks = sorted(
             (t for t in foreman_result.market_tasks

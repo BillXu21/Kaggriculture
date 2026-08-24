@@ -32,14 +32,30 @@ SCENARIOS = [
     ("98184881.json", 3, 0), ("98184881.json", 6, 1),
 ]
 
+# Broader accumulated-candidate set: every elite replay contributes two
+# mid-game days on alternating seats (deterministic, no cherry-picking).
+_ELITE = ["97879422.json", "97927291.json", "97968292.json", "98004787.json",
+          "98045895.json", "98089225.json", "98093786.json", "98134768.json",
+          "98137050.json", "98139342.json", "98139344.json", "98141707.json",
+          "98141712.json", "98184881.json", "98185000.json", "98189541.json",
+          "98189542.json", "98198569.json"]
+EXPANDED_SCENARIOS = [(SPECIMEN, 2, 0), (SPECIMEN, 4, 1)] + [
+    (_ELITE[i % len(_ELITE)], (3, 6, 9)[(i // len(_ELITE)) % 3],
+     (i // len(_ELITE)) % 2)
+    for i in range(2 * len(_ELITE))
+]
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
     parser.add_argument("--label", default="run")
+    parser.add_argument("--set", choices=("smoke", "expanded"),
+                        default="smoke")
     args = parser.parse_args()
 
-    for name, _, _ in SCENARIOS:
+    scenarios = SCENARIOS if args.set == "smoke" else EXPANDED_SCENARIOS
+    for name, _, _ in scenarios:
         path = PRIMARY_SAMPLES / name
         if not path.exists():
             raise SystemExit(f"missing replay sample: {path}")
@@ -47,7 +63,7 @@ def main() -> None:
     started = time.perf_counter()
     factories: dict[tuple[str, int], object] = {}
     results = []
-    for name, day, seat in SCENARIOS:
+    for name, day, seat in scenarios:
         key = (name, day)
         if key not in factories:
             factories[key] = make_expert_executor_agent(
