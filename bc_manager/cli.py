@@ -44,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--count-max", type=int, default=100)
     parser.add_argument("--include-opponent-board", action="store_true")
+    parser.add_argument("--variant", choices=("V0", "E"), default="V0",
+                        help="model variant: V0 (current inputs) or E "
+                             "(adds the audited 14-channel economic "
+                             "context; issue #6)")
     parser.add_argument("--tiny", action="store_true",
                         help="16/1/1/32/dropout=0 CPU validation config")
     # training configuration
@@ -100,7 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.parquet, model_config=model_config,
             training_config=training_config, train_dates=args.train_dates,
             val_dates=args.val_dates, min_score=args.min_score,
-            device_spec=args.device)
+            device_spec=args.device, model_variant=args.variant)
     except SchemaVersionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

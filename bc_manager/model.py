@@ -36,6 +36,11 @@ from .constants import (
     TILE_KIND_IDS,
     TOTAL_DAYS,
 )
+from .economics import (
+    ECONOMIC_CONTEXT_KEY,
+    ECONOMIC_DIM,
+    normalize_model_variant,
+)
 
 NUM_CROPS = len(CROP_ORDER)                      # 5
 NUM_ANIMALS = len(ANIMAL_ORDER)                  # 3
@@ -227,12 +232,21 @@ LABOR_DIM = 3
 
 
 class GlobalEncoders(nn.Module):
-    """Five compact global tokens; scalars are never tokenized individually."""
+    """Five compact global tokens; scalars are never tokenized individually.
 
-    def __init__(self, d_model: int, dropout: float) -> None:
+    With `use_economic_context=True` (variant E only) the audited 14-channel
+    economic vector is appended to the self-resource token input; the five
+    global tokens and all output shapes are otherwise unchanged.
+    """
+
+    def __init__(self, d_model: int, dropout: float,
+                 use_economic_context: bool = False) -> None:
         super().__init__()
+        self.use_economic_context = bool(use_economic_context)
+        self_resource_dim = SELF_RESOURCE_DIM + (
+            ECONOMIC_DIM if self.use_economic_context else 0)
         self.day_embedding = nn.Embedding(TOTAL_DAYS, d_model)
-        self.self_resource = _global_mlp(SELF_RESOURCE_DIM, d_model, dropout)
+        self.self_resource = _global_mlp(self_resource_dim, d_model, dropout)
         self.market = _global_mlp(MARKET_DIM, d_model, dropout)
         self.town = _global_mlp(TOWN_DIM, d_model, dropout)
         self.labor = _global_mlp(LABOR_DIM, d_model, dropout)
@@ -248,6 +262,9 @@ class GlobalEncoders(nn.Module):
         unlocked = batch["unlocked"].to(torch.float32)
         self_features = torch.cat(
             [money, shed, seeds, carried, unlocked, hires_today], dim=-1)
+        if self.use_economic_context:
+            econ = batch[ECONOMIC_CONTEXT_KEY].to(torch.float32)
+            self_features = torch.cat([self_features, econ], dim=-1)
 
         market_inventory = _sign_log1p(
             batch["market_inventory"].to(torch.float32))
@@ -280,11 +297,24 @@ class GlobalEncoders(nn.Module):
 
 
 class DailyManagerTransformer(nn.Module):
-    """Stateless daily manager: tile Transformer with structured heads."""
+    """Stateless daily manager: tile Transformer with structured heads.
 
-    def __init__(self, config: ManagerConfig | None = None) -> None:
+    `model_variant` selects the input contract without touching the V0
+    architecture: "V0" (default) is byte-compatible with every pre-V1
+    checkpoint (state-dict keys/shapes unchanged, `economic_context`
+    rejected as an unknown input); "E" additionally requires the audited
+    14-channel `economic_context` float32 [B, 14] and appends it to the
+    self-resource token input. The variant is stored OUTSIDE
+    `ManagerConfig` so serialized model_config payloads stay exactly as the
+    JAX V0 converter expects them.
+    """
+
+    def __init__(self, config: ManagerConfig | None = None,
+                 *, model_variant: str = "V0") -> None:
         super().__init__()
         self.config = config if config is not None else ManagerConfig()
+        self.model_variant = normalize_model_variant(model_variant)
+        self.uses_economic_context = self.model_variant == "E"
         d = self.config.d_model
         dropout = self.config.dropout
 
@@ -293,7 +323,8 @@ class DailyManagerTransformer(nn.Module):
         # only applied when include_opponent_board is enabled.
         self.role_embedding = nn.Embedding(2, d)
         self.tile_encoder = TileEncoder(d, dropout)
-        self.global_encoders = GlobalEncoders(d, dropout)
+        self.global_encoders = GlobalEncoders(
+            d, dropout, use_economic_context=self.uses_economic_context)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d, nhead=self.config.num_heads,
             dim_feedforward=self.config.ffn_dim, dropout=dropout,
@@ -323,7 +354,10 @@ class DailyManagerTransformer(nn.Module):
         allowed = set(OWN_INPUT_KEYS)
         if self.config.include_opponent_board:
             allowed |= OPPONENT_PUBLIC_INPUT_KEYS
-        unknown = sorted(keys - OWN_INPUT_KEYS - OPPONENT_PUBLIC_INPUT_KEYS)
+        if self.uses_economic_context:
+            allowed |= {ECONOMIC_CONTEXT_KEY}
+        unknown = sorted(
+            keys - allowed - OPPONENT_PUBLIC_INPUT_KEYS)
         if unknown:
             raise ValueError(
                 f"unknown input keys {unknown}; only adapter predictive "
@@ -335,6 +369,20 @@ class DailyManagerTransformer(nn.Module):
             raise ValueError(
                 f"missing required input keys {missing}; expected adapter "
                 f"arrays {sorted(allowed)}")
+        if self.uses_economic_context:
+            econ = batch[ECONOMIC_CONTEXT_KEY]
+            if econ.dtype != torch.float32:
+                raise ValueError(
+                    f"{ECONOMIC_CONTEXT_KEY} must be float32, got "
+                    f"{econ.dtype}")
+            expected = (batch["board_kind"].shape[0], ECONOMIC_DIM)
+            if tuple(econ.shape) != expected:
+                raise ValueError(
+                    f"{ECONOMIC_CONTEXT_KEY} must have shape {expected}, "
+                    f"got {tuple(econ.shape)}")
+            if not bool(torch.isfinite(econ).all()):
+                raise ValueError(
+                    f"{ECONOMIC_CONTEXT_KEY} contains non-finite values")
 
     def _encode_tiles(self, batch: Mapping[str, Tensor], prefix: str,
                       role: int) -> Tensor:

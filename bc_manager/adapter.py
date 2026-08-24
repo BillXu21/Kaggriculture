@@ -94,6 +94,7 @@ from .constants import (
     board_field_present,
     sell_bin_index,
 )
+from .economics import ECONOMIC_CONTEXT_KEY, derive_economic_context
 
 # Dotted-path projection: PyArrow names each selected nested leaf column by
 # its last path component ("events.sells" -> "sells").
@@ -414,8 +415,16 @@ def _input_arrays_from_starts(
 
 def table_to_arrays(
     table: pa.Table, *, include_opponent: bool = False,
+    with_economic_context: bool = False,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], list[dict[str, Any]]]:
-    """Convert a filtered canonical table into compact NumPy arrays."""
+    """Convert a filtered canonical table into compact NumPy arrays.
+
+    With `with_economic_context=True` the audited 14-channel economic vector
+    (issue #6 variant E) is derived AFTER all selected files have been
+    concatenated, grouped strictly by `(metadata.episode_id, metadata.seat)`
+    with exact day-1 key joins — never positionally — so cross-file
+    consecutive days join correctly and no future/end data is read.
+    """
     _require_schema_version(table, "in-memory Arrow table")
     start_rows = _column_rows(table, "start")
     target_rows = _column_rows(table, "targets")
@@ -425,6 +434,14 @@ def table_to_arrays(
 
     inputs = _input_arrays_from_starts(
         start_rows, day_col, include_opponent=include_opponent)
+    if with_economic_context:
+        inputs[ECONOMIC_CONTEXT_KEY] = derive_economic_context(
+            [m.get("episode_id") for m in meta_rows],
+            [m.get("seat") for m in meta_rows],
+            day_col,
+            inputs["scalars"][:, 0],
+            inputs["unlocked"].sum(axis=1),
+        )
     targets = build_targets(target_rows, sells_rows)
     meta = [_eval_metadata(m, d) for m, d in zip(meta_rows, day_col)]
     return inputs, targets, meta
@@ -553,12 +570,14 @@ def load_dataset(
     dates: Sequence[str],
     min_score: float = MIN_SCORE_DEFAULT,
     include_opponent: bool = False,
+    with_economic_context: bool = False,
 ) -> dict[str, Any]:
     """Load one date-filtered dataset split as compact arrays."""
     table, report = load_selected_table(paths, dates=dates,
                                         min_score=min_score)
-    inputs, targets, meta = table_to_arrays(table,
-                                            include_opponent=include_opponent)
+    inputs, targets, meta = table_to_arrays(
+        table, include_opponent=include_opponent,
+        with_economic_context=with_economic_context)
     return {"inputs": inputs, "targets": targets, "meta": meta,
             "report": report}
 
@@ -570,12 +589,19 @@ def load_train_val(
     val_dates: Sequence[str] = VAL_DATES_DEFAULT,
     min_score: float = MIN_SCORE_DEFAULT,
     include_opponent: bool = False,
+    with_economic_context: bool = False,
 ) -> dict[str, Any]:
     """Date-held-out train/validation split with equal min_score filtering.
 
     Split membership comes exclusively from metadata.partition_date; there is
     no random row split anywhere. Rows whose partition_date is in neither
     allowlist are excluded and counted.
+
+    Economic-context derivation (when requested) runs inside each split on
+    the fully concatenated table. An episode's rows all share one
+    partition_date and one min_score, so date/score filtering can never
+    split a `(episode_id, seat)` group internally; the exact day-1 key join
+    additionally defaults safely on any gap.
     """
     overlap = set(train_dates) & set(val_dates)
     if overlap:
@@ -589,7 +615,8 @@ def load_train_val(
         mask = pa.array([d in set(allowed) for d in dates_col])
         split_table = table.filter(mask)
         inputs, targets, meta = table_to_arrays(
-            split_table, include_opponent=include_opponent)
+            split_table, include_opponent=include_opponent,
+            with_economic_context=with_economic_context)
         return {"inputs": inputs, "targets": targets, "meta": meta,
                 "report": {"rows_read": read_report["rows_read"],
                            "rows_selected": len(meta),

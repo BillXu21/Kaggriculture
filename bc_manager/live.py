@@ -38,8 +38,17 @@ from replay_daily.storage import (
 )
 
 from .adapter import _input_arrays_from_starts
+from .economics import (
+    ECONOMIC_CONTEXT_KEY,
+    EconomicHistory,
+    economic_context,
+)
 
-__all__ = ["encode_live_inputs", "validate_previous_execution"]
+__all__ = [
+    "encode_live_inputs",
+    "validate_previous_execution",
+    "EconomicHistory",
+]
 
 _PREVIOUS_EXECUTION_KEYS = ("workers_hired", "hire_cost")
 _REQUIRED_OBS_KEYS = ("farms", "market", "town", "day", "hour")
@@ -83,6 +92,8 @@ def encode_live_inputs(
     *,
     include_opponent: bool = False,
     step: int | None = None,
+    economic_history: EconomicHistory | None = None,
+    economic_prev_start: tuple[int, float] | None = None,
 ) -> dict[str, np.ndarray]:
     """Encode one raw live 1.32.7 observation into one-row BC input arrays.
 
@@ -91,9 +102,25 @@ def encode_live_inputs(
     is no silent default because lifecycle timing (`past_lifespan`) depends on
     it.
 
+    Economic context (issue #6 variant E) is emitted only when explicitly
+    requested via exactly one of:
+
+    - `economic_history`: an `EconomicHistory` tracker for the current
+      episode/seat; it records this daily-start (day, money) observation and
+      derives the previous-day delta only from its own earlier recorded
+      daily-start state (never from actions). Reset it on a new episode.
+    - `economic_prev_start`: an explicit `(prev_day, prev_money)` pair for
+      the prior daily-start observation; valid iff `prev_day == day - 1`.
+
+    Passing both raises. With neither, no `economic_context` key is emitted
+    and the V0 encoding is byte-identical to before.
+
     Raises ValueError with a clear message on missing mechanically required
     fields or invalid labor/day/step values.
     """
+    if economic_history is not None and economic_prev_start is not None:
+        raise ValueError(
+            "pass either economic_history or economic_prev_start, not both")
     if not isinstance(obs, Mapping):
         raise ValueError(
             f"obs must be a mapping, got {type(obs).__name__}")
@@ -135,5 +162,17 @@ def encode_live_inputs(
     if include_opponent:
         start["opponent_public"] = normalize_public_state(
             opponent_public_state(dict(obs), seat, day, resolved_step))
-    return _input_arrays_from_starts([start], [day],
-                                     include_opponent=include_opponent)
+    inputs = _input_arrays_from_starts([start], [day],
+                                       include_opponent=include_opponent)
+    if economic_history is not None or economic_prev_start is not None:
+        money = float(start["self"]["money"])
+        unlocked_count = len(start["self"]["unlocked_quadrants"])
+        if economic_history is not None:
+            delta, valid = economic_history.observe(day, money)
+        else:
+            prev_day, prev_money = economic_prev_start
+            valid = int(prev_day) == day - 1
+            delta = money - float(prev_money) if valid else 0.0
+        inputs[ECONOMIC_CONTEXT_KEY] = economic_context(
+            money, unlocked_count, delta if valid else None)[None, :]
+    return inputs

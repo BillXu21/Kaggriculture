@@ -29,6 +29,12 @@ from .constants import (
     VAL_DATES_DEFAULT,
 )
 from .loss import GROUP_NAMES, ManagerLossConfig, manager_loss
+from .coherence import (
+    coherence_metrics,
+    current_animal_counts,
+    current_crop_counts,
+)
+from .economics import normalize_model_variant
 from .metrics import group_metrics, nonzero_recall, sell_presence_accuracy
 from .model import (
     DailyManagerTransformer,
@@ -180,6 +186,16 @@ def evaluate(model: DailyManagerTransformer, loader: DataLoader,
                 outputs["sell_quantity_log1p"].cpu().numpy())
             trues.setdefault("quantity", []).append(
                 targets["sell_quantity_log1p"].cpu().numpy())
+            # Coherence diagnostics need the current-state arrays only.
+            preds.setdefault("_current_crop", []).append(
+                current_crop_counts(inputs["board_crop"].cpu().numpy()))
+            preds.setdefault("_current_animal", []).append(
+                current_animal_counts(inputs["board_animal"].cpu().numpy()))
+            preds.setdefault("_current_land", []).append(
+                inputs["unlocked"].to(torch.float32).sum(dim=1)
+                .cpu().numpy())
+            preds.setdefault("_cash", []).append(
+                inputs["scalars"][:, 0].to(torch.float32).cpu().numpy())
 
     report: dict[str, Any] = {
         "rows": rows,
@@ -222,6 +238,25 @@ def evaluate(model: DailyManagerTransformer, loader: DataLoader,
     report["sell_positive_quantity_log_mae"] = (
         float(np.mean(np.abs(qty_p[positive] - qty_t[positive])))
         if positive.any() else 0.0)
+
+    # Plan-coherence diagnostics (issue #6): prediction vs expert targets.
+    # Diagnostic-only — never clipped, never part of any loss group above.
+    current_crop = np.concatenate(preds["_current_crop"])
+    current_animal = np.concatenate(preds["_current_animal"])
+    current_land = np.concatenate(preds["_current_land"])
+    cash = np.concatenate(preds["_cash"])
+    report["coherence"] = {
+        "pred": coherence_metrics(
+            np.concatenate(preds["crop_logits"]),
+            np.concatenate(preds["animal_logits"]),
+            np.concatenate(preds["land"]),
+            current_crop, current_animal, current_land, cash),
+        "expert": coherence_metrics(
+            np.concatenate(trues["crop_logits"]),
+            np.concatenate(trues["animal_logits"]),
+            np.concatenate(trues["land"]),
+            current_crop, current_animal, current_land, cash),
+    }
     return report
 
 
@@ -278,14 +313,21 @@ def save_checkpoint(path: str | Path, *, kind: str, epoch: int,
                     model: DailyManagerTransformer,
                     model_config: ManagerConfig,
                     training_config: TrainingConfig,
-                    validation_metrics: Mapping[str, Any]) -> None:
-    """Atomic best/last checkpoint write inside the caller's directory."""
+                    validation_metrics: Mapping[str, Any],
+                    model_variant: str = "V0") -> None:
+    """Atomic best/last checkpoint write inside the caller's directory.
+
+    The variant is stored as a top-level payload field, never inside
+    `model_config` (whose keys must keep matching the JAX V0 converter's
+    frozen ManagerConfig). Payloads without the field load as V0.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "format": CHECKPOINT_FORMAT,
         "kind": kind,
         "epoch": int(epoch),
+        "model_variant": normalize_model_variant(model_variant),
         "model_state_dict": model.state_dict(),
         "model_config": asdict(model_config),
         "training_config": asdict(training_config),
@@ -305,13 +347,34 @@ def load_checkpoint(path: str | Path) -> dict[str, Any]:
     return payload
 
 
+def checkpoint_model_variant(payload: Mapping[str, Any]) -> str:
+    """Normalized variant of a v1 payload; absent field means V0."""
+    try:
+        return normalize_model_variant(payload.get("model_variant", "V0"))
+    except ValueError as exc:
+        raise ValueError(
+            f"checkpoint carries an invalid model_variant: {exc}") from exc
+
+
 def load_model_from_checkpoint(
     path: str | Path, device: str | torch.device = "cpu",
+    *, expected_variant: str | None = None,
 ) -> tuple[DailyManagerTransformer, dict[str, Any]]:
-    """Reconstruct the model from the serialized config and state."""
+    """Reconstruct the model from the serialized config and state.
+
+    Old payloads without `model_variant` load as V0. With
+    `expected_variant` set, a mismatch fails clearly instead of silently
+    evaluating the wrong input contract.
+    """
     payload = load_checkpoint(path)
+    variant = checkpoint_model_variant(payload)
+    if expected_variant is not None \
+            and variant != normalize_model_variant(expected_variant):
+        raise ValueError(
+            f"{path}: checkpoint variant {variant!r} does not match the "
+            f"requested variant {normalize_model_variant(expected_variant)!r}")
     model_config = ManagerConfig(**payload["model_config"])
-    model = DailyManagerTransformer(model_config)
+    model = DailyManagerTransformer(model_config, model_variant=variant)
     model.load_state_dict(payload["model_state_dict"])
     return model.to(device).eval(), payload
 
@@ -351,16 +414,20 @@ def run_training(
     val_dates: Sequence[str] = VAL_DATES_DEFAULT,
     min_score: float = MIN_SCORE_DEFAULT,
     device_spec: str = "auto",
+    model_variant: str = "V0",
     log: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """Full in-RAM BC run: load -> tensors -> baseline -> epochs -> ckpts."""
     model_config = model_config if model_config is not None else ManagerConfig()
     training_config = training_config if training_config is not None \
         else TrainingConfig()
+    variant = normalize_model_variant(model_variant)
+    uses_economic_context = variant == "E"
 
     data = load_train_val(paths, train_dates=train_dates,
                           val_dates=val_dates, min_score=min_score,
-                          include_opponent=model_config.include_opponent_board)
+                          include_opponent=model_config.include_opponent_board,
+                          with_economic_context=uses_economic_context)
     if len(data["train"]["meta"]) == 0:
         raise ValueError(
             f"empty train split: no rows selected for dates "
@@ -405,12 +472,13 @@ def run_training(
     baseline_report = evaluate_baseline(
         baseline, data["val"]["inputs"]["day"], data["val"]["targets"])
 
-    model = DailyManagerTransformer(model_config).to(device)
+    model = DailyManagerTransformer(model_config, model_variant=variant) \
+        .to(device)
     param_count = model.trainable_parameters
     optimizer = torch.optim.AdamW(model.parameters(), lr=training_config.lr,
                                   weight_decay=training_config.weight_decay)
 
-    log(f"device={device} amp={bool(amp_enabled)} "
+    log(f"device={device} amp={bool(amp_enabled)} variant={variant} "
         f"params={param_count} "
         f"train_rows={len(train_dataset)} val_rows={len(val_dataset)}")
     log(f"model_config={asdict(model_config)}")
@@ -450,12 +518,14 @@ def run_training(
                 save_checkpoint(best_path, kind="best", epoch=epoch,
                                 model=model, model_config=model_config,
                                 training_config=training_config,
-                                validation_metrics=val_report)
+                                validation_metrics=val_report,
+                                model_variant=variant)
         if last_path is not None:
             save_checkpoint(last_path, kind="last", epoch=epoch, model=model,
                             model_config=model_config,
                             training_config=training_config,
-                            validation_metrics=val_report)
+                            validation_metrics=val_report,
+                            model_variant=variant)
         history.append(record)
         groups = " ".join(f"{name}={val_report[f'group.{name}']:.4f}"
                           for name in GROUP_NAMES)
@@ -484,6 +554,7 @@ def run_training(
         "best_validation_total": best_total,
         "stopped_early": stopped_early,
         "baseline_validation": baseline_report,
+        "model_variant": variant,
         "trainable_parameters": param_count,
         "device": str(device),
         "amp_enabled": bool(amp_enabled),
