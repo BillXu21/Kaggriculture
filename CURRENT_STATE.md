@@ -9,6 +9,7 @@ Last updated: 2026-08-23
 - Engine/corpus: `kaggle-environments 1.32.7`, canonical replay schema **v3**.
 - Training direction: **BC -> closed-loop executor validation -> PPO/RL refinement**.
 - Primary goal: build a refinement/self-play pipeline that measurably improves a competent learned starting policy.
+- BC V1 ablation (issue #6, 2026-08-23): the four-way variant matrix **V0/J/E/JE is fully implemented and locally validated** (commits `2f48564`..`fc95752`; 275-test combined sweep + independent audit 225 passed + one official opening-only plumbing smoke). Real corpus/checkpoints are absent locally: **no teacher-forced variant results, no closed-loop panel results, no winner**. The exact Kaggle train/panel runbook is `research/BC_V1_ABLATION_RUN.md`; the fixed paired panel (seeds 7/17/42/123/2026 × both seats, bank median-then-mean ranking) is the only promotion gate — teacher-forced/coherence metrics alone never promote.
 
 ## Opening Book (Issue #4)
 
@@ -197,6 +198,39 @@ Selling remains the clearest teacher-forced weakness: true positive rate 11.21%,
 Conclusion: **D-019 passes its intended representation diagnostic.** Do not spend the next cycle on model scaling/tuning before closed-loop evidence.
 
 Detailed run/eval: `research/FIRST_BC_V0_EVAL.md`.
+
+## BC V1 Ablation (Issue #6)
+
+Implemented, locally validated, **not yet run on real data**. Four manager
+variants over the unchanged D-019 trunk and data layer:
+
+| variant | change | parameters |
+| --- | --- | ---: |
+| V0 | baseline; exact pre-V1 behavior preserved | 1,071,040 |
+| J | joint plan decoder (one coherent plan object instead of independent heads) | 1,204,288 |
+| E | 14-channel realized-economic context via a live `EconomicHistory` tracker exactly mirroring batch derivation (previous-day net-cash delta, hire affordability from the observed `hires_today` counter) | 1,072,832 |
+| JE | joint decoder + economic context | 1,206,080 |
+
+Hard feature rule (Stage 0 audit,
+`research/BC_V1_ECONOMIC_CONTEXT.md`): submitted market intents are not
+realized fills — gross revenue/spend/fill quantities are never inferred;
+only observed money snapshots and the `hires_today` counter feed features.
+Coherence diagnostics are recorded per live plan but never clipped into or
+fed back to any decision.
+
+Local evidence: stage sweeps up to 275 passed (BC V1 + bc_manager +
+executor_v0 + opening_book); independent audit 62 new + 163 compat = 225
+passed; one official opening-only seed-7/seat-0 smoke under pinned 1.32.7
+(96 turns, clean handoff, zero divergence/fallback — plumbing only, no BC
+weights attached). Real corpus Parquet and trained checkpoints are absent
+locally: no teacher-forced variant results, no panel results, no winner.
+
+Promotion gate: the fixed paired closed-loop panel — `standard_mixed`
+opening days 0–3 -> tested BC -> unchanged executor, seeds
+7/17/42/123/2026 × both seats = 40 games, ranked by final-bank median then
+mean; teacher-forced totals and coherence are prerequisites/diagnostics
+only. Exact copy-paste Kaggle train/preflight/panel commands:
+`research/BC_V1_ABLATION_RUN.md`.
 
 ## BC V0 Simplification Backlog
 

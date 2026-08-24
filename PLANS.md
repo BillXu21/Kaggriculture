@@ -330,6 +330,15 @@ Do not start here before a functioning RL baseline.
 
 ## Immediate Planning Agenda
 
+0. **Run the BC V1 ablation on Kaggle (issue #6 next gate).** Implementation
+   is complete and locally validated (commits `2f48564`..`fc95752`; see
+   `research/BC_V1_ABLATION_RUN.md`). Execute the exact runbook: train
+   V0/J/E/JE in one identical matrix over the five-day corpus, strict
+   `--validate-only` preflight, then the 40-game paired closed-loop panel
+   (seeds 7/17/42/123/2026 × both seats, bank median-then-mean ranking).
+   Record real results in `HISTORY.md`/`CURRENT_STATE.md` before any
+   follow-up; teacher-forced/coherence metrics alone never promote a
+   variant (D-026); no winner exists yet.
 1. ~~finish the real engine-executed BC-manager + executor smoke and require non-empty per-day diagnostics/compliance~~ Done for the repo-local checkpoint plumbing path; continue to inspect compliance before score claims;
 2. implement the common official-engine evaluation/match runner from `research/CODING_AGENT_SPRINT.md`;
 3. implement the scalar exact fast engine and differential oracle against pinned 1.32.7 (differential oracle live; Stage-2b mechanic-cluster parity slices 1-4 done at zero divergence; full-episode legal-ish corpus DONE 2026-08-23: 8 complete 720-step seeds, zero divergence, D-022; independent stateful closed-loop A/B DONE for three fixed-plan seeds plus one repo-local checkpoint episode; throughput/benchmarks DONE 2026-08-23, D-025);

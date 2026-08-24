@@ -2,6 +2,51 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-23 — Issue #6 Implemented: BC V1 Four-Variant Ablation (V0/J/E/JE) With Fixed Closed-Loop Panel Gate
+
+Implemented the complete BC V1 ablation in four bounded commits on `main`
+(`2f48564` Stage 0 audit -> `192d0dc` E foundation -> `3d7fae1` J/JE decoder
+-> `fc95752` live integration + panel CLI), then recorded the durable state
+and exact Kaggle runbook (`research/BC_V1_ABLATION_RUN.md`, decision D-026).
+No executor behavior, opening playback, or engine code changed; diagnostics
+exposure is purely additive.
+
+- **Variants** over the unchanged D-019 trunk/data layer: V0 baseline
+  1,071,040 params; J joint plan decoder 1,204,288 (+133,248); E realized-
+  economic context 1,072,832 (+1,792); JE both 1,206,080. V0/J checkpoints
+  keep the exact pre-V1 encoder path (regression-tested). E/JE feed a live
+  `EconomicHistory` tracker that exactly mirrors batch derivation including
+  day gaps and partition boundaries.
+- **Feature discipline** (Stage 0 audit,
+  `research/BC_V1_ECONOMIC_CONTEXT.md`): submitted market intents are never
+  treated as realized fills — no gross revenue/spend/fill inference; only
+  observed money snapshots and the `hires_today` counter are used. Coherence
+  diagnostics are JSON-safe (explicit zero-cash/over-threshold flags, never
+  Infinity) and diagnostic-only: never clipped into plans, never fed back.
+- **Panel gate** (`python -m bc_manager.ablation`, D-026): strict checkpoint
+  gates (format v1, stored `model_variant` matching the mapping, teacher-
+  forced `validation_metrics.total`; smoke weights rejected), official
+  1.32.7 provenance guard, `standard_mixed` opening days 0–3 -> tested BC ->
+  unchanged executor, seeds 7/17/42/123/2026 × seats {0,1} = 40 games,
+  ranking by closed-loop final-bank median then mean; seed-17 collapse flag
+  and seed-2026 retention reported beside raw banks. Teacher-forced totals
+  and coherence are prerequisites/diagnostics only and never promote a
+  variant. `--validate-only` preflights without importing the engine.
+- **Local evidence:** stage sweeps grew to 275 passed across BC V1 +
+  bc_manager + executor_v0 + opening_book suites at `fc95752`; independent
+  Ox audit 62 new + 163 compat = 225 passed (PASS_WITH_FINDINGS, no code
+  blockers); one official opening-only seed-7/seat-0 smoke under pinned
+  1.32.7 replayed all 96 turns with clean handoff and zero divergence/
+  fallback/status anomalies — plumbing only, no BC weights attached.
+- **Not done / not claimed:** real five-day corpus Parquet and trained
+  checkpoints are absent locally, so there are NO teacher-forced variant
+  results, NO closed-loop panel results, and NO winner. The Kaggle runbook
+  (fresh clone, exact deps incl. `kaggle-environments==1.32.7`, corpus
+  locate-or-fail, four identical-matrix training commands, preflight,
+  primary panel command, artifact pass criteria) is copy-paste ready in
+  `research/BC_V1_ABLATION_RUN.md`. PPO/recurrence/value heads, plan
+  affordability clipping, JAX V1, and executor changes remain out of scope.
+
 ## 2026-08-23 — Issue #2 A/B Benchmarks: Official 1.32.7 vs Fast Engine vs diffmap Reference
 
 Ran the reproducible same-machine benchmark suite required by issue #2
