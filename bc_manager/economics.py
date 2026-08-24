@@ -51,7 +51,7 @@ __all__ = [
 ECONOMIC_DIM = 14
 ECONOMIC_CONTEXT_KEY = "economic_context"
 
-MODEL_VARIANTS = ("V0", "E")
+MODEL_VARIANTS = ("V0", "J", "E", "JE")
 
 SEED_COSTS = tuple(int(CROPS[name]["seed"]) for name in CROP_ORDER)
 ANIMAL_COSTS = tuple(int(ANIMALS[name]["cost"]) for name in ANIMAL_ORDER)
@@ -63,7 +63,7 @@ _LOG_CLIP = 8.0
 
 
 def normalize_model_variant(value: str) -> str:
-    """Normalize/validate a model-variant name to 'V0' or 'E'."""
+    """Normalize/validate a model-variant name to V0/J/E/JE."""
     if not isinstance(value, str):
         raise ValueError(
             f"model_variant must be a string, got {type(value).__name__}")

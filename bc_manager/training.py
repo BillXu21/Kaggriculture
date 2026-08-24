@@ -422,7 +422,7 @@ def run_training(
     training_config = training_config if training_config is not None \
         else TrainingConfig()
     variant = normalize_model_variant(model_variant)
-    uses_economic_context = variant == "E"
+    uses_economic_context = variant in ("E", "JE")
 
     data = load_train_val(paths, train_dates=train_dates,
                           val_dates=val_dates, min_score=min_score,

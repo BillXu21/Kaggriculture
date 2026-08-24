@@ -44,10 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--count-max", type=int, default=100)
     parser.add_argument("--include-opponent-board", action="store_true")
-    parser.add_argument("--variant", choices=("V0", "E"), default="V0",
-                        help="model variant: V0 (current inputs) or E "
-                             "(adds the audited 14-channel economic "
-                             "context; issue #6)")
+    parser.add_argument("--variant", choices=("V0", "J", "E", "JE"),
+                        default="V0",
+                        help="model variant: V0 (current inputs), J (joint "
+                             "plan decoder), E (economic context), or JE "
+                             "(both; issue #6)")
     parser.add_argument("--tiny", action="store_true",
                         help="16/1/1/32/dropout=0 CPU validation config")
     # training configuration

@@ -219,7 +219,7 @@ def test_transform_helpers_and_validation():
     assert normalize_model_variant("e") == "E"
     assert normalize_model_variant("V0") == "V0"
     with pytest.raises(ValueError, match="model_variant"):
-        normalize_model_variant("J")
+        normalize_model_variant("X")  # J/JE are valid since Stage 2
 
 
 # ------------------------------------- 2. cross-file batch history grouping
@@ -481,7 +481,7 @@ def test_invalid_checkpoint_variant_fails_clearly(tmp_path):
         "format": "bc_manager_checkpoint_v1",
         "kind": "last",
         "epoch": 1,
-        "model_variant": "JE",
+        "model_variant": "ZZ",  # not a valid variant in any stage
         "model_state_dict": model.state_dict(),
         "model_config": {},
         "training_config": {},

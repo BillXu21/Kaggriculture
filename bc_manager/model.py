@@ -90,6 +90,13 @@ OPPONENT_PUBLIC_INPUT_KEYS = frozenset({
 
 GLOBAL_TOKEN_NAMES = ("self_resource", "market", "town", "labor", "day")
 
+# Fixed-semantic joint-decoder decision tokens (issue #6 experiment J).
+# Index order is part of the forward contract; the sell token is shared by
+# both sell heads.
+DECISION_TOKEN_NAMES = ("crop", "animal", "land", "fertilizer", "care",
+                        "sell")
+DECISION_SELL_INDEX = DECISION_TOKEN_NAMES.index("sell")
+
 
 @dataclass
 class ManagerConfig:
@@ -299,14 +306,28 @@ class GlobalEncoders(nn.Module):
 class DailyManagerTransformer(nn.Module):
     """Stateless daily manager: tile Transformer with structured heads.
 
-    `model_variant` selects the input contract without touching the V0
-    architecture: "V0" (default) is byte-compatible with every pre-V1
-    checkpoint (state-dict keys/shapes unchanged, `economic_context`
-    rejected as an unknown input); "E" additionally requires the audited
-    14-channel `economic_context` float32 [B, 14] and appends it to the
-    self-resource token input. The variant is stored OUTSIDE
-    `ManagerConfig` so serialized model_config payloads stay exactly as the
-    JAX V0 converter expects them.
+    `model_variant` selects the input/decoder contract without touching the
+    V0 architecture:
+
+    - "V0" (default): byte-compatible with every pre-V1 checkpoint;
+      `economic_context` is rejected as an unknown input; all seven heads
+      read the single manager vector.
+    - "E": additionally requires the audited 14-channel `economic_context`
+      float32 [B, 14], appended to the self-resource token input.
+    - "J"/"JE": instantiate a small NON-CAUSAL joint plan decoder — six
+      fixed-semantic learned decision tokens (crop, animal, land,
+      fertilizer, care, sell), each conditioned on the final normalized
+      manager representation by direct addition, processed together by ONE
+      bidirectional `nn.TransformerEncoderLayer` (ffn=2*d_model, gelu,
+      norm_first, no mask). Every token attends to all six before logits,
+      which is the cross-task coupling seven independent linear heads
+      cannot express. Each task head then reads its contextualized token;
+      the shared sell token feeds both sell heads. Output keys/shapes and
+      decoding are unchanged. Joint modules exist ONLY for J/JE, so V0/E
+      state dicts stay byte-compatible.
+
+    The variant is stored OUTSIDE `ManagerConfig` so serialized
+    model_config payloads stay exactly as the JAX V0 converter expects.
     """
 
     def __init__(self, config: ManagerConfig | None = None,
@@ -314,7 +335,8 @@ class DailyManagerTransformer(nn.Module):
         super().__init__()
         self.config = config if config is not None else ManagerConfig()
         self.model_variant = normalize_model_variant(model_variant)
-        self.uses_economic_context = self.model_variant == "E"
+        self.uses_economic_context = self.model_variant in ("E", "JE")
+        self.uses_joint_decoder = self.model_variant in ("J", "JE")
         d = self.config.d_model
         dropout = self.config.dropout
 
@@ -325,6 +347,13 @@ class DailyManagerTransformer(nn.Module):
         self.tile_encoder = TileEncoder(d, dropout)
         self.global_encoders = GlobalEncoders(
             d, dropout, use_economic_context=self.uses_economic_context)
+        if self.uses_joint_decoder:
+            self.decision_tokens = nn.Parameter(
+                torch.randn(1, len(DECISION_TOKEN_NAMES), d) * 0.02)
+            self.joint_layer = nn.TransformerEncoderLayer(
+                d_model=d, nhead=self.config.num_heads,
+                dim_feedforward=2 * d, dropout=dropout,
+                activation="gelu", batch_first=True, norm_first=True)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d, nhead=self.config.num_heads,
             dim_feedforward=self.config.ffn_dim, dropout=dropout,
@@ -410,23 +439,51 @@ class DailyManagerTransformer(nn.Module):
         manager = self.encoder_norm(hidden[:, 0])
 
         c = self.config.count_classes
-        outputs = {
-            "crop_logits":
-                self.crop_head(manager).view(b, NUM_CROPS, c),
-            "animal_logits":
-                self.animal_head(manager).view(b, NUM_ANIMALS, c),
-            "land_logits": self.land_head(manager),
-            "fertilizer_logits":
-                self.fertilizer_head(manager).view(b, NUM_CROPS, c),
-            "care_logits":
-                self.care_head(manager).view(b, NUM_ANIMALS, c),
-            "sell_presence_logits":
-                self.sell_presence_head(manager).view(b, NUM_PRODUCTS,
-                                                      SELL_BIN_COUNT),
-            "sell_quantity_log1p":
-                self.sell_quantity_head(manager).view(b, NUM_PRODUCTS,
-                                                      SELL_BIN_COUNT),
-        }
+        if self.uses_joint_decoder:
+            # Joint plan decoder: every decision token is conditioned on the
+            # manager representation and attends to ALL six tokens
+            # simultaneously (bidirectional, no mask) before its head reads
+            # it — real cross-task coupling, no causal ordering.
+            tokens = self.decision_tokens.expand(b, -1, -1) \
+                + manager.unsqueeze(1)
+            contextual = self.joint_layer(tokens)
+            sell_token = contextual[:, DECISION_SELL_INDEX]
+            outputs = {
+                "crop_logits":
+                    self.crop_head(contextual[:, 0]).view(b, NUM_CROPS, c),
+                "animal_logits":
+                    self.animal_head(contextual[:, 1]).view(b, NUM_ANIMALS, c),
+                "land_logits": self.land_head(contextual[:, 2]),
+                "fertilizer_logits":
+                    self.fertilizer_head(contextual[:, 3])
+                    .view(b, NUM_CROPS, c),
+                "care_logits":
+                    self.care_head(contextual[:, 4]).view(b, NUM_ANIMALS, c),
+                "sell_presence_logits":
+                    self.sell_presence_head(sell_token)
+                    .view(b, NUM_PRODUCTS, SELL_BIN_COUNT),
+                "sell_quantity_log1p":
+                    self.sell_quantity_head(sell_token)
+                    .view(b, NUM_PRODUCTS, SELL_BIN_COUNT),
+            }
+        else:
+            outputs = {
+                "crop_logits":
+                    self.crop_head(manager).view(b, NUM_CROPS, c),
+                "animal_logits":
+                    self.animal_head(manager).view(b, NUM_ANIMALS, c),
+                "land_logits": self.land_head(manager),
+                "fertilizer_logits":
+                    self.fertilizer_head(manager).view(b, NUM_CROPS, c),
+                "care_logits":
+                    self.care_head(manager).view(b, NUM_ANIMALS, c),
+                "sell_presence_logits":
+                    self.sell_presence_head(manager).view(b, NUM_PRODUCTS,
+                                                          SELL_BIN_COUNT),
+                "sell_quantity_log1p":
+                    self.sell_quantity_head(manager).view(b, NUM_PRODUCTS,
+                                                          SELL_BIN_COUNT),
+            }
         return outputs
 
 
