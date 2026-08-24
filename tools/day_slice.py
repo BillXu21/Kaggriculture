@@ -157,6 +157,38 @@ def _count_tiles(farm: Mapping[str, Any]) -> tuple[dict[str, int], dict[str, int
     return crops, animals, weeds, empty_structures
 
 
+_ANIMAL_COSTS = {"GOOSE": 300, "COW": 400, "SHEEP": 500}
+_CROP_SEED_COSTS = {"WHEAT": 10, "CARROT": 20, "TOMATO": 50,
+                    "STRAWBERRY": 100, "MELON": 80}
+
+
+def _wealth(obs_seat: Mapping[str, Any], seat: int) -> float:
+    """Cash + inventories at observed market prices + assets at cost.
+
+    One-day cash deltas hide same-day investment (seeds bought, animals
+    placed, weeds reclaimed); pairing on identical start states makes this
+    deterministic wealth the fairer primary comparison (issue #7).
+    """
+    farm = obs_seat["farms"][seat]
+    private = obs_seat.get("private") or {}
+    prices = (obs_seat.get("market") or {}).get("prices") or {}
+    total = float(farm["money"])
+    shed = private.get("shed") or {}
+    for product, qty in shed.items():
+        total += int(qty) * float(prices.get(product, 0))
+    for crop, qty in (private.get("seeds") or {}).items():
+        total += int(qty) * _CROP_SEED_COSTS.get(crop, 0)
+    for inv in private.get("inventories") or []:
+        for item, qty in inv.items():
+            total += int(qty) * float(prices.get(item, 0))
+    crops, animals, _, _ = _count_tiles(farm)
+    for crop, count in crops.items():
+        total += count * _CROP_SEED_COSTS.get(crop, 0)
+    for species, count in animals.items():
+        total += count * _ANIMAL_COSTS.get(species, 0)
+    return total
+
+
 def _farm_metrics(obs_seat: Mapping[str, Any], seat: int) -> dict[str, Any]:
     farm = obs_seat["farms"][seat]
     crops, animals, weeds, empty_structures = _count_tiles(farm)
@@ -169,6 +201,7 @@ def _farm_metrics(obs_seat: Mapping[str, Any], seat: int) -> dict[str, Any]:
         "unlocked": len(farm.get("unlocked_quadrants", [])),
         "hands": len(farm.get("hands", [])),
         "hires_today": int(farm.get("hires_today", 0)),
+        "wealth": _wealth(obs_seat, seat),
     }
 
 
@@ -204,6 +237,8 @@ class SliceResult:
     boundary_first_diff: str | None = None
     cash_start: float = 0.0
     cash_end: float = 0.0
+    wealth_start: float = 0.0
+    wealth_end: float = 0.0
     crops_start: dict[str, int] = field(default_factory=dict)
     crops_end: dict[str, int] = field(default_factory=dict)
     animals_start: dict[str, int] = field(default_factory=dict)
@@ -332,6 +367,8 @@ def _run_day_slice_impl(
         boundary_first_diff=boundary_first_diff,
         cash_start=start["cash"],
         cash_end=end["cash"],
+        wealth_start=start["wealth"],
+        wealth_end=end["wealth"],
         crops_start=start["crops"],
         crops_end=end["crops"],
         animals_start=start["animals"],
