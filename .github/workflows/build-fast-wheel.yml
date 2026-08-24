@@ -50,11 +50,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --force-reinstall dist/*.whl
 
-      - name: Fast-engine import/reset smoke
+      - name: Fast-engine import/reset smoke from installed wheel
         shell: bash
         run: |
-          python - <<'PY'
+          # Do not run this import from the checkout root: the source-tree
+          # fast_env package would shadow the installed wheel and does not
+          # contain the compiled extension. Smoke the actual wheel from an
+          # unrelated directory instead.
+          cd "${RUNNER_TEMP}"
+          PYTHONPATH= python - <<'PY'
+          import fast_env
           from fast_env import FastKaggricultureEnv
+
+          print("fast_env loaded from", fast_env.__file__)
+          assert "site-packages" in fast_env.__file__, fast_env.__file__
 
           env = FastKaggricultureEnv(configuration={"seed": 7})
           obs = env.reset()
