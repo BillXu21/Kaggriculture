@@ -1,6 +1,6 @@
 # Executor V0.5 overnight optimization (issue #7)
 
-Branch: `executor-v05-overnight`  |  Base SHA: `32fef4ac295e9addaf01cd339eee60a0ad14eaca`  |  Final SHA: `110a71628f207bc72be17ddbfeeb34af3439503c` (this commit; code work ends at `885adad`, evidence/doc commits follow)
+Branch: `executor-v05-overnight`  |  Base SHA: `32fef4ac295e9addaf01cd339eee60a0ad14eaca`  |  Final state: all executor CODE work ends at `885adadda351a39e2797058fe3c4c8cb5f506bac`; commits after it are evidence artifacts and documentation only (see `git log 32fef4a..HEAD`). Branch tip is pushed to origin.
 
 Scope discipline: executor-only mechanical compiler work under the frozen
 manager. No manager/opening/BC changes. The BC-E checkpoint was **not used**
