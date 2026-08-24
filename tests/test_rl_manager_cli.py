@@ -38,7 +38,7 @@ def _train_args(**overrides):
         "episodes_per_update": 8,
         "updates": 1,
         "epochs": 4,
-        "minibatch_size": 64,
+        "minibatch_size": 8,
         "lr": 3e-4,
         "kl_to_frozen_coef": 0.0,
         "output_dir": "artifacts/local/ppo-smoke",
@@ -77,6 +77,9 @@ def test_parser_defaults_are_safe_single_process():
         "out/ppo.npz"])
     assert (args.num_workers, args.num_envs, args.num_threads) == (1, 1, 1)
     assert args.backend == "fast"
+    # Safe small default: 8 divides the expected complete-game row count
+    # for the default episodes_per_update=8 (8 * 26 = 208).
+    assert args.minibatch_size == 8
 
     ev = build_parser().parse_args([
         "eval", "--checkpoint", "ppo.npz", "--e-checkpoint", "ck.pt",
@@ -113,6 +116,22 @@ def test_train_plan_rejects_unsafe_knobs(tmp_path):
         plan_training(_train_args(**base, num_threads=0))
     with pytest.raises(ValueError, match="master-seed"):
         plan_training(_train_args(**base, master_seed=-1))
+
+
+def test_train_plan_rejects_minibatch_incompatible_with_expected_rows(
+        tmp_path):
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    base = {"e_checkpoint": str(checkpoint)}
+    # Default plan (8 episodes * 26 rows = 208) must pass its own default.
+    assert plan_training(_train_args(**base))["ppo"]["minibatch_size"] == 8
+    # 64 does not divide 208: fail at PLAN time, before any rollout.
+    with pytest.raises(ValueError,
+                       match="must divide the expected complete-game row"):
+        plan_training(_train_args(**base, minibatch_size=64))
+    # A divisor of 208 is accepted.
+    plan = plan_training(_train_args(**base, minibatch_size=104))
+    assert plan["ppo"]["minibatch_size"] == 104
 
 
 def test_train_plan_full_fields(tmp_path):

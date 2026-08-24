@@ -242,7 +242,11 @@ New modules (no B1 semantic edits):
   (`--e-checkpoint`, fail loud if missing), an explicit executor factory
   selection, backend, master seed, worker/env/thread knobs (default safe 1;
   >1 worker fails loud as not-yet-implemented), episode/update/minibatch
-  settings, and output/checkpoint paths. Eval exposes exactly the fixed seed
+  settings (minibatch defaults to the safe small value 8; plan time rejects
+  a minibatch size that does not divide the expected complete-game row
+  count `episodes_per_update * 26` BEFORE any rollout — the runtime
+  `ppo_update` strict divisibility check stays authoritative for actual
+  rows), and output/checkpoint paths. Eval exposes exactly the fixed seed
   sets smoke(17,42,2026)/dev(200..263)/holdout(5000..5031), always plans BOTH
   seat orientations, prints the planned game count, and refuses dev/holdout
   without `--confirm-expensive`. Evaluation output follows one fixed schema

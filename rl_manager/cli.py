@@ -77,7 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--episodes-per-update", type=int, default=8)
     train.add_argument("--updates", type=int, default=1)
     train.add_argument("--epochs", type=int, default=4)
-    train.add_argument("--minibatch-size", type=int, default=64)
+    train.add_argument("--minibatch-size", type=int, default=8,
+                       help="Must divide the expected complete-game row "
+                            "count (episodes_per_update * 26); checked at "
+                            "plan time before any rollout.")
     train.add_argument("--lr", type=float, default=3e-4)
     train.add_argument("--kl-to-frozen-coef", type=float, default=0.0)
     train.add_argument("--output-dir", required=True)
@@ -149,6 +152,18 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
                         ("minibatch_size", args.minibatch_size)):
         if value < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be >= 1")
+    # Plan-time divisibility check: complete d4..29 games yield exactly
+    # episodes_per_update * 26 candidate manager rows. The runtime
+    # `ppo_update` strict check remains authoritative for truncations and
+    # actual row counts; this only catches incompatible plans BEFORE any
+    # env/checkpoint-heavy work.
+    expected_rows = int(args.episodes_per_update) * 26
+    if expected_rows % int(args.minibatch_size) != 0:
+        raise ValueError(
+            f"--minibatch-size {args.minibatch_size} must divide the "
+            f"expected complete-game row count {expected_rows} "
+            f"(episodes_per_update {args.episodes_per_update} * 26); "
+            f"runtime ppo_update would fail loud after rollout")
     plan.update({
         "mode": "train",
         "e_checkpoint": str(Path(args.e_checkpoint)),
