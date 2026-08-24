@@ -2,6 +2,60 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-24 — Issue #9 Stage B2: Stage-A Integration, Tiny Live PPO Smoke, CLIs, Diagnostics
+
+Completed the issue #9 infrastructure locally on top of B1 (`06cc25c`): the
+PPO policy now conforms to the Stage-A batched interface and a tiny
+end-to-end rollout -> trajectory -> GAE -> one update -> checkpoint/eval
+artifact chain runs green.
+
+- `rl_manager/ppo_adapter.py` (new): `PPOBatchedPolicy` implements the
+  Stage-A `BatchedPlanPolicy` protocol over the B1 `PPOPolicy` — contiguous
+  own-only E arrays + explicit string `prng_id` (sha256 -> uint32 root key,
+  per-row decision seeds via fold_in), stochastic training mode and
+  deterministic eval mode (exact frozen-E decode before drift), exact action
+  tensors / six logprob groups + total / value / immutable identity; sell
+  quantities always from the immutable frozen snapshot. Plus
+  `ppo_batched_policy_from_state` (checkpoint resume reusing EXACT stored
+  params/frozen/rng) and `select_ppo_subset` (deterministic evenly-spaced
+  2–8 row subset AFTER full-trajectory GAE/normalization).
+- `rl_manager/diagnostics.py` (new): compact strictly JSON-safe diagnostics
+  record (`allow_nan=False`) — rollout seed/composition/steps, timing split
+  env/executor/policy/orchestration, return/win/banks/margin, six-group
+  entropy, approx KL, clip fraction, value loss, explained variance,
+  advantage stats, KL-to-frozen drift, executor unfinished/
+  missed-maintenance totals, anomalies/provenance, pre/post fingerprints,
+  checkpoint path; missing values are null + machine-readable reason.
+- `rl_manager/cli.py` (new): guarded train/eval commands. Train requires an
+  existing real BC-E checkpoint (fail loud if missing) and an explicit
+  executor factory; worker/env/thread knobs default to safe 1 (>1 worker
+  fails loud as not-yet-implemented). Eval exposes fixed seed sets
+  smoke(17,42,2026)/dev(200..263)/holdout(5000..5031), always both seats,
+  prints planned game count, requires `--confirm-expensive` for dev/holdout;
+  fixed output schema W/L/T, paired margins, median/mean banks,
+  per-orientation split, anomalies, worst seeds. Tests cover ONLY
+  parser/planning/aggregation; commands never executed by tests.
+- `rl_manager/__init__.py`: exports the new adapter/diagnostics symbols.
+- Tests: `tests/test_rl_manager_ppo_integration.py` (10 tests: adapter
+  fields/single-batched-call/prng determinism/own-only rejection,
+  deterministic init parity with frozen E, ONE complete fast game ->
+  52 transitions -> full-trajectory GAE -> exact stored-action logprob
+  recompute -> ONE 4-row-minibatch PPO update with finite metrics, changed
+  trainable params, bit-identical frozen snapshot, checkpoint roundtrip +
+  bit-identical resume + pre/post eval equality, JSON-safe diagnostics
+  artifact, honest-nulls check, official-engine and real-checkpoint gated
+  skips) and `tests/test_rl_manager_cli.py` (11 tests: safe defaults,
+  fail-loud validation, seed-set planning counts, confirmation gate, fixed
+  aggregation schema on synthetic records).
+- Validation: rl_manager suite + focused issue-#8 JAX parity/train =
+  130 passed + 4 skipped in ~187 s (skips: official engine dependency
+  absent x2, real BC-E checkpoint absent x2). Complete fast-engine games
+  executed by new B2 tests: exactly ONE (numThreads=1). Ruff clean on all
+  changed/new files.
+- Non-claims: tiny random-init E, one gradient step — plumbing correctness
+  only, no policy-quality claim. Serious training remains blocked on issue
+  #7 (executor selection) and the absent real BC-E checkpoint.
+
 ## 2026-08-24 — Issue #9 Stage A Correction: Automatic Artifact Provenance (A1)
 
 Small correction commit on top of the Stage A harness: trajectory artifacts

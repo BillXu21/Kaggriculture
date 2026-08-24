@@ -194,11 +194,85 @@ executors stay plain Python. Nothing about multi-process dispatch,
 throughput, or scaling is measured in Stage A; measurement waits for real
 hardware and real checkpoints.
 
-## Stage B (Pending)
+## Stage B1 (PPO V0 core — implemented 2026-08-24)
 
-PPO updates are NOT implemented: no optimizer, no advantage/GAE, no
-minibatching, no clipping, no value loss. The schema reserves the six
-logprob groups, logprob_total, and value slots so Stage B needs no buffer
-migration. Serious training additionally remains blocked on issue #7
-(executor selection: V0 vs selected V0.5) — training against an executor
-that is about to be replaced would waste the run.
+`rl_manager.ppo_policy` / `rl_manager.gae` / `rl_manager.ppo` /
+`rl_manager.ppo_checkpoint` implement the PPO core over the Stage-A schema:
+mutable E trunk + independently initialized small value head on the additive
+manager-representation seam; immutable frozen-E snapshot that always supplies
+sell quantities (exact issue-#8 round-half-up rule, gated by THIS policy's
+presence bits); 17 conditionally independent categoricals + 54 Bernoullis
+with the raw-summed joint logprob and six-group entropy; vmapped sampling
+keyed by explicit per-row decision seeds (`fold_in(root_key, row_index)`);
+GAE(lambda) grouped by (episode, seat) in day order with terminal ±1/0
+rewards and full-batch advantage normalization before any minibatch split;
+masked-AdamW update (frozen leaves get no gradient step AND no decay) with
+conventional plumbing defaults (clip .2 / value .5 / entropy .01 / grad clip
+1.0 / gamma .99 / lambda .95, all configurable, none tuned); optional
+analytic KL-to-frozen regularizer (default disabled); strict pickle-free RL
+checkpoint format `rl_manager_ppo_checkpoint_v1` storing params, frozen
+snapshot, optimizer state, explicit PRNG stream, step, rollout seed, and
+provenance — a resumed state runs the next update bit-identically.
+
+## Stage B2 (Stage-A integration + tiny live smoke + CLIs — implemented 2026-08-24)
+
+New modules (no B1 semantic edits):
+
+- `rl_manager/ppo_adapter.py`: `PPOBatchedPolicy` implements the Stage-A
+  `BatchedPlanPolicy` protocol over a `PPOPolicy`. It consumes contiguous
+  own-only E arrays plus an explicit string `prng_id`
+  (sha256 -> uint32 root key; per-row seeds attach to row identity), offers
+  stochastic (training) and deterministic (eval) modes — deterministic mode
+  reproduces the frozen JAX-E decode exactly before any drift — returns exact
+  action tensors, six logprob groups + total, value, and an immutable
+  name/version/fingerprint identity. Also: `ppo_batched_policy_from_state`
+  (checkpoint-resume reconstruction reusing EXACT stored params/frozen/rng)
+  and `select_ppo_subset` (deterministic evenly-spaced 2–8 row subset taken
+  AFTER full-trajectory GAE/normalization, for local one-step smokes).
+- `rl_manager/diagnostics.py`: compact strictly JSON-safe diagnostics record
+  (`allow_nan=False`) covering rollout seed/composition/steps, timing split
+  env/executor/policy/orchestration, return/win/banks/margin, entropy by the
+  six groups, approx KL, clip fraction, value loss, explained variance,
+  advantage stats, KL-to-frozen action drift, executor unfinished/
+  missed-maintenance totals, anomalies/provenance, pre/post policy
+  fingerprints, checkpoint path. Unavailable quantities are serialized as
+  `null` with machine-readable reasons under `missing`.
+- `rl_manager/cli.py`: guarded train/eval commands (`python -m rl_manager.cli
+  train|eval`). Train REQUIRES an existing real BC-E torch checkpoint
+  (`--e-checkpoint`, fail loud if missing), an explicit executor factory
+  selection, backend, master seed, worker/env/thread knobs (default safe 1;
+  >1 worker fails loud as not-yet-implemented), episode/update/minibatch
+  settings, and output/checkpoint paths. Eval exposes exactly the fixed seed
+  sets smoke(17,42,2026)/dev(200..263)/holdout(5000..5031), always plans BOTH
+  seat orientations, prints the planned game count, and refuses dev/holdout
+  without `--confirm-expensive`. Evaluation output follows one fixed schema
+  (W/L/T, paired margins, median/mean banks, per-orientation split,
+  anomalies, worst seeds). Tests cover ONLY parsing/planning/aggregation —
+  the commands are never executed by tests.
+
+Tiny live smoke evidence (`tests/test_rl_manager_ppo_integration.py`,
+ONE complete fast-engine game total, numThreads=1, tiny random-init E):
+stochastic PPO candidate vs frozen `JaxEPlanPolicy`,
+composition `candidate_vs_frozen` -> DONE/DONE, 52 transitions (26 trainable
+candidate rows), terminal reward patched on the final manager row; GAE over
+the complete candidate trajectory normalizes advantages to mean ~0; exact
+stored-action logprob recompute (`evaluate_actions` == stored
+`logprob_total`, bit-equal) BEFORE the update proves no resampling; ONE PPO
+update call (epochs=1, one 4-row evenly-spaced minibatch) leaves all metrics
+finite, changes base+value params, keeps the frozen snapshot bit-identical;
+checkpoint save/load preserves every leaf including the PRNG stream, loaded
+deterministic eval equals pre-save eval on a fixed batch, and resumed-state
+next-update is bit-identical; diagnostics artifact written and re-parsed.
+Deterministic-mode adapter parity with frozen E is proven separately on a
+fixed synthetic batch. Official-engine and real-checkpoint paths are gated
+skips recording their rerun conditions.
+
+Validation totals (this packet): rl_manager suite + focused issue-#8 JAX
+parity/train = 130 passed + 4 skipped in ~187 s (skips: official engine
+dependency absent x2, real BC-E checkpoint absent x2). Complete fast-engine
+games executed by the new B2 tests: exactly ONE. No quality claim anywhere:
+the smoke uses a tiny random-init E and one gradient step; serious training
+remains blocked on issue #7 (executor selection) and the real BC-E
+checkpoint.
+
+
