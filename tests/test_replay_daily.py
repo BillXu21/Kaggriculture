@@ -990,3 +990,22 @@ def test_manifest_loader_joins_scores():
     rows = load_manifest(str(MANIFEST))
     row = rows[94735084]
     assert float(row["avg_score"]) > 0 and float(row["min_score"]) > 0
+
+def test_derive_animal_accepts_fast_engine_age_shape_and_fails_loudly():
+    """Both observation shapes derive identically; neither field fails loudly.
+
+    Official 1.32.7 observations carry ``placed_day`` on animal tiles while the
+    fast-engine decoder emits ``age``; canonical derivation must accept both
+    (issue #7 one-day slice harness runs the executor on fast-engine obs).
+    """
+    base = {"kind": "PASTURE", "animal": "COW", "yield_units": 0,
+            "fed_today": False, "consecutive_unfed": 0, "cared_today": False,
+            "fertilizer_available": True, "pending_care_bonus": 0}
+    fast = dict(base, age=2)
+    official = dict(base, placed_day=3)
+    derived_fast = canonical_tile(fast, 5, 120)["derived"]
+    derived_official = canonical_tile(official, 5, 120)["derived"]
+    assert derived_fast == derived_official
+    assert derived_fast["days_until_next_product"] == 6
+    with pytest.raises(KeyError):
+        canonical_tile({"kind": "PASTURE", "animal": "COW"}, 5, 120)

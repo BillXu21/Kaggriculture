@@ -88,28 +88,35 @@ def project_plan(
             "buy_build_deficit": feasible - current,
         }
 
+    # CARE/FERTILIZE eligibility counts assets the plan itself establishes
+    # this day (max of current and requested targets), not just the
+    # start-of-day snapshot: clipping CARE against current animals while the
+    # same plan buys animals made every request permanently infeasible at
+    # hour 0 (issue #7). Requests above the planned asset total still clip.
     fertilizer_diag: dict[str, dict[str, int]] = {}
     fertilizer_targets: dict[str, int] = {}
     for crop in CROP_ORDER:
-        eligible = _count(current_crops, crop)
+        current = _count(current_crops, crop)
+        planned_total = max(current, requested.crop_targets_dict[crop])
         req = requested.fertilizer_by_crop_dict[crop]
-        feasible = min(req, eligible)
+        feasible = min(req, planned_total)
         fertilizer_targets[crop] = feasible
         fertilizer_diag[crop] = {
-            "requested": req, "eligible": eligible, "feasible": feasible,
-            "shortfall": req - feasible,
+            "requested": req, "eligible": planned_total,
+            "feasible": feasible, "shortfall": req - feasible,
         }
 
     care_diag: dict[str, dict[str, int]] = {}
     care_targets: dict[str, int] = {}
     for name in ANIMAL_ORDER:
-        eligible = _count(current_animals, name)
+        current = _count(current_animals, name)
+        planned_total = max(current, requested.animal_targets_dict[name])
         req = requested.care_by_animal_dict[name]
-        feasible = min(req, eligible)
+        feasible = min(req, planned_total)
         care_targets[name] = feasible
         care_diag[name] = {
-            "requested": req, "eligible": eligible, "feasible": feasible,
-            "shortfall": req - feasible,
+            "requested": req, "eligible": planned_total,
+            "feasible": feasible, "shortfall": req - feasible,
         }
 
     feasible_plan = DailyPlan.create(

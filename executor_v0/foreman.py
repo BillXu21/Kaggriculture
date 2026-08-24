@@ -29,10 +29,9 @@ across workers), and blocked PLANT tasks stay unassigned with an honest
 ``no_global_seeds`` reason. Seed shortages surface as BUY_SEED market tasks
 generated upstream.
 
-Intentional V0 backlog (not an engine rule): movement only considers steps
-that reduce Manhattan distance and conservatively avoids locked tiles; when
-both reducing steps are illegal the worker PASSes instead of sidestepping.
-A one-step lookahead/sidestep is deferred to the post-V0 upgrade backlog.
+Movement legality is exact: every in-bounds tile is enterable (engine
+movement ops are unconditional), so a Manhattan-reducing step always exists
+toward any in-bounds target and workers never dead-end into PASS en route.
 """
 
 from collections.abc import Mapping, Sequence
@@ -163,13 +162,18 @@ def _shed_available(obs: Mapping, seat: int, item: str) -> int:
 
 def _legal_step(board, unlocked_quadrants, frm: tuple[int, int],
                 to: tuple[int, int]) -> bool:
+    """Exact 1.32.7 movement legality: any in-bounds tile is enterable.
+
+    Engine evidence (rust/kaggriculture_env/src/lib.rs ``apply_unit_action``):
+    movement operations 1..=4 are exempt from the unlocked-quadrant guard that
+    silences other operations on locked tiles, and nothing else gates
+    ``move_position`` -- weeds, structures, locked quadrants, and other
+    workers never block walking; only the board edge stops a step. The
+    previous conservative refusal to path through locked quadrants was not an
+    engine rule and made legal routes look impossible (issue #7).
+    """
     y, x = to
-    if not (0 <= y < 10 and 0 <= x < 10):
-        return False
-    from executor_v0.layout import quadrant_of
-    if quadrant_of(y, x) not in set(unlocked_quadrants):
-        return False
-    return tile_role(board[y][x]) != "locked"
+    return 0 <= y < 10 and 0 <= x < 10
 
 
 def _step_toward(board, unlocked_quadrants, pos: tuple[int, int],

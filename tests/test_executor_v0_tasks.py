@@ -82,11 +82,12 @@ def animal_tile(animal="GOOSE", *, yield_units=0, fed_today=True,
 
 
 def make_obs(day=3, hour=2, step=90, tiles=None, unlocked=("NW",),
-             shed=None, seeds=None, inventories=None, farmer=(0, 0)):
+             shed=None, seeds=None, inventories=None, farmer=(0, 0),
+             money=3000.0):
     tiles = tiles if tiles is not None else [[None] * 10 for _ in range(10)]
     farm = {
         "farmer": list(farmer), "hands": [], "hires_today": 0,
-        "money": 3000.0, "tiles": tiles,
+        "money": money, "tiles": tiles,
         "unlocked_quadrants": list(unlocked),
     }
     return {
@@ -353,9 +354,11 @@ def test_care_and_fertilize_exact_allocations_with_required_items():
     result = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
     cares = by_kind(result, "CARE")
     # GOOSE budget 1 of 2 eligible; COW eligible 1 but budget 5 -> clipped to
-    # eligibility; SHEEP none exist and nothing is fabricated.
+    # eligibility; SHEEP none exist and nothing is fabricated. Proximity ties
+    # break by distance to the persistent shed hub anchor (4, 4): (0, 2) is
+    # 6 steps away vs (0, 1) at 7, so the budgeted GOOSE CARE lands on (0, 2).
     assert sorted((t.animal, t.tile) for t in cares) == [
-        ("COW", (0, 3)), ("GOOSE", (0, 1))]
+        ("COW", (0, 3)), ("GOOSE", (0, 2))]
     ferts = by_kind(result, "FERTILIZE")
     # TOMATO budget 3, eligible 2 (active-fertilizer tile excluded).
     assert sorted(t.tile for t in ferts) == [(1, 1), (1, 2)]
@@ -520,3 +523,175 @@ def _logical_to_raw(board):
                 out_row.append(tile)
         out.append(out_row)
     return out
+
+
+# --------------------------------------------------- issue #7 water urgency
+
+
+WATER_TEST_DAY = 20
+
+
+def _plant_for_water(crop, *, age_days, consecutive_unwatered=0,
+                     watered_today=False, yield_units=0,
+                     fertilized_until_day=-1):
+    t = plant_tile(crop, planted_day=WATER_TEST_DAY - age_days,
+                   yield_units=yield_units,
+                   watered_today=watered_today,
+                   fertilized_until_day=fertilized_until_day)
+    t["consecutive_unwatered"] = consecutive_unwatered
+    # Direct _water_urgency calls read derived.age_days verbatim; keep it
+    # consistent with the day arithmetic canonical_board would produce.
+    t["derived"]["age_days"] = age_days
+    return t
+
+
+def test_water_must_class_only_at_weed_boundary():
+    from executor_v0.tasks import _water_urgency
+    # One prior unwatered refresh: another miss converts to WEED -> must.
+    assert _water_urgency(
+        _plant_for_water("WHEAT", age_days=1, consecutive_unwatered=1)) \
+        == "must"
+    # Freshly planted tiles carry consecutive_unwatered=1 (planting day
+    # counts as unwatered) -> must water on planting day.
+    assert _water_urgency(
+        _plant_for_water("MELON", age_days=0, consecutive_unwatered=1)) \
+        == "must"
+    # Already watered today: nothing to do.
+    assert _water_urgency(
+        _plant_for_water("WHEAT", age_days=1, watered_today=True)) is None
+
+
+def test_water_yield_class_single_harvest_window():
+    from executor_v0.tasks import _water_urgency
+    # WHEAT window [2, 4]: inside with room for yield -> yield-relevant.
+    assert _water_urgency(_plant_for_water("WHEAT", age_days=2)) == "yield"
+    assert _water_urgency(_plant_for_water("WHEAT", age_days=4)) == "yield"
+    # Outside the window watering gains no observable yield today.
+    assert _water_urgency(_plant_for_water("WHEAT", age_days=0)) is None
+    assert _water_urgency(_plant_for_water("WHEAT", age_days=5)) is None
+    # Yield already at max: no gain.
+    assert _water_urgency(
+        _plant_for_water("WHEAT", age_days=3, yield_units=6)) is None
+    # MELON window [(12+1)//2, 12] = [6, 12].
+    assert _water_urgency(_plant_for_water("MELON", age_days=6)) == "yield"
+    assert _water_urgency(_plant_for_water("MELON", age_days=5)) is None
+
+
+def test_water_yield_class_ongoing_requires_fertilizer_and_production_eve():
+    from executor_v0.tasks import _water_urgency
+    # TOMATO first_yield 8 interval 1: tomorrow produces when age+1-8 % 1 == 0
+    # i.e. any age >= 7; unfertilized -> skip (bonus stays +1 either way).
+    assert _water_urgency(_plant_for_water("TOMATO", age_days=7)) is None
+    # Fertilized and producing tomorrow -> yield-relevant (+2 vs +1).
+    assert _water_urgency(
+        _plant_for_water("TOMATO", age_days=7, fertilized_until_day=9)) \
+        == "yield"
+    # STRAWBERRY first_yield 10 interval 2: production eve at ages 9, 11, ...
+    assert _water_urgency(
+        _plant_for_water("STRAWBERRY", age_days=9,
+                         fertilized_until_day=12)) == "yield"
+    assert _water_urgency(
+        _plant_for_water("STRAWBERRY", age_days=10,
+                         fertilized_until_day=12)) is None
+
+
+def test_generate_tasks_splits_water_classes_by_priority():
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[0][0] = _plant_for_water("WHEAT", age_days=1,
+                                   consecutive_unwatered=1)
+    tiles[0][1] = _plant_for_water("WHEAT", age_days=3)
+    tiles[0][2] = _plant_for_water("TOMATO", age_days=4)
+    obs = make_obs(day=WATER_TEST_DAY, step=WATER_TEST_DAY * 24, tiles=tiles)
+    plan = make_plan()
+    result = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
+    waters = by_kind(result, "WATER")
+    must = [t for t in waters if t.priority == Priority.MAINTENANCE]
+    yield_w = [t for t in waters if t.priority == Priority.PRODUCTIVE]
+    assert [t.tile for t in must] == [(0, 0)]
+    assert [t.tile for t in yield_w] == [(0, 1)]
+    # The young unfertilized TOMATO gets NO water task at all.
+    assert all(t.tile != (0, 2) for t in waters)
+
+
+# -------------------------------------------------- issue #7 weed reclamation
+
+
+def _saturate_nw_except(tiles, keep_clear):
+    """Fill every NW tile except `keep_clear` with non-claimable TOMATO."""
+    for y in range(5):
+        for x in range(5):
+            if (y, x) not in keep_clear:
+                tiles[y][x] = plant_tile("TOMATO",
+                                         planted_day=WATER_TEST_DAY)
+
+
+def test_crop_deficit_reclaims_weed_tiles_with_dig_dependency():
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[2][2] = "WEED"          # official bare-string sentinel
+    tiles[3][3] = {"kind": "WEED"}  # fast-engine dict shape
+    _saturate_nw_except(tiles, {(2, 2), (3, 3)})
+    obs = make_obs(day=WATER_TEST_DAY, step=WATER_TEST_DAY * 24, tiles=tiles)
+    plan = make_plan(crop_targets={"WHEAT": 2})
+    result = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
+    digs = by_kind(result, "DIG")
+    plants = by_kind(result, "PLANT")
+    assert sorted(t.tile for t in digs) == [(2, 2), (3, 3)]
+    assert len(plants) == 2
+    for p in plants:
+        assert p.depends_on == (f"DIG:{p.tile[0]},{p.tile[1]}",)
+
+
+def test_animal_shortage_reclaims_weeds_before_sacrificing_crops():
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[0][1] = "WEED"
+    tiles[0][2] = plant_tile("WHEAT")
+    _saturate_nw_except(tiles, {(0, 1), (0, 2)})
+    obs = make_obs(day=WATER_TEST_DAY, step=WATER_TEST_DAY * 24,
+                   tiles=tiles, shed={"COW": 1})
+    plan = make_plan(animal_targets={"COW": 1})
+    result = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
+    digs = by_kind(result, "DIG")
+    builds = by_kind(result, "BUILD_PASTURE")
+    places = by_kind(result, "PLACE")
+    assert [t.tile for t in digs] == [(0, 1)]
+    assert builds and builds[0].tile == (0, 1)
+    assert builds[0].depends_on == ("DIG:0,1",)
+    assert places and places[0].depends_on == (builds[0].key,)
+    # The living WHEAT crop is never sacrificed while a weed is reclaimable.
+    assert all(t.tile != (0, 2) for t in digs + builds + places)
+
+
+def test_build_deferred_when_animal_neither_owned_nor_affordable():
+    tiles = [[None] * 10 for _ in range(10)]
+    obs = make_obs(tiles=tiles, shed={}, money=100.0)  # COW costs 400
+    plan = make_plan(animal_targets={"COW": 1})
+    result = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
+    assert by_kind(result, "BUILD_PASTURE") == []
+    assert any(u.startswith("build_deferred_no_animal:COW")
+               for u in result.unresolved)
+
+
+def test_build_emitted_when_animal_affordable_even_if_not_owned():
+    tiles = [[None] * 10 for _ in range(10)]
+    obs = make_obs(tiles=tiles, shed={}, money=3000.0)
+    plan = make_plan(animal_targets={"COW": 1})
+    result = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
+    builds = by_kind(result, "BUILD_PASTURE")
+    assert len(builds) == 1
+    assert builds[0].depends_on == ()
+    places = by_kind(result, "PLACE")
+    assert places and places[0].depends_on == (builds[0].key,)
+
+
+def test_crop_and_animal_planners_never_claim_same_tile():
+    from executor_v0.layout import plan_day_layouts
+    board = [[None] * 10 for _ in range(10)]
+    result = plan_day_layouts(
+        board, unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 3},
+        animals_needed={"GOOSE": 2, "COW": 1, "SHEEP": 0})
+    crop_tiles = {intent.coord for intent in result.crops.plants}
+    animal_tiles = {slot.coord for slot in result.animals.placements}
+    assert crop_tiles, "crop planner should claim empty NW tiles"
+    assert animal_tiles, "animal planner should claim empty NW tiles"
+    assert crop_tiles.isdisjoint(animal_tiles)

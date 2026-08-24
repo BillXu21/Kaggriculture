@@ -17,6 +17,14 @@ Deliberate V0 simplifications preserved here (see EXECUTOR_V0_PLAN.md):
 
 All returned intents are deterministic: ties break on ``(y, x)`` after the
 primary key (score or Manhattan distance to the explicit anchor).
+
+Issue #7 additions: ``tile_role`` recognizes both observed WEED shapes;
+``SHED_HUB_ANCHOR`` is the persistent central logistics hub used as the
+default layout anchor (stable across turns/days -- never the moving farmer);
+``plan_animal_layout`` / ``reconcile_crops`` may reclaim WEED tiles as a
+last-resort slot pool (DIG prerequisite emitted upstream); and
+``plan_day_layouts`` runs both planners over one shared set of tile claims so
+crop and animal layouts can never reserve the same tile.
 """
 
 from collections.abc import Mapping
@@ -32,6 +40,7 @@ __all__ = [
     "manhattan",
     "quadrant_of",
     "tile_role",
+    "SHED_HUB_ANCHOR",
     "AnimalSlotPlan",
     "AnimalLayoutResult",
     "plan_animal_layout",
@@ -39,7 +48,15 @@ __all__ = [
     "DigIntent",
     "CropReconciliationResult",
     "reconcile_crops",
+    "DayLayoutResult",
+    "plan_day_layouts",
 ]
+
+# Persistent central logistics hub: the shed sits at the board center and all
+# PICKUP/DROP traffic passes its four access tiles. Layout anchors minimize
+# ongoing service distance from here; unlike the farmer position this anchor
+# never moves, so compiled layouts stay stable within and across days.
+SHED_HUB_ANCHOR = (4, 4)
 
 
 # ------------------------------------------------------------------ config
@@ -88,6 +105,9 @@ def tile_role(tile: Any) -> str:
             return "weed"
         return "locked"  # "LOCKED" and any unrecognized sentinel
     if isinstance(tile, Mapping):
+        if tile.get("kind") == "WEED":
+            # fast-engine decoder shape; official replays use the bare string
+            return "weed"
         if "animal" in tile:
             return "animal_structure"
         kind = tile.get("kind")
@@ -169,10 +189,10 @@ def plan_animal_layout(
 
     Order per species (canonical ANIMAL_ORDER): reuse an empty matching
     structure first (mechanically free), then build on the nearest empty
-    legal tile, then convert the cheapest crop tile. Locked/weed tiles,
-    occupied structures, wrong-type empty structures, and anything outside
-    the unlocked quadrants are never selected. No tiles are reserved for
-    hypothetical future animals.
+    legal tile, then reclaim the nearest WEED tile (DIG prerequisite), then
+    convert the cheapest crop tile. Locked tiles, occupied structures,
+    wrong-type empty structures, and anything outside the unlocked quadrants
+    are never selected. No tiles are reserved for hypothetical future animals.
     """
     for name in animals_needed:
         if name not in ANIMAL_ORDER:
@@ -185,6 +205,7 @@ def plan_animal_layout(
     empty_structures: dict[str, list[tuple[int, int]]] = {
         "COOP": [], "PASTURE": []}
     empty_tiles: list[tuple[int, int]] = []
+    weed_tiles: list[tuple[int, int]] = []
     crop_tiles: list[tuple[float, tuple[int, int], str]] = []
 
     for y, row in enumerate(board):
@@ -195,6 +216,8 @@ def plan_animal_layout(
             role = tile_role(tile)
             if role == "empty":
                 empty_tiles.append(coord)
+            elif role == "weed":
+                weed_tiles.append(coord)
             elif role == "empty_structure":
                 empty_structures[tile["kind"]].append(coord)
             elif role == "plant":
@@ -203,6 +226,7 @@ def plan_animal_layout(
                                      config=config), coord))
 
     empty_tiles = _sorted_coords(empty_tiles, anchor)
+    weed_tiles = _sorted_coords(weed_tiles, anchor)
     for kind in empty_structures:
         empty_structures[kind] = _sorted_coords(empty_structures[kind], anchor)
     crop_tiles.sort(key=lambda item: (item[0], item[1][0], item[1][1]))
@@ -221,6 +245,14 @@ def plan_animal_layout(
             coord = empty_tiles.pop(0)
             placements.append(AnimalSlotPlan(animal, structure, coord,
                                              "new_build"))
+            need -= 1
+        while need > 0 and weed_tiles:
+            # Weeds block BUILD exactly like occupied tiles; reclaiming one
+            # costs a DIG turn but destroys no sunk investment, so weeds are
+            # strictly preferred over sacrificing crops (issue #7).
+            coord = weed_tiles.pop(0)
+            placements.append(AnimalSlotPlan(animal, structure, coord,
+                                             "weed_reclaim"))
             need -= 1
         while need > 0 and crop_tiles:
             _, coord = crop_tiles.pop(0)
@@ -268,10 +300,11 @@ def reconcile_crops(
     Per canonical crop order: count matching PLANT tiles; when above target,
     retain the highest-sunk-investment matches and release only the true
     excess (cheapest first); when below target, fill from nearest empty
-    legal tiles first and only then from the cheapest released excess of
-    other types. Tiles needed for their own target are never sacrificed.
-    Sticky structures are never touched. Unmet deficits are reported
-    honestly instead of over-planning.
+    legal tiles first, then reclaim nearest WEED tiles (DIG prerequisite),
+    and only then from the cheapest released excess of other types. Tiles
+    needed for their own target are never sacrificed. Sticky structures are
+    never touched. Unmet deficits are reported honestly instead of
+    over-planning.
     """
     for name in crop_targets:
         if name not in CROP_ORDER:
@@ -284,6 +317,7 @@ def reconcile_crops(
     scored: dict[str, list[tuple[float, tuple[int, int]]]] = {
         crop: [] for crop in CROP_ORDER}
     empty_tiles: list[tuple[int, int]] = []
+    weed_tiles: list[tuple[int, int]] = []
 
     for y, row in enumerate(board):
         for x, tile in enumerate(row):
@@ -299,12 +333,16 @@ def reconcile_crops(
                                          config=config), coord))
             elif role == "empty":
                 empty_tiles.append(coord)
+            elif role == "weed":
+                weed_tiles.append(coord)
 
     empty_tiles = _sorted_coords(empty_tiles, anchor)
+    weed_tiles = _sorted_coords(weed_tiles, anchor)
 
     digs: list[DigIntent] = []
     plants: list[PlantIntent] = []
     empty_filled: dict[str, int] = {crop: 0 for crop in CROP_ORDER}
+    weed_filled: dict[str, int] = {crop: 0 for crop in CROP_ORDER}
     released: list[tuple[float, tuple[int, int], str]] = []
 
     for crop in CROP_ORDER:
@@ -320,13 +358,21 @@ def reconcile_crops(
             plants.append(PlantIntent(coord, crop))
             empty_filled[crop] += 1
             deficit -= 1
+        while deficit > 0 and weed_tiles:
+            # Reclaim a WEED tile: DIG then PLANT. Cheaper in sunk investment
+            # than digging a living crop of another type (issue #7).
+            coord = weed_tiles.pop(0)
+            digs.append(DigIntent(coord, "WEED"))
+            plants.append(PlantIntent(coord, crop))
+            weed_filled[crop] += 1
+            deficit -= 1
 
     released.sort(key=lambda item: (item[0], item[1][0], item[1][1]))
     unresolved: list[tuple[str, int]] = []
     for crop in CROP_ORDER:
         target = int(crop_targets.get(crop, 0))
         current = len(scored[crop])
-        deficit = target - current - empty_filled[crop]
+        deficit = target - current - empty_filled[crop] - weed_filled[crop]
         while deficit > 0 and released:
             _, coord, old_crop = released.pop(0)
             digs.append(DigIntent(coord, old_crop))
@@ -337,3 +383,56 @@ def reconcile_crops(
 
     return CropReconciliationResult(digs=tuple(digs), plants=tuple(plants),
                                     unresolved_deficits=tuple(unresolved))
+
+
+# ------------------------------------------------------- coordinated layouts
+
+_CLAIMED = object()  # internal sentinel: tile already claimed by the other planner
+
+
+@dataclass(frozen=True)
+class DayLayoutResult:
+    """Both planners' results over one shared set of tile claims."""
+
+    crops: CropReconciliationResult
+    animals: AnimalLayoutResult
+
+
+def plan_day_layouts(
+    board: list[list[Any]],
+    *,
+    unlocked_quadrants,
+    crop_targets: Mapping[str, int],
+    animals_needed: Mapping[str, int],
+    anchor: tuple[int, int] = SHED_HUB_ANCHOR,
+    config: SacrificeConfig = SacrificeConfig(),
+) -> DayLayoutResult:
+    """Plan animal and crop layouts once over a shared set of tile claims.
+
+    Running ``plan_animal_layout`` and ``reconcile_crops`` independently lets
+    both claim the same empty tile; the resulting PLANT/BUILD task collision
+    wastes labor and scatters the layout (issue #7). Animals plan first
+    (structures are sticky and their slots are scarcer), every tile they
+    claim is masked out, and crops reconcile over the remainder. The default
+    anchor is the persistent shed hub, so compiled targets do not churn as
+    workers move during the day.
+    """
+    animal_result = plan_animal_layout(
+        board, unlocked_quadrants=unlocked_quadrants,
+        animals_needed=animals_needed, anchor=anchor, config=config)
+
+    claimed = {slot.coord for slot in animal_result.placements}
+    if not claimed:
+        return DayLayoutResult(
+            crops=reconcile_crops(
+                board, unlocked_quadrants=unlocked_quadrants,
+                crop_targets=crop_targets, anchor=anchor, config=config),
+            animals=animal_result)
+
+    masked = [row[:] for row in board]
+    for y, x in claimed:
+        masked[y][x] = _CLAIMED  # tile_role -> "other": ignored by reconcile
+    crop_result = reconcile_crops(
+        masked, unlocked_quadrants=unlocked_quadrants,
+        crop_targets=crop_targets, anchor=anchor, config=config)
+    return DayLayoutResult(crops=crop_result, animals=animal_result)

@@ -1,4 +1,4 @@
-"""Derived lifecycle timing for canonical board tiles.
+﻿"""Derived lifecycle timing for canonical board tiles.
 
 Rules are transcribed from the pinned 1.32.7 engine source
 (commit 28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c), functions:
@@ -78,6 +78,23 @@ def derive_plant(tile: dict[str, Any], current_day: int, current_step: int) -> d
     }
 
 
+def _animal_placed_day(tile: dict[str, Any], current_day: int) -> int:
+    """Placement day from either observation shape.
+
+    Official 1.32.7 observations carry `placed_day` on animal tiles; the
+    fast-engine decoder emits `age` (days since placement) instead. Both
+    encode the same fact; accept either and fail loudly when neither is
+    present.
+    """
+    placed = tile.get("placed_day")
+    if placed is not None:
+        return int(placed)
+    age = tile.get("age")
+    if age is not None:
+        return current_day - int(age)
+    raise KeyError("animal tile needs 'placed_day' or 'age'")
+
+
 def derive_animal(tile: dict[str, Any], current_day: int) -> dict[str, Any]:
     """Derived timing for an animal structure tile (COOP/PASTURE holding an animal)."""
     animal_data = ANIMALS[tile["animal"]]
@@ -88,7 +105,7 @@ def derive_animal(tile: dict[str, Any], current_day: int) -> dict[str, Any]:
         days_until_next_product: int | None = 0
     elif tile.get("consecutive_unfed", 0) < 1 or tile.get("fed_today") is True:
         next_d = _next_production_day(
-            current_day, tile["placed_day"], animal_data["first_yield_day"],
+            current_day, _animal_placed_day(tile, current_day), animal_data["first_yield_day"],
             animal_data["interval"], None,
         )
         days_until_next_product = None if next_d is None else next_d - current_day

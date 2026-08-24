@@ -253,6 +253,16 @@ This file records decisions that remain authoritative across chats and work sess
 - Scope boundary: the PASS responder makes this a controlled ablation comparison between variants, not a competitive-strength measurement; competitive claims still require the frozen-opponent panels of the evaluation rules.
 - Revisit when: the panel has produced real results and a successor gate (e.g. frozen competent-opponent panel or league entry) is defined, or the engine pin moves.
 
+## D-0xx: Executor V0.5 mechanical rules pinned from exact engine semantics (issue #7, 2026-08-24)
+
+- Watering is classed by exact lifecycle mechanics: MUST only at the weed boundary (`consecutive_unwatered >= 1`, planting day included); YIELD for single-harvest window watering and fertilized ongoing production-eve; everything else deferred. Blanket daily watering is retired as a labor sink.
+- Layouts anchor to the persistent shed hub `(4,4)` (canonical `[y,x]`), never the moving farmer; animal planning claims tiles before crop reconciliation via `plan_day_layouts`; WEED tiles are reclaimable slot pools behind DIG prerequisites.
+- Movement legality is bounds-only: engine ops 1-4 move unconditionally, so locked quadrants/tiles never block walking.
+- Market queue uses sequential within-turn cash: queued SELL revenue funds later HIRE/BUY candidates; every BUY is gated by exact whole-order cost; unaffordable skips are logged, not resubmitted blindly.
+- Hiring is any-hour, workload-derived (crude per-worker divisor plus a maintenance-travel floor), with no arbitrary daily cap; hands are daily per engine reset semantics.
+- CARE/FERTILIZE feasibility counts plan-implied same-day assets (max of current and requested targets).
+- One-day replay-slice evaluation with boundary parity verification is the accepted inner-loop methodology; paired wealth (cash + inventories at market prices + assets at cost) is the primary comparison; unfinished-task count stays diagnostic-only.
+
 ## D-027 - Port Only the Promoted BC-E Variant to JAX; Keep J/JE PyTorch-Only
 
 - Date: 2026-08-24
