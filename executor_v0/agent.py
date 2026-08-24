@@ -412,8 +412,14 @@ class ExecutorAgent:
 
     # ------------------------------------------------------------ diagnostics
     def diagnostics_json(self) -> dict[str, Any]:
-        """JSON-serializable per-day/game diagnostics accumulated so far."""
-        return {
+        """JSON-serializable per-day/game diagnostics accumulated so far.
+
+        Additive issue #6 key: when the injected provider exposes its own
+        ``diagnostics_json`` (e.g. CheckpointPlanProvider closed-loop
+        coherence), it is embedded under ``provider_diagnostics``. Purely
+        additive — action generation never consults this method.
+        """
+        diagnostics: dict[str, Any] = {
             "schema_version": _DIAGNOSTICS_SCHEMA_VERSION,
             "seat": self.seat,
             "days": {str(day): record
@@ -427,6 +433,10 @@ class ExecutorAgent:
             },
             "fallback_errors": [dict(e) for e in self._errors],
         }
+        provider_diagnostics = getattr(self.provider, "diagnostics_json", None)
+        if callable(provider_diagnostics):
+            diagnostics["provider_diagnostics"] = provider_diagnostics()
+        return diagnostics
 
 
 def make_agent(*, provider: PlanProvider | None = None,

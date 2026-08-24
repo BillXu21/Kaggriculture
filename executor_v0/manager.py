@@ -22,11 +22,19 @@ from typing import Mapping, Protocol, runtime_checkable
 import numpy as np
 import torch
 
+from bc_manager.coherence import (
+    aggregate_plan_coherence,
+    current_animal_counts,
+    current_crop_counts,
+    plan_coherence_record,
+)
 from bc_manager.constants import ANIMAL_ORDER, CROP_ORDER, PRODUCT_ORDER
+from bc_manager.economics import EconomicHistory
 from bc_manager.live import encode_live_inputs
 from bc_manager.model import ManagerConfig, predict_counts, predict_land, \
     predict_sells
-from bc_manager.training import load_model_from_checkpoint
+from bc_manager.training import checkpoint_model_variant, \
+    load_model_from_checkpoint
 
 from .plan import SELL_BIN_ANCHORS, DailyPlan
 
@@ -116,7 +124,16 @@ def decode_daily_plan(outputs: Mapping[str, torch.Tensor], *,
 
 
 class CheckpointPlanProvider:
-    """Real D-019 manager loaded from an explicit checkpoint path/device."""
+    """Real D-019 manager loaded from an explicit checkpoint path/device.
+
+    Variant-aware (issue #6): the normalized `model_variant` is discovered
+    from the checkpoint payload itself — callers never guess. E/JE providers
+    own one `EconomicHistory` per game and feed it to the live encoder so
+    the previous-day net-cash channel matches batch derivation exactly;
+    V0/J use the exact pre-V1 encoder call with no economic key or tracker.
+    Each once-per-day plan also records diagnostic-only closed-loop plan
+    coherence (never clipped, never fed back into anything).
+    """
 
     def __init__(self, checkpoint_path: str | Path, device: str = "cpu",
                  include_opponent_board: bool | None = None) -> None:
@@ -126,6 +143,7 @@ class CheckpointPlanProvider:
                 f"BC manager checkpoint not found: {path}; supply the real "
                 f"D-019 best.pt path instead of fabricating one")
         self.model, payload = load_model_from_checkpoint(path, device=device)
+        self.model_variant = checkpoint_model_variant(payload)
         self.model_config = ManagerConfig(**payload["model_config"])
         if include_opponent_board is None:
             include_opponent_board = self.model_config.include_opponent_board
@@ -134,19 +152,54 @@ class CheckpointPlanProvider:
                 "include_opponent_board=True is incompatible with a model "
                 "trained without the opponent public board")
         self.include_opponent_board = bool(include_opponent_board)
+        # One fresh tracker per provider (= per game); day0/gap/backwards
+        # semantics live in EconomicHistory itself. V0/J never touch it.
+        self._economic_history: EconomicHistory | None = (
+            EconomicHistory() if self.uses_economic_context else None)
+        self._coherence_records: list[dict] = []
+
+    @property
+    def uses_economic_context(self) -> bool:
+        return self.model_variant in ("E", "JE")
 
     def daily_plan(self, obs, seat, previous_execution=None) -> DailyPlan:
         inputs = encode_live_inputs(
             obs, seat, previous_execution,
-            include_opponent=self.include_opponent_board)
+            include_opponent=self.include_opponent_board,
+            economic_history=self._economic_history)
         batch = {
             key: torch.from_numpy(np.ascontiguousarray(value))
             for key, value in inputs.items()
         }
         with torch.no_grad():
             outputs = self.model(batch)
+        self._record_coherence(obs, inputs, outputs)
         return decode_daily_plan(outputs,
                                  count_max=self.model_config.count_max)
+
+    def _record_coherence(self, obs, inputs, outputs) -> None:
+        """Diagnostic-only lower-bound coherence for this plan; no clipping."""
+        crop_target = predict_counts(outputs["crop_logits"])[0].numpy()
+        animal_target = predict_counts(outputs["animal_logits"])[0].numpy()
+        land_target = int(predict_land(outputs["land_logits"])[0])
+        self._coherence_records.append(plan_coherence_record(
+            day=int(obs["day"]),
+            cash=float(inputs["scalars"][0, 0]),
+            crop_target_counts=crop_target,
+            animal_target_counts=animal_target,
+            land_target=land_target,
+            crop_current=current_crop_counts(inputs["board_crop"])[0],
+            animal_current=current_animal_counts(inputs["board_animal"])[0],
+            unlocked_count=int(inputs["unlocked"][0].sum()),
+        ))
+
+    def diagnostics_json(self) -> dict:
+        """JSON-safe closed-loop coherence diagnostics accumulated so far."""
+        return {
+            "model_variant": self.model_variant,
+            "records": list(self._coherence_records),
+            "aggregate": aggregate_plan_coherence(self._coherence_records),
+        }
 
 
 class CachingPlanProvider:

@@ -262,9 +262,17 @@ def run_opening_game(engine_make: Callable[..., Any], *, opening: str,
                      seat: int, seed: int, opponent_kind: str,
                      downstream_factory: Callable[[], Any],
                      mode: str = "opening") -> dict[str, Any]:
-    """Run one official game with the wrapper in ``seat``; return a record."""
-    wrapper = make_opening_agent(opening=opening,
-                                 downstream=downstream_factory(), seat=seat)
+    """Run one official game with the wrapper in ``seat``; return a record.
+
+    Additive issue #6 key: when the downstream instance exposes
+    ``diagnostics_json`` (e.g. an ExecutorAgent with provider coherence),
+    it is captured after the game under ``downstream_diagnostics``; the
+    trivial PASS responder yields None. Playback/handoff/acceptance behavior
+    is unchanged.
+    """
+    downstream = downstream_factory()
+    wrapper = make_opening_agent(opening=opening, downstream=downstream,
+                                 seat=seat)
     opponents, mirror = build_opponents(opponent_kind, opening, seat)
     agents: list[Any] = [None, None]
     agents[seat] = adapt_one_arg(wrapper)
@@ -305,6 +313,10 @@ def run_opening_game(engine_make: Callable[..., Any], *, opening: str,
             f"{mirror_diag['divergence']['occurred']}"))
 
     failed = [c for c in acceptance if not c["ok"]]
+    downstream_diagnostics = None
+    downstream_diag = getattr(downstream, "diagnostics_json", None)
+    if callable(downstream_diag):
+        downstream_diagnostics = downstream_diag()
     return {
         "mode": mode,
         "engine_env_id": ENGINE_ENV_ID,
@@ -315,6 +327,7 @@ def run_opening_game(engine_make: Callable[..., Any], *, opening: str,
         "opponent": opponent_kind,
         "opening_diagnostics": diag,
         "mirror_diagnostics": mirror_diag,
+        "downstream_diagnostics": downstream_diagnostics,
         "status_anomalies": anomalies,
         "envelope": envelope,
         "acceptance": acceptance,

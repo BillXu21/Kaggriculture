@@ -36,6 +36,8 @@ __all__ = [
     "land_expansion_cost",
     "cash_ratio",
     "coherence_metrics",
+    "plan_coherence_record",
+    "aggregate_plan_coherence",
 ]
 
 
@@ -139,4 +141,85 @@ def coherence_metrics(
         "land_regression_rate": float(
             np.mean(np.asarray(land_target, dtype=np.int64)
                     < np.asarray(unlocked_count, dtype=np.int64))),
+    }
+
+
+# ------------------------------------------------- closed-loop diagnostics
+# Same lower-bound definitions as above, applied to one live manager plan
+# against the current encoded state. Diagnostic-only: nothing here clips or
+# rewrites the plan. Ratios are stored JSON-safely (finite number or null
+# plus explicit flags) so artifacts never contain nonstandard Infinity.
+
+
+def _json_safe_ratio(cost: float, cash: float) -> dict:
+    if cost <= 0:
+        return {"ratio": 0.0, "zero_cash": False,
+                "over_1x": False, "over_2x": False}
+    if cash <= 0:
+        return {"ratio": None, "zero_cash": True,
+                "over_1x": True, "over_2x": True}
+    ratio = cost / cash
+    return {"ratio": ratio, "zero_cash": False,
+            "over_1x": bool(ratio > 1.0), "over_2x": bool(ratio > 2.0)}
+
+
+def plan_coherence_record(
+    day: int,
+    cash: float,
+    crop_target_counts,
+    animal_target_counts,
+    land_target: int,
+    crop_current,
+    animal_current,
+    unlocked_count: int,
+) -> dict:
+    """One JSON-safe closed-loop coherence record for a single daily plan."""
+    cost = int(lower_bound_acquisition_cost(
+        np.asarray(crop_current, dtype=np.int64)[None, :],
+        np.asarray(crop_target_counts, dtype=np.int64)[None, :],
+        np.asarray(animal_current, dtype=np.int64)[None, :],
+        np.asarray(animal_target_counts, dtype=np.int64)[None, :],
+        np.asarray([int(unlocked_count)], dtype=np.int64),
+        np.asarray([int(land_target)], dtype=np.int64),
+    )[0])
+    return {
+        "day": int(day),
+        "cash": float(cash),
+        "lower_bound_cost": cost,
+        **_json_safe_ratio(float(cost), float(cash)),
+        "land_regression": bool(int(land_target) < int(unlocked_count)),
+        "requested": {
+            "crops": [int(v) for v in crop_target_counts],
+            "animals": [int(v) for v in animal_target_counts],
+            "land_count": int(land_target),
+        },
+        "current": {
+            "crops": [int(v) for v in crop_current],
+            "animals": [int(v) for v in animal_current],
+            "unlocked_count": int(unlocked_count),
+        },
+    }
+
+
+def aggregate_plan_coherence(records) -> dict:
+    """Aggregate per-day closed-loop coherence records into game summaries."""
+    records = list(records)
+    if not records:
+        return {"days": 0}
+    costs = [float(r["lower_bound_cost"]) for r in records]
+    finite_ratios = [r["ratio"] for r in records if r["ratio"] is not None]
+    return {
+        "days": len(records),
+        "lower_bound_cost_mean": float(np.mean(costs)),
+        "lower_bound_cost_median": float(np.median(costs)),
+        "ratio_finite_mean": (
+            float(np.mean(finite_ratios)) if finite_ratios else None),
+        "ratio_finite_median": (
+            float(np.median(finite_ratios)) if finite_ratios else None),
+        "over_1x_rate": float(np.mean([r["over_1x"] for r in records])),
+        "over_2x_rate": float(np.mean([r["over_2x"] for r in records])),
+        "zero_cash_positive_cost_days": int(
+            sum(1 for r in records if r["zero_cash"])),
+        "land_regression_rate": float(
+            np.mean([r["land_regression"] for r in records])),
     }
