@@ -19,10 +19,14 @@ from rl_manager.cli import (
     HOLDOUT_SEEDS,
     SMOKE_SEEDS,
     build_parser,
+    execute_debug_trace,
+    plan_debug_trace,
     plan_evaluation,
     plan_training,
     summarize_evaluation,
 )
+from rl_manager.debug_trace import load_trace
+from tests.test_rl_manager_runner import _TraceBackend, _TraceExecutorFactory
 
 
 def _train_args(**overrides):
@@ -96,6 +100,43 @@ def test_parser_requires_explicit_executor_and_subcommand():
             "--output-dir", "out", "--checkpoint", "out/ppo.npz"])
     with pytest.raises(SystemExit):
         build_parser().parse_args([])
+
+
+def test_debug_trace_parser_supports_selected_seed_seat_cases():
+    args = build_parser().parse_args([
+        "debug-trace", "--case", "17:0", "--case", "2026:1",
+    ])
+    plan = plan_debug_trace(args)
+    assert plan["cases"] == [(17, 0), (2026, 1)]
+    assert plan["backend"] == "fast"
+    assert plan["max_turns"] == 719
+
+    single = build_parser().parse_args([
+        "debug-trace", "--seed", "42", "--seat", "0",
+    ])
+    assert plan_debug_trace(single)["cases"] == [(42, 0)]
+
+
+def test_debug_trace_short_smoke_writes_valid_artifact(
+        tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "rl_manager.runner.make_backend",
+        lambda name, configuration: _TraceBackend(configuration),
+    )
+    monkeypatch.setattr(
+        "rl_manager.runner.make_default_executor_factory",
+        lambda: _TraceExecutorFactory(),
+    )
+    args = build_parser().parse_args([
+        "debug-trace", "--case", "17:0", "--max-turns", "2",
+        "--output-dir", str(tmp_path),
+    ])
+    summaries = execute_debug_trace(plan_debug_trace(args))
+    path = tmp_path / "seed_17_seat_0.json"
+    loaded = load_trace(path)
+    assert summaries[0]["turns"] == len(loaded["turns"]) == 3
+    assert summaries[0]["bytes"] == path.stat().st_size
+    assert "trace seed=17 seat=0" in capsys.readouterr().out
 
 
 # ----------------------------------------------------------- train planning

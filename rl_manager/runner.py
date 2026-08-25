@@ -42,6 +42,7 @@ from oracle.backend import EngineBackend, make_backend
 from replay_daily.constants import total_hire_cost
 
 from rl_manager.decode import plans_from_action_tensors
+from rl_manager.debug_trace import TraceRecorder
 from rl_manager.executor_factory import make_default_executor_factory
 from rl_manager.provenance import (
     backend_provenance,
@@ -82,6 +83,9 @@ class RunnerConfig:
     max_turns: int = GAME_TURNS
     num_envs: int = 1  # lockstep envs per chunk (single-process mode)
     record_rollout: bool = False  # capture full primitive trace for parity
+    record_debug_trace: bool = False  # capture canonical viewer trace opt-in
+    debug_trace_seat: int | None = None  # requested private-seat/view selector
+    debug_trace_view: str = "joint"
 
 
 @dataclass(frozen=True)
@@ -159,6 +163,7 @@ class EpisodeResult:
     #   "opponent": {...}, "trainable"} x 2] — recorded at finalize time so
     # artifact metadata never depends on caller-side policy bookkeeping.
     policy_identities: tuple[dict[str, Any], ...]
+    debug_trace: dict[str, Any] | None = None
 
 
 def _executor_factory_provenance(factory: Any) -> dict[str, Any]:
@@ -172,6 +177,45 @@ def _executor_factory_provenance(factory: Any) -> dict[str, Any]:
         "identifier": identifier,
         "version_sha256": sha256_hex(identifier),
     }
+
+
+def _debug_trace_metadata(
+    spec: EpisodeSpec,
+    config: RunnerConfig,
+    provenance: Mapping[str, Any],
+    configuration: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build deterministic metadata for one opt-in full-state trace."""
+    # Refresh after backend construction so lazy fast-engine loading can be
+    # reflected in the trace's engine identity.
+    backend = backend_provenance(config.backend_name, configuration)
+    engine = backend.get("engine_module") or config.backend_name
+    metadata: dict[str, Any] = {
+        "seed": int(spec.seed),
+        "view": str(config.debug_trace_view),
+        "backend": str(config.backend_name),
+        "engine": str(engine),
+        "provenance": {
+            "schema_producer": "rl_manager.runner",
+            "trace_schema_version": 1,
+            "episode_index": int(spec.episode_index),
+            "composition": str(spec.composition),
+            "opening": copy.deepcopy(dict(provenance["opening"])),
+            "backend": backend,
+            "backend_configuration": copy.deepcopy(dict(configuration)),
+            "executor_factory": _executor_factory_provenance(
+                provenance["executor_factory"]),
+            "action_state_alignment": {
+                "initial": "step 0 reset snapshot carries its primitive decision",
+                "decision": "canonical_state is observed before joint_actions",
+                "terminal": "final observed canonical_state has no action or sidecar",
+                "sidecars": "executor_debug contains only same-turn available seats",
+            },
+        },
+    }
+    if config.debug_trace_seat is not None:
+        metadata["seat"] = int(config.debug_trace_seat)
+    return metadata
 
 
 def build_artifact_metadata(
@@ -232,6 +276,11 @@ class _EpisodeState:
         self.configuration = configuration
         self.backend: EngineBackend = make_backend(
             config.backend_name, configuration)
+        self.trace_recorder = (
+            TraceRecorder(_debug_trace_metadata(
+                spec, config, provenance, configuration))
+            if config.record_debug_trace else None)
+        self.current_canonical_state: dict[str, Any] | None = None
         self.providers = [QueuedPlanProvider(), QueuedPlanProvider()]
         factory = provenance["executor_factory"]
         self.executors = [
@@ -276,7 +325,10 @@ class _EpisodeState:
         reach the executor or the live encoder. The backend snapshot is read
         immediately after reset/step, so it describes exactly these
         observations; no private oracle helper is imported here."""
-        canonical_farms = self.backend.canonical_state()["farms"]
+        canonical = self.backend.canonical_state()
+        if self.trace_recorder is not None:
+            self.current_canonical_state = canonical
+        canonical_farms = canonical["farms"]
         adapted = []
         for obs in observations:
             view = dict(obs)
@@ -286,6 +338,57 @@ class _EpisodeState:
             view["farms"] = [copy.deepcopy(farm) for farm in canonical_farms]
             adapted.append(view)
         return adapted
+
+    def _executor_debug_for_turn(
+            self, *, day: int, hour: int) -> dict[str, Any] | None:
+        """Return only same-turn public executor snapshots, if available."""
+        if self.trace_recorder is None:
+            return None
+        available: dict[str, Any] = {}
+        for seat, executor in enumerate(self.executors):
+            snapshot = getattr(executor, "debug_trace_turn", None)
+            if snapshot is None:
+                continue
+            if not isinstance(snapshot, dict):
+                raise TypeError(
+                    f"executor seat {seat} debug_trace_turn must be a dict or None")
+            if (("day" in snapshot and snapshot["day"] != day)
+                    or ("hour" in snapshot and snapshot["hour"] != hour)):
+                continue
+            available[str(seat)] = snapshot
+        return available or None
+
+    def record_decision_trace(
+            self, actions: Sequence[Mapping[str, Any]]) -> None:
+        if self.trace_recorder is None:
+            return
+        if self.current_canonical_state is None:  # pragma: no cover - seam guard
+            raise RuntimeError("trace decision recorded before canonical state")
+        canonical = self.current_canonical_state
+        self.trace_recorder.append_turn(
+            step=canonical["step"],
+            day=canonical["day"],
+            hour=canonical["hour"],
+            canonical_state=canonical,
+            joint_actions={str(seat): copy.deepcopy(dict(action))
+                           for seat, action in enumerate(actions)},
+            executor_debug=self._executor_debug_for_turn(
+                day=canonical["day"], hour=canonical["hour"]),
+        )
+
+    def record_terminal_trace(self) -> dict[str, Any] | None:
+        if self.trace_recorder is None:
+            return None
+        if self.current_canonical_state is None:  # pragma: no cover - seam guard
+            raise RuntimeError("trace finalized before canonical state")
+        canonical = self.current_canonical_state
+        self.trace_recorder.append_turn(
+            step=canonical["step"],
+            day=canonical["day"],
+            hour=canonical["hour"],
+            canonical_state=canonical,
+        )
+        return self.trace_recorder.build()
 
     def _note_day_start(self, seat: int) -> None:
         obs = self.obs[seat]
@@ -360,6 +463,11 @@ class SelfPlayRunner:
         master_seed: int | None = None,
     ) -> None:
         self.config = config
+        if config.debug_trace_seat not in (None, 0, 1):
+            raise ValueError("debug_trace_seat must be None, 0, or 1")
+        if not isinstance(config.debug_trace_view, str) \
+                or not config.debug_trace_view:
+            raise ValueError("debug_trace_view must be a non-empty string")
         self.buffer = trajectory_buffer
         self.executor_factory = executor_factory or \
             make_default_executor_factory()
@@ -416,7 +524,8 @@ class SelfPlayRunner:
                     state.rollout.joint_actions.append((
                         int(state.obs[0]["step"]), day, hour,
                         copy.deepcopy(dict(actions[0])),
-                        copy.deepcopy(dict(actions[1]))))
+                         copy.deepcopy(dict(actions[1]))))
+                state.record_decision_trace(actions)
                 per_state_actions.append(actions)
             t2 = time.perf_counter()
 
@@ -573,6 +682,7 @@ class SelfPlayRunner:
     # ------------------------------------------------------------ finalize
     def _finalize(self, state: _EpisodeState) -> EpisodeResult:
         state.finalized = True
+        debug_trace = state.record_terminal_trace()
         # Seal the final day's primitive-action digest and patch rows.
         current_day = int(state.obs[0]["day"])
         state.seal_day_digest(current_day)
@@ -642,6 +752,7 @@ class SelfPlayRunner:
                     "trainable": seat in state.spec.trainable_seats,
                 }
                 for seat in range(2)),
+            debug_trace=debug_trace,
         )
 
     # ------------------------------------------------------------- artifact
