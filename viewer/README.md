@@ -24,6 +24,18 @@ observed turns: the reset snapshot followed by each observed transition.
 Output filenames are deterministic:
 `artifacts/debug_traces/seed_<SEED>_seat_<SEAT>.json`.
 
+For an official-backend run in the verified project-local environment, invoke
+that interpreter explicitly from the repository root:
+
+```powershell
+$py = "C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\data\temp\official-1327-venv\Scripts\python.exe"
+& $py -m rl_manager.cli debug-trace --backend official --case 17:0
+```
+
+The virtualenv is a read-only runtime dependency; do not install packages into
+it. The current worktree supplies the imported `rl_manager`, viewer, and other
+repository modules.
+
 One case, using the default fast backend and tiny E policy:
 
 ```powershell
@@ -82,8 +94,9 @@ http://127.0.0.1:8765/viewer/?trace=/artifacts/debug_traces/seed_17_seat_0.json
 ```
 
 The `trace` query value is a repository-served path, not a `file://` URL. The
-server root is the repository root, so `/artifacts/...` maps to the ignored
-artifact directory. To check the HTTP responses in PowerShell:
+server exposes only the viewer assets and JSON files under
+`/artifacts/debug_traces/`; repository source files and traversal paths are
+not served. To check the HTTP responses in PowerShell:
 
 ```powershell
 (Invoke-WebRequest http://127.0.0.1:8765/viewer/).StatusCode
@@ -94,6 +107,12 @@ Both should print `200`. If the query URL is inconvenient, open
 `http://127.0.0.1:8765/viewer/`, click **Load trace**, and choose the JSON
 file, or drag it onto the drop zone. The file picker is also the fallback when
 the trace URL is mistyped.
+
+The `trace` query value must be an absolute same-origin path under
+`/artifacts/debug_traces/` and must end in `.json`. Remote URLs, protocol-
+relative URLs, viewer-source paths, relative paths, traversal, and other
+non-artifact paths are rejected in the viewer with an error; file picker and
+drag/drop loading remain local fallbacks.
 
 ## Viewer controls and alignment
 
@@ -130,6 +149,56 @@ node tests/viewer_probe.js artifacts/debug_traces/seed_17_seat_0.json
 For multiple cases, repeat the two checks per filename. The probe validates the
 schema through viewer helpers, builds a 100-cell view model, and checks that
 loading does not mutate the trace.
+
+### Current official-runtime evidence
+
+The official runtime was verified at:
+
+```text
+C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\data\temp\official-1327-venv\Scripts\python.exe
+Python 3.13.1; kaggle-environments 1.32.7
+```
+
+CLI help succeeded, and this sequential one-turn smoke succeeded:
+
+```powershell
+& "C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\data\temp\official-1327-venv\Scripts\python.exe" -m rl_manager.cli debug-trace --backend official --case 17:0 --max-turns 1 --output-dir artifacts/debug_traces
+```
+
+Observed artifact evidence:
+
+| case | artifact | schema/turns | bytes | helper/open check |
+| --- | --- | ---: | ---: | --- |
+| `17:0` one-turn smoke | `artifacts/debug_traces/seed_17_seat_0.json` | v1 / 2 | 9053 | Python loader valid; `node tests/viewer_probe.js artifacts/debug_traces/seed_17_seat_0.json` reported `turns=2`, `cells=100`, `sidecar=false`; HTTP trace route 200 |
+
+The required full-run command was then attempted sequentially for `17:0`,
+`42:0`, `1013:0`, and `2026:1`:
+
+```powershell
+& $py -m rl_manager.cli debug-trace --backend official --case 17:0 --output-dir artifacts/debug_traces
+& $py -m rl_manager.cli debug-trace --backend official --case 42:0 --output-dir artifacts/debug_traces
+& $py -m rl_manager.cli debug-trace --backend official --case 1013:0 --output-dir artifacts/debug_traces
+& $py -m rl_manager.cli debug-trace --backend official --case 2026:1 --output-dir artifacts/debug_traces
+```
+
+All four exited with the same runtime failure before a full artifact was
+written: `executor_v0` reaches `_buy_order_cost`, which imports
+`fast_env.market`, and the current worktree's `fast_env` package then raises
+`ModuleNotFoundError: No module named 'fast_env._kaggriculture_env'`. The
+official engine itself starts successfully; no full 720-turn validation or
+selected-trajectory observation is claimed from these attempts.
+
+The successful one-turn smoke provides these bounded observations only: the
+trace has reset `(step=0, day=0, hour=0)` followed by `(step=1, day=0, hour=1)`;
+the reset turn carries joint-action keys for both seats but no
+`executor_debug` sidecar, and the final observed turn has neither action nor
+sidecar. These fields demonstrate the stored alignment contract, not a causal
+claim about executor behavior, feed, market, travel, or end-of-day debt.
+
+The server checks for this stage returned HTTP `200` for `/viewer/` and the
+JSON artifact, and `404` for `/README.md` and
+`/artifacts/debug_traces/../README.md`. Generated artifacts remain ignored and
+are not committed.
 
 When recording observations from a real selected run, cite the displayed
 turn/day/hour and the stored fields rather than inferring causes. Useful

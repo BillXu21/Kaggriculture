@@ -8,13 +8,63 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 VIEWER = ROOT / "viewer"
-SMOKE_TRACE = ROOT / "artifacts" / "debug_traces" / "seed_17_seat_0.json"
+
+
+def _write_smoke_trace(path: Path) -> None:
+    def farm():
+        return {
+            "money": 1000,
+            "tiles": [[None for _ in range(10)] for _ in range(10)],
+            "farmer": [2, 3],
+            "hands": [[4, 5]],
+            "unlocked_quadrants": ["NW"],
+            "hires_today": 0,
+        }
+
+    def state(step):
+        return {
+            "step": step,
+            "day": 0,
+            "hour": step,
+            "farms": [farm(), farm()],
+            "privates": [
+                {"shed": {}, "seeds": {}, "inventories": [{}, {}]},
+                {"shed": {}, "seeds": {}, "inventories": [{}, {}]},
+            ],
+            "market": {"inventory": {}, "prices": {}},
+            "town": {"unlocked_shops": []},
+            "rewards": [0, 0],
+            "statuses": ["ACTIVE", "ACTIVE"],
+        }
+
+    document = {
+        "schema_version": 1,
+        "metadata": {"seed": 17, "seat": 0, "view": "joint"},
+        "turns": [
+            {"step": step, "day": 0, "hour": step, "canonical_state": state(step)}
+            for step in range(3)
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+
+@pytest.fixture
+def smoke_trace():
+    path = ROOT / "artifacts" / "debug_traces" / "_viewer_test_trace.json"
+    _write_smoke_trace(path)
+    try:
+        yield path
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def test_viewer_assets_have_required_controls_and_panels():
@@ -48,9 +98,8 @@ def test_viewer_helpers_render_representative_canonical_data_without_mutation():
     assert result == {"turns": 3, "cells": 100, "workers": 2, "crop": "WHEAT", "animal": "SHEEP", "sidecar": True, "trails": 2}
 
 
-def test_smoke_trace_loads_through_viewer_helper():
-    assert SMOKE_TRACE.is_file()
-    result = _run_probe(SMOKE_TRACE)
+def test_smoke_trace_loads_through_viewer_helper(smoke_trace):
+    result = _run_probe(smoke_trace)
     assert result["turns"] == 3
     assert result["cells"] == 100
     assert result["sidecar"] is False
@@ -62,7 +111,7 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def test_viewer_server_serves_assets_and_trace():
+def test_viewer_server_serves_only_allowed_assets_and_trace(smoke_trace):
     port = _free_port()
     process = subprocess.Popen(
         [sys.executable, "-m", "viewer.server", "--port", str(port)],
@@ -83,9 +132,23 @@ def test_viewer_server_serves_assets_and_trace():
                 if time.time() >= deadline:
                     raise
                 time.sleep(0.05)
-        for path in ("/viewer/viewer.js", "/viewer/styles.css", "/artifacts/debug_traces/seed_17_seat_0.json"):
+        for path in (
+            "/viewer/viewer.js",
+            "/viewer/styles.css",
+            "/artifacts/debug_traces/_viewer_test_trace.json",
+        ):
             with urlopen(base + path, timeout=2) as response:
                 assert response.status == 200, path
+        for path in (
+            "/README.md",
+            "/rl_manager/cli.py",
+            "/viewer/../README.md",
+            "/artifacts/debug_traces/../README.md",
+            "/artifacts/debug_traces/_viewer_test_trace.txt",
+        ):
+            with pytest.raises(HTTPError) as error:
+                urlopen(base + path, timeout=2)
+            assert error.value.code == 404, path
     finally:
         process.terminate()
         process.wait(timeout=5)

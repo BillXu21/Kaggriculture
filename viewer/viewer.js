@@ -11,6 +11,22 @@
   function validCoordinate(value) { return Array.isArray(value) && value.length === 2 && Number.isInteger(value[0]) && Number.isInteger(value[1]) && value[0] >= 0 && value[0] < 10 && value[1] >= 0 && value[1] < 10; }
   function sameCoordinate(left, right) { return validCoordinate(left) && validCoordinate(right) && left[0] === right[0] && left[1] === right[1]; }
   function quadrant(row, column) { return (row < 5 ? "N" : "S") + (column < 5 ? "W" : "E"); }
+  var tracePathPrefix = "/artifacts/debug_traces/";
+
+  function validateTraceUrl(value, pageUrl) {
+    var raw = typeof value === "string" ? value : "";
+    if (!raw || raw.charAt(0) !== "/" || raw.indexOf("//") === 0) return { ok: false, error: "Trace URL must be an absolute local artifact path." };
+    try {
+      var page = new URL(pageUrl || "http://127.0.0.1/viewer/"), target = new URL(raw, page.href), path = decodeURIComponent(target.pathname);
+      if (target.origin !== page.origin) return { ok: false, error: "Trace URL must use the viewer's same origin." };
+      if (path.indexOf("\\") !== -1 || path.indexOf(tracePathPrefix) !== 0) return { ok: false, error: "Trace URL must point under /artifacts/debug_traces/." };
+      var relative = path.slice(tracePathPrefix.length), segments = relative.split("/");
+      if (!relative || relative.charAt(relative.length - 1) === "/" || segments.some(function (segment) { return segment === "." || segment === ".."; }) || !/\.json$/i.test(path)) return { ok: false, error: "Trace URL must name a JSON artifact under /artifacts/debug_traces/." };
+      return { ok: true, url: target.href };
+    } catch (error) {
+      return { ok: false, error: "Trace URL is not a valid local artifact path." };
+    }
+  }
 
   function validateTrace(document) {
     if (!isObject(document)) throw new Error("Trace must be a JSON object.");
@@ -168,7 +184,7 @@
     return { trace: trace, turn: turn, state: state, seat: seat, farm: farm, privateState: privateState, workers: workers, workerStates: workerStates, cells: boardCells(state, seat, markers), executor: executor, plan: executor && executor.manager ? executor.manager : null, taskMarkers: markers, assignmentGeometry: assignments, trails: extractTrails(trace, index, seat, opts.trailWindow || 12) };
   }
 
-  return { validateTrace: validateTrace, formatTile: formatTile, workerData: workerData, workerActionState: workerActionState, classifyTask: classifyTask, cropState: cropState, animalState: animalState, extractTrails: extractTrails, assignmentGeometry: assignmentGeometry, taskMarkers: taskMarkers, boardCells: boardCells, buildViewModel: buildViewModel, planText: planText };
+  return { validateTrace: validateTrace, validateTraceUrl: validateTraceUrl, formatTile: formatTile, workerData: workerData, workerActionState: workerActionState, classifyTask: classifyTask, cropState: cropState, animalState: animalState, extractTrails: extractTrails, assignmentGeometry: assignmentGeometry, taskMarkers: taskMarkers, boardCells: boardCells, buildViewModel: buildViewModel, planText: planText };
 }));
 
 (function () {
@@ -221,7 +237,7 @@
   function makeSeatToggle() { var count = trace && trace.turns.length ? trace.turns[0].canonical_state.farms.length : 0; $("seat-toggle").innerHTML = ""; for (var index = 0; index < count; index += 1) { var button = document.createElement("button"); button.type = "button"; button.className = "toggle-button" + (index === seat ? " active" : ""); button.textContent = "Seat " + index; button.dataset.seat = index; button.onclick = function () { seat = Number(this.dataset.seat); makeSeatToggle(); render(); }; $("seat-toggle").appendChild(button); } }
   function setTrace(document, source) { try { core.validateTrace(document); trace = document; step = 0; var farmCount = document.turns.length ? document.turns[0].canonical_state.farms.length : 0; seat = Number.isInteger(document.metadata.seat) && document.metadata.seat >= 0 && document.metadata.seat < farmCount ? document.metadata.seat : 0; makeSeatToggle(); render(); setStatus("Loaded " + source + " · " + document.turns.length + " turn" + (document.turns.length === 1 ? "" : "s"), "ok"); } catch (error) { stop(); trace = null; render(); setStatus(error.message || String(error), "error"); } }
   function loadFile(file) { if (!file) return; file.text().then(function (contents) { setTrace(JSON.parse(contents), file.name); }).catch(function (error) { setTrace(null, file.name); setStatus("Could not load " + file.name + ": " + (error.message || error), "error"); }); }
-  function loadUrl(url) { setStatus("Loading " + url + "…"); fetch(url).then(function (response) { if (!response.ok) throw new Error("HTTP " + response.status); return response.json(); }).then(function (document) { setTrace(document, url); }).catch(function (error) { setStatus("Could not load trace URL: " + (error.message || error), "error"); }); }
+  function loadUrl(url) { var checked = core.validateTraceUrl(url, window.location.href); if (!checked.ok) { setStatus("Could not load trace URL: " + checked.error, "error"); return; } setStatus("Loading " + checked.url + "…"); fetch(checked.url).then(function (response) { if (!response.ok) throw new Error("HTTP " + response.status); return response.json(); }).then(function (document) { setTrace(document, checked.url); }).catch(function (error) { setStatus("Could not load trace URL: " + (error.message || error), "error"); }); }
   function bindOverlay(id, key) { $(id).addEventListener("change", function () { overlays[key] = this.checked; render(); }); }
 
   document.addEventListener("DOMContentLoaded", function () {

@@ -77,6 +77,17 @@ const model = core.buildViewModel(trace, 0, 0);
 if (JSON.stringify(trace) !== before) throw new Error("viewer helpers mutated trace input");
 if (model.cells.length !== 100) throw new Error("expected 100 board cells");
 if (!source) {
+  const pageUrl = "http://127.0.0.1:8765/viewer/";
+  for (const [url, allowed] of [
+    ["/artifacts/debug_traces/seed_17_seat_0.json", true],
+    ["https://example.invalid/trace.json", false],
+    ["//example.invalid/trace.json", false],
+    ["/viewer/viewer.js", false],
+    ["/artifacts/debug_traces/../README.json", false],
+    ["artifacts/debug_traces/seed_17_seat_0.json", false],
+  ]) {
+    if (core.validateTraceUrl(url, pageUrl).ok !== allowed) throw new Error(`unexpected trace URL policy for ${url}`);
+  }
   if (!model.cells.some((cell) => cell.label === "WHEAT" && cell.detail.includes("age 1d"))) throw new Error("crop lifecycle detail missing");
   if (core.classifyTask({kind: "FEED"}).category !== "feed-survival") throw new Error("FEED classification missing");
   if (core.classifyTask({kind: "WATER", source: "water_must_weed_boundary"}).category !== "water-must") throw new Error("mandatory WATER classification missing");
