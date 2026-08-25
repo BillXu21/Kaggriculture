@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kaggriculture debug trace viewer</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">DEBUG TRACE · SCHEMA V1</p>
+        <h1>Kaggriculture replay viewer</h1>
+        <p id="load-status" class="status" role="status">Choose a trace JSON file or drop one here.</p>
+      </div>
+      <div class="load-actions">
+        <label class="button primary" for="trace-file">Load trace</label>
+        <input id="trace-file" type="file" accept="application/json,.json" hidden>
+        <button id="clear-trace" class="button" type="button">Clear</button>
+      </div>
+    </header>
+
+    <section id="drop-zone" class="drop-zone" aria-label="Trace drop zone">
+      <span>Drop schema-v1 JSON here</span>
+      <span class="muted">or use <code>?trace=/path/to/trace.json</code> from a local server</span>
+    </section>
+
+    <section class="toolbar panel" aria-label="Playback controls">
+      <div class="toolbar-row">
+        <button id="step-back" class="button" type="button" title="Previous step (Left arrow)">◀ Back</button>
+        <button id="play-toggle" class="button primary" type="button" title="Play or pause (Space)">▶ Play</button>
+        <button id="step-forward" class="button" type="button" title="Next step (Right arrow)">Forward ▶</button>
+        <label class="speed-control">Speed
+          <select id="speed-select">
+            <option value="1000">1×</option>
+            <option value="500">2×</option>
+            <option value="250">4×</option>
+            <option value="100">10×</option>
+          </select>
+        </label>
+      </div>
+      <div class="slider-row">
+        <span id="step-label">Step 0 / 0</span>
+        <input id="step-slider" type="range" min="0" max="0" value="0" step="1" aria-label="Trace step">
+        <span id="turn-label" class="muted">No trace loaded</span>
+      </div>
+    </section>
+
+    <section class="toolbar panel" aria-label="Seat selection">
+      <div id="seat-toggle" class="toggle-group" role="group" aria-label="Farm seat"></div>
+      <span id="view-label" class="muted">No seat selected</span>
+    </section>
+
+    <div id="viewer-content" class="viewer-content" hidden>
+      <section class="board-panel panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">CANONICAL BOARD</p>
+            <h2 id="board-title">Farm</h2>
+          </div>
+          <span class="legend"><i class="legend-swatch unlocked"></i> unlocked <i class="legend-swatch locked"></i> locked</span>
+        </div>
+        <div id="board" class="board" role="grid" aria-label="10 by 10 canonical farm board"></div>
+        <p class="board-note">Coordinates are <code>[row, column]</code>. Hover or focus a cell for lifecycle and resource details.</p>
+      </section>
+
+      <section class="worker-panel panel">
+        <div class="section-heading"><h2>Workers</h2><span id="worker-count" class="muted"></span></div>
+        <div id="workers" class="worker-list"></div>
+      </section>
+
+      <section class="summary-grid">
+        <article id="time-panel" class="panel info-panel"></article>
+        <article id="economy-panel" class="panel info-panel"></article>
+        <article id="storage-panel" class="panel info-panel"></article>
+        <article id="market-panel" class="panel info-panel"></article>
+        <article id="manager-panel" class="panel info-panel wide-panel"></article>
+        <article id="executor-panel" class="panel info-panel wide-panel"></article>
+        <article id="survival-panel" class="panel info-panel"></article>
+        <article id="actions-panel" class="panel info-panel"></article>
+      </section>
+    </div>
+  </main>
+  <script src="viewer.js"></script>
+</body>
+</html>
