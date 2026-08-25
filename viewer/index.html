@@ -61,7 +61,28 @@
           </div>
           <span class="legend"><i class="legend-swatch unlocked"></i> unlocked <i class="legend-swatch locked"></i> locked</span>
         </div>
-        <div id="board" class="board" role="grid" aria-label="10 by 10 canonical farm board"></div>
+        <div class="overlay-controls" aria-label="Diagnostic overlay controls">
+          <label><input id="trail-toggle" type="checkbox" checked> trails</label>
+          <label><input id="assignment-toggle" type="checkbox" checked> assignment lines/targets</label>
+          <label><input id="task-toggle" type="checkbox" checked> task markers</label>
+          <label><input id="urgency-toggle" type="checkbox" checked> urgency/status colors</label>
+          <label><input id="labels-toggle" type="checkbox" checked> labels</label>
+          <label class="trail-window-control">trail window <input id="trail-window" type="range" min="8" max="24" value="12" step="1"><span id="trail-window-label">12 turns</span></label>
+        </div>
+        <div id="overlay-legend" class="overlay-legend" aria-label="Executor overlay legend">
+          <span class="legend-item feed-survival">FEED survival</span>
+          <span class="legend-item water-must">mandatory WATER</span>
+          <span class="legend-item water-yield">yield WATER</span>
+          <span class="legend-item harvest">HARVEST</span>
+          <span class="legend-item manager">manager</span>
+          <span class="legend-item blocked">blocked/unassigned</span>
+          <span class="legend-item neutral">unknown/neutral</span>
+          <span class="legend-help">Lines connect the stored worker position to a stored task target; text panels remain authoritative when coordinates are absent.</span>
+        </div>
+        <div class="board-stage">
+          <div id="board" class="board" role="grid" aria-label="10 by 10 canonical farm board"></div>
+          <svg id="overlay-svg" class="overlay-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"></svg>
+        </div>
         <p class="board-note">Coordinates are <code>[row, column]</code>. Hover or focus a cell for lifecycle and resource details.</p>
       </section>
 

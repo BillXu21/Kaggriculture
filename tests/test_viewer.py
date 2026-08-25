@@ -24,10 +24,15 @@ def test_viewer_assets_have_required_controls_and_panels():
         "play-toggle", "speed-select", "seat-toggle", "board", "workers",
         "time-panel", "economy-panel", "storage-panel", "market-panel",
         "manager-panel", "executor-panel", "survival-panel", "actions-panel",
+        "trail-toggle", "assignment-toggle", "task-toggle", "urgency-toggle",
+        "labels-toggle", "trail-window", "overlay-svg", "overlay-legend",
     ):
         assert f'id="{element_id}"' in html
     assert "styles.css" in html and "viewer.js" in html
     assert "repeat(10" in (VIEWER / "styles.css").read_text(encoding="utf-8")
+    assert 'min="8" max="24"' in html
+    for semantic in ("feed-survival", "water-must", "water-yield", "harvest", "manager", "blocked", "neutral"):
+        assert semantic in html or semantic in (VIEWER / "styles.css").read_text(encoding="utf-8")
 
 
 def _run_probe(trace: Path | None = None) -> dict:
@@ -40,7 +45,7 @@ def _run_probe(trace: Path | None = None) -> dict:
 
 def test_viewer_helpers_render_representative_canonical_data_without_mutation():
     result = _run_probe()
-    assert result == {"turns": 1, "cells": 100, "workers": 2, "crop": "WHEAT", "animal": "SHEEP", "sidecar": True}
+    assert result == {"turns": 3, "cells": 100, "workers": 2, "crop": "WHEAT", "animal": "SHEEP", "sidecar": True, "trails": 2}
 
 
 def test_smoke_trace_loads_through_viewer_helper():
