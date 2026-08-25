@@ -289,3 +289,66 @@ This file records decisions that remain authoritative across chats and work sess
 - Evidence boundary: tiny live smoke uses ONE complete fast-engine game (tiny random-init E, numThreads=1), full-trajectory GAE, bit-equal stored-action logprob recompute before the update, ONE 4-row-minibatch update with finite metrics, bit-identical checkpoint resume, and pre/post deterministic eval equality. Combined sweep 130 passed + 4 skipped (~187 s). No policy-quality claim; official-engine parity and real-checkpoint paths remain gated skips.
 - Rationale: correctness of batched RL plumbing is provable locally against a stationary opponent without optimizing quality against an executor that issue #7 may replace; explicit fail-loud guards prevent accidental expensive panels or implicit executor choices.
 - Revisit when: issue #7 selects the executor (factory swap + first serious run), the real BC-E checkpoint lands at `artifacts/local/bc-v1-E/best.pt`, or multi-process rollout workers are actually implemented.
+
+## D-030 - Require Multi-Day Fixed-Plan Evidence Before Promoting Executor Heuristics
+
+- Date: 2026-08-25
+- Status: active
+- Decision: One-day replay slices remain a fast diagnostic inner loop, but executor heuristics are not promoted on one-day evidence alone. Promotion now requires a deterministic fixed-plan ladder: focused mechanics tests -> one-day fixtures -> 3-day A/B -> 5-day A/B -> 7-day A/B for serious candidates -> bounded full-game real-policy confirmation.
+- Rationale: elite replay inspection and V0.6 behavior showed that locally sensible scheduling/layout rules can create multi-day oscillation, debt, or strategic side effects that a single day cannot reveal. Holding the manager plan tape fixed isolates the executor from policy drift while exposing compounding execution effects.
+- Evidence boundary: the first harness on branch `executor-v07-fixed-plan` supports strict DailyPlan tapes and 3/5/7-day comparisons. Earlier expert-intent tapes are valid executor evidence but must never be mislabeled as BC-E evidence; real BC-E tapes are preferred once the checkpoint is available.
+- Revisit when: a better causal executor-evaluation method provides equally isolated multi-day evidence with lower cost.
+
+## D-031 - Freeze the Two-Layer Architecture Through the First Real Self-Play Experiments
+
+- Date: 2026-08-25
+- Status: active
+- Decision: Keep the near-term architecture as learned daily manager -> deterministic executor. Do not add a learned tactical/middle policy or primitive-action policy before the frozen two-layer stack has been tested with real BC-E and small PPO/self-play experiments.
+- Rationale: elite replay study suggests a tactical layer may eventually be useful, especially for task selection/scheduling, but adding it now would multiply compute and interface complexity before we know which failures actually require it. Deterministic routing should not be relearned without evidence.
+- Future candidate: if self-play/viewer evidence shows that daily strategic outputs cannot express important turn-level task-choice behavior, prefer a learned task-selection layer over raw movement primitives: high-level manager intent -> candidate coordinate/task commands -> deterministic routing/compiler.
+- Revisit when: repeated closed-loop failures are attributable to missing tactical choice rather than manager strategy or deterministic execution.
+
+## D-032 - Use Visual Inspection as a Bounded Mechanical-Bug Filter, Not a Strategy-Imitation Loop
+
+- Date: 2026-08-25
+- Status: active
+- Decision: After Executor V0.7 is frozen, use the custom replay viewer on a tiny set of real BC-E trajectories and patch only obvious, reproducible mechanical failures. Limit this phase to one or two small correction passes before returning to self-play.
+- Rationale: visual replay exposed genuine executor issues (for example task stealing and inefficient watering) but also elite strategic behaviors such as crop abandonment and geometry choices. Blindly copying those behaviors would encode the winning policy into the executor and violate D-011.
+- Practical test: first ask whether the executor failed to execute a feasible strategy or the manager chose an unsustainable/undesirable strategy. Only the first normally justifies an executor patch.
+- Revisit when: viewer evidence demonstrates a recurring mechanical defect that cannot be isolated with the current bounded process.
+
+## D-033 - Treat Broad Previous-Day Work-Debt Expansion Suppression as Architectural Debt, Not a Permanent Mechanical Invariant
+
+- Date: 2026-08-25
+- Status: active constraint pending V0.7 ablation
+- Decision: The V0.6 rule that suppresses BUILD/PLACE/BUY_ANIMAL/BUY_LAND after any previous-day EOD work debt must not silently become the permanent executor contract. V0.7 must compare the current broad veto against no previous-day debt veto under the real BC-E checkpoint while retaining current hard survival protections. Do not replace it with another arbitrary cash/debt threshold.
+- Evidence: representative V0.6 trajectories showed `expansion_suppressed_days` around 25-26 of the 26 manager-controlled days, with manager debt often 75-85% of EOD debt even in 50k-60k-bank games. This means the executor was effectively acting as a second strategic governor. Two attempted narrower substitutes (feed-only current-survival gate and current must-water gate) regressed fixed-plan safety and were reverted.
+- Interpretation rule: if removing the broad veto exposes bad BC-E overcommitment while the executor mechanically executes feasible work correctly, that is manager/RL training signal, not sufficient reason to restore a hidden strategic override.
+- Revisit when: the real BC-E ablation identifies a narrower exact mechanical condition that is necessary to prevent avoidable loss.
+
+## D-034 - Audit Manager Action Expressiveness for Strategic Contraction Before Serious PPO
+
+- Date: 2026-08-25
+- Status: active
+- Decision: Before serious PPO/self-play training, audit the manager/projection contract to ensure strategically useful target decreases are representable, especially crop and animal inventory contraction. The executor must not hide missing action expressiveness with product-price or abandonment heuristics.
+- Rationale: elite replay inspection showed a player intentionally allowing strawberries to turn into weeds after crashing their price. If the current manager projection clamps crop/animal targets upward to current inventory, RL literally cannot express "maintain fewer of this asset" and will be blamed for an interface limitation.
+- Intended ownership: manager/RL decides whether an asset should continue to be maintained/replaced; executor determines the legal/mechanical way to realize that intent. A target below current animal count must never imply mechanically killing animals unless the game exposes a valid strategic action; it can at minimum mean stop adding/replacing them.
+- Revisit when: the contract audit proves all needed contraction semantics already exist, or a richer learned tactical layer supersedes the daily target representation.
+
+## D-035 - Standardize on Passive Canonical Debug Traces for Executor Diagnosis
+
+- Date: 2026-08-25
+- Status: active
+- Decision: Use issue #11's versioned canonical debug trace and local viewer as the standard executor inspection seam. Instrumentation must remain post-decision/passive and must never feed back into task generation, assignment, market ordering, manager calls, or returned primitive actions.
+- Evidence: branch `issue-11-replay-debug-viewer` at `0f72bcd28ef20703718a8a16503b6776c4d4b046` was independently validated READY TO MERGE LATER. Exact base-vs-branch primitive actions, rewards/statuses, manager transitions, and final results matched under deterministic official-engine checks; trace-enabled vs disabled also matched. Coordinates/inventory alignment and local-server boundaries were validated.
+- Integration rule: finalize V0.7 behavior first, then adapt the passive snapshots around the new `_act` implementation rather than resolving conflicts by taking the old viewer branch's behavioral code.
+- Revisit when: trace size/performance materially interferes with evaluation or a richer debugging format becomes necessary.
+
+## D-036 - Use the Real Promoted BC-E Checkpoint for Final Executor Validation and First Self-Play Baselines
+
+- Date: 2026-08-25
+- Status: active
+- Decision: The real promoted checkpoint is now available locally at `C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\artifacts\local\bc-v1-E\best.pt` and should be used for the remaining V0.7 validation, seed-17 diagnosis, real viewer traces, and first serious closed-loop/self-play baseline. It remains an ignored external artifact and must not be committed.
+- Metadata: E-own, epoch 27, validation total `2.910865758929336`.
+- Rationale: tiny/random policies and expert-intent plan tapes are adequate for plumbing or isolated executor tests but are not substitutes for the actual policy distribution when deciding whether the executor is ready for RL.
+- Revisit when: a newer manager checkpoint is promoted by a closed-loop gate or the artifact is intentionally versioned elsewhere.
