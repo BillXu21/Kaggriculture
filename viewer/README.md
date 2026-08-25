@@ -159,20 +159,36 @@ C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\data\temp\official-1327
 Python 3.13.1; kaggle-environments 1.32.7
 ```
 
-CLI help succeeded, and this sequential one-turn smoke succeeded:
+CLI help succeeded, and the full selected runs below used this exact
+PowerShell interpreter:
 
 ```powershell
-& "C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\data\temp\official-1327-venv\Scripts\python.exe" -m rl_manager.cli debug-trace --backend official --case 17:0 --max-turns 1 --output-dir artifacts/debug_traces
+$py = "C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\data\temp\official-1327-venv\Scripts\python.exe"
+```
+
+Equivalent commands after activating that environment, or from an ordinary
+environment that already provides the pinned official dependency, use
+`python` directly:
+
+```powershell
+python -m rl_manager.cli debug-trace --backend official --case 17:0 --output-dir artifacts/debug_traces
 ```
 
 Observed artifact evidence:
 
+The probe builds its model at reset index 0, so `sidecar=false` in the table
+means the expected opening-turn absence; later turns contain the sidecars
+described below.
+
 | case | artifact | schema/turns | bytes | helper/open check |
 | --- | --- | ---: | ---: | --- |
-| `17:0` one-turn smoke | `artifacts/debug_traces/seed_17_seat_0.json` | v1 / 2 | 9053 | Python loader valid; `node tests/viewer_probe.js artifacts/debug_traces/seed_17_seat_0.json` reported `turns=2`, `cells=100`, `sidecar=false`; HTTP trace route 200 |
+| `17:0` | `artifacts/debug_traces/seed_17_seat_0.json` | v1 / 720 | 11964111 | Python schema/720-turn/monotonic/age-alias checks passed; probe reported `turns=720`, `cells=100`, `sidecar=false`; viewer query and artifact routes 200 |
+| `42:0` | `artifacts/debug_traces/seed_42_seat_0.json` | v1 / 720 | 11954068 | Same checks passed; probe reported `turns=720`, `cells=100`, `sidecar=false`; viewer query and artifact routes 200 |
+| `1013:0` | `artifacts/debug_traces/seed_1013_seat_0.json` | v1 / 720 | 11962958 | Same checks passed; probe reported `turns=720`, `cells=100`, `sidecar=false`; viewer query and artifact routes 200 |
+| `2026:1` | `artifacts/debug_traces/seed_2026_seat_1.json` | v1 / 720 | 11960383 | Same checks passed; probe reported `turns=720`, `cells=100`, `sidecar=false`; viewer query and artifact routes 200 |
 
-The required full-run command was then attempted sequentially for `17:0`,
-`42:0`, `1013:0`, and `2026:1`:
+The four full runs were executed sequentially with the following commands;
+each CLI summary reported `turns=720` and `terminated=True`:
 
 ```powershell
 & $py -m rl_manager.cli debug-trace --backend official --case 17:0 --output-dir artifacts/debug_traces
@@ -181,22 +197,45 @@ The required full-run command was then attempted sequentially for `17:0`,
 & $py -m rl_manager.cli debug-trace --backend official --case 2026:1 --output-dir artifacts/debug_traces
 ```
 
-All four exited with the same runtime failure before a full artifact was
-written: `executor_v0` reaches `_buy_order_cost`, which imports
-`fast_env.market`, and the current worktree's `fast_env` package then raises
-`ModuleNotFoundError: No module named 'fast_env._kaggriculture_env'`. The
-official engine itself starts successfully; no full 720-turn validation or
-selected-trajectory observation is claimed from these attempts.
+The documented viewer launch and open-check were:
 
-The successful one-turn smoke provides these bounded observations only: the
-trace has reset `(step=0, day=0, hour=0)` followed by `(step=1, day=0, hour=1)`;
-the reset turn carries joint-action keys for both seats but no
-`executor_debug` sidecar, and the final observed turn has neither action nor
-sidecar. These fields demonstrate the stored alignment contract, not a causal
-claim about executor behavior, feed, market, travel, or end-of-day debt.
+```powershell
+python -m viewer.server --port 8765
+```
 
-The server checks for this stage returned HTTP `200` for `/viewer/` and the
-JSON artifact, and `404` for `/README.md` and
+```text
+http://127.0.0.1:8765/viewer/?trace=/artifacts/debug_traces/seed_17_seat_0.json
+```
+
+Concrete observations from the successful traces (all counts below were
+present in each selected artifact and combine both executor seat snapshots):
+
+- The first executor sidecar appears at step 96 (day 4, hour 0), for both
+  seats; sidecars continue through step 718 (day 29, hour 22), while terminal
+  step 719 has no sidecar. This records the opening-to-executor alignment, not
+  a causal claim about the opening policy.
+- Task records include 5,798 `PLACE`, 1,318 `FERTILIZE`, 1,198 `BUY_ANIMAL`,
+  982 `WATER`, 432 each of `COLLECT_FERTILIZER`, `FEED`, and `CARE`, 406
+  `HARVEST`, and 192 `BUY_PRODUCT` records. There are 1,528 assignment
+  records and 3,302 unassigned task keys; these are stored task/assignment
+  facts, not proof that any task caused a later state.
+- Survival sidecars reach `unfed_count=5`,
+  `starvation_boundary_count=4`, and `shortage=5`. `expansion_suppressed` is
+  `true` in 672 of 1,246 survival snapshots. These fields show recorded
+  pressure/suppression indicators; they do not establish starvation or causal
+  policy failure.
+- The traces contain 24 sidecar snapshots with non-empty `market.submitted`
+  and 670 with non-empty `market.unaffordable`. Joint actions include stored
+  movement (`NORTH=134`, `WEST=130`, `SOUTH=24`, `EAST=22`) and interaction
+  actions including `WATER=104`, `FEED=28`, and `CARE=28`. The viewer helper
+  extracts a 12-point farmer trail at the final window for each selected case.
+- `eod_work_debt` is present in 50 survival snapshots; its largest `all` list
+  contains 53 task keys, with maxima of 5 maintenance, 24 manager, 14
+  productive, and 11 survival entries. This documents end-of-day debt fields;
+  it does not infer why the work remained unresolved.
+
+The server checks for this stage returned HTTP `200` for `/viewer/` and each
+JSON artifact route, and `404` for `/README.md` and
 `/artifacts/debug_traces/../README.md`. Generated artifacts remain ignored and
 are not committed.
 
