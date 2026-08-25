@@ -724,6 +724,160 @@ def test_achieved_current_updated_every_turn_including_latest_day():
     assert day["achieved_current"]["crops"]["WHEAT"] == 0
 
 
+# ---------------------------------------------------------- turn debug trace
+
+
+def test_debug_trace_turn_is_compact_json_safe_and_defensive():
+    tiles = empty_tiles()
+    tiles[2][2] = plant_tile("WHEAT", watered_today=False)
+    tiles[4][4] = pasture_tile("GOOSE", fed_today=False,
+                               consecutive_unfed=1)
+    tiles[4][5] = pasture_tile("COW", fed_today=False,
+                               consecutive_unfed=1)
+    sell_quantities = {
+        product: {anchor: 0 for anchor in (0, 4, 8, 12, 16, 20)}
+        for product in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY",
+                        "MELON", "EGG", "MILK", "WOOL", "FERTILIZER")
+    }
+    sell_quantities["WHEAT"][20] = 1
+    sell_quantities["CARROT"][20] = 1
+    sell_quantities["TOMATO"][20] = 1
+    plan = simple_plan(
+        crop_targets={"WHEAT": 3, "CARROT": 0, "TOMATO": 0,
+                      "STRAWBERRY": 0, "MELON": 0},
+        fertilizer_by_crop={"WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+                            "STRAWBERRY": 0, "MELON": 0},
+        care_by_animal={"GOOSE": 1, "COW": 1, "SHEEP": 0},
+        sell_quantities=sell_quantities)
+    agent = ExecutorAgent(
+        recording_provider(plan), seat=0,
+        config=AgentConfig(max_market_orders=1))
+    assert agent.debug_trace_turn is None
+
+    obs = make_obs(day=3, hour=23, money=0.0,
+                   shed={"WHEAT": 2, "CARROT": 1, "TOMATO": 1,
+                         "FERTILIZER": 1},
+                   seeds={}, tiles=tiles)
+    obs["market"]["prices"] = {"CARROT": 0, "TOMATO": 0}
+    action = agent(obs)
+    snapshot = agent.debug_trace_turn
+    assert snapshot is not None
+    json.dumps(snapshot, allow_nan=False, sort_keys=True)
+    assert action == {
+        "farmer": snapshot["actions"]["farmer"],
+        "hands": snapshot["actions"]["hands"],
+        "market": snapshot["market"]["submitted"],
+    }
+
+    assert snapshot["day"] == 3
+    assert snapshot["hour"] == 23
+    assert snapshot["manager"]["requested"]["crop_targets"]["WHEAT"] == 3
+    assert snapshot["manager"]["feasible"]["fertilizer_by_crop"]["WHEAT"] == 1
+    assert "land" in snapshot["manager"]["projection_changes"]
+    assert any(task["kind"] == "FEED" for task in snapshot["tasks"])
+    assert all({
+        "key", "kind", "priority", "source", "tile", "deadline_hour",
+        "required_item", "depends_on", "crop", "animal", "product",
+        "quantity",
+    } <= set(task) for task in snapshot["tasks"])
+    assert any(
+        assignment["task_key"] is not None
+        and assignment["target"] is not None
+        and "reason" in assignment
+        and "action" in assignment
+        for assignment in snapshot["assignments"]
+    )
+    assert set(snapshot["unassigned"]) == {"task_keys", "reasons"}
+    assert snapshot["market"]["submitted"]
+    assert snapshot["market"]["unaffordable"]
+    assert snapshot["market"]["skipped"]
+    survival = snapshot["survival"]
+    assert survival["unfed_count"] == 2
+    assert survival["starvation_boundary_count"] == 2
+    assert survival["shed_wheat"] == 2
+    assert survival["carried_wheat"] == 0
+    assert survival["protected_reserve"] == 2
+    assert survival["feed_reserve_protected_units"] == 2
+    assert survival["shortage"] == 0
+    assert survival["expansion_suppressed"] is True
+    assert survival["eod_work_debt"]["all"]
+
+    original = agent.debug_trace_turn
+    snapshot["actions"]["farmer"][0] = "MUTATED"
+    snapshot["tasks"][0]["key"] = "MUTATED"
+    snapshot["manager"]["requested"]["crop_targets"]["WHEAT"] = 999
+    assert agent.debug_trace_turn == original
+    with pytest.raises(AttributeError):
+        agent.debug_trace_turn = {}
+
+
+def test_debug_trace_observation_does_not_change_actions_or_ordering():
+    plan = simple_plan(crop_targets={"WHEAT": 4, "CARROT": 0,
+                                     "TOMATO": 0, "STRAWBERRY": 0,
+                                     "MELON": 0})
+
+    def run(read_trace):
+        agent = ExecutorAgent(recording_provider(plan), seat=0)
+        tiles = empty_tiles()
+        tiles[2][2] = plant_tile("WHEAT", watered_today=False)
+        actions = []
+        traces = []
+        for hour in (2, 3):
+            actions.append(agent(make_obs(day=3, hour=hour, tiles=tiles)))
+            if read_trace:
+                traces.append(json.dumps(agent.debug_trace_turn,
+                                         allow_nan=False, sort_keys=True))
+        return (json.dumps(actions, allow_nan=False, sort_keys=True), traces)
+
+    ignored_actions, ignored_traces = run(read_trace=False)
+    observed_actions, observed_traces = run(read_trace=True)
+    assert ignored_actions == observed_actions
+    assert ignored_traces == []
+    assert observed_traces == run(read_trace=True)[1]
+
+
+def test_debug_trace_failure_is_passive(monkeypatch):
+    plan = simple_plan(crop_targets={"WHEAT": 1, "CARROT": 0,
+                                     "TOMATO": 0, "STRAWBERRY": 0,
+                                     "MELON": 0})
+    tiles = empty_tiles()
+    tiles[2][2] = plant_tile("WHEAT", watered_today=False)
+    obs = make_obs(day=3, hour=2, tiles=tiles)
+    expected = ExecutorAgent(recording_provider(plan), seat=0)(
+        copy.deepcopy(obs))
+    agent = ExecutorAgent(recording_provider(plan), seat=0)
+
+    def fail_snapshot(**_kwargs):
+        raise RuntimeError("snapshot rendering failed")
+
+    monkeypatch.setattr(agent, "_build_debug_trace_turn", fail_snapshot)
+    assert agent(copy.deepcopy(obs)) == expected
+    assert agent.debug_trace_turn is None
+
+
+def test_debug_trace_coexists_with_prior_debt_toggle():
+    tiles = empty_tiles()
+    tiles[2][2] = plant_tile("WHEAT", yield_units=3)
+    plan = simple_plan(
+        crop_targets={"WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+                      "STRAWBERRY": 0, "MELON": 0},
+        animal_targets={"GOOSE": 1, "COW": 0, "SHEEP": 0},
+        land_count=2)
+    agent = ExecutorAgent(
+        recording_provider(plan), seat=0,
+        config=AgentConfig(
+            suppress_expansion_from_prior_debt=False,
+            turn_trace=True))
+
+    agent(make_obs(day=3, hour=23, farmer=(0, 0), tiles=tiles))
+    action = agent(make_obs(day=4, hour=0, farmer=(0, 0), tiles=empty_tiles()))
+
+    assert agent.diagnostics_json()["days"]["4"]["turn_trace"]
+    assert agent.debug_trace_turn["survival"]["expansion_suppressed"] is False
+    assert any(order[0] in ("BUY_ANIMAL", "BUY_LAND")
+               for order in action["market"])
+
+
 # ------------------------------------------------------------- replay smoke
 
 

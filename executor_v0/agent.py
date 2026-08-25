@@ -33,6 +33,7 @@ only loaded when an explicit path is supplied (never fabricated).
 """
 
 from collections.abc import Mapping
+import copy
 from dataclasses import dataclass, field
 import math
 from typing import Any, Callable
@@ -51,7 +52,7 @@ from replay_daily.constants import (
 from replay_daily.lifecycle import canonical_board
 
 from .foreman import ForemanConfig, run_foreman
-from .tasks import Task
+from .tasks import GenerationResult, Task
 from .manager import CheckpointPlanProvider, PlanProvider
 from .plan import SELL_BIN_ANCHORS, DailyPlan
 from .projection import clip_sell, project_plan
@@ -152,6 +153,19 @@ def _animal_feed_state(obs: Mapping, seat: int) -> dict[str, int]:
     }
 
 
+def _snapshot_copy(value: Any) -> Any:
+    """Copy the explicitly selected snapshot values into JSON-safe values."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {str(key): _snapshot_copy(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_snapshot_copy(item) for item in value]
+    return None
+
+
 class ExecutorAgent:
     def __init__(self, provider: PlanProvider, *, seat: int | None = None,
                  config: AgentConfig | None = None) -> None:
@@ -173,6 +187,7 @@ class ExecutorAgent:
         self._day_records: dict[int, dict[str, Any]] = {}
         self._errors: list[dict[str, Any]] = []
         self._suppress_expansion_today: bool = False
+        self._debug_trace_turn: dict[str, Any] | None = None
 
     def __call__(self, obs: Mapping) -> dict[str, Any]:
         try:
@@ -453,6 +468,98 @@ class ExecutorAgent:
         return pending
 
     @staticmethod
+    def _market_snapshot_order(kind: str, payload: Any) -> list:
+        if kind == "sell":
+            return list(payload["order"])
+        return list(payload)
+
+    def _build_debug_trace_turn(
+        self,
+        *,
+        day: int,
+        hour: int,
+        tasks: tuple[Task, ...],
+        generated_tasks: tuple[Task, ...],
+        generation: GenerationResult,
+        foreman_result: Any,
+        feed: Mapping[str, int],
+        expansion_suppressed: bool,
+        orders: list[list],
+        candidates: list[tuple[str, Any]],
+        unaffordable_orders: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        task_by_key = {task.key: task for task in tasks}
+        assignments = []
+        for assignment in foreman_result.assignments:
+            task = task_by_key.get(assignment.task_key)
+            assignments.append({
+                "worker_index": assignment.worker_index,
+                "task_key": assignment.task_key,
+                "reason": assignment.reason,
+                "action": list(assignment.action),
+                "target": list(task.tile) if task is not None and task.tile is not None else None,
+            })
+
+        included_count = len(orders)
+        skipped = [
+            {
+                "reason": "market_order_cap",
+                "order": self._market_snapshot_order(kind, payload),
+            }
+            for kind, payload in candidates[included_count:]
+        ]
+        record = self._day_records[day]
+        survival_record = record["survival"]
+        eod_work_debt = record.get("end_of_day_work_debt") if hour == 23 else None
+
+        snapshot = {
+            "schema_version": 1,
+            "day": day,
+            "hour": hour,
+            "actions": {
+                "farmer": list(foreman_result.farmer_action),
+                "hands": [list(action) for action in foreman_result.hands_actions],
+            },
+            "manager": {
+                "requested": self._requested.to_json_dict() if self._requested is not None else None,
+                "feasible": self._feasible.to_json_dict() if self._feasible is not None else None,
+                "projection_changes": self._projection_diagnostics,
+            },
+            "tasks": [task.to_json_dict() for task in generated_tasks],
+            "unresolved_tasks": list(generation.unresolved),
+            "assignments": assignments,
+            "unassigned": {
+                "task_keys": [task.key for task in foreman_result.unassigned_tile_tasks],
+                "reasons": dict(sorted(foreman_result.unassigned_reasons.items())),
+            },
+            "market": {
+                "submitted": [list(order) for order in orders],
+                "unaffordable": [
+                    {
+                        "task": item.get("task"),
+                        "cost": item.get("cost"),
+                        "cash_available": item.get("cash_available"),
+                        "survival": item.get("survival"),
+                    }
+                    for item in unaffordable_orders
+                ],
+                "skipped": skipped,
+            },
+            "survival": {
+                "unfed_count": feed["unfed"],
+                "starvation_boundary_count": feed["starving"],
+                "shed_wheat": feed["shed_wheat"],
+                "carried_wheat": feed["carried_wheat"],
+                "protected_reserve": feed["shed_reserve"],
+                "feed_reserve_protected_units": survival_record["feed_reserve_protected_units"],
+                "shortage": feed["shortage"],
+                "expansion_suppressed": bool(expansion_suppressed),
+                "eod_work_debt": eod_work_debt,
+            },
+        }
+        return _snapshot_copy(snapshot)
+
+    @staticmethod
     def _trace_task(task: Task, farm: Mapping) -> dict[str, Any]:
         """Return only causal, JSON-safe fields for one survival task."""
         entry: dict[str, Any] = {
@@ -626,7 +733,8 @@ class ExecutorAgent:
             self._refresh_sell_ledger(obs, bin_anchor)
 
         generation = generate_tasks(obs, seat, feasible_plan=self._feasible, remaining_sells=self._remaining_sells)
-        tasks = generation.sorted_tasks()
+        generated_tasks = generation.sorted_tasks()
+        tasks = generated_tasks
         feed = _animal_feed_state(obs, seat)
         current_survival_pressure = bool(feed["starving"] or feed["shortage"])
         expansion_suppressed = self._suppress_expansion_today or current_survival_pressure
@@ -763,11 +871,35 @@ class ExecutorAgent:
                 # successful executor decision into a fallback action.
                 pass
 
+        try:
+            self._debug_trace_turn = self._build_debug_trace_turn(
+                day=day,
+                hour=hour,
+                tasks=tasks,
+                generated_tasks=generated_tasks,
+                generation=generation,
+                foreman_result=foreman_result,
+                feed=feed,
+                expansion_suppressed=expansion_suppressed,
+                orders=orders,
+                candidates=candidates,
+                unaffordable_orders=unaffordable_orders,
+            )
+        except Exception:
+            # Diagnostics must remain passive even if an unexpected optional
+            # value cannot be rendered; the already-decided action is stable.
+            self._debug_trace_turn = None
+
         return {
             "farmer": list(foreman_result.farmer_action),
             "hands": [list(a) for a in foreman_result.hands_actions],
             "market": orders[:self.config.max_market_orders],
         }
+
+    @property
+    def debug_trace_turn(self) -> dict[str, Any] | None:
+        """Return a defensive copy of the latest primitive-turn snapshot."""
+        return copy.deepcopy(self._debug_trace_turn)
 
     def diagnostics_json(self) -> dict[str, Any]:
         diagnostics = {
