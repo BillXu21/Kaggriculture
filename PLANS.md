@@ -1,390 +1,244 @@
 # Kaggriculture Plans
 
-Last updated: 2026-08-24
+Last updated: 2026-08-25
 
 ## Strategic Objective
 
-Build a competitive Kaggriculture agent in which **reinforcement learning owns meaningful farm and market decisions**, while deterministic infrastructure handles exact mechanics that are poor uses of learning capacity: legality, pathfinding, task execution, state bookkeeping, and prevention of meaningless invalid-action cascades.
+Build a competitive Kaggriculture agent where **reinforcement learning owns meaningful farm and market strategy** and deterministic code owns exact mechanics that are poor uses of model capacity: legality, pathfinding, worker execution, prerequisites, bookkeeping, and prevention of mechanically avoidable asset loss.
 
-The immediate phase is now **closed-loop BC/executor validation plus implementation of reusable RL infrastructure**. The host has stated that 1.32.7 should be the last balance change except game-breaking bugs, so the project can prepare to freeze the engine contract while still checking for bug-fix releases.
+The project has enough infrastructure to stop broad executor invention. The immediate goal is to freeze a credible two-layer stack, inspect it visually, and then return to learning.
 
-Detailed RL design lives in [`research/RL_DESIGN.md`](research/RL_DESIGN.md).
+Current intended stack:
 
-A temporary high local coding-agent-usage window is being used for large, mechanically testable infrastructure packets that are likely to be needed regardless of later strategy choices. The bounded sprint plan is in [`research/CODING_AGENT_SPRINT.md`](research/CODING_AGENT_SPRINT.md). This does **not** supersede the staged learning gates: infrastructure may be prepared early, but PPO/self-play complexity is not activated before the simpler stationary problems work.
+`standard_mixed d0-d3 -> learned daily manager -> deterministic executor`
 
-Current active packet (issue #9 Stage B2, 2026-08-24): the RL rollout/self-play/trajectory harness `rl_manager` AND the PPO V0 plumbing are implemented and locally validated — Stage A batched own-only-E JAX policy seam, lockstep N-env runner with identity-grouped day batches over `oracle.backend`, exact d4h0 opening handoff and stateless E economic history, strict-schema trajectory NPZ + JSON sidecar; Stage B1 PPO core (mutable E trunk + value head, frozen-E sell quantities, GAE, masked-AdamW update, strict RL checkpoint); Stage B2 integration (`PPOBatchedPolicy` Stage-A adapter with exact deterministic-init parity to frozen E, checkpoint-resume reconstruction, post-GAE tiny-subset selection, compact JSON-safe diagnostics artifact, guarded train/eval CLIs with fixed smoke/dev/holdout seed sets and both-seat planning). Evidence: 130 passed + 4 skipped across the rl_manager suite + focused issue-#8 JAX parity/train (~187 s); tiny live smoke = ONE complete fast game -> full-trajectory GAE -> exact stored-action logprob recompute -> ONE 4-row-minibatch update -> checkpoint roundtrip with bit-identical resume. Plumbing only, no quality claim (tiny random-init E); serious training stays blocked on issue #7 executor selection and the absent real BC-E checkpoint. Details: `research/RL_SELFPLAY_V0.md`. The issue-#8 gates stand: real-checkpoint parity once `artifacts/local/bc-v1-E/best.pt` is copied from Kaggle, then the (unmeasured) 8-device TPU benchmark per `research/JAX_TPU_V5_RUN.md` when hardware exists.
+A learned tactical/middle controller remains a plausible future architecture, but it is deferred until the two-layer stack has been tested in closed-loop self-play. Raw primitive-action RL is also deferred.
 
-## Phase 0 — Freeze 1.32.7, Rules, RNG, and Provenance
+## Current Phase — Finish and Freeze Executor V0.7
 
-### Current engine events
+Issue #7 is now a **bounded finish/validation packet**, not an open-ended optimization project.
 
-**1.32.6 / PR #1394**
+Real BC-E checkpoint:
 
-- town-center demand became flat 1× once/day;
-- shops are sampled with replacement;
-- duplicate shop instances consume independently;
-- maximum shop instances = 8.
+`C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\artifacts\local\bc-v1-E\best.pt`
 
-**1.32.7 / PR #1399**
+This file is local/ignored and must never be committed.
 
-- adds a nonlinear `hinge` scarcity curve;
-- carrot, tomato, and egg use `hinge` on the scarcity side;
-- carrot scarcity target also rises from 0.20 to 1.00;
-- the intent is to make carrots, tomatoes, and goose/egg production conditionally valuable under favorable randomized shop demand.
+### Required V0.7 decisions
 
-### Goals
+1. **R4 watering reservation**
+   - Review the narrow rule that reserves an exact weed-boundary WATER task for a worker already standing on that tile.
+   - Decide exactly one: promote unchanged, make one narrow correctness repair, or reject.
+   - Do not continue into R5/R6/R7 heuristic search.
 
-- lock exact 1.32.7 source/package/spec hashes;
-- distinguish source-confirmed behavior from live-server rollout assumptions;
-- identify all stochastic mechanics and reveal times;
-- verify 1.32.7 price curves with behavioral tests;
-- archive important public notebooks/submissions with provenance;
-- avoid training against stale pre-1.32.7 economics.
+2. **Real BC-E multi-day validation**
+   - Use the fixed-plan 3/5/7-day harness with DailyPlan tapes recorded from the real BC-E manager where practical.
+   - Keep earlier expert-intent results, but label them separately; they are executor evidence, not BC-E evidence.
 
-### Deliverables
+3. **Seed-17 diagnosis**
+   - Reproduce both seats with the actual `standard_mixed -> BC-E -> executor` stack.
+   - Determine whether the remaining animal losses are mechanical (resource exists but scheduling/delivery fails) or strategic (BC-E creates an unsustainable farm/cash state).
+   - Only the mechanical case should normally produce an executor patch.
 
-- versioned engine manifest;
-- mechanics ledger;
-- exact market curve table and regression tests;
-- randomness/reveal-time map;
-- public-baseline catalog with engine compatibility notes;
-- competition/rules snapshot.
+4. **Prior-debt veto ablation**
+   - Compare the current broad previous-day EOD-debt expansion veto against **no previous-day debt veto**, retaining only current hard survival protection.
+   - Use the real BC-E checkpoint on a small deterministic panel.
+   - Do not replace it with another arbitrary debt/cash threshold.
+   - If removing the veto exposes a bad BC-E strategy, that is useful training signal rather than automatic justification for a hidden executor governor.
 
-### Exit Criteria
+5. **Freeze V0.7**
+   - Focused tests and deterministic parity must pass.
+   - No opening divergence/fallback errors.
+   - No mechanically avoidable animal escape when feed is physically/financially available.
+   - Minimum-safe watering for maintained crops.
+   - No hidden economic strategy or manager-target rewriting.
 
-- fresh local environment reproduces the 1.32.7 source contract;
-- exact source/spec hashes are recorded;
-- hinge regression values pass;
-- all strategically relevant RNG is identified;
-- unresolved mechanics are explicit.
+### Multi-day executor promotion ladder
 
-## Phase 1 — Evaluation, Public Baselines, and Trace Collection
+Executor changes now use:
 
-### Goals
+1. exact mechanics/unit tests;
+2. one-day fixtures for rapid diagnosis;
+3. 3-day fixed-plan A/B;
+4. 5-day fixed-plan A/B;
+5. 7-day fixed-plan A/B for promotion candidates;
+6. bounded real BC-E full-game panel;
+7. broad panels only when the candidate is already clearly strong.
 
-- reproduce/archive several strong public deterministic agents;
-- build deterministic local tournament harness;
-- evaluate fixed seeds in both seats;
-- save replays and machine-readable metrics;
-- establish a frozen opponent pool;
-- collect full trajectories for BC/action-abstraction analysis;
-- quantify the new 1.32.7 scarcity regimes before model training.
+One-day results remain useful but are no longer sufficient for promotion.
 
-### Required Metrics
+## Next Phase — Integrate the Debug Viewer
 
-- W/L/T and paired win rate;
-- final bank and margin;
-- seat-specific results;
-- runtime/timeout status;
-- invalid/ineffective actions;
-- shed overflow, crop loss, animal escape, stranded value;
-- production and sales by product;
-- market price/inventory trajectories;
-- shop composition by day;
-- scarcity-knee crossings and max price for carrot/tomato/egg;
-- exact seed, agent hashes, and engine identity.
+Issue #11 branch `issue-11-replay-debug-viewer` at validated tip `0f72bcd28ef20703718a8a16503b6776c4d4b046` is **READY TO MERGE LATER**.
 
-### Initial 1.32.7 Studies
+Its instrumentation was independently validated as behaviorally passive: base-vs-branch primitive actions and trace-enabled-vs-disabled behavior matched under deterministic official-engine checks.
 
-1. **Scarcity distribution** — reproduce host-reported no-production opportunity frequencies (~50% tomato, 26% carrot, 22% egg).
-2. **Crossing timing** — when does each product first cross its hinge knee?
-3. **Pivot frontier** — how late can a crop/animal pivot still pay back?
-4. **Opponent suppression** — how much does reactive production eliminate the opportunity?
-5. **Public baseline staleness** — which strong routes fail to exploit or actively mishandle 1.32.7 regimes?
-6. **Shop-regime variance** — how much outcome variance is explained by shop multiset/hinge events?
+After V0.7 behavior is frozen:
 
-### Exit Criteria
+1. integrate issue #11 carefully around the new executor `_act` logic;
+2. preserve passive post-decision snapshot semantics;
+3. rerun trace-on/off exact action parity using real BC-E;
+4. generate a tiny local trace set;
+5. do not commit giant trace JSON artifacts.
 
-- deterministic replay works;
-- paired evaluation works;
-- strong current-engine traces exist;
-- 1.32.7 opportunity frequencies/timing are measured;
-- we know whether adaptive pivoting is large enough to justify explicit model capacity.
+### Initial visual inspection set
 
-## Phase 2 — RL Environment and Action Space
+Start with only a few real BC-E trajectories:
 
-### Core design
+- seed 17 seat 0;
+- seed 17 seat 1;
+- seed 42 seat 0;
+- one healthy/high-bank trajectory from the bounded panel.
 
-Use **hierarchical intent-level RL**, not raw primitive navigation.
+Inspect for obvious mechanical failure only:
 
-### Worker task families
+- feed available but not delivered;
+- workers crossing or stealing exact-deadline work unnecessarily;
+- repeated pickup/drop churn;
+- must-water tasks serviced too late despite local capacity;
+- dependency/build/place mistakes;
+- clearly wasteful routing/assignment;
+- inconsistent inventory/task state.
 
-- plant;
-- water;
-- harvest;
-- fertilize;
-- dig;
-- build coop/pasture;
-- place/feed/care animals;
-- collect fertilizer;
-- pickup/drop;
-- purposeful movement;
-- continue/wait.
+Limit this stage to **one or two small correction passes**. Do not use the viewer as an excuse to hand-code elite strategy.
 
-Use generated mechanically feasible candidates and pointer/entity scoring.
+## Manager Contract Audit Before Serious PPO
 
-### Market head
+Before serious self-play training, audit whether the current action/projection contract can express the strategic behaviors RL is expected to learn.
 
-Dedicated autoregressive market actions:
+Highest-priority question: **can desired crop and animal inventories decrease?**
 
-- type;
-- product;
-- quantity;
-- stop token;
-- preserve order sequencing.
+Elite replay inspection showed strategically meaningful contraction/abandonment (for example, allowing a crashed-price crop to die rather than continuing to spend labor maintaining it). If current projection semantics clamp requested crop/animal targets upward to current inventory, the learned manager cannot express contraction at all.
 
-Compare exact quantity, buckets, parameterized integer distributions, and generated quantity candidates. Mechanically useful curve landmarks such as scarcity knees may be included as candidate quantities, but the generator must not decide whether exploiting them is good.
+Required distinction:
 
-### Mechanical masks
+- manager chooses whether an asset is strategically worth maintaining/replacing;
+- executor decides how to execute that intent mechanically.
 
-Mask impossible actions. Do **not** mask merely bad-looking strategy or encode static product priorities.
+Do not implement product-price abandonment heuristics inside the executor.
 
-### Decision frequency
+The audit should check every manager output for the same class of problem: whether it represents a true desired strategic state or an irreversible/additive instruction that prevents RL from exploring useful behavior.
 
-Compare:
+## First Self-Play / RL Sequence
 
-1. turn-level persistent tasks;
-2. event-driven semi-MDP;
-3. hybrid global/day-level + event-driven worker + frequent market decisions.
+Once V0.7 and the manager contract are credible:
 
-Current favorite: hybrid.
+### 1. Closed-loop BC-E baseline
 
-1.32.7 economic events such as shop unlocks and hinge crossings are natural replanning triggers.
+Run the frozen real BC-E manager through the frozen executor in the same rollout infrastructure intended for RL.
 
-### Exit Criteria
+Measure complete-game distributions, not teacher-forced imitation quality:
 
-- exact action grammar documented;
-- task conflicts/resolution documented;
-- masks tested;
-- no strategic policy hidden in candidate generation;
-- acceptable throughput.
+- W/L/T and bank/margin;
+- catastrophic collapse rate;
+- animal/crop losses;
+- farm size and labor trajectory;
+- cash/liquidity trajectory;
+- manager target changes;
+- executor survival/maintenance failures;
+- opponent/market regime where relevant.
 
-## Phase 3 — Observation and Model Design
+### 2. PPO plumbing smoke with the real checkpoint
 
-### Required observation groups
+Use the existing `rl_manager` PPO path:
 
-- time/turns remaining;
-- money, land, labor;
-- own private inventory/seeds/carried items;
-- both farm maps/entities;
-- worker entities;
-- crop/animal lifecycle features;
-- shop **count vector/multiset**;
-- market price/inventory/history;
-- product curve parameters (`base`, `I0`, `T`, shape/targets);
-- normalized scarcity and distance to each knee;
-- local/marginal price sensitivity where useful;
-- opponent visible production pipeline;
-- optional recent history/recurrent state.
+- initialize from the promoted BC-E policy;
+- run a tiny complete rollout;
+- GAE/logprob recomputation/update/checkpoint roundtrip;
+- verify no divergence or frozen-snapshot corruption.
 
-### Model hypothesis
+This is still a plumbing gate, not a policy-quality claim.
 
-Start entity-oriented:
+### 3. Small development run
 
-- farm/tile/entity encoders;
-- product/market entities;
-- shared transformer trunk;
-- optional recurrent memory;
-- worker-task pointer head;
-- market autoregressive head;
-- optional global strategy head;
-- value head.
+Only after the smoke is clean:
 
-### Exit Criteria
+- candidate vs frozen BC-E;
+- small fixed seed set, both seats;
+- terminal objective remains primary;
+- inspect full trajectories and strategy changes;
+- do not immediately add dense shaping when the first run is imperfect.
 
-- schema versioned;
-- normalization documented;
-- actor-visible vs training-only information separated;
-- inference cost/model-size estimate recorded.
+### 4. Diagnose before redesign
 
-## Phase 4 — Reward Design
+If learning fails, determine why:
 
-### Competitive objective
+- manager action space cannot express the needed adaptation;
+- observation lacks relevant strategic state;
+- terminal-only credit assignment is too weak;
+- executor still contains a mechanical bottleneck;
+- daily decision frequency is too coarse;
+- a tactical middle layer is genuinely needed.
 
-Leading terminal reward:
+Only then consider reward shaping, richer action frequency, or a learned tactical policy.
 
-- win `+1`;
-- tie `0`;
-- loss `-1`.
+## Executor / Manager Boundary
 
-### Dense credit assignment
+### Deterministic executor owns
 
-Investigate potential-based shaping rather than arbitrary maintenance bonuses.
+- exact action legality and mechanics;
+- worker routing/assignment/loading;
+- exact prerequisite chains;
+- exact cash/order sequencing;
+- minimum-safe watering for crops the strategy maintains;
+- feeding existing animals and preventing mechanically avoidable escape;
+- mechanically implied seed/feed/fertilizer/animal purchases;
+- passive diagnostics and reproducible execution.
 
-Candidate potential inputs:
+### Learned manager/RL owns
 
-- bank;
-- realistic liquidation value;
-- time-realizable crop/animal output;
-- asset productive lifetime;
-- failure/overflow risk;
-- opponent-equivalent value;
-- learned/model-based continuation value.
+- crop and animal composition;
+- expansion/contraction;
+- land and labor capacity at the strategic level;
+- deciding whether an asset should continue to be maintained;
+- liquidity, cash reserve, recovery, and deleveraging;
+- market/product strategy;
+- opponent- and shop-dependent adaptation.
 
-### 1.32.7 guardrail
+The default debugging question is:
 
-Do **not** use naive `inventory × current spot price` as potential value. Hinge prices can spike, but selling meaningful quantity changes the price and a production pivot may arrive too late. Shaping must account for price impact and remaining time or it may reward fake mark-to-market wealth.
+> Did the executor fail to execute a feasible strategy, or did the manager choose an unsustainable strategy?
 
-### Auxiliary objectives
-
-- future bank;
-- future market price/inventory;
-- time/probability to hinge crossing;
-- near-term production;
-- opponent sales/hidden inventory;
-- pivot profitability;
-- win probability.
-
-### Exit Criteria
-
-- exact reward equation;
-- terminal/shaping invariants tested;
-- no maintenance-loop or hinge-mark-to-market exploit;
-- reward magnitude/variance measured.
-
-## Phase 5 — Behavior Cloning Bootstrap
-
-### Plan
-
-1. collect fresh demonstrations under 1.32.7;
-2. store observations, primitive actions, intent labels, and engine metadata;
-3. clone precision-sensitive logistics strongly;
-4. consider weaker/segmented imitation weights for high-level product/economic choices so stale public strategy does not dominate;
-5. test state-conditioned generalization across unseen shops/scarcity regimes;
-6. fine-tune with RL so the policy can depart from scripts.
-
-### Exit Criteria
-
-- cloned policy runs viable farms;
-- mechanical/logistics performance is useful;
-- model does not simply memorize turn-indexed product choices;
-- unseen 1.32.7 regimes do not catastrophically break it.
-
-## Phase 6 — PPO Robustness and Competitive Training
-
-PPO remains the first algorithm candidate, conditional on throughput.
-
-### Stage A — regime adaptation
-
-Train against frozen public agents across varied 1.32.7 seeds, including ordinary and hinge-scarcity regimes.
-
-Rare regimes may be oversampled early for learning, followed by training/evaluation on the natural distribution.
-
-### Stage B — frozen competitive pool
-
-Track performance by:
-
-- opponent family;
-- shop regime;
-- hinge opportunity type;
-- seat;
-- catastrophic failure rate.
-
-### Stage C — population/self-play
-
-Mix champion, historical checkpoints, public baselines, and strategy-diverse policies.
-
-### Stage D — targeted exploiters
-
-Potential exploiters:
-
-- aggressive scarcity-chaser;
-- scarcity-suppressor/flooder;
-- product-collision agent;
-- unusual timing/liquidation policy.
-
-Goal: teach game-theoretic adaptation rather than blind spike chasing.
-
-## Phase 7 — Opponent Modeling and Memory
-
-Goals:
-
-- infer hidden opponent inventory and likely sales;
-- forecast visible production supply;
-- predict whether the opponent will suppress a scarcity opportunity;
-- detect strategy families;
-- adapt before market collisions.
-
-Compare explicit history features, recurrent actor state, auxiliary hidden-inventory prediction, and dedicated opponent encoders.
-
-## Phase 8 — Optional Search / Planning Hybrids
-
-Later, combine learned policy/value with short-horizon exact simulation for:
-
-- market order sequencing;
-- production pivots after unusual shop draws;
-- scarcity exploitation/suppression;
-- daily resource allocation;
-- terminal liquidation.
-
-Do not start here before a functioning RL baseline.
-
-## Phase 9 — Submission Hardening
-
-- exact Kaggle runtime smoke;
-- no-network verification;
-- deterministic packaging;
-- dependency minimization;
-- timeout/memory tests;
-- safe fallback behavior;
-- provenance/hash recording;
-- submission/leaderboard tracking.
-
-## Immediate Planning Agenda
-
-0. **Run the BC V1 ablation on Kaggle (issue #6 next gate).** Implementation
-   is complete and locally validated (commits `2f48564`..`fc95752`; see
-   `research/BC_V1_ABLATION_RUN.md`). Execute the exact runbook: train
-   V0/J/E/JE in one identical matrix over the five-day corpus, strict
-   `--validate-only` preflight, then the 40-game paired closed-loop panel
-   (seeds 7/17/42/123/2026 × both seats, bank median-then-mean ranking).
-   Record real results in `HISTORY.md`/`CURRENT_STATE.md` before any
-   follow-up; teacher-forced/coherence metrics alone never promote a
-   variant (D-026); no winner exists yet.
-1. ~~finish the real engine-executed BC-manager + executor smoke and require non-empty per-day diagnostics/compliance~~ Done for the repo-local checkpoint plumbing path; continue to inspect compliance before score claims;
-2. implement the common official-engine evaluation/match runner from `research/CODING_AGENT_SPRINT.md`;
-3. implement the scalar exact fast engine and differential oracle against pinned 1.32.7 (differential oracle live; Stage-2b mechanic-cluster parity slices 1-4 done at zero divergence; full-episode legal-ish corpus DONE 2026-08-23: 8 complete 720-step seeds, zero divergence, D-022; independent stateful closed-loop A/B DONE for three fixed-plan seeds plus one repo-local checkpoint episode; throughput/benchmarks DONE 2026-08-23, D-025);
-4. implement population/league infrastructure with deterministic paired scheduling and explicit promotion gates;
-5. implement algorithm-neutral rollout storage, returns/GAE, and deterministic minibatching;
-6. prove self-play orchestration with fake/frozen policies before attaching a learner;
-7. only then add the PPO-specific value/log-prob/loss interface after the executor compliance gate;
-8. freeze 1.32.7 source/spec/hash and keep upstream bug-fix watch;
-9. map remaining RNG/reveal timing and maintain engine differential tests;
-10. benchmark official and fast simulator throughput — DONE 2026-08-23 (`docs/benchmarks/ISSUE2_THROUGHPUT.md`, D-025): scalar dict API 4.7x vs official, native floor 341x, default-pool scaling ~2.9x at N>=512; observation-writer cost (84% of large-batch step time) is the single deferred optimization candidate for a distinct correction stage;
-11. build frozen competent-opponent panels and strategy-family cross-play;
-12. recheck upstream immediately before substantive training.
+Only the first normally justifies an executor change.
 
 ## Deferred Until Evidence Supports Them
 
-- raw primitive-movement PPO from scratch;
-- pure SAC over the full action space;
-- MCTS over all 720 primitive turns;
+- learned tactical/middle model;
+- raw primitive movement RL;
+- corner/serpentine/Top-1 layout imitation sweeps;
+- strategic crop-abandonment heuristics in deterministic code;
+- broad executor hyperparameter searches;
 - neural pathfinding;
-- hard-coded fixed product ranking;
-- large architecture sweeps before interface/reward contracts are stable;
-- expensive training before engine lock and throughput measurements;
-- sophisticated PFSP/league matchmaking before fixed-mixture self-play works;
-- distributed rollout infrastructure before local throughput is profiled;
-- approximate/vectorized custom simulation before scalar differential parity.
+- arbitrary maintenance reward bonuses;
+- naive spot mark-to-market reward shaping;
+- large architecture sweeps before the manager contract is audited;
+- sophisticated league/PFSP machinery before fixed-mixture self-play works;
+- large 64+64 executor panels for minor changes.
 
-## Rejected or Unsupported Assumptions
+## Infrastructure Already Available
 
-- high single-player bank automatically means competitive strength;
-- public leaderboard strategy remains optimal after 1.32.7;
-- carrots/tomatoes/eggs are globally good because they can spike;
-- carrots/tomatoes/eggs are globally bad because old public routes ignored them;
-- discussion prose overrides engine source;
-- RL must control every movement primitive to be real RL;
-- naive mark-to-market value is safe under nonlinear price impact;
-- host no-production scarcity percentages describe strategic self-play frequencies.
+The following are no longer blockers:
+
+- pinned official 1.32.7 differential oracle and full-episode parity evidence;
+- high-throughput fast engine;
+- promoted BC-E checkpoint and JAX E port;
+- `standard_mixed` opening;
+- executor V0.6 survival diagnostics;
+- 3/5/7-day fixed-plan executor harness on the active V0.7 branch;
+- Stage-A self-play rollout/trajectory infrastructure;
+- PPO core/adapter/checkpoint/diagnostic plumbing;
+- validated custom debug replay viewer on issue #11.
+
+The current bottleneck is therefore **policy/executor boundary quality**, not missing infrastructure.
 
 ## Session Workflow
 
 At the end of substantial work:
 
-1. update `CURRENT_STATE.md`;
-2. append to `HISTORY.md`;
-3. revise this roadmap if priorities changed;
-4. add durable choices to `DECISIONS.md`;
-5. update `MECHANICS.md` for source/behavior changes;
-6. update `research/RL_DESIGN.md` when the RL interface/reward hypothesis changes.
+1. keep `CURRENT_STATE.md` compact and authoritative;
+2. add completed milestones/failures to `HISTORY.md`;
+3. revise this roadmap when priorities move;
+4. add durable architecture/evaluation choices to `DECISIONS.md`;
+5. update `MECHANICS.md` only when source/behavioral mechanics change;
+6. update RL design notes when the manager/action/reward contract changes;
+7. record exact commands/provenance before expensive runs.
