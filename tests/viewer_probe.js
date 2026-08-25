@@ -111,5 +111,8 @@ if (!source) {
   if (!model.cells[12].detail.includes("must water before refresh")) throw new Error("crop detail rule missing");
   if (model.workers.length !== 2 || model.workers[1].inventory.FERTILIZER !== 2) throw new Error("worker private inventory missing");
   if (!model.executor || !model.executor.manager || model.executor.assignments.length !== 2) throw new Error("executor sidecar missing");
+  if (typeof core.number !== "function" || typeof core.json !== "function") throw new Error("number/json helpers not exported");
+  if (typeof core.number(1234.5) !== "string" || core.number(1234.5).length === 0) throw new Error("number helper failed to format");
+  if (core.json({a: 1}) !== '{"a":1}') throw new Error("json helper stringification missing");
 }
 console.log(JSON.stringify({turns: trace.turns.length, cells: model.cells.length, workers: model.workers.length, crop: model.cells[12].label, animal: model.cells[78].label, sidecar: Boolean(model.executor), trails: core.extractTrails(trace, Math.min(2, trace.turns.length - 1), 0, 12).length}));
