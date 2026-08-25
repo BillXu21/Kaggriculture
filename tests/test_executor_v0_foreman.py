@@ -53,11 +53,11 @@ def make_obs(farmer=(0, 0), hands=(), inventories=None, shed=None, seeds=None,
 
 def task(key, kind, tile=None, *, priority=Priority.MANAGER, item=None,
          quantity=1, crop=None, animal=None, product=None, deadline=None,
-         depends_on=(), source=""):
+         depends_on=()):
     return Task(key=key, kind=kind, tile=tile, priority=priority,
                 required_item=item, quantity=quantity, crop=crop,
                 animal=animal, product=product, deadline_hour=deadline,
-                depends_on=tuple(depends_on), source=source)
+                depends_on=tuple(depends_on))
 
 
 def assignment_for(result, worker_index):
@@ -113,117 +113,6 @@ def test_missing_required_item_prevents_underfoot_execution():
     assert result.farmer_action == ("PASS",)
     assert result.counts["pickup"] == 0
     assert [t.key for t in result.unassigned_tile_tasks] == ["FEED:2,2"]
-
-
-def test_underfoot_survival_water_reserved_for_later_worker():
-    obs = make_obs(farmer=(0, 0), hands=[[4, 7]], inventories=[{}, {}])
-    water = task(
-        "WATER:7,4", "WATER", (7, 4), priority=Priority.MAINTENANCE,
-        source="water_must_weed_boundary")
-    manager = task("DIG:0,1", "DIG", (0, 1), priority=Priority.MANAGER)
-
-    result = run_foreman(obs, 0, tasks=[water, manager])
-
-    assert result.farmer_action == ("EAST",)
-    assert assignment_for(result, 0).task_key == "DIG:0,1"
-    assert result.hands_actions[0] == ("WATER",)
-    assert assignment_for(result, 1).task_key == "WATER:7,4"
-
-
-def test_multiple_underfoot_workers_reserve_to_earliest_worker():
-    obs = make_obs(farmer=(4, 7), hands=[[4, 7]], inventories=[{}, {}])
-    water = task(
-        "WATER:7,4", "WATER", (7, 4), priority=Priority.MAINTENANCE,
-        source="water_must_weed_boundary")
-
-    result = run_foreman(obs, 0, tasks=[water])
-
-    assert result.farmer_action == ("WATER",)
-    assert result.hands_actions[0] == ("PASS",)
-    assert assignment_for(result, 0).task_key == "WATER:7,4"
-    assert assignment_for(result, 1).task_key is None
-
-
-def test_survival_water_without_underfoot_worker_keeps_legacy_greedy_path():
-    obs = make_obs(farmer=(0, 0))
-    water = task(
-        "WATER:4,4", "WATER", (4, 4), priority=Priority.MAINTENANCE,
-        source="water_must_weed_boundary")
-
-    result = run_foreman(obs, 0, tasks=[water])
-
-    assert result.farmer_action == ("SOUTH",)
-    assert assignment_for(result, 0).task_key == "WATER:4,4"
-    assert assignment_for(result, 0).reason == "move_to_task:(1, 0)"
-
-
-def test_yield_useful_water_is_not_reserved_for_underfoot_worker():
-    obs = make_obs(farmer=(0, 0), hands=[[4, 4]], inventories=[{}, {}])
-    water = task(
-        "WATER:4,4", "WATER", (4, 4), priority=Priority.PRODUCTIVE,
-        source="water_yield_window")
-
-    result = run_foreman(obs, 0, tasks=[water])
-
-    assert result.farmer_action == ("SOUTH",)
-    assert result.hands_actions[0] == ("PASS",)
-    assert assignment_for(result, 0).task_key == "WATER:4,4"
-    assert assignment_for(result, 1).task_key is None
-
-
-def test_water_reservation_does_not_idle_earlier_worker():
-    obs = make_obs(farmer=(0, 0), hands=[[4, 4]], inventories=[{}, {}])
-    water = task(
-        "WATER:4,4", "WATER", (4, 4), priority=Priority.MAINTENANCE,
-        source="water_must_weed_boundary")
-    manager = task("DIG:0,0", "DIG", (0, 0), priority=Priority.MANAGER)
-
-    result = run_foreman(obs, 0, tasks=[water, manager])
-
-    assert result.farmer_action == ("DIG",)
-    assert assignment_for(result, 0).task_key == "DIG:0,0"
-    assert result.hands_actions[0] == ("WATER",)
-
-
-def test_water_reservation_fallback_releases_for_later_greedy_worker():
-    obs = make_obs(
-        farmer=(0, 0), hands=[[4, 4], [0, 9]],
-        inventories=[{}, {"WHEAT": 1}, {}])
-    water = task(
-        "WATER:4,4", "WATER", (4, 4), priority=Priority.MAINTENANCE,
-        source="water_must_weed_boundary")
-    feed = task("FEED:4,4", "FEED", (4, 4),
-                 priority=Priority.MAINTENANCE, item="WHEAT",
-                 source="mechanical")
-
-    result = run_foreman(obs, 0, tasks=[water, feed])
-
-    assert assignment_for(result, 0).task_key is None
-    assert assignment_for(result, 1).task_key == "FEED:4,4"
-    assert assignment_for(result, 2).task_key == "WATER:4,4"
-    assert result.hands_actions[1] == ("NORTH",)
-
-
-def test_water_reservation_output_is_deterministic():
-    obs = make_obs(
-        farmer=(0, 0), hands=[[4, 4], [7, 7]],
-        inventories=[{}, {}, {}])
-    tasks = [
-        task("WATER:4,4", "WATER", (4, 4),
-             priority=Priority.MAINTENANCE,
-             source="water_must_weed_boundary"),
-        task("WATER:7,7", "WATER", (7, 7),
-             priority=Priority.MAINTENANCE,
-             source="water_must_weed_boundary"),
-        task("DIG:0,1", "DIG", (0, 1), priority=Priority.MANAGER),
-    ]
-
-    first = run_foreman(obs, 0, tasks=tasks)
-    second = run_foreman(copy.deepcopy(obs), 0, tasks=copy.deepcopy(tasks))
-
-    assert first.to_json_dict() == second.to_json_dict()
-    assert [a.task_key for a in first.assignments] == [
-        "DIG:0,1", "WATER:4,4", "WATER:7,7"]
 
 
 # ------------------------------------------------- priority / claims / ties

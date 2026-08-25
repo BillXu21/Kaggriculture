@@ -298,25 +298,6 @@ def run_foreman(
         if task_.kind == "PLANT" and task_.crop:
             seed_budget[task_.crop] = seed_budget.get(task_.crop, 0) + 1
 
-    # Reserve survival water for the earliest worker already standing on its
-    # tile; otherwise an earlier distant worker can claim it before that
-    # worker's underfoot turn.
-    reserved_survival_water: dict[str, int] = {}
-    for task in tile_tasks:
-        if task.kind != "WATER" \
-                or task.source != "water_must_weed_boundary" \
-                or task.tile is None or task.required_item is not None \
-                or _interaction_op(task) is None:
-            continue
-        for worker in workers:
-            if worker.position != task.tile:
-                continue
-            if not _carried(worker, task.required_item) \
-                    or not seeds_available(task):
-                continue
-            reserved_survival_water[task.key] = worker.index
-            break
-
     claimed: set[str] = set()
     assignments: list[Assignment] = []
     counts = {"movement": 0, "interaction": 0, "pickup": 0, "pass": 0}
@@ -332,10 +313,6 @@ def run_foreman(
     for worker in workers:
         chosen: Task | None = None
         reason = ""
-        reserved_for_worker = {
-            key for key, worker_index in reserved_survival_water.items()
-            if worker_index == worker.index
-        }
 
         # 1. Underfoot: highest-priority actionable task at our tile.
         for task in tile_tasks:
@@ -352,26 +329,11 @@ def run_foreman(
             chosen, reason = task, "underfoot_execution"
             break
 
-        if reserved_for_worker:
-            if chosen is None or chosen.key not in reserved_for_worker:
-                for key in reserved_for_worker:
-                    reserved_survival_water.pop(key, None)
-            else:
-                # One worker gets one turn; release any additional same-tile
-                # reservations so another worker can claim them this turn.
-                for key in reserved_for_worker:
-                    if key != chosen.key:
-                        reserved_survival_water.pop(key, None)
-
         # 2. Greedy assignment minimizing priority-dominated score.
         if chosen is None:
             best_score = None
             for task in tile_tasks:
                 if task.key in claimed or task.tile is None:
-                    continue
-                reserved_worker = reserved_survival_water.get(task.key)
-                if reserved_worker is not None \
-                        and reserved_worker != worker.index:
                     continue
                 if not seeds_available(task):
                     unassigned_reasons.setdefault(task.key,
