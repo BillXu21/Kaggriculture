@@ -2,6 +2,8 @@
 
 import copy
 
+import pytest
+
 from executor_v0.agent import AgentConfig, ExecutorAgent
 from executor_v0.manager import FixedPlanProvider
 from executor_v0.plan import DailyPlan
@@ -161,6 +163,75 @@ def test_partial_affordable_feed_buy_is_submitted():
     assert action["market"] == [["BUY_PRODUCT", "WHEAT", 1]]
     assert agent.diagnostics_json()["days"]["3"]["survival"][
         "partial_feed_buys"] == 1
+
+
+def test_full_shed_suppresses_survival_feed_buy_without_changing_shortage_guardrail():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("GOOSE")
+    agent = agent_for(plan(
+        animal_targets={"GOOSE": 2, "COW": 0, "SHEEP": 0}, land_count=2))
+
+    action = agent(make_obs(tiles=tiles, shed={"CARROT": 100}, unlocked=("NW",)))
+
+    assert not any(order[:2] == ["BUY_PRODUCT", "WHEAT"]
+                   for order in action["market"])
+    survival = agent.diagnostics_json()["days"]["3"]["survival"]
+    assert survival["feed_shortage_turns"] == 1
+    assert survival["expansion_suppressed_current"] is True
+
+
+def test_survival_feed_buy_is_capped_to_partial_shed_room():
+    tiles = empty_tiles()
+    for row, column in ((4, 4), (4, 5), (4, 6), (5, 4), (5, 5)):
+        tiles[row][column] = pasture_tile("GOOSE")
+    agent = agent_for(plan(animal_targets={"GOOSE": 5, "COW": 0, "SHEEP": 0}))
+
+    action = agent(make_obs(tiles=tiles, shed={"CARROT": 98}))
+
+    assert [order for order in action["market"]
+            if order[:2] == ["BUY_PRODUCT", "WHEAT"]] == [
+                ["BUY_PRODUCT", "WHEAT", 2]]
+    assert agent.diagnostics_json()["days"]["3"]["survival"][
+        "partial_feed_buys"] == 1
+
+
+def test_carried_wheat_does_not_consume_shed_room_for_survival_buy():
+    tiles = empty_tiles()
+    for row, column in ((4, 4), (4, 5), (4, 6), (5, 4), (5, 5)):
+        tiles[row][column] = pasture_tile("GOOSE")
+    agent = agent_for(plan(animal_targets={"GOOSE": 5, "COW": 0, "SHEEP": 0}))
+
+    action = agent(make_obs(
+        tiles=tiles, shed={"CARROT": 98}, inventories=[{"WHEAT": 2}]))
+
+    assert [order for order in action["market"]
+            if order[:2] == ["BUY_PRODUCT", "WHEAT"]] == [
+                ["BUY_PRODUCT", "WHEAT", 2]]
+
+
+def test_missing_or_none_shed_preserves_full_affordable_survival_buy():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("GOOSE")
+    tiles[4][5] = pasture_tile("GOOSE")
+
+    for missing in (True, False):
+        agent = agent_for(plan(animal_targets={"GOOSE": 2, "COW": 0, "SHEEP": 0}))
+        obs = make_obs(tiles=tiles, shed={})
+        if missing:
+            del obs["private"]["shed"]
+        else:
+            obs["private"]["shed"] = None
+
+        action = agent(obs)
+
+        assert [order for order in action["market"]
+                if order[:2] == ["BUY_PRODUCT", "WHEAT"]] == [
+                    ["BUY_PRODUCT", "WHEAT", 2]]
+
+
+def test_zero_shed_capacity_is_rejected():
+    with pytest.raises(ValueError, match="config.shed_capacity must be a positive integer"):
+        agent_for(plan(), config=AgentConfig(shed_capacity=0))
 
 
 def test_temporary_waiting_that_finishes_on_hour23_is_not_work_debt():

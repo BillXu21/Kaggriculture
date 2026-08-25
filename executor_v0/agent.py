@@ -80,6 +80,7 @@ class AgentConfig:
     tasks_per_worker: int = 10
     hire_cost_mult: int = FARM_HAND_COST_MULT_DEFAULT
     max_market_orders: int = 10
+    shed_capacity: int = 100
     foreman: ForemanConfig = field(default_factory=ForemanConfig)
     strict: bool = False
     turn_trace: bool = False
@@ -176,6 +177,7 @@ class ExecutorAgent:
         self.config = config or AgentConfig()
         _require_positive_int(self.config.tasks_per_worker, "config.tasks_per_worker")
         _require_positive_int(self.config.max_market_orders, "config.max_market_orders")
+        _require_positive_int(self.config.shed_capacity, "config.shed_capacity")
         self._day: int | None = None
         self._requested: DailyPlan | None = None
         self._feasible: DailyPlan | None = None
@@ -419,7 +421,16 @@ class ExecutorAgent:
         return None
 
     def _affordable_survival_feed_buy(self, obs: Mapping, task: Task, unlocked_count: int, available_cash: float):
-        for quantity in range(int(task.quantity), 0, -1):
+        private = obs.get("private")
+        shed = private.get("shed") if isinstance(private, Mapping) else None
+        used = sum(
+            quantity for quantity in shed.values()
+            if isinstance(quantity, int)
+            and not isinstance(quantity, bool)
+            and quantity >= 0
+        ) if isinstance(shed, Mapping) else 0
+        room = max(0, self.config.shed_capacity - used)
+        for quantity in range(min(int(task.quantity), room), 0, -1):
             cost = self._buy_order_cost(obs, task, unlocked_count, quantity=quantity)
             if cost is not None and available_cash + _MONEY_EPSILON >= cost:
                 return self._buy_op(task, quantity=quantity), cost, quantity
