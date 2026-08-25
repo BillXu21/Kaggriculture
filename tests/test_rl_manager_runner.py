@@ -18,6 +18,7 @@ deterministic rerun-equality requirement, numThreads=1):
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -27,6 +28,7 @@ import pytest
 
 from bc_manager_jax.model import init_params, tiny_manager_config
 from rl_manager.decode import ACTION_TENSOR_SHAPES
+from rl_manager.debug_trace import canonical_json_bytes, validate_trace
 from rl_manager.executor_factory import EXECUTOR_FACTORY_VERSION
 from rl_manager.policy import JaxEPlanPolicy, params_fingerprint
 from rl_manager.provenance import sha256_hex
@@ -47,6 +49,7 @@ from rl_manager.types import (
     PolicyIdentity,
     PolicyOutputs,
 )
+from tests.test_rl_manager_debug_trace import _state as _canonical_trace_state
 
 MASTER_SEED = 17
 NUM_MANAGER_DAYS = 26  # d4..d29 per seat
@@ -438,3 +441,148 @@ def test_truncated_results_carry_distinct_explicit_seeds():
     assert len(set(seeds)) == len(seeds)  # explicit distinct seed stream
     stream = SeedStream(MASTER_SEED)
     assert seeds == [stream.episode_seed(i + 100) for i in (0, 1)]
+
+
+class _TraceBackend:
+    """Small backend seam using the real canonical fixture, not an env loop."""
+
+    name = "fake-trace"
+
+    def __init__(self, configuration):
+        self._step = 0
+        self._rewards = [0.0, 0.0]
+
+    def reset(self):
+        self._step = 0
+        return self._observations()
+
+    def step(self, actions):
+        del actions
+        self._step += 1
+        return self._observations(), list(self._rewards), self.statuses
+
+    def canonical_state(self):
+        state = _canonical_trace_state(
+            self._step, day=self._step // 24, hour=self._step % 24)
+        for farm in state["farms"]:
+            tile = farm["tiles"][0][0]
+            farm["tiles"] = [[None] * 10 for _ in range(10)]
+            farm["tiles"][0][0] = tile
+        return state
+
+    @property
+    def rewards(self):
+        return list(self._rewards)
+
+    @property
+    def statuses(self):
+        return ["ACTIVE", "ACTIVE"]
+
+    def _observations(self):
+        state = self.canonical_state()
+        return [
+            {
+                "day": state["day"],
+                "hour": state["hour"],
+                "step": state["step"],
+                "player": seat,
+                "farms": copy.deepcopy(state["farms"]),
+                "private": copy.deepcopy(state["privates"][seat]),
+                "market": copy.deepcopy(state["market"]),
+                "town": copy.deepcopy(state["town"]),
+            }
+            for seat in range(2)
+        ]
+
+
+class _TraceExecutor:
+    def __init__(self, seat):
+        self.seat = seat
+        self.debug_trace_turn = None
+
+    def __call__(self, obs):
+        day, hour = int(obs["day"]), int(obs["hour"])
+        if day >= 4:
+            self.debug_trace_turn = {
+                "schema_version": 1,
+                "day": day,
+                "hour": hour,
+                "seat": self.seat,
+            }
+        return {"farmer": ["PASS"], "hands": [], "market": []}
+
+
+class _TraceExecutorFactory:
+    name = "trace-test-executor"
+    version = "trace-test-v1"
+
+    def create(self, *, backend_name, seat, configuration, provider):
+        del backend_name, configuration, provider
+        return _TraceExecutor(seat)
+
+
+def _debug_trace_run(*, max_turns: int, enabled: bool, monkeypatch):
+    monkeypatch.setattr(
+        "rl_manager.runner.make_backend",
+        lambda name, configuration: _TraceBackend(configuration),
+    )
+    policy = _ConstantPlanPolicy("trace")
+    runner = SelfPlayRunner(
+        _runner_config(
+            max_turns=max_turns,
+            record_debug_trace=enabled,
+            debug_trace_seat=1,
+        ),
+        executor_factory=_TraceExecutorFactory(),
+        master_seed=MASTER_SEED,
+    )
+    spec = build_episode_spec(0, MASTER_SEED, E_VS_E, policy, policy)
+    return runner.run([spec])[0]
+
+
+def test_debug_trace_opt_in_records_reset_decisions_and_terminal_state(monkeypatch):
+    result = _debug_trace_run(max_turns=2, enabled=True, monkeypatch=monkeypatch)
+    trace = result.debug_trace
+    assert trace is not None
+    validate_trace(trace)
+    assert trace["metadata"]["seed"] == MASTER_SEED
+    assert trace["metadata"]["seat"] == 1
+    assert trace["metadata"]["view"] == "joint"
+    assert [turn["step"] for turn in trace["turns"]] == [0, 1, 2]
+    assert [turn["canonical_state"]["step"] for turn in trace["turns"]] == [0, 1, 2]
+    assert all("joint_actions" in turn for turn in trace["turns"][:2])
+    assert "joint_actions" not in trace["turns"][-1]
+    assert trace["turns"][0]["joint_actions"]["0"]["farmer"]
+
+
+def test_debug_trace_executor_sidecars_attach_to_same_turn_and_seat(monkeypatch):
+    result = _debug_trace_run(max_turns=97, enabled=True, monkeypatch=monkeypatch)
+    trace = result.debug_trace
+    assert trace is not None
+    handoff = next(turn for turn in trace["turns"]
+                   if turn["step"] == 96)
+    assert set(handoff["executor_debug"]) == {"0", "1"}
+    assert all(snapshot["day"] == 4 and snapshot["hour"] == 0
+               for snapshot in handoff["executor_debug"].values())
+    assert all("executor_debug" not in turn
+               for turn in trace["turns"] if turn["step"] < 96)
+
+
+def test_debug_trace_is_deterministic_and_behavior_matches_disabled_capture(monkeypatch):
+    first = _debug_trace_run(max_turns=2, enabled=True, monkeypatch=monkeypatch)
+    second = _debug_trace_run(max_turns=2, enabled=True, monkeypatch=monkeypatch)
+    disabled = _debug_trace_run(max_turns=2, enabled=False, monkeypatch=monkeypatch)
+    assert first.debug_trace is not None and second.debug_trace is not None
+    assert canonical_json_bytes(first.debug_trace) \
+        == canonical_json_bytes(second.debug_trace)
+    for field in ("final_banks", "margin", "winner_seat", "rewards",
+                  "statuses", "transitions", "terminated", "trace_digest"):
+        assert getattr(first, field) == getattr(disabled, field), field
+    assert disabled.debug_trace is None
+
+
+def test_debug_trace_invalid_selector_configuration():
+    with pytest.raises(ValueError, match="debug_trace_seat"):
+        SelfPlayRunner(_runner_config(debug_trace_seat=2))
+    with pytest.raises(ValueError, match="debug_trace_view"):
+        SelfPlayRunner(_runner_config(debug_trace_view=""))
