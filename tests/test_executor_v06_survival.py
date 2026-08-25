@@ -2,7 +2,7 @@
 
 import copy
 
-from executor_v0.agent import ExecutorAgent
+from executor_v0.agent import AgentConfig, ExecutorAgent
 from executor_v0.manager import FixedPlanProvider
 from executor_v0.plan import DailyPlan
 
@@ -90,8 +90,8 @@ def plan(*, crop_targets=None, animal_targets=None, land_count=1,
     )
 
 
-def agent_for(daily_plan):
-    return ExecutorAgent(FixedPlanProvider(daily_plan), seat=0)
+def agent_for(daily_plan, *, config=None):
+    return ExecutorAgent(FixedPlanProvider(daily_plan), seat=0, config=config)
 
 
 def test_wheat_sells_preserve_current_day_feed_reserve():
@@ -207,3 +207,87 @@ def test_movement_on_hour23_remains_real_work_debt_and_suppresses_next_day():
     assert diag["days"]["3"]["next_day_expansion_suppressed"] is True
     assert diag["days"]["4"]["survival"][
         "expansion_suppressed_from_prior_debt"] is True
+    assert diag["config"]["suppress_expansion_from_prior_debt"] is True
+
+
+def _prior_debt_plan():
+    return plan(
+        crop_targets={"WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+                      "STRAWBERRY": 0, "MELON": 0},
+        animal_targets={"GOOSE": 1, "COW": 0, "SHEEP": 0},
+        land_count=2,
+    )
+
+
+def _prior_debt_observations():
+    tiles = empty_tiles()
+    tiles[2][2] = plant_tile("WHEAT", yield_units=3)
+    return (
+        make_obs(day=3, hour=23, farmer=(0, 0), tiles=tiles),
+        make_obs(day=4, hour=0, farmer=(0, 0), tiles=empty_tiles()),
+    )
+
+
+def test_prior_debt_toggle_false_preserves_debt_and_allows_expansion():
+    agent = agent_for(
+        _prior_debt_plan(),
+        config=AgentConfig(
+            suppress_expansion_from_prior_debt=False, turn_trace=True),
+    )
+    day3, day4 = _prior_debt_observations()
+    agent(day3)
+    action = agent(day4)
+    diagnostics = agent.diagnostics_json()
+
+    assert diagnostics["config"]["suppress_expansion_from_prior_debt"] is False
+    assert diagnostics["days"]["3"]["end_of_day_work_debt"]["all"]
+    assert diagnostics["days"]["3"]["next_day_expansion_suppressed"] is False
+    assert diagnostics["days"]["4"]["survival"][
+        "expansion_suppressed_from_prior_debt"] is False
+    assert any(order[0] in ("BUY_ANIMAL", "BUY_LAND")
+               for order in action["market"])
+    expansion = diagnostics["days"]["4"]["turn_trace"][0]["expansion"]
+    assert expansion["suppressed_from_prior"] is False
+    assert "prior_day_work_debt" not in expansion["reasons"]
+
+
+def test_prior_debt_toggle_false_keeps_current_feed_suppression():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("GOOSE", consecutive_unfed=1)
+    agent = agent_for(
+        plan(animal_targets={"GOOSE": 2, "COW": 0, "SHEEP": 0},
+             land_count=2),
+        config=AgentConfig(suppress_expansion_from_prior_debt=False),
+    )
+
+    action = agent(make_obs(tiles=tiles, shed={}, inventories=[{}],
+                            unlocked=("NW",)))
+    diagnostics = agent.diagnostics_json()
+
+    assert action["market"]
+    assert action["market"][0][:2] == ["BUY_PRODUCT", "WHEAT"]
+    assert not any(order[0] in ("BUY_ANIMAL", "BUY_LAND")
+                   for order in action["market"])
+    assert diagnostics["days"]["3"]["survival"][
+        "expansion_suppressed_current"] is True
+
+
+def test_prior_debt_toggle_does_not_change_safe_actions_or_ordinary_diagnostics():
+    observations = [
+        make_obs(day=3, hour=0),
+        make_obs(day=3, hour=1),
+    ]
+    enabled = agent_for(
+        plan(), config=AgentConfig(suppress_expansion_from_prior_debt=True))
+    disabled = agent_for(
+        plan(), config=AgentConfig(suppress_expansion_from_prior_debt=False))
+
+    enabled_actions = [enabled(copy.deepcopy(obs)) for obs in observations]
+    disabled_actions = [disabled(copy.deepcopy(obs)) for obs in observations]
+    enabled_diag = enabled.diagnostics_json()
+    disabled_diag = disabled.diagnostics_json()
+    enabled_diag.pop("config")
+    disabled_diag.pop("config")
+
+    assert enabled_actions == disabled_actions
+    assert enabled_diag == disabled_diag

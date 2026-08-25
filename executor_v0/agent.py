@@ -82,6 +82,7 @@ class AgentConfig:
     foreman: ForemanConfig = field(default_factory=ForemanConfig)
     strict: bool = False
     turn_trace: bool = False
+    suppress_expansion_from_prior_debt: bool = True
 
 
 def _require_positive_int(value: Any, what: str) -> int:
@@ -227,8 +228,13 @@ class ExecutorAgent:
             record["fertilizer_completed_observed"] = fert_done
             debt = record.get("end_of_day_work_debt") or {}
             prior_debt = bool(debt.get("all"))
-            record["next_day_expansion_suppressed"] = prior_debt
-        self._suppress_expansion_today = prior_debt
+            prior_debt_suppressed = (
+                prior_debt and self.config.suppress_expansion_from_prior_debt
+            )
+            record["next_day_expansion_suppressed"] = prior_debt_suppressed
+        else:
+            prior_debt_suppressed = False
+        self._suppress_expansion_today = prior_debt_suppressed
         raw_hires = farm.get("hires_today", 0)
         self._max_hires_today = raw_hires if isinstance(raw_hires, int) and not isinstance(raw_hires, bool) else 0
         self._requested = self.provider.daily_plan(obs, seat, dict(self._previous_execution))
@@ -767,6 +773,11 @@ class ExecutorAgent:
         diagnostics = {
             "schema_version": _DIAGNOSTICS_SCHEMA_VERSION,
             "seat": self.seat,
+            "config": {
+                "suppress_expansion_from_prior_debt": (
+                    self.config.suppress_expansion_from_prior_debt
+                ),
+            },
             "days": {str(day): record for day, record in sorted(self._day_records.items())},
             "illegal_actions": {
                 "available": False,
