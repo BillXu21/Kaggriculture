@@ -34,7 +34,7 @@ __all__ = [
     "main",
 ]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ARTIFACT_TYPE = "executor_v07_full_game_evaluator"
 DEFAULT_OPENING = "standard_mixed"
 DEFAULT_OPPONENT = "PASS"
@@ -207,6 +207,7 @@ def _animal_snapshot(state: Mapping[str, Any], seat: int) -> dict[str, Any]:
     inventory = market.get("inventory") if isinstance(market.get("inventory"), Mapping) else {}
     prices = market.get("prices") if isinstance(market.get("prices"), Mapping) else {}
     return {
+        "money": farm.get("money"),
         "total_animals": board_total + shed_total + carried_total,
         "board_animals": board_animals,
         "shed_animals": {animal: int(shed.get(animal, 0) or 0) for animal in sorted(ANIMAL_NAMES)},
@@ -250,6 +251,82 @@ def _wheat_animal_orders(action: Mapping[str, Any]) -> list[Any]:
     ]
 
 
+def _submitted_wheat_quantities(action: Mapping[str, Any]) -> tuple[int, int]:
+    """Return submitted WHEAT BUY_PRODUCT and SELL quantities."""
+    buy = 0
+    sell = 0
+    orders = action.get("market")
+    if not isinstance(orders, list):
+        return buy, sell
+    for order in orders:
+        if not isinstance(order, list) or len(order) < 3:
+            continue
+        if order[1] != "WHEAT":
+            continue
+        quantity = order[2]
+        if isinstance(quantity, bool) or not isinstance(quantity, int):
+            continue
+        if order[0] == "BUY_PRODUCT":
+            buy += quantity
+        elif order[0] == "SELL":
+            sell += quantity
+    return buy, sell
+
+
+def _wheat_fill_ledger(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    submitted_buy: int,
+    submitted_sell: int,
+) -> dict[str, Any]:
+    """Infer fills only when the fixed PASS market delta identifies them."""
+    market_delta = after["market_wheat_inventory"] - before["market_wheat_inventory"]
+    if submitted_buy and submitted_sell:
+        return {
+            "inferred_wheat_buy_fill_quantity": None,
+            "inferred_wheat_sell_fill_quantity": None,
+            "wheat_fill_attribution": None,
+            "wheat_fill_reason": "buy_and_sell_net_market_delta_is_ambiguous",
+        }
+
+    if submitted_buy:
+        fill = -market_delta
+        if 0 <= fill <= submitted_buy:
+            return {
+                "inferred_wheat_buy_fill_quantity": fill,
+                "inferred_wheat_sell_fill_quantity": 0,
+                "wheat_fill_attribution": "exact_fixed_pass_market_delta",
+                "wheat_fill_reason": None,
+            }
+        reason = "market_delta_not_consistent_with_submitted_buy"
+    elif submitted_sell:
+        fill = market_delta
+        if 0 <= fill <= submitted_sell:
+            return {
+                "inferred_wheat_buy_fill_quantity": 0,
+                "inferred_wheat_sell_fill_quantity": fill,
+                "wheat_fill_attribution": "exact_fixed_pass_market_delta",
+                "wheat_fill_reason": None,
+            }
+        reason = "market_delta_not_consistent_with_submitted_sell"
+    elif market_delta == 0:
+        return {
+            "inferred_wheat_buy_fill_quantity": 0,
+            "inferred_wheat_sell_fill_quantity": 0,
+            "wheat_fill_attribution": "exact_fixed_pass_market_delta",
+            "wheat_fill_reason": None,
+        }
+    else:
+        reason = "market_changed_without_submitted_wheat_order"
+
+    return {
+        "inferred_wheat_buy_fill_quantity": None,
+        "inferred_wheat_sell_fill_quantity": None,
+        "wheat_fill_attribution": None,
+        "wheat_fill_reason": reason,
+    }
+
+
 def _timeline_entry(
     before_state: Mapping[str, Any],
     after_state: Mapping[str, Any],
@@ -260,6 +337,8 @@ def _timeline_entry(
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     before = _animal_snapshot(before_state, seat)
     after = _animal_snapshot(after_state, seat)
+    submitted_buy, submitted_sell = _submitted_wheat_quantities(action)
+    wheat_fill = _wheat_fill_ledger(before, after, submitted_buy, submitted_sell)
     day = int(before_state.get("day", 0))
     hour = int(before_state.get("hour", 0))
     entry: dict[str, Any] = {
@@ -267,14 +346,34 @@ def _timeline_entry(
         "step": int(after_state.get("step", transition)),
         "day": day,
         "hour": hour,
+        "money_before": before["money"],
+        "money_after": after["money"],
+        "money_delta": after["money"] - before["money"],
         "animal_total_before": before["total_animals"],
         "animal_total_after": after["total_animals"],
         "board_animals": after["board_animals"],
+        "shed_wheat_before": before["shed_wheat"],
         "shed_wheat": after["shed_wheat"],
+        "shed_wheat_after": after["shed_wheat"],
+        "shed_wheat_delta": after["shed_wheat"] - before["shed_wheat"],
+        "carried_wheat_before": before["carried_wheat"],
         "carried_wheat": after["carried_wheat"],
+        "carried_wheat_after": after["carried_wheat"],
+        "carried_wheat_delta": after["carried_wheat"] - before["carried_wheat"],
+        "available_wheat_before": before["available_wheat"],
         "available_wheat": after["available_wheat"],
+        "available_wheat_after": after["available_wheat"],
+        "available_wheat_delta": after["available_wheat"] - before["available_wheat"],
+        "market_wheat_inventory_before": before["market_wheat_inventory"],
         "market_wheat_inventory": after["market_wheat_inventory"],
+        "market_wheat_inventory_after": after["market_wheat_inventory"],
+        "market_wheat_inventory_delta": (
+            after["market_wheat_inventory"] - before["market_wheat_inventory"]
+        ),
         "market_wheat_price": after["market_wheat_price"],
+        "submitted_wheat_buy_quantity": submitted_buy,
+        "submitted_wheat_sell_quantity": submitted_sell,
+        **wheat_fill,
         "submitted_tested_seat_market_orders": _wheat_animal_orders(action),
         "turn_trace": turn_trace,
         "feed_shortage": (

@@ -47,12 +47,17 @@ class FakeProvider:
 class FakeBackend:
     name = "fast"
 
-    def __init__(self, configuration):
+    def __init__(self, configuration, *, ledger_mode=None):
         self.seed = configuration["seed"]
+        self.ledger_mode = ledger_mode
         self.step_number = 0
         self.terminal_step = 2
         self._statuses = ["ACTIVE", "ACTIVE"]
         self._rewards = [0.0, 0.0]
+        self._money = 3000.0
+        self._shed_wheat = 2
+        self._carried_wheat = 0
+        self._market_wheat = 100
         self.trace = load_built_in_trace("standard_mixed")
 
     @property
@@ -79,7 +84,7 @@ class FakeBackend:
         tiles = [[None] * 10 for _ in range(10)]
         tiles[4][4] = animal
         farm = {
-            "money": 3000.0,
+            "money": self._money,
             "tiles": tiles,
             "farmer": [0, 0],
             "hands": hands,
@@ -87,14 +92,17 @@ class FakeBackend:
             "hires_today": 0,
         }
         private = {
-            "shed": {"WHEAT": 2}, "seeds": {},
-            "inventories": [{} for _ in range(1 + len(hands))],
+            "shed": {"WHEAT": self._shed_wheat}, "seeds": {},
+            "inventories": [
+                {"WHEAT": self._carried_wheat},
+                *({} for _ in range(len(hands))),
+            ],
         }
         return {
             "day": day, "hour": hour, "step": self.step_number,
             "player": seat, "farms": [copy.deepcopy(farm), copy.deepcopy(farm)],
             "private": private,
-            "market": {"inventory": {"WHEAT": 100}, "prices": {"WHEAT": 10}},
+            "market": {"inventory": {"WHEAT": self._market_wheat}, "prices": {"WHEAT": 10}},
             "town": {"unlocked_shops": []},
         }
 
@@ -104,6 +112,22 @@ class FakeBackend:
         return [self._observation(0), self._observation(1)]
 
     def step(self, actions):
+        if self.ledger_mode and self.step_number == 0:
+            assert actions[0]["market"] == [["HIRE"], ["HIRE"], ["HIRE"], ["HIRE"], ["HIRE"],
+                                              ["BUY_ANIMAL", "COW", 2], ["BUY_ANIMAL", "SHEEP", 2],
+                                              ["BUY_SEED", "WHEAT", 7], ["BUY_SEED", "MELON", 12],
+                                              ["BUY_PRODUCT", "WHEAT", 6]]
+            if self.ledger_mode == "filled":
+                self._money -= 60
+                self._shed_wheat += 6
+                self._market_wheat -= 6
+            elif self.ledger_mode == "feed":
+                self._money -= 40
+                self._shed_wheat += 4
+                self._shed_wheat -= 2  # FEED consumes two of the four filled units.
+                self._market_wheat -= 4
+            elif self.ledger_mode == "ambiguous":
+                self._market_wheat += 1
         del actions
         self.step_number += 1
         if self.step_number >= self.terminal_step:
@@ -125,7 +149,8 @@ class FakeBackend:
 
 
 def _run(tmp_path: Path, *, trace=False, seeds=(17,), seats=(0,), max_transitions=2,
-         terminal_step=2, provider_records=None, backend_records=None, **kwargs):
+         terminal_step=2, ledger_mode=None, provider_records=None, backend_records=None,
+         **kwargs):
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"fake-checkpoint")
     provider_records = provider_records if provider_records is not None else []
@@ -138,7 +163,7 @@ def _run(tmp_path: Path, *, trace=False, seeds=(17,), seats=(0,), max_transition
 
     def backend_factory(name, config):
         assert name == "fast"
-        backend = FakeBackend(config)
+        backend = FakeBackend(config, ledger_mode=ledger_mode)
         backend.terminal_step = terminal_step
         backend_records.append(backend)
         return backend
@@ -149,6 +174,53 @@ def _run(tmp_path: Path, *, trace=False, seeds=(17,), seats=(0,), max_transition
         provider_factory=provider_factory, backend_factory=backend_factory,
         **kwargs,
     )
+
+
+def test_wheat_buy_fill_ledger_records_cash_and_rejected_buy(tmp_path):
+    filled = _run(tmp_path, max_transitions=1, terminal_step=1, ledger_mode="filled")
+    filled_entry = filled["games"][0]["timeline"][0]
+    assert filled_entry["submitted_wheat_buy_quantity"] == 6
+    assert filled_entry["submitted_wheat_sell_quantity"] == 0
+    assert filled_entry["money_before"] == 3000.0
+    assert filled_entry["money_after"] == 2940.0
+    assert filled_entry["money_delta"] == -60.0
+    assert filled_entry["market_wheat_inventory_before"] == 100
+    assert filled_entry["market_wheat_inventory_after"] == 94
+    assert filled_entry["market_wheat_inventory_delta"] == -6
+    assert filled_entry["inferred_wheat_buy_fill_quantity"] == 6
+    assert filled_entry["wheat_fill_attribution"] == "exact_fixed_pass_market_delta"
+    assert filled_entry["wheat_fill_reason"] is None
+
+    rejected = _run(tmp_path, max_transitions=1, terminal_step=1, ledger_mode="rejected")
+    rejected_entry = rejected["games"][0]["timeline"][0]
+    assert rejected_entry["submitted_wheat_buy_quantity"] == 6
+    assert rejected_entry["market_wheat_inventory_delta"] == 0
+    assert rejected_entry["money_delta"] == 0.0
+    assert rejected_entry["inferred_wheat_buy_fill_quantity"] == 0
+    assert rejected_entry["wheat_fill_attribution"] == "exact_fixed_pass_market_delta"
+
+
+def test_wheat_feed_consumption_is_distinct_from_market_fill(tmp_path):
+    artifact = _run(tmp_path, max_transitions=1, terminal_step=1, ledger_mode="feed")
+    entry = artifact["games"][0]["timeline"][0]
+
+    assert entry["shed_wheat_before"] == 2
+    assert entry["shed_wheat_after"] == 4
+    assert entry["available_wheat_before"] == 2
+    assert entry["available_wheat_after"] == 4
+    assert entry["available_wheat_delta"] == 2
+    assert entry["market_wheat_inventory_delta"] == -4
+    assert entry["inferred_wheat_buy_fill_quantity"] == 4
+
+
+def test_wheat_fill_is_nullable_when_market_delta_is_not_attributable(tmp_path):
+    artifact = _run(tmp_path, max_transitions=1, terminal_step=1, ledger_mode="ambiguous")
+    entry = artifact["games"][0]["timeline"][0]
+
+    assert entry["submitted_wheat_buy_quantity"] == 6
+    assert entry["inferred_wheat_buy_fill_quantity"] is None
+    assert entry["wheat_fill_attribution"] is None
+    assert entry["wheat_fill_reason"] == "market_delta_not_consistent_with_submitted_buy"
 
 
 def test_deterministic_bytes_and_animal_drop_event(tmp_path):
