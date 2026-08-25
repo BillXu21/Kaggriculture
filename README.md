@@ -44,6 +44,7 @@ Read these files first:
 - [`DECISIONS.md`](DECISIONS.md): durable decisions and rationale.
 - [`MECHANICS.md`](MECHANICS.md): versioned mechanics ledger and uncertainty tracking.
 - [`AGENTS.md`](AGENTS.md): operating instructions for future chats and coding agents.
+- [`viewer/README.md`](viewer/README.md): exact debug-trace generation, validation, and viewer workflow.
 
 ## Repository Layout
 
