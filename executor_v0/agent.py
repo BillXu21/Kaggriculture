@@ -43,7 +43,6 @@ from replay_daily.constants import (
     ANIMALS,
     CROPS,
     FARM_HAND_COST_MULT_DEFAULT,
-    LAND_ORDER,
     LAND_PRICES,
     PRODUCTS,
     hire_cost,
@@ -56,7 +55,7 @@ from .tasks import Task
 from .manager import CheckpointPlanProvider, PlanProvider
 from .plan import SELL_BIN_ANCHORS, DailyPlan
 from .projection import clip_sell, project_plan
-from .tasks import GenerationResult, generate_tasks
+from .tasks import generate_tasks
 
 __all__ = ["AgentConfig", "ExecutorAgent", "make_agent"]
 
@@ -82,6 +81,7 @@ class AgentConfig:
     max_market_orders: int = 10
     foreman: ForemanConfig = field(default_factory=ForemanConfig)
     strict: bool = False
+    turn_trace: bool = False
 
 
 def _require_positive_int(value: Any, what: str) -> int:
@@ -446,6 +446,164 @@ class ExecutorAgent:
                 seen.add(task_key)
         return pending
 
+    @staticmethod
+    def _trace_task(task: Task, farm: Mapping) -> dict[str, Any]:
+        """Return only causal, JSON-safe fields for one survival task."""
+        entry: dict[str, Any] = {
+            "key": task.key,
+            "tile": list(task.tile) if task.tile is not None else None,
+            "source": task.source,
+            "priority": task.priority.name,
+        }
+        if task.kind == "WATER" and task.tile is not None:
+            y, x = task.tile
+            tiles = farm.get("tiles") or []
+            tile = tiles[y][x] if 0 <= y < len(tiles) \
+                and 0 <= x < len(tiles[y]) else None
+            if isinstance(tile, Mapping):
+                for name in ("consecutive_unwatered", "watered_today"):
+                    value = tile.get(name)
+                    if isinstance(value, bool):
+                        entry[name] = value
+                    elif name == "consecutive_unwatered" \
+                            and isinstance(value, int):
+                        entry[name] = value
+        return entry
+
+    @staticmethod
+    def _trace_worker_position(farm: Mapping, worker_index: int) -> list[int] | None:
+        positions = [farm.get("farmer")]
+        positions.extend(farm.get("hands") or [])
+        if not 0 <= worker_index < len(positions):
+            return None
+        position = positions[worker_index]
+        if not isinstance(position, (list, tuple)) or len(position) != 2:
+            return None
+        try:
+            # Foreman positions are canonical [y, x], while observations use
+            # [x, y].  This is the position at the start of this turn.
+            return [int(position[1]), int(position[0])]
+        except (TypeError, ValueError):
+            return None
+
+    def _record_turn_trace(
+        self,
+        obs: Mapping,
+        seat: int,
+        day: int,
+        hour: int,
+        feed: Mapping[str, int],
+        expansion_suppressed: bool,
+        tasks: tuple[Task, ...],
+        dispatch_tasks: tuple[Task, ...],
+        foreman_result: Any,
+        pending: list[str],
+        trace_market_by_payload: Mapping[int, tuple[str, str]],
+        included: list[tuple[str, Any]],
+        unaffordable_orders: list[dict[str, Any]],
+    ) -> None:
+        farm = obs["farms"][seat]
+        survival_tasks = [
+            task for task in tasks
+            if task.kind == "FEED"
+            or (task.kind == "WATER" and task.source == "water_must_weed_boundary")
+        ]
+        survival_keys = {task.key for task in survival_tasks}
+        pending_keys = set(pending)
+        dispatched_keys = {task.key for task in dispatch_tasks}
+        # A starvation preemption removes non-FEED survival work from the
+        # foreman's input; retain it as pending rather than misreporting it as
+        # absent from the generated survival set.
+        pending_survival = [
+            task.key for task in survival_tasks
+            if task.key in pending_keys or task.key not in dispatched_keys
+        ]
+        expansion_keys = {
+            task.key for task in tasks
+            if task.kind in ("BUY_ANIMAL", "BUY_LAND")
+        }
+        submitted = {"survival": [], "expansion": []}
+        for payload_kind, payload in included:
+            if payload_kind != "buy":
+                continue
+            category_and_key = trace_market_by_payload.get(id(payload))
+            if category_and_key is not None:
+                category, key = category_and_key
+                submitted[category].append(key)
+        unaffordable = {"survival": [], "expansion": []}
+        for item in unaffordable_orders:
+            key = item.get("task")
+            if key in survival_keys:
+                unaffordable["survival"].append(key)
+            elif key in expansion_keys:
+                unaffordable["expansion"].append(key)
+
+        assignments = []
+        for assignment in foreman_result.assignments:
+            action = list(assignment.action)
+            assignments.append({
+                "worker": "farmer" if assignment.worker_index == 0
+                else f"hand_{assignment.worker_index - 1}",
+                "worker_index": assignment.worker_index,
+                "position": self._trace_worker_position(
+                    farm, assignment.worker_index),
+                "task_key": assignment.task_key,
+                "action": action,
+                "op_family": action[0] if action else None,
+            })
+
+        reasons = []
+        if self._suppress_expansion_today:
+            reasons.append("prior_day_work_debt")
+        if feed["starving"]:
+            reasons.append("current_starvation")
+        if feed["shortage"]:
+            reasons.append("current_feed_shortage")
+        entry = {
+            "day": day,
+            "hour": hour,
+            "feed": {
+                "starving": bool(feed["starving"]),
+                "shortage": int(feed["shortage"]),
+                "unfed": int(feed["unfed"]),
+                "reserve": int(feed["shed_reserve"]),
+            },
+            "expansion": {
+                "suppressed_current": bool(expansion_suppressed),
+                "suppressed_from_prior": bool(self._suppress_expansion_today),
+                "reasons": reasons,
+            },
+            "survival_tasks": {
+                "feed": [self._trace_task(task, farm) for task in survival_tasks
+                         if task.kind == "FEED"],
+                "water_must_weed_boundary": [
+                    self._trace_task(task, farm) for task in survival_tasks
+                    if task.kind == "WATER"
+                    and task.source == "water_must_weed_boundary"],
+            },
+            "assignments": assignments,
+            "unassigned_survival_task_keys": [
+                task.key for task in foreman_result.unassigned_tile_tasks
+                if task.key in survival_keys],
+            "pending_survival_task_keys": pending_survival,
+            "counts": dict(foreman_result.counts),
+            "market": {
+                category: {
+                    "submitted_keys": values,
+                    "unaffordable_keys": unaffordable[category],
+                }
+                for category, values in submitted.items()
+            },
+        }
+        trace = self._day_records[day].setdefault("turn_trace", [])
+        for index, prior in enumerate(trace):
+            if prior.get("hour") == hour:
+                trace[index] = entry
+                break
+        else:
+            trace.append(entry)
+        trace.sort(key=lambda item: (int(item["day"]), int(item["hour"])))
+
     def _act(self, obs: Mapping) -> dict[str, Any]:
         seat = self._resolve_seat(obs)
         day, hour = int(obs["day"]), int(obs["hour"])
@@ -504,6 +662,7 @@ class ExecutorAgent:
         ]
 
         candidates = [("sell", c) for c in sell_candidates]
+        trace_market_by_payload: dict[int, tuple[str, str]] = {}
         unaffordable_orders = []
         for task in survival_feed_buys:
             op, cost, quantity = self._affordable_survival_feed_buy(obs, task, unlocked_count, running_cash)
@@ -517,6 +676,8 @@ class ExecutorAgent:
                 survival_record["partial_feed_buys"] += 1
             running_cash -= cost
             candidates.append(("buy", op))
+            if self.config.turn_trace:
+                trace_market_by_payload[id(op)] = ("survival", task.key)
 
         hire_orders, hires_requested = self._hire_orders(
             obs, seat,
@@ -542,6 +703,8 @@ class ExecutorAgent:
                 continue
             running_cash -= cost
             candidates.append(("buy", op))
+            if self.config.turn_trace and task.kind in ("BUY_ANIMAL", "BUY_LAND"):
+                trace_market_by_payload[id(op)] = ("expansion", task.key)
 
         included = candidates[:self.config.max_market_orders]
         orders = [payload["order"] if kind == "sell" else payload for kind, payload in included]
@@ -582,6 +745,17 @@ class ExecutorAgent:
         }
         record["care_completed_observed"] = care_done
         record["fertilizer_completed_observed"] = fert_done
+
+        if self.config.turn_trace:
+            try:
+                self._record_turn_trace(
+                    obs, seat, day, hour, feed, expansion_suppressed, tasks,
+                    dispatch_tasks, foreman_result, pending,
+                    trace_market_by_payload, included, unaffordable_orders)
+            except Exception:
+                # Trace capture is strictly diagnostic and must never turn a
+                # successful executor decision into a fallback action.
+                pass
 
         return {
             "farmer": list(foreman_result.farmer_action),

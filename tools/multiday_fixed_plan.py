@@ -454,6 +454,7 @@ def _artifact_document(
     diagnostics: Mapping[str, Any],
     opponent_trace: list[Any],
     tested_trace: list[Any],
+    turn_trace: bool,
 ) -> dict[str, Any]:
     window = tape_provenance["recording_window"]
     turns = len(tested_trace)
@@ -499,6 +500,7 @@ def _artifact_document(
             "configuration": _json_safe(config),
         },
         "seat": seat,
+        "run_config": {"turn_trace": turn_trace},
         "window": {
             "start_day": int(window["start_day"]),
             "end_day": int(window["end_day"]),
@@ -562,12 +564,15 @@ def run_multiday_fixed_plan(
     output_path: str | os.PathLike[str] | None = None,
     label: str | None = None,
     executor_provenance: str | None = None,
+    turn_trace: bool = False,
 ) -> MultiDayFixedPlanResult:
     """Execute one immutable tape window against a fixed replay opponent.
 
     The tape recording window supplies the absolute start/end day.  The
     explicit ``window_length`` must equal that inclusive tape window and must
     be 3, 5, or 7; no alternate start-day or live manager path is accepted.
+    ``turn_trace`` is opt-in diagnostic capture and does not alter executor
+    decisions.
     """
     if isinstance(window_length, bool) or window_length not in _WINDOW_LENGTHS:
         raise FixedPlanRunError(
@@ -579,6 +584,8 @@ def run_multiday_fixed_plan(
         raise FixedPlanRunError(
             f"backend must be one of {SUPPORTED_BACKENDS}, got {backend!r}"
         )
+    if not isinstance(turn_trace, bool):
+        raise FixedPlanRunError(f"turn_trace must be a boolean, got {turn_trace!r}")
     label = _require_nonempty_string(label, "label")
     executor_provenance = _require_nonempty_string(
         executor_provenance, "executor_provenance"
@@ -635,7 +642,7 @@ def run_multiday_fixed_plan(
     agent = make_agent(
         provider=FixedPlanTapeProvider(tape),
         seat=seat,
-        config=AgentConfig(strict=True),
+        config=AgentConfig(strict=True, turn_trace=turn_trace),
     )
     opponent = 1 - seat
     day_records: list[dict[str, Any]] = []
@@ -715,6 +722,7 @@ def run_multiday_fixed_plan(
         diagnostics=diagnostics,
         opponent_trace=opponent_trace,
         tested_trace=action_trace,
+        turn_trace=turn_trace,
     )
     result = MultiDayFixedPlanResult(document)
     if output_path is not None:
@@ -735,6 +743,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--executor-provenance", required=True)
+    parser.add_argument(
+        "--turn-trace",
+        action="store_true",
+        help="enable bounded per-turn executor causality diagnostics",
+    )
     args = parser.parse_args(argv)
     result = run_multiday_fixed_plan(
         args.replay,
@@ -745,6 +758,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_path=args.output,
         label=args.label,
         executor_provenance=args.executor_provenance,
+        turn_trace=args.turn_trace,
     )
     print(result.to_json())
     return 0

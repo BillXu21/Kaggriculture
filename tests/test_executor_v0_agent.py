@@ -543,6 +543,111 @@ def test_projection_change_and_unfinished_tasks_recorded():
     assert day["requested"]["crop_targets"]["WHEAT"] == 9
 
 
+def test_turn_trace_is_opt_in_and_default_diagnostics_are_unchanged():
+    obs = make_obs(day=3, hour=2)
+    default_agent = ExecutorAgent(recording_provider(simple_plan()), seat=0)
+    traced_agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(turn_trace=True))
+
+    default_agent(obs)
+    traced_agent(copy.deepcopy(obs))
+
+    assert "turn_trace" not in default_agent.diagnostics_json()["days"]["3"]
+    assert traced_agent.diagnostics_json()["days"]["3"]["turn_trace"]
+
+
+def test_turn_trace_entry_shape_contains_survival_routing_and_counts():
+    tiles = empty_tiles()
+    tiles[2][2] = plant_tile(
+        consecutive_unwatered=1, watered_today=False)
+    tiles[4][4] = pasture_tile(
+        fed_today=False, consecutive_unfed=1)
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(turn_trace=True))
+
+    agent(make_obs(day=3, hour=2, tiles=tiles, shed={"WHEAT": 2}))
+    trace = agent.diagnostics_json()["days"]["3"]["turn_trace"]
+    assert len(trace) == 1
+    entry = trace[0]
+    assert set(entry) == {
+        "day", "hour", "feed", "expansion", "survival_tasks",
+        "assignments", "unassigned_survival_task_keys",
+        "pending_survival_task_keys", "counts", "market",
+    }
+    assert entry["day"] == 3
+    assert entry["hour"] == 2
+    assert entry["feed"] == {
+        "starving": True, "shortage": 0, "unfed": 1, "reserve": 1,
+    }
+    assert entry["expansion"] == {
+        "suppressed_current": True,
+        "suppressed_from_prior": False,
+        "reasons": ["current_starvation"],
+    }
+    assert entry["survival_tasks"]["feed"][0] == {
+        "key": "FEED:4,4", "tile": [4, 4], "source": "mechanical",
+        "priority": "MAINTENANCE",
+    }
+    assert entry["survival_tasks"]["water_must_weed_boundary"][0] == {
+        "key": "WATER:2,2", "tile": [2, 2],
+        "source": "water_must_weed_boundary", "priority": "MAINTENANCE",
+        "consecutive_unwatered": 1, "watered_today": False,
+    }
+    assert set(entry["counts"]) == {"movement", "interaction", "pickup", "pass"}
+    assert all(set(assignment) == {
+        "worker", "worker_index", "position", "task_key", "action",
+        "op_family",
+    } for assignment in entry["assignments"])
+    json.loads(json.dumps(agent.diagnostics_json(), sort_keys=True))
+
+
+def test_turn_trace_replaces_repeated_hour_and_stays_ordered():
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(turn_trace=True))
+    first = make_obs(day=3, hour=5)
+    second_tiles = empty_tiles()
+    second_tiles[1][1] = plant_tile(
+        consecutive_unwatered=1, watered_today=False)
+    second = make_obs(day=3, hour=5, tiles=second_tiles)
+    agent(first)
+    agent(make_obs(day=3, hour=2))
+    agent(second)
+
+    trace = agent.diagnostics_json()["days"]["3"]["turn_trace"]
+    assert [entry["hour"] for entry in trace] == [2, 5]
+    assert len([entry for entry in trace if entry["hour"] == 5]) == 1
+    assert trace[1]["survival_tasks"]["water_must_weed_boundary"]
+
+
+def test_turn_trace_does_not_change_actions_or_ordinary_diagnostics():
+    tiles = empty_tiles()
+    tiles[2][2] = plant_tile(consecutive_unwatered=1)
+    tiles[4][4] = pasture_tile(fed_today=False)
+    observations = [
+        make_obs(day=3, hour=0, tiles=tiles, shed={"WHEAT": 2}),
+        make_obs(day=3, hour=1, tiles=tiles, shed={"WHEAT": 2}),
+        make_obs(day=3, hour=2, tiles=tiles, shed={"WHEAT": 2}),
+    ]
+    plain = ExecutorAgent(recording_provider(simple_plan()), seat=0)
+    traced = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(turn_trace=True))
+
+    plain_actions = [plain(copy.deepcopy(obs)) for obs in observations]
+    traced_actions = [traced(copy.deepcopy(obs)) for obs in observations]
+    assert plain_actions == traced_actions
+
+    plain_diag = plain.diagnostics_json()
+    traced_diag = traced.diagnostics_json()
+    for record in traced_diag["days"].values():
+        record.pop("turn_trace", None)
+    assert json.dumps(plain_diag, sort_keys=True) == \
+        json.dumps(traced_diag, sort_keys=True)
+
+
 # ------------------------------------------------------------------ DI seams
 
 

@@ -20,6 +20,19 @@ from tools.multiday_fixed_plan import (
 )
 
 
+def _fast_engine_available() -> bool:
+    try:
+        from fast_env.api import FastKaggricultureEnv  # noqa: F401
+    except (ImportError, ModuleNotFoundError):
+        return False
+    return True
+
+
+requires_fast = pytest.mark.skipif(
+    not _fast_engine_available(), reason="fast engine extension is unavailable"
+)
+
+
 CONFIGURATION = {
     "episodeSteps": 720,
     "boardSize": 10,
@@ -83,6 +96,98 @@ def _replay_three_days() -> dict:
     }
 
 
+def _static_replay_three_days() -> dict:
+    """Small backend-independent replay for stable trace plumbing tests."""
+    base = {
+        "day": 0,
+        "hour": 0,
+        "step": 0,
+        "player": 0,
+        "farms": [{
+            "farmer": [0, 0],
+            "hands": [],
+            "hires_today": 0,
+            "money": 3000.0,
+            "tiles": [[None] * 10 for _ in range(10)],
+            "unlocked_quadrants": ["NW"],
+        }] * 2,
+        "market": {
+            "inventory": {product: 10000 for product in PRODUCTS},
+            "prices": {product: 100 for product in PRODUCTS},
+        },
+        "town": {"unlocked_shops": []},
+        "private": {
+            "shed": {}, "seeds": {}, "inventories": [],
+        },
+    }
+    steps = []
+    for index in range(3 * 24 + 1):
+        observations = []
+        for seat in (0, 1):
+            observation = copy.deepcopy(base)
+            observation["player"] = seat
+            observation["day"] = index // 24
+            observation["hour"] = index % 24
+            observation["step"] = index
+            observations.append(observation)
+        steps.append([
+            {
+                "action": copy.deepcopy(PASS_ACTION),
+                "observation": observations[seat],
+                "reward": 0,
+                "status": "ACTIVE",
+            }
+            for seat in (0, 1)
+        ])
+    return {
+        "configuration": dict(CONFIGURATION),
+        "id": 4242,
+        "info": {"EpisodeId": 4242, "seed": CONFIGURATION["seed"]},
+        "steps": steps,
+    }
+
+
+class _StaticBackend:
+    name = "fast"
+
+    def __init__(self, configuration):
+        del configuration
+        self._step = 0
+        self._replay = _static_replay_three_days()
+        self._rewards = [0.0, 0.0]
+        self._statuses = ["ACTIVE", "ACTIVE"]
+
+    def reset(self):
+        self._step = 0
+        return [
+            copy.deepcopy(self._replay["steps"][0][seat]["observation"])
+            for seat in (0, 1)
+        ]
+
+    def step(self, actions):
+        del actions
+        self._step += 1
+        return (
+            [
+                copy.deepcopy(self._replay["steps"][self._step][seat]["observation"])
+                for seat in (0, 1)
+            ],
+            list(self._rewards),
+            list(self._statuses),
+        )
+
+    def canonical_state(self):
+        return {"step": self._step}
+
+    @property
+    def rewards(self):
+        return list(self._rewards)
+
+    @property
+    def statuses(self):
+        return list(self._statuses)
+
+
 def _tape(seat: int = 0, length: int = 3) -> FixedPlanTape:
     end = length - 1
     provenance = {
@@ -116,6 +221,7 @@ def _run(replay, tape, **kwargs):
     )
 
 
+@requires_fast
 def test_three_day_fast_runner_is_deterministic_and_fully_fixed():
     replay = _replay_three_days()
     tape = _tape()
@@ -153,6 +259,7 @@ def test_three_day_fast_runner_is_deterministic_and_fully_fixed():
     ).hexdigest()
 
 
+@requires_fast
 def test_runner_writes_the_same_canonical_artifact(tmp_path):
     replay = _replay_three_days()
     output = tmp_path / "fixed-plan.json"
@@ -160,6 +267,7 @@ def test_runner_writes_the_same_canonical_artifact(tmp_path):
     assert output.read_text(encoding="utf-8").rstrip("\n") == result.to_json()
 
 
+@requires_fast
 def test_runner_metric_helpers_receive_one_backend_observation(monkeypatch):
     original = multiday_fixed_plan._farm_metrics
     seen_types = []
@@ -202,8 +310,40 @@ def test_runner_rejects_window_and_seat_mismatches():
         )
 
 
+@requires_fast
 def test_runner_rejects_first_boundary_difference():
     replay = _replay_three_days()
     replay["steps"][0][0]["observation"]["farms"][0]["money"] += 1
     with pytest.raises(BoundaryMismatchError, match="boundary mismatch.*seat 0"):
         _run(replay, _tape())
+
+
+def test_turn_trace_is_opt_in_and_preserves_actions_and_primary_metrics(monkeypatch):
+    monkeypatch.setattr(
+        multiday_fixed_plan,
+        "make_backend",
+        lambda backend, configuration: _StaticBackend(configuration),
+    )
+    replay = _static_replay_three_days()
+    tape = _tape()
+    disabled = _run(replay, tape, turn_trace=False).to_dict()
+    enabled = _run(replay, tape, turn_trace=True).to_dict()
+
+    assert disabled["run_config"] == {"turn_trace": False}
+    assert enabled["run_config"] == {"turn_trace": True}
+    assert disabled["strategy_inputs"]["tested_action_trace_sha256"] == \
+        enabled["strategy_inputs"]["tested_action_trace_sha256"]
+    assert disabled["strategy_inputs"]["opponent_trace_sha256"] == \
+        enabled["strategy_inputs"]["opponent_trace_sha256"]
+    for disabled_day, enabled_day in zip(disabled["days"], enabled["days"]):
+        assert "turn_trace" not in disabled_day["diagnostics"]
+        trace = enabled_day["diagnostics"]["turn_trace"]
+        assert len(trace) == 24
+        assert [entry["hour"] for entry in trace] == list(range(24))
+        assert {
+            key: value for key, value in disabled_day.items()
+            if key != "diagnostics"
+        } == {
+            key: value for key, value in enabled_day.items()
+            if key != "diagnostics"
+        }
