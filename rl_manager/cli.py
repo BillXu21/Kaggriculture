@@ -27,6 +27,8 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from rl_manager.runner import GAME_TURNS
+
 #: Fixed evaluation seed sets (issue #9 Evaluation section).
 SMOKE_SEEDS: tuple[int, ...] = (17, 42, 2026)
 DEV_SEEDS: tuple[int, ...] = tuple(range(200, 264))
@@ -103,6 +105,34 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--output-json", required=True)
     ev.add_argument(CONFIRM_FLAG, action="store_true",
                     help="Required for the expensive dev/holdout panels.")
+
+    trace = sub.add_parser(
+        "debug-trace",
+        help="Generate complete canonical issue #11 trace JSON artifacts.",
+    )
+    trace.add_argument(
+        "--case", action="append", metavar="SEED:SEAT",
+        help="Trace one case; repeat for multiple cases (for example 17:0).",
+    )
+    trace.add_argument("--seed", type=int,
+                       help="Single-case seed alternative to --case.")
+    trace.add_argument("--seat", type=int, choices=(0, 1),
+                       help="Single-case requested seat with --seed.")
+    trace.add_argument("--backend", default="fast", choices=KNOWN_BACKENDS)
+    trace.add_argument(
+        "--e-checkpoint", required=True,
+        help="Path to the REAL trained BC-E torch checkpoint.",
+    )
+    trace.add_argument("--policy-seed", type=int, default=11,
+                       help="Reserved deterministic policy seed (default 11).")
+    trace.add_argument("--num-threads", type=int, default=1)
+    trace.add_argument(
+        "--max-turns", type=int, default=GAME_TURNS,
+        help=f"Primitive transitions to run (default {GAME_TURNS}; "
+             "trace contains the reset plus observed states).",
+    )
+    trace.add_argument("--output-dir", default="artifacts/debug_traces",
+                       help="Output directory for trace JSON files.")
     return parser
 
 
@@ -202,6 +232,66 @@ def plan_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     print(f"planned evaluation: {plan['planned_games']} games "
           f"(seed set {args.seed_set!r}, both seat orientations)")
     return plan
+
+
+def _parse_debug_case(value: str) -> tuple[int, int]:
+    try:
+        seed_text, seat_text = value.split(":", 1)
+        seed, seat = int(seed_text), int(seat_text)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(
+            f"--case must use SEED:SEAT, got {value!r} (for example 17:0)") \
+            from exc
+    if seed < 0:
+        raise ValueError(f"--case seed must be nonnegative, got {seed}")
+    if seat not in (0, 1):
+        raise ValueError(f"--case seat must be 0 or 1, got {seat}")
+    return seed, seat
+
+
+def plan_debug_trace(args: argparse.Namespace) -> dict[str, Any]:
+    """Validate a debug-trace invocation without constructing an environment."""
+    cases: list[tuple[int, int]] = []
+    if args.case:
+        if args.seed is not None or args.seat is not None:
+            raise ValueError(
+                "use either repeated --case or --seed with --seat, not both")
+        cases = [_parse_debug_case(value) for value in args.case]
+    elif args.seed is not None or args.seat is not None:
+        if args.seed is None or args.seat is None:
+            raise ValueError("--seed and --seat must be supplied together")
+        if args.seed < 0:
+            raise ValueError(f"--seed must be nonnegative, got {args.seed}")
+        if args.seat not in (0, 1):
+            raise ValueError(f"--seat must be 0 or 1, got {args.seat}")
+        cases = [(int(args.seed), int(args.seat))]
+    else:
+        raise ValueError("provide --case SEED:SEAT or --seed SEED --seat SEAT")
+    if len(set(cases)) != len(cases):
+        raise ValueError(f"duplicate debug-trace cases are not allowed: {cases}")
+    if args.backend not in KNOWN_BACKENDS:
+        raise ValueError(f"--backend must be one of {KNOWN_BACKENDS}")
+    if args.policy_seed < 0:
+        raise ValueError("--policy-seed must be nonnegative")
+    if args.num_threads < 1:
+        raise ValueError("--num-threads must be >= 1")
+    if args.max_turns < 0:
+        raise ValueError("--max-turns must be >= 0")
+    checkpoint = Path(args.e_checkpoint)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(
+            f"--e-checkpoint {checkpoint} does not exist; the real BC-E "
+            "checkpoint is required and is never committed to the repository")
+    return {
+        "mode": "debug-trace",
+        "cases": cases,
+        "backend": str(args.backend),
+        "e_checkpoint": str(checkpoint),
+        "policy_seed": int(args.policy_seed),
+        "num_threads": int(args.num_threads),
+        "max_turns": int(args.max_turns),
+        "output_dir": str(Path(args.output_dir)),
+    }
 
 
 # ----------------------------------------------------------- execution
@@ -308,6 +398,91 @@ def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no
     return summary
 
 
+def _make_debug_trace_policy(plan: Mapping[str, Any]) -> Any:
+    """Load the explicit frozen BC-E checkpoint through the JAX policy seam."""
+    from bc_manager_jax.checkpoint import load_torch_checkpoint
+    from bc_manager_jax.model import ManagerConfig
+    from rl_manager.policy import JaxEPlanPolicy
+
+    checkpoint = plan["e_checkpoint"]
+    params, metadata = load_torch_checkpoint(checkpoint)
+    try:
+        config = ManagerConfig(**metadata["model_config"])
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            f"BC-E checkpoint {checkpoint} lacks metadata.model_config; "
+            "supply a compatible committed BC-E checkpoint") from exc
+    return JaxEPlanPolicy(params, config, name="trace_e")
+
+
+def execute_debug_trace(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Run selected runner episodes and write validated canonical traces."""
+    from rl_manager.debug_trace import load_trace, save_trace, validate_trace
+    from rl_manager.runner import (
+        RunnerConfig,
+        SelfPlayRunner,
+        build_episode_spec,
+    )
+    from rl_manager.types import E_VS_E
+
+    output_dir = Path(plan["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    policy = _make_debug_trace_policy(plan)
+    summaries: list[dict[str, Any]] = []
+    for episode_index, (seed, seat) in enumerate(plan["cases"]):
+        runner = SelfPlayRunner(
+            RunnerConfig(
+                backend_name=plan["backend"],
+                backend_configuration={
+                    "seed": 0, "numThreads": int(plan["num_threads"])},
+                opening="standard_mixed",
+                max_turns=int(plan["max_turns"]),
+                record_debug_trace=True,
+                debug_trace_seat=seat,
+                debug_trace_view="joint",
+            ),
+            master_seed=seed,
+        )
+        spec = build_episode_spec(
+            episode_index, seed, E_VS_E, policy, policy)
+        try:
+            result = runner.run([spec])[0]
+        except ModuleNotFoundError as exc:
+            if exc.name == "fast_env._kaggriculture_env":
+                raise RuntimeError(
+                    "the fast backend native module is unavailable; build or "
+                    "install the project native wheel before running debug-trace "
+                    "generation, or pass --backend official when the official "
+                    "engine dependency is installed"
+                ) from exc
+            raise
+        if result.debug_trace is None:  # pragma: no cover - runner seam guard
+            raise RuntimeError("runner returned no debug trace after opt-in capture")
+        path = output_dir / f"seed_{seed}_seat_{seat}.json"
+        # save_trace intentionally replaces an existing same-case file with the
+        # deterministic canonical representation; callers may rerun a case.
+        save_trace(path, result.debug_trace)
+        loaded = load_trace(path)
+        validate_trace(loaded)
+        size = path.stat().st_size
+        summary = {
+            "seed": seed,
+            "seat": seat,
+            "turns": len(loaded["turns"]),
+            "path": str(path),
+            "bytes": size,
+            "winner_seat": result.winner_seat,
+            "terminated": result.terminated,
+        }
+        print(
+            f"trace seed={seed} seat={seat} turns={summary['turns']} "
+            f"path={path} bytes={size} winner_seat={result.winner_seat} "
+            f"terminated={result.terminated}"
+        )
+        summaries.append(summary)
+    return summaries
+
+
 # ---------------------------------------------------------- aggregation
 
 
@@ -401,6 +576,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "train":
         plan = plan_training(args)
         execute_training(plan)  # pragma: no cover
+        return 0
+    if args.command == "debug-trace":
+        plan = plan_debug_trace(args)
+        execute_debug_trace(plan)
         return 0
     plan = plan_evaluation(args)
     execute_evaluation(plan)  # pragma: no cover
