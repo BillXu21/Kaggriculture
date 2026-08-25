@@ -253,7 +253,7 @@ This file records decisions that remain authoritative across chats and work sess
 - Scope boundary: the PASS responder makes this a controlled ablation comparison between variants, not a competitive-strength measurement; competitive claims still require the frozen-opponent panels of the evaluation rules.
 - Revisit when: the panel has produced real results and a successor gate (e.g. frozen competent-opponent panel or league entry) is defined, or the engine pin moves.
 
-## D-0xx: Executor V0.5 mechanical rules pinned from exact engine semantics (issue #7, 2026-08-24)
+## D-030: Executor V0.5 mechanical rules pinned from exact engine semantics (issue #7, 2026-08-24)
 
 - Watering is classed by exact lifecycle mechanics: MUST only at the weed boundary (`consecutive_unwatered >= 1`, planting day included); YIELD for single-harvest window watering and fertilized ongoing production-eve; everything else deferred. Blanket daily watering is retired as a labor sink.
 - Layouts anchor to the persistent shed hub `(4,4)` (canonical `[y,x]`), never the moving farmer; animal planning claims tiles before crop reconciliation via `plan_day_layouts`; WEED tiles are reclaimable slot pools behind DIG prerequisites.
@@ -289,3 +289,12 @@ This file records decisions that remain authoritative across chats and work sess
 - Evidence boundary: tiny live smoke uses ONE complete fast-engine game (tiny random-init E, numThreads=1), full-trajectory GAE, bit-equal stored-action logprob recompute before the update, ONE 4-row-minibatch update with finite metrics, bit-identical checkpoint resume, and pre/post deterministic eval equality. Combined sweep 130 passed + 4 skipped (~187 s). No policy-quality claim; official-engine parity and real-checkpoint paths remain gated skips.
 - Rationale: correctness of batched RL plumbing is provable locally against a stationary opponent without optimizing quality against an executor that issue #7 may replace; explicit fail-loud guards prevent accidental expensive panels or implicit executor choices.
 - Revisit when: issue #7 selects the executor (factory swap + first serious run), the real BC-E checkpoint lands at `artifacts/local/bc-v1-E/best.pt`, or multi-process rollout workers are actually implemented.
+
+## D-031 — Reject R4 and Retain Prior-Debt Suppression as Bounded Heuristic Debt
+
+- Date: 2026-08-25
+- Status: active
+- Decision: Reject/revert R4; retain the prior-debt suppression default **ON** in the frozen V0.7 executor. Keep the accepted survival WHEAT shed-room clamp at official/default `shed_capacity=100`, with survival work still ordered before hiring.
+- Rationale: R4 failed the real BC-E fixed-plan 7d regression. The ON setting is a bounded survivability heuristic, not learned strategy and not a universal acceptance claim.
+- Evidence: final no-R4 PASS panel, seeds 17/42/2026 x seats 0/1: ON banks `[17005,14961,23346,26587,56742,65959]`, mean `34100`, median `24966.5`, minimum `14961`; OFF banks `[265,265,30,33,0,0]`, mean `98.8`, median `31.5`, minimum `0`. Loss units are ON starvation `0` / overflow `12`, OFF starvation `38` / overflow `12`. The setting is bounded to this panel and remains architectural debt.
+- Revisit when: the next RL executor-factory swap and serious training decision supplies broader evidence; do not generalize beyond this three-seed, two-seat PASS panel.

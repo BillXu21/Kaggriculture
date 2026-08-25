@@ -2,6 +2,52 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-25 — Executor V0.7 Frozen: R4 Rejected, Shed-Room Fix Accepted, Viewer #11 Closed
+
+Closed issue #7 / Executor V0.7 at `a7c826d` without changing code or tests in
+this documentation pass. R4 was rejected and reverted after the real BC-E
+fixed-plan 7d regression: wealth **-14,302**, cash **-9,515**, weeds **+11**,
+crops destroyed **+14**, survival debt **69 -> 84**, starvation **22 -> 44**,
+and harvest **124 -> 98**. Expert-intent-only improvements are not acceptance
+evidence.
+
+Accepted changes are the panel outcome ledger (`02984a0`) and the survival
+WHEAT shed-room clamp (`a7c826d`). The clamp uses official/default
+`shed_capacity=100` and preserves survival-before-hire order. The final
+no-R4 fixed-plan panel is bounded to PASS, seeds 17/42/2026, both seats, and
+six rows:
+
+| seed | seat | prior-debt ON bank | prior-debt OFF bank |
+| ---: | ---: | ---: | ---: |
+| 17 | 0 | 17,005 | 265 |
+| 17 | 1 | 14,961 | 265 |
+| 42 | 0 | 23,346 | 30 |
+| 42 | 1 | 26,587 | 33 |
+| 2026 | 0 | 56,742 | 0 |
+| 2026 | 1 | 65,959 | 0 |
+
+ON aggregates are mean **34,100**, median **24,966.5**, minimum **14,961**;
+OFF aggregates are mean **98.8**, median **31.5**, minimum **0**. Loss units
+are ON starvation **0** / overflow **12**, versus OFF starvation **38** /
+overflow **12**. The default prior-debt setting remains ON as explicit
+heuristic architectural debt, bounded only to this panel; it is not a
+generalization or acceptance claim.
+
+The seed-17 day-20 starvation-purchase defect was fixed: banks changed from
+`8062/8489` to `17005/14961`. The residual day-22 six-animal/seat condition
+is true manager-policy debt: carried cows are discarded at day end into a full
+shed, not a starvation or executor defect; no further heuristic was added.
+Viewer #11 is closed and passive: schema/runner/snapshot/viewer/debug-trace
+CLI support is committed, four ignored real BC-E E_VS_E traces were generated
+and parsed, and ON/OFF action/result parity is exact for seeds 17 and 42.
+E_VS_E banks intentionally differ from the PASS panel, and no traces were
+committed. The real BC-E validation input was externally supplied read-only
+from
+`C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\artifacts\local\bc-v1-E\best.pt`, variant E epoch 27, SHA-256
+`F4B029D3E463ABA1DBD0544377D0D616E3DE94AA6CC469D3446F018DDDD8F6BF2`.
+It is intentionally absent from this isolated worktree because local
+artifacts/checkpoints are ignored and remains uncommitted.
+
 ## 2026-08-24 — Issue #9 Stage B2: Stage-A Integration, Tiny Live PPO Smoke, CLIs, Diagnostics
 
 Completed the issue #9 infrastructure locally on top of B1 (`06cc25c`): the

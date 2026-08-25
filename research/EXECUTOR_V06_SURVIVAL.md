@@ -2,7 +2,7 @@
 
 Date: 2026-08-24
 
-Status: implemented on `main`; bounded fast-engine re-evaluation still required.
+Status: superseded and closed by the V0.7 final note: [`research/EXECUTOR_V07_FINAL.md`](EXECUTOR_V07_FINAL.md). The surviving guardrails and their bounded evidence are recorded there.
 
 ## Why this pass exists
 
