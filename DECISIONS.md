@@ -290,7 +290,7 @@ This file records decisions that remain authoritative across chats and work sess
 - Rationale: correctness of batched RL plumbing is provable locally against a stationary opponent without optimizing quality against an executor that issue #7 may replace; explicit fail-loud guards prevent accidental expensive panels or implicit executor choices.
 - Revisit when: issue #7 selects the executor (factory swap + first serious run), the real BC-E checkpoint lands at `artifacts/local/bc-v1-E/best.pt`, or multi-process rollout workers are actually implemented.
 
-## D-031 — Reject R4 and Retain Prior-Debt Suppression as Bounded Heuristic Debt
+## D-037 — Reject R4 and Retain Prior-Debt Suppression as Bounded Heuristic Debt
 
 - Date: 2026-08-25
 - Status: active
