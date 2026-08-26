@@ -16,11 +16,21 @@ Do not rely on chat memory when these files provide a durable answer.
 
 ## Current Project Mode
 
-The project is presently in a bounded implementation phase for the first closed-loop BC executor.
+The project is in a **post-V0.7 forensic + RL-readiness phase**.
 
-Broad implementation, reinforcement learning, expensive experiments, search/VRP optimization, opponent modeling, and BC architecture changes remain unauthorized unless the user explicitly expands scope.
+The final 24-game real-BC-E / V0.7 PASS panel found acceptable middle-of-distribution performance but three catastrophic `<1k` tails. Do **not** declare V0.7 generalization-validated, launch another broad heuristic search, or start a large PPO/self-play run yet.
 
-**Codex authorization:** the user explicitly authorized the bounded implementation packet in GitHub issue #1, `Codex packet: minimal closed-loop BC executor V0`. Codex may implement exactly that packet and should stop at its acceptance criteria. No other speculative Codex work is authorized by this note.
+Immediate authorized work is bounded to:
+
+- generate and inspect a small set of visual replays spanning catastrophic, same-seed control, median, and strong outcomes;
+- use passive logs/traces to identify the **first bad day** and classify each failure as manager strategy, executor mechanics, or policy-executor interaction;
+- patch only obvious, reproducible mechanical defects that prevent execution of a feasible strategy;
+- profile rollout throughput and CPU scaling before serious RL, including where time is spent in engine, executor, encoding, orchestration/IPC, and policy inference;
+- prepare small RL initialization/reward experiments only after the executor is accepted/frozen.
+
+Current learning hypothesis is not a durable architecture change: BC-E may imitate elite strategies that operate too close to the execution frontier for the current deterministic executor. A policy trained closed-loop may need to learn around that executor. Candidate future experiments include full BC-E initialization, BC-E trunk with reset action heads, and scratch manager training after a longer deterministic opening.
+
+Do not silently convert those candidate experiments into production architecture. Record evidence first.
 
 ## Core Technical Direction
 
@@ -28,11 +38,11 @@ Prefer:
 
 - exact engine tracking;
 - deterministic evaluation;
-- strong public-baseline reproduction;
+- learned strategy with deterministic mechanical execution;
 - structured route execution;
 - closed-loop repair;
-- opponent-aware macro planning;
-- market simulation and optimization.
+- passive causal diagnostics;
+- measured throughput optimization before large training runs.
 
 Do not assume primitive-action deep RL is the correct starting point.
 
