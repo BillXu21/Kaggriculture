@@ -26,7 +26,7 @@ Diagnostic rule:
 - Final branch HEAD: `b1b9b306b48a6ae3fcb2464109088e7ecea91b7c`.
 - Important V0.7 commits: `02984a0` panel outcome ledger, `a7c826d` shed-room survival-buy fix/frozen behavior, `b1b9b30` final evidence/docs.
 - Branch is pushed to `origin/executor-v07-fixed-plan`, clean, not merged.
-- It is currently 15 commits ahead and 4 behind main, with merge base `3726e373...`; reconcile the two documentation histories deliberately when merging.
+- Main and the executor branch have diverged from merge base `3726e373...`; main gained continuity-doc commits while V0.7 was running. Compare refs immediately before merge and reconcile the two documentation histories deliberately instead of relying on a transient ahead/behind count.
 
 ## Real BC-E Checkpoint
 
