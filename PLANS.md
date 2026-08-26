@@ -134,7 +134,7 @@ Only the first normally justifies executor changes.
 Before merging `executor-v07-fixed-plan`:
 
 - preserve both diverged documentation histories;
-- resolve the duplicate durable-decision ID for the branch's R4/prior-debt decision without overwriting main D-031..D-036;
+- preserve the executor branch's resolved **D-037** R4/prior-debt decision alongside main D-031..D-036;
 - record the forensic conclusion and any accepted mechanical patch;
 - keep large traces/checkpoints local/ignored.
 
