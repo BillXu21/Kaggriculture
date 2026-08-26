@@ -130,7 +130,7 @@ Known accepted mechanical fix:
 
 - survival WHEAT purchases respect remaining shed capacity.
 
-Before merge, reconcile diverged documentation histories deliberately and resolve the duplicate durable-decision ID for the executor branch's R4/prior-debt decision without overwriting main's existing D-031..D-036.
+The earlier durable-decision ID collision has been fixed on `executor-v07-fixed-plan`: the branch's R4/prior-debt decision is now **D-037**, preserving main's existing D-031..D-036. Merge still requires deliberate reconciliation of the diverged documentation histories.
 
 ## Real BC-E Checkpoint
 
