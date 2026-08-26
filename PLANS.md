@@ -1,170 +1,157 @@
 # Kaggriculture Plans
 
-Last updated: 2026-08-25
+Last updated: 2026-08-26
 
 ## Strategic Objective
 
 Build a competitive Kaggriculture agent where **reinforcement learning owns meaningful farm/market strategy** and deterministic code owns exact mechanics: legality, pathfinding, worker execution, prerequisites, bookkeeping, minimum-safe maintenance, and prevention of mechanically avoidable asset loss.
 
-Near-term architecture stays:
+Working architecture remains:
 
-`standard_mixed d0-d3 -> learned daily manager -> deterministic executor`
+`optimized deterministic opening -> learned daily manager -> deterministic executor`
 
-Do not add a learned tactical/middle controller or primitive-action RL before real self-play demonstrates the need.
+The opening is currently `standard_mixed d0-d3`. Extending it later is a valid RL curriculum experiment. Learned tactical/middle control and primitive-action RL remain deferred.
 
-## Current Phase — Close Executor V0.7
+## Current Phase — Explain the Catastrophic Tail
 
-The executor heuristic-search phase is over. Branch `executor-v07-fixed-plan` is pushed and clean at `b1b9b306b48a6ae3fcb2464109088e7ecea91b7c`; frozen behavior is `a7c826d`.
+The final 24-game real-BC-E / V0.7 PASS panel produced mean `28,587.4`, median `25,321.5`, min `2`, max `65,959`, `<1k = 3`, `<10k = 3`.
 
-Final decisions:
+The old V0.6 reference was approximately mean `30,110`, median `24,358`, min `8,062`, `<1k = 0`, `<10k = 2`.
 
-- R4 watering reservation: **rejected/reverted** after real BC-E regression.
-- Survival WHEAT shed-room clamp: **accepted**.
-- Broad prior-day work-debt expansion suppression: **temporarily retained ON as explicit architectural debt**, because real BC-E collapses catastrophically with it OFF.
-- Passive issue #11 debug tracing/viewer: integrated into the branch.
-- No R5/R6/R7 or alternative debt-threshold search.
+The middle of the V0.7 distribution is acceptable, but the catastrophic tail is not. Do **not** call V0.7 generalization validated, restart broad heuristic search, or launch large self-play yet.
 
-Real BC-E PASS panel, seeds `17,42,2026`, both seats:
+The immediate question is whether the failures are:
 
-| mode | mean bank | median | min | starvation loss units |
-| --- | ---: | ---: | ---: | ---: |
-| debt shield ON | 34,100 | 24,966.5 | 14,961 | 0 |
-| debt shield OFF | 98.8 | 31.5 | 0 | 38 |
+1. BC-E requesting an unsustainable strategy;
+2. the executor failing to execute a mechanically feasible strategy; or
+3. a policy-executor interaction where a marginal BC plan becomes catastrophic because of heuristic inefficiency.
 
-Interpretation: the current BC policy depends heavily on the shield to avoid over-expansion. Keep it ON for the first RL experiments and log suppression frequency. The long-term goal is for RL to make it unnecessary, not to hand-design a more strategic executor governor.
+## Immediate Step 1 — Visual Replay Forensics
 
-## Immediate Gate — One Final 24-Game ON Panel
+Inspect:
 
-Run the real BC-E checkpoint with V0.7, fixed PASS opponent, both seats, debt shield ON, seeds:
+- seed 7 / seat 1 — bank 2;
+- seed 1019 / seat 0 — bank 76;
+- seed 1019 / seat 1 — bank 55;
+- seed 7 / seat 0 — bank 18,319 same-seed control;
+- seed 2026 / seat 1 — bank 65,959 strong success;
+- optionally seed 1013 / seat 1 or a median trajectory.
 
-`7,17,42,123,2026,1013,1022,1003,1026,1011,1024,1019`
+For each, identify the **first visibly bad day** and 1–2 days of lead-up. Use the stock Kaggle viewer for global pattern recognition and the passive custom trace only for causal details.
 
-Use `tools.run_executor_v07_panel` from `executor-v07-fixed-plan`, official backend if practical.
+Look for aggressive expansion, workload/geometry jumps, excessive travel or task stealing, missed must-water/harvest/feed deadlines, shed congestion/overflow, impossible animal handling, market/cash sequencing failure, or a discrete event that starts the death spiral.
 
-Only answer:
+## Immediate Step 2 — Targeted Log / Capacity Diagnosis
 
-1. are there new catastrophic `<1k` or `<10k` cases?
-2. does the shed-room fix preserve the known-collapse recoveries?
-3. does starvation stay near zero outside the three development seeds?
-4. how does the bank distribution compare with the old V0.6 24-game reference (mean about `30,110`, median about `24,358`, min `8,062`, `<1k=0`, `<10k=2`)?
+After the visual pass, inspect only the bounded failure window. Record:
 
-Do not run another OFF panel. Do not respond to a mediocre but non-catastrophic result with another heuristic search.
+- BC requested plan;
+- requested vs feasible plan;
+- workers and available worker-actions;
+- conservative lower bound on mandatory work;
+- EOD debt by class;
+- critical deadline misses;
+- expansion-suppression events;
+- cash start/end;
+- shed occupancy/overflow;
+- skipped buys and reasons;
+- animal purchases vs placement/storage capacity;
+- classification: manager, executor, or interaction.
 
-## Merge / Freeze Gate
+When practical, replay the exact same captured BC-E DailyPlan tape through V0.6 and V0.7. V0.6-survives/V0.7-dies is strong executor-regression evidence; both-die similarly is stronger manager/executor-compatibility evidence.
 
-If the final ON panel is credible:
+Allow only one bounded obvious-mechanical-defect pass. Do not encode strategic governors such as "too many cows", delayed expansion, crop preference, or new arbitrary cash/debt vetoes into the executor.
 
-1. reconcile `executor-v07-fixed-plan` with main; branch and main have diverged documentation histories, so preserve both the V0.7 implementation/evidence and the newer main continuity docs intentionally;
-2. consider Executor V0.7 mechanically frozen and issue #7 complete enough for RL;
-3. keep generated traces/checkpoints/artifacts local/ignored.
+## Step 3 — Throughput / 96-Core Readiness
 
-## Viewer Policy
+Before serious RL, profile wall time separately for:
 
-Use the custom canonical debug trace as a **diagnostic sidecar**, not as the main visual experience. The stock Kaggle viewer is easier for holistic farm-pattern inspection and already has polished imagery.
+1. engine stepping;
+2. executor `_act`;
+3. canonical-state conversion / encoding;
+4. IPC/orchestration/trajectory work;
+5. batched JAX inference.
 
-Only use custom traces when manager/task/assignment/feed/water/debt metadata is needed to isolate a mechanical bug. Defer frontend redesign; a future version should augment or visually follow the existing Kaggle viewer rather than rebuilding the game presentation from scratch.
+Benchmark persistent concurrency roughly at `1 -> 4 -> 12 -> 24 -> 48 -> 96`.
 
-## Manager Contract — No Immediate Redesign
+Prefer many independent single-threaded games feeding grouped day-boundary observations into large policy batches unless measurement proves otherwise. Never do per-environment accelerator calls.
 
-Current audit result:
+Rust executor work is conditional on profiling. If Python executor time is material, prefer one parity-tested Rust core that can reproduce frozen V0.6 and V0.7 behavior instead of two separate rewrites.
 
-- crop contraction is representable end-to-end because crop targets are absolute counts and reconciliation can release excess;
-- animal targets are intentionally non-destructive (`max(current, requested)`), so lower desired count means stop adding/replacing rather than killing/starving animals;
-- deliberate crop digging / price-crash abandonment is advanced behavior and does not need to be learned now, especially if demonstrations are sparse.
+## Step 4 — Small RL Initialization Experiments
 
-Measure what BC-E and PPO actually output before redesigning the manager action space.
+Working hypothesis: BC-E may imitate elite strategies that operate close to the execution frontier. Closed-loop RL may need to learn strategy around the executor's actual capabilities.
 
-## First Real RL Sequence
+Compare small equal-compute candidates before scaling:
 
-### 1. Real closed-loop BC-E baseline
+1. **full BC-E init** — maximum inherited knowledge, but maximum inherited elite habits;
+2. **BC-E trunk + reset action heads** — preserve state representation while relearning strategy around this executor;
+3. **scratch daily manager** — clean executor-aware policy, but likely worse sample efficiency.
 
-Run the frozen BC-E checkpoint through the exact rollout infrastructure intended for RL with frozen V0.7.
+The reset-head middle ground is a high-priority experiment.
 
-Record complete-game distributions and strategy diagnostics:
+## Opening Curriculum
 
-- banks/margins/W-L-T;
-- collapse rate;
-- animal/crop losses;
-- farm-size/labor/cash trajectories;
-- manager target trajectories;
-- expansion-suppression frequency;
-- executor survival/maintenance failures.
+Keep an optimized deterministic opening for initial RL. Consider extending the opening beyond d3 so scratch/near-scratch learning begins from a productive farm with fewer than the current 26 learned daily decisions.
 
-This becomes the pre-PPO baseline. Teacher-forced validation is not the quality gate.
+This can reduce trivial early bankruptcy, shorten credit assignment, and preserve sample efficiency without inheriting BC-E's late-game strategic habits.
 
-### 2. PPO plumbing smoke from BC-E
+## Reward Plan — Terminal and Simple First
 
-Use the existing `rl_manager` PPO path with the real checkpoint:
+Prefer one terminal episode reward rather than dense daily economic shaping.
 
-- complete rollout;
-- stored-action logprob recomputation;
-- GAE;
-- one small update;
-- checkpoint/resume roundtrip;
-- deterministic pre/post eval sanity;
-- frozen BC-E snapshot must remain immutable.
+Initial candidate:
 
-This is still plumbing validation, not a policy-quality claim.
+`normalized final cash + explicit bankruptcy penalty + smaller terminal outcome term`
 
-### 3. Small development run vs frozen BC-E
+Early training should prioritize **make money + survive**. Later, as policies become strong, anneal toward outcome-dominated or outcome-only reward because final cash becomes less aligned with top-level competitive play.
 
-Keep prior-debt suppression ON initially. Train/evaluate on a small fixed set before any broad run.
+Do not add dense hand-built economic-value rewards by default. Do not add plan-infeasibility punishment initially; if later needed, it must use a conservative mechanically provable workload lower bound rather than executor EOD debt.
 
-Important diagnostic: **suppression rate should fall as policy quality improves.** If PPO learns capacity management, it should stop asking for expansion that the executor vetoes. Bank improvement without declining dependence on the shield is weaker evidence.
+## First RL Sequence After Executor Acceptance
 
-### 4. Diagnose before redesign
+1. establish real BC-E baseline through the exact RL rollout infrastructure;
+2. run the real-checkpoint PPO plumbing smoke;
+3. run tiny equal-compute initialization comparisons;
+4. keep prior-day debt suppression ON initially and log its firing rate;
+5. compare bank distribution, collapse rate, survival, requested expansion, suppression rate, entropy/KL/clip/value diagnostics;
+6. scale only after rollout throughput is measured.
 
-If learning stalls, classify the bottleneck before adding complexity:
-
-- action space cannot express needed strategy;
-- observation misses strategic state;
-- daily decision frequency is too coarse;
-- terminal credit is insufficient;
-- executor still has a reproducible mechanical defect;
-- tactical task choice truly requires a learned middle layer.
-
-Only then consider denser reward shaping, more frequent manager actions, or a tactical model.
-
-## JAX / TPU
-
-TPU throughput work is paused, not promoted to a blocker.
-
-Known state:
-
-- synthetic/random PyTorch <-> JAX parity tests are green;
-- the newly activated real-checkpoint parity test has a test bug: the JAX side loads trained weights while the PyTorch reference is freshly initialized and never loads `model_state_dict`;
-- Kaggle TPU subprocesses repeatedly failed TPU backend initialization;
-- no real TPU throughput result exists.
-
-Fix the real-checkpoint parity test and TPU ownership/runtime issue later, when the actual RL path needs TPU execution. Do not spend current time debugging the notebook environment in isolation.
+A stronger learned manager should reduce dependence on the prior-debt expansion shield rather than merely improve bank while constantly triggering it.
 
 ## Executor / Manager Boundary
 
-Deterministic executor owns exact mechanics, legal execution, routing/assignment, prerequisites, cash/order sequencing, feeding existing animals, minimum-safe watering for maintained crops, mechanically implied resource acquisition, and passive diagnostics.
+Executor owns exact mechanics and feasible execution. Manager/RL owns strategic expansion, composition, liquidity, capacity, and market choices.
 
-Learned manager/RL owns expansion pace, crop/animal composition, labor/farm capacity at strategic level, liquidity/recovery, whether an asset remains worth maintaining/replacing, market/product strategy, and opponent/shop adaptation.
+Default diagnostic:
 
-Default question:
-
-> Did the executor fail to execute a feasible strategy, or did the manager choose an unsustainable strategy?
+> Did the executor fail to execute a feasible strategy, did the manager choose an unsustainable strategy, or did a near-feasible strategy cross the failure boundary because of executor inefficiency?
 
 Only the first normally justifies executor changes.
 
+## Merge / Documentation Gate
+
+Before merging `executor-v07-fixed-plan`:
+
+- preserve both diverged documentation histories;
+- resolve the duplicate durable-decision ID for the branch's R4/prior-debt decision without overwriting main D-031..D-036;
+- record the forensic conclusion and any accepted mechanical patch;
+- keep large traces/checkpoints local/ignored.
+
 ## Explicitly Deferred
 
-- deliberate crop digging / sophisticated crop abandonment;
-- watering/task-assignment heuristic variants;
-- corner/serpentine/Top-1 geometry imitation;
-- new debt/cash veto thresholds;
+- R5/R6/R7 or broad executor heuristic search;
+- deliberate crop-digging / elite geometry imitation;
+- new arbitrary strategic veto thresholds;
 - learned tactical/middle policy;
-- raw primitive-action RL;
-- broad executor parameter sweeps;
+- primitive-action RL;
 - custom viewer redesign;
-- TPU debugging that is not blocking the real training path;
-- sophisticated league/PFSP work before fixed candidate-vs-frozen-E self-play works.
+- sophisticated league/PFSP work before basic self-play works;
+- Rust implementation without profile evidence;
+- TPU debugging that does not block the selected training path.
 
 ## Continuity
 
-Authoritative long-session compaction: `research/PROJECT_CHECKPOINT_2026-08-25_V07_FREEZE.md`.
+Detailed post-panel plan: `research/POST_V07_GENERALIZATION_PLAN_2026-08-26.md`.
 
-At the end of the next substantial run, update `CURRENT_STATE.md`, add a completed milestone to `HISTORY.md`, and record any genuinely durable new architecture/evaluation decision in `DECISIONS.md`.
+Prior compaction: `research/PROJECT_CHECKPOINT_2026-08-25_V07_FREEZE.md`.
