@@ -236,14 +236,24 @@ def _at_terminal_action_horizon(obs: Mapping) -> bool:
     return step >= _FINAL_ACTIONABLE_STEP
 
 
-def generate_optional_idle_cleanup_tasks(obs: Mapping, seat: int) -> tuple[Task, ...]:
-    """Return weed-first, safe idle cleanup candidates for this observation.
+def generate_optional_idle_cleanup_tasks(
+    obs: Mapping,
+    seat: int,
+    mode: str = "weed_water",
+) -> tuple[Task, ...]:
+    """Return safe PASS-only cleanup candidates for the requested mode.
 
     Cleanup is intentionally separate from ``generate_tasks`` so it cannot
     contribute to manager workload, shortage purchases, or work debt.  The
     caller may only assign these candidates to workers whose normal action was
-    PASS; they are never a normal foreman dispatch pool.
+    PASS; they are never a normal foreman dispatch pool. ``water_only`` emits
+    only optional WATER tasks, while ``weed_water`` emits weed DIG tasks first
+    and then optional WATER tasks.
     """
+    if mode not in ("none", "water_only", "weed_water"):
+        raise ValueError(f"unsupported optional cleanup mode: {mode!r}")
+    if mode == "none":
+        return ()
     _validate_obs(obs, seat)
     try:
         state = _canonical_own_state(obs, seat)
@@ -258,6 +268,8 @@ def generate_optional_idle_cleanup_tasks(obs: Mapping, seat: int) -> tuple[Task,
             if quadrant_of(y, x) not in unlocked:
                 continue
             if tile_role(tile) == "weed":
+                if mode != "weed_water":
+                    continue
                 optional.append(Task(
                     key=f"DIG_CLEANUP:{y},{x}", kind="DIG",
                     priority=Priority.OPTIONAL, tile=coord, crop="WEED",
@@ -291,11 +303,8 @@ def generate_optional_idle_cleanup_tasks(obs: Mapping, seat: int) -> tuple[Task,
 
 
 def generate_optional_water_tasks(obs: Mapping, seat: int) -> tuple[Task, ...]:
-    """Backward-compatible watering-only view of idle cleanup candidates."""
-    return tuple(
-        task for task in generate_optional_idle_cleanup_tasks(obs, seat)
-        if task.kind == "WATER"
-    )
+    """Return the distinct water-only PASS cleanup candidate set."""
+    return generate_optional_idle_cleanup_tasks(obs, seat, mode="water_only")
 
 
 # --------------------------------------------------------------- generation

@@ -501,6 +501,7 @@ def _run_one(
         optional_idle_cleanup=optional_idle_cleanup,
         optional_spare_watering=optional_spare_watering,
     )
+    cleanup_mode = config.cleanup_mode
     downstream, provider_variant = _build_downstream(
         checkpoint_path, seat, config, provider_factory
     )
@@ -609,6 +610,7 @@ def _run_one(
         "aggressive_sell_all": aggressive_sell_all,
         "optional_idle_cleanup": optional_idle_cleanup or optional_spare_watering,
         "optional_spare_watering": optional_spare_watering,
+        "cleanup_mode": cleanup_mode,
         "cleanup_metrics": executor_diagnostics.get("cleanup_metrics", {}),
         "status": final_status,
         "transitions": transitions,
@@ -638,6 +640,7 @@ def _run_one(
         "aggressive_sell_all": aggressive_sell_all,
         "optional_idle_cleanup": optional_idle_cleanup or optional_spare_watering,
         "optional_spare_watering": optional_spare_watering,
+        "cleanup_mode": cleanup_mode,
         "tested_action_trace_sha256": game["tested_action_trace_sha256"],
         "final": game["final"],
     })).hexdigest()
@@ -773,6 +776,10 @@ def run_panel(
             "optional_idle_cleanup, optional_spare_watering "
             "must be booleans"
         )
+    cleanup_mode = (
+        "weed_water" if optional_idle_cleanup else
+        "water_only" if optional_spare_watering else "none"
+    )
     repo_root = Path(__file__).resolve().parents[1]
     games = [
         _run_one(
@@ -798,6 +805,10 @@ def run_panel(
         "aggressive_sell_all": aggressive_sell_all,
         "optional_idle_cleanup": optional_idle_cleanup or optional_spare_watering,
         "optional_spare_watering": optional_spare_watering,
+        "cleanup_mode": (
+            "weed_water" if optional_idle_cleanup else
+            "water_only" if optional_spare_watering else "none"
+        ),
     }
     document: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -809,6 +820,7 @@ def run_panel(
             "tool": "tools.run_executor_v07_panel",
             "optional_idle_cleanup": optional_idle_cleanup or optional_spare_watering,
             "optional_spare_watering": optional_spare_watering,
+            "cleanup_mode": cleanup_mode,
         },
         "checkpoint": dict(checkpoint_info),
         "backend": backend_provenance(backend, {"seed": "per_game"}),
@@ -825,6 +837,7 @@ def run_panel(
             "aggressive_sell_all": aggressive_sell_all,
             "optional_idle_cleanup": optional_idle_cleanup or optional_spare_watering,
             "optional_spare_watering": optional_spare_watering,
+            "cleanup_mode": cleanup_mode,
             "max_transitions": max_transitions,
             "configuration": configuration,
         },
@@ -869,11 +882,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--optional-idle-cleanup", action="store_true",
-        help="enable weed-first PASS-only idle cleanup",
+        help="enable weed-first then water PASS-only cleanup",
     )
     parser.add_argument(
         "--optional-spare-watering", action="store_true",
-        help="legacy alias for --optional-idle-cleanup",
+        help="enable water-only PASS cleanup (legacy flag name); --optional-idle-cleanup supersedes it",
     )
     parser.add_argument("--max-transitions", type=int, default=DEFAULT_MAX_TRANSITIONS)
     parser.add_argument("--output", required=True)

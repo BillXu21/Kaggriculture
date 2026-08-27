@@ -318,6 +318,12 @@ def test_optional_spare_watering_flag_propagates_and_is_recorded(tmp_path):
     assert enabled["games"][0]["executor_diagnostics"]["config"][
         "optional_spare_watering"
     ] is True
+    assert enabled["request"]["cleanup_mode"] == "water_only"
+    assert enabled["source_provenance"]["cleanup_mode"] == "water_only"
+    assert enabled["games"][0]["cleanup_mode"] == "water_only"
+    assert enabled["games"][0]["executor_diagnostics"]["config"][
+        "cleanup_mode"
+    ] == "water_only"
 
 
 def test_optional_idle_cleanup_flag_propagates_and_legacy_alias_is_accepted(tmp_path):
@@ -330,6 +336,12 @@ def test_optional_idle_cleanup_flag_propagates_and_legacy_alias_is_accepted(tmp_
     assert enabled["games"][0]["executor_diagnostics"]["config"][
         "optional_idle_cleanup"
     ] is True
+    assert enabled["request"]["cleanup_mode"] == "weed_water"
+    assert enabled["source_provenance"]["cleanup_mode"] == "weed_water"
+    assert enabled["games"][0]["cleanup_mode"] == "weed_water"
+    assert enabled["games"][0]["executor_diagnostics"]["config"][
+        "cleanup_mode"
+    ] == "weed_water"
 
     args = build_parser().parse_args([
         "--checkpoint", "checkpoint.pt", "--seeds", "17", "--seats", "0",

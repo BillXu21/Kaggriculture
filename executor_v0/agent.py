@@ -95,8 +95,17 @@ class AgentConfig:
 
     @property
     def idle_cleanup_enabled(self) -> bool:
-        """Resolve the generalized flag and its legacy watering alias."""
+        """Whether either PASS-only cleanup mode is enabled."""
         return self.optional_idle_cleanup or self.optional_spare_watering
+
+    @property
+    def cleanup_mode(self) -> str:
+        """Resolve weed cleanup as the superset when both flags are enabled."""
+        if self.optional_idle_cleanup:
+            return "weed_water"
+        if self.optional_spare_watering:
+            return "water_only"
+        return "none"
 
 
 def _require_positive_int(value: Any, what: str) -> int:
@@ -910,7 +919,8 @@ class ExecutorAgent:
         optional_tasks: tuple[Task, ...] = ()
         foreman_result = normal_foreman
         if self.config.idle_cleanup_enabled:
-            optional_tasks = generate_optional_idle_cleanup_tasks(obs, seat)
+            optional_tasks = generate_optional_idle_cleanup_tasks(
+                obs, seat, mode=self.config.cleanup_mode)
             foreman_result = apply_idle_cleanup(
                 obs, seat, normal_foreman, optional_tasks)
         self._record_cleanup_telemetry(
@@ -1096,9 +1106,8 @@ class ExecutorAgent:
                 "aggressive_sell_all": self.config.aggressive_sell_all,
                 "optional_idle_cleanup": self.config.idle_cleanup_enabled,
                 "optional_spare_watering": self.config.optional_spare_watering,
-                "optional_idle_cleanup_mode": (
-                    "weed_first" if self.config.idle_cleanup_enabled else "off"
-                ),
+                "optional_idle_cleanup_mode": self.config.cleanup_mode,
+                "cleanup_mode": self.config.cleanup_mode,
             },
             "cleanup_metrics": self._cleanup_diagnostics(),
             "days": {str(day): record for day, record in sorted(self._day_records.items())},

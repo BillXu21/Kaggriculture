@@ -98,6 +98,12 @@ def test_generation_is_weed_first_and_water_remains_strictly_filtered():
         ("WATER", "WATER_OPTIONAL:0,1", "water_optional_spare"),
     ]
 
+    water_only = generate_optional_idle_cleanup_tasks(
+        make_obs(tiles=tiles, unlocked=("NW",)), 0, mode="water_only")
+    assert [(task.kind, task.key, task.source) for task in water_only] == [
+        ("WATER", "WATER_OPTIONAL:0,1", "water_optional_spare"),
+    ]
+
 
 def test_pass_becomes_underfoot_water():
     tiles = [[None] * 10 for _ in range(10)]
@@ -202,18 +208,43 @@ def test_cleanup_claims_are_not_persistent_between_turns():
     assert normal.farmer_action == ("PASS",)
 
 
-def test_legacy_watering_alias_enables_generalized_cleanup():
+def test_legacy_watering_alias_enables_water_only_cleanup():
     tiles = [[None] * 10 for _ in range(10)]
     tiles[0][0] = "WEED"
     agent = ExecutorAgent(
         FixedPlanProvider(empty_plan()), seat=0,
         config=AgentConfig(optional_spare_watering=True))
 
-    assert agent(make_obs(tiles=tiles))["farmer"] == ["DIG"]
+    assert agent(make_obs(tiles=tiles))["farmer"] == ["PASS"]
     config = agent.diagnostics_json()["config"]
     assert config["optional_spare_watering"] is True
     assert config["optional_idle_cleanup"] is True
-    assert config["optional_idle_cleanup_mode"] == "weed_first"
+    assert config["optional_idle_cleanup_mode"] == "water_only"
+
+
+def test_weed_first_cleanup_is_superset_and_wins_when_both_flags_are_set():
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[0][0] = "WEED"
+    tiles[0][1] = plant()
+    obs = make_obs(tiles=tiles)
+
+    water_only = ExecutorAgent(
+        FixedPlanProvider(empty_plan()), seat=0,
+        config=AgentConfig(optional_spare_watering=True))
+    weed_water = ExecutorAgent(
+        FixedPlanProvider(empty_plan()), seat=0,
+        config=AgentConfig(optional_idle_cleanup=True))
+    both = ExecutorAgent(
+        FixedPlanProvider(empty_plan()), seat=0,
+        config=AgentConfig(optional_idle_cleanup=True,
+                            optional_spare_watering=True))
+
+    assert water_only(obs)["farmer"] == ["EAST"]
+    assert weed_water(obs)["farmer"] == ["DIG"]
+    assert both(obs)["farmer"] == ["DIG"]
+    assert water_only.diagnostics_json()["config"]["cleanup_mode"] == "water_only"
+    assert weed_water.diagnostics_json()["config"]["cleanup_mode"] == "weed_water"
+    assert both.diagnostics_json()["config"]["cleanup_mode"] == "weed_water"
 
 
 def test_cleanup_does_not_create_hire_debt_or_market_work():
