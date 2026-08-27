@@ -168,6 +168,119 @@ or behavior mutation was performed here.
   post-Stage-3-correction panel; the current panel cannot establish its isolated
   economic effect.
 
+## Isolated Stage 4 rerun after Stage 3 revert
+
+- Date: 2026-08-27
+- Source revision: `7204103fc2ca6e351cc2a95506c961977d199bb2` (`revert: reject Stage 3 aggressive fertilizer retention`)
+- Stage 4 commit retained: `b9c88ff517a2d8ab6c3ae08ebf0e514ee6a0b200`
+- Result: **REJECT Stage 4 for archive acceptance; no archive pin update**
+- Checkpoint SHA-256: `f4b029d3e463aba1db0544377d0d616e3de94aa6cc469d3446f018dddd8f6bf2`
+
+The exact fixed panel was run once with the same 12 seeds × 2 seats, PASS
+opponent, `standard_mixed`, fast backend, 719 transitions, prior-debt
+suppression ON, aggressive selling ON, and turn trace ON.
+
+```text
+python -m tools.run_executor_v07_panel --checkpoint "C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\artifacts\local\bc-v1-E\best.pt" --seeds 7,17,42,123,2026,1013,1022,1003,1026,1011,1024,1019 --seats 0,1 --opponent PASS --opening standard_mixed --prior-debt-suppression on --aggressive-sell-all --turn-trace --backend fast --output "artifacts/executor-v07-stage5-isolated-stage4-post-stage3-revert.json" --label "executor-v07-stage5-isolated-stage4-post-stage3-revert"
+python -m tools.audit_executor_v07_care_fertilize --artifact "artifacts/executor-v07-stage5-isolated-stage4-post-stage3-revert.json" --output "artifacts/executor-v07-stage5-isolated-stage4-post-stage3-revert-care-fertilize-audit.json" --expected-repo-sha 7204103fc2ca6e351cc2a95506c961977d199bb2 --expected-checkpoint-sha256 f4b029d3e463aba1db0544377d0d616e3de94aa6cc469d3446f018dddd8f6bf2 --seeds 7,17,42,123,2026,1013,1022,1003,1026,1011,1024,1019 --seats 0,1 --backend fast --opening standard_mixed --day-start 4 --day-end 29
+```
+
+| item | value |
+|---|---|
+| panel artifact | `artifacts/executor-v07-stage5-isolated-stage4-post-stage3-revert.json` |
+| panel file SHA-256 | `bd9dd3ef58f7b87f33aa2fcad980aa826a6a1ccfcf94012bb491927853027546` |
+| panel internal SHA-256 | `8862450c5036b5791c1a7d843220fe274ffb73b90022ed7856e892611f3db159` |
+| audit artifact | `artifacts/executor-v07-stage5-isolated-stage4-post-stage3-revert-care-fertilize-audit.json` |
+| audit file SHA-256 | `3f406eff7244015eef302fda6b2d22118ef49ebbc2e86879702018b683240c6e` |
+| audit report SHA-256 | `ca62fc6b1ba6b0b145778023bf15a3a0e9c96fc16f927e9ed0e06ff7ce2a33b3` |
+
+Validation passed: 24/24 exact cases, no duplicates or omissions, every game
+`complete`, 719 transitions, and `DONE/DONE`.
+
+### Isolated bank table
+
+| seed | seat | isolated Stage 4 bank | pre-behavior bank | delta |
+|---:|---:|---:|---:|---:|
+| 7 | 0 | 50655 | 61572 | -10917 |
+| 7 | 1 | 47290 | 54439 | -7149 |
+| 17 | 0 | 63139 | 53146 | +9993 |
+| 17 | 1 | 63956 | 54400 | +9556 |
+| 42 | 0 | 58652 | 58267 | +385 |
+| 42 | 1 | 64092 | 60340 | +3752 |
+| 123 | 0 | 49304 | 55220 | -5916 |
+| 123 | 1 | 49304 | 55220 | -5916 |
+| 2026 | 0 | 69206 | 67342 | +1864 |
+| 2026 | 1 | 71315 | 65468 | +5847 |
+| 1013 | 0 | 72512 | 66274 | +6238 |
+| 1013 | 1 | 72425 | 65271 | +7154 |
+| 1022 | 0 | 57309 | 60141 | -2832 |
+| 1022 | 1 | 59247 | 57216 | +2031 |
+| 1003 | 0 | 66927 | 59740 | +7187 |
+| 1003 | 1 | 68461 | 54871 | +13590 |
+| 1026 | 0 | 61348 | 62642 | -1294 |
+| 1026 | 1 | 63732 | 61837 | +1895 |
+| 1011 | 0 | 70073 | 65782 | +4291 |
+| 1011 | 1 | 70073 | 65782 | +4291 |
+| 1024 | 0 | 74151 | 64655 | +9496 |
+| 1024 | 1 | 68459 | 65889 | +2570 |
+| 1019 | 0 | 67632 | 66546 | +1086 |
+| 1019 | 1 | 66953 | 56614 | +10339 |
+
+| panel | mean | median | min | max | <1k | <10k |
+|---|---:|---:|---:|---:|---:|---:|
+| isolated Stage 4 | 63592.3 | 65509.5 | 47290 | 74151 | 0 | 0 |
+| actual pre-behavior (`8f716bec`) | 60778.1 | 60956 | 53146 | 67342 | 0 | 0 |
+| user older aggregate | 60230.3 | 58334 | 51692 | 69070 | 0 | 0 |
+
+Against the actual pre-behavior artifact, the isolated panel improved mean by
+`+2814.2`, median by `+4553.5`, and max by `+6809`, but reduced min by `-5856`.
+Against the user aggregate, differences are mean `+3362.0`, median `+7175.5`,
+min `-4402`, and max `+5081`; low-tail counts remain zero.
+
+### Isolated diagnostics
+
+- CARE: requested `4,579`, assigned `2,931`, observed state count `0`; COW
+  requested `2,857`, SHEEP `1,722`, GOOSE `0`.
+- FERTILIZE: requested `1,241`, assigned `604`, observed state count `2,741`;
+  all requested fertilizer work was STRAWBERRY.
+- CARE requested-positive/zero-observed/material rows: COW `589/589/589`,
+  SHEEP `582/582/582`; GOOSE `0/0/0`.
+- FERTILIZE requested-positive/zero-observed/material rows: STRAWBERRY
+  `208/0/42`; all other crops `0/0/0`.
+- Audit classifications: 45 manager-infeasible, 1,168 unresolved. State
+  completion fields retain the Stage 2 limitation and are not accepted-action
+  ledgers.
+- Fallback errors: 0; day errors: 0; engine status anomalies: 0; unaffordable
+  market orders: 0; unresolved generator entries: 613.
+- Prior-debt suppression: 564/624 days; current suppression: 624/624 days.
+- Feed-shortage/starvation turns: 738/264; animal-decrease events and animals
+  lost: 0/0; all games remained above the low-tail thresholds.
+
+### Stage 4 diagnosis
+
+There are six negative per-game deltas, including four losses of at least 5,000,
+concentrated across both seats of seeds 7 and 123. This meets the packet's
+proportional major-regression definition despite the aggregate improvement.
+
+For every negative case, the first assignment divergence is d4h18 at tile
+`(1,4)`: pre-behavior assigns `HARVEST:1,4`, while Stage 4 assigns
+`WATER:1,4`; the next turn then harvests. The first state divergence is the
+same transition's available wheat, current `0` versus pre-behavior `3`, showing
+that the dependency changes harvest timing and downstream liquidity. Aggregate
+traces show 9,622 WATER and 5,304 HARVEST assignments, versus 9,537 and 5,482
+pre-behavior; same-tile pairs are WATER-first 2,340 versus 2,042 and
+HARVEST-first 1,220 versus 1,461. The trace does not expose the generated
+dependency field or engine acceptance ledger, so these counts are behavioral
+ordering evidence rather than proof of engine action acceptance.
+
+### Isolated recommendation
+
+Reject Stage 4 for archive acceptance and recommend the exact clean correction
+`git revert b9c88ff` for the root decision. No revert, archive expected-bank or
+fingerprint update, or executor mutation was performed in this packet. The
+original combined Stage 3+4 all-zero artifact and rejection evidence above remain
+unchanged.
+
 ## Stage 3 / issue #14C disposition
 
 - Status: **REJECTED and reverted**; do not reintroduce the fertilizer-retention
