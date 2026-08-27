@@ -11,9 +11,9 @@ import sys
 import tarfile
 import tempfile
 
-EXPECTED_BANK = 54439.0
+EXPECTED_BANK = 47290.0
 EXPECTED_TRACE_FINGERPRINT = (
-    "516fab6d316b76e8b93fce3b4d185e49b2df53aa742be6558574563c1929dc40"
+    "a38bf47884e5e6e89c2d77f7aab07819f3559e898af40372942460693c8b6afc"
 )
 EXPECTED_STATUSES = {"ACTIVE", "DONE"}
 REQUIRED_PACKAGES = (
@@ -175,8 +175,8 @@ if result["sys_path_repository_root_present"]:
     fail("repository root appeared on sys.path")
 if anomalies:
     fail(f"status history anomalies: {anomalies}")
-if bank != 54439.0:
-    fail(f"reference bank mismatch: expected 54439.0, got {bank}")
+if bank != 47290.0:
+    fail(f"reference bank mismatch: expected 47290.0, got {bank}")
 '''
 
 

@@ -1,7 +1,7 @@
 # Executor V0.7 Stage 5 Post-Stage 4 Regression Panel
 
 - Date: 2026-08-27
-- Status: **REJECT current Stage 3+4 revision for archive acceptance; do not update the archive pin**
+- Status: **ACCEPT current post-Stage-4 revision for archive acceptance; exact archive identity updated below**
 - Start/final HEAD: `b9c88ff517a2d8ab6c3ae08ebf0e514ee6a0b200` (`executor: sequence yield water before harvest`)
 - Branch: `executor-v07-fixed-plan`
 - Behavior changes: none in this packet; raw panel and audit JSON are ignored local evidence.
@@ -173,7 +173,7 @@ or behavior mutation was performed here.
 - Date: 2026-08-27
 - Source revision: `7204103fc2ca6e351cc2a95506c961977d199bb2` (`revert: reject Stage 3 aggressive fertilizer retention`)
 - Stage 4 commit retained: `b9c88ff517a2d8ab6c3ae08ebf0e514ee6a0b200`
-- Result: **REJECT Stage 4 for archive acceptance; no archive pin update**
+- Result: **ACCEPT Stage 4 for archive acceptance by root judgment; exact archive pin update is recorded below**
 - Checkpoint SHA-256: `f4b029d3e463aba1db0544377d0d616e3de94aa6cc469d3446f018dddd8f6bf2`
 
 The exact fixed panel was run once with the same 12 seeds × 2 seats, PASS
@@ -273,13 +273,15 @@ HARVEST-first 1,220 versus 1,461. The trace does not expose the generated
 dependency field or engine acceptance ledger, so these counts are behavioral
 ordering evidence rather than proof of engine action acceptance.
 
-### Isolated recommendation
+### Isolated recommendation (superseded by root acceptance)
 
-Reject Stage 4 for archive acceptance and recommend the exact clean correction
-`git revert b9c88ff` for the root decision. No revert, archive expected-bank or
-fingerprint update, or executor mutation was performed in this packet. The
-original combined Stage 3+4 all-zero artifact and rejection evidence above remain
-unchanged.
+The original conservative writer recommendation was to reject Stage 4 for archive
+acceptance and recommend `git revert b9c88ff`. Root superseded that threshold:
+the six negative cases are labor/cash tradeoffs, not feed/starvation failures,
+and no concrete distinguishing feed exception or unconstrained cash forecast is
+justified. The original combined Stage 3+4 all-zero artifact and rejection
+evidence above remain unchanged; Stage 3 fertilizer retention remains rejected
+and cleanly reverted at `7204103`.
 
 ## Stage 3 / issue #14C disposition
 
@@ -295,3 +297,41 @@ unchanged.
   executor-only mechanical workaround exists under the bans on cash governors,
   generic reserves or release rules, strategic heuristics, manager-policy
   changes, and tuning pile-ons.
+
+## Final Stage 5 verdict and exact archive compatibility identity
+
+- Date: 2026-08-27
+- Current source revision used to build: `11ecead2d5efe8bf87fc0da533c739e344d7eaa6`
+- Verdict: **ACCEPT** the retained Stage 4 lifecycle sequencing and update the
+  exact raw-loaded archive reference. Stage 3 fertilizer retention remains
+  **REJECTED and reverted** at `7204103` because the combined experiment drove
+  all 24 banks to zero; aggressive mode again sells FERTILIZER.
+- The complete isolated Stage 4 evidence above is preserved: mean `63,592.3`
+  vs actual pre-behavior `60,778.1` (`+2,814.2`), median `65,509.5` vs
+  `60,956` (`+4,553.5`), six negative per-game deltas, no `<1k`/`<10k` cases,
+  and no errors, status anomalies, unaffordable orders, or animal losses.
+  Independent paid review classified the negative cases as labor/cash
+  tradeoffs, not feed/starvation failures. No concrete distinguishing feed
+  exception exists, and a cash forecast would violate the stated constraints;
+  no such exception or forecast is introduced.
+
+### Old-to-new exact identity
+
+| revision | archive | archive SHA-256 | official bank | action fingerprint |
+|---|---|---|---:|---|
+| pre-behavior `8f716bec` | `artifacts/local/submissions/bc-e-v07.tar.gz` | `4ccfcf25d30465661c912626a5d029210897ec5855c3dc2b55db2cdfd1a7d6cf` | `54,439.0` | `516fab6d316b76e8b93fce3b4d185e49b2df53aa742be6558574563c1929dc40` |
+| current `11ecead2` | `artifacts/local/submissions/bc-e-v07.tar.gz` | `c12218ac1010c894ed22fd065049a290d03555c9f44ad0d6cc667fa52ee13de2` | `47,290.0` | `a38bf47884e5e6e89c2d77f7aab07819f3559e898af40372942460693c8b6afc` |
+
+The current archive was rebuilt with the existing deterministic builder from
+the authorized BC-E `best.pt` (checkpoint SHA-256
+`f4b029d3e463aba1db0544377d0d616e3de94aa6cc469d3446f018dddd8f6bf2`). It has
+50 members, including the six local runtime packages, root `main.py`,
+`best.pt`, and `submission_manifest.json`; archive/checkpoint remain ignored.
+
+Final exact verification used repository-local `.venv` with
+`kaggle-environments==1.32.7`, raw `get_last_callable`, strict mode, fresh
+extraction, repository-root import isolation, and a full status scan. Result:
+bank `47290.0`, 720 status-history entries, zero anomalies, 719 candidate
+actions, repository-root source paths absent, official provenance passed, and
+the new fingerprint matched. Focused submission tests, including loud omitted
+`fast_env` failure, and Ruff passed.

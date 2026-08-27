@@ -49,17 +49,34 @@ Confidence labels:
   `KAGGRICULTURE_SUBMISSION_STRICT=1`, while the production template defaults
   to the existing `strict=False` all-PASS fallback and preserves the default
   non-aggressive executor mode outside this submission configuration.
-- The pinned pre-behavior-change check is official Kaggriculture 1.32.7,
-  seed 7, candidate seat 1 versus PASS, final candidate bank **54,439**;
-  every status in the full environment history must be `ACTIVE` or `DONE`.
+- The pinned compatibility check is official Kaggriculture 1.32.7, seed 7,
+  candidate seat 1 versus PASS, with every status in the full environment
+  history required to be `ACTIVE` or `DONE`. The preserved pre-behavior
+  reference at revision `8f716bec` ended at bank **54,439** with archive SHA
+  `4ccfcf25d30465661c912626a5d029210897ec5855c3dc2b55db2cdfd1a7d6cf` and
+  action fingerprint
+  `516fab6d316b76e8b93fce3b4d185e49b2df53aa742be6558574563c1929dc40`.
+- The accepted post-Stage-4 compatibility reference was built from source
+  revision `11ecead2d5efe8bf87fc0da533c739e344d7eaa6`; it ends at bank
+  **47,290** with archive SHA
+  `c12218ac1010c894ed22fd065049a290d03555c9f44ad0d6cc667fa52ee13de2` and
+  action fingerprint
+  `a38bf47884e5e6e89c2d77f7aab07819f3559e898af40372942460693c8b6afc`.
 - Stage 1 local archive evidence is recorded in `HISTORY.md`. The authorized
   BC-E input's verified SHA-256 is
   `f4b029d3e463aba1db0544377d0d616e3de94aa6cc469d3446f018dddd8f6bf2`.
-- Exact accepted result: archive SHA-256
-  `4ccfcf25d30465661c912626a5d029210897ec5855c3dc2b55db2cdfd1a7d6cf`,
+- Exact current accepted result: archive SHA-256
+  `c12218ac1010c894ed22fd065049a290d03555c9f44ad0d6cc667fa52ee13de2`,
   official provenance 1.32.7, 720 full-history entries, zero status anomalies,
-  candidate seat-1 bank `54,439.0`, and deterministic action fingerprint
-  `516fab6d316b76e8b93fce3b4d185e49b2df53aa742be6558574563c1929dc40`.
+  candidate seat-1 bank `47,290.0`, and deterministic action fingerprint
+  `a38bf47884e5e6e89c2d77f7aab07819f3559e898af40372942460693c8b6afc`.
+- Stage 5 accepts the retained Stage 4 lifecycle sequencing (`b9c88ff`): the
+  isolated panel mean was `63,592.3` vs `60,778.1` (+`2,814.2`) and median
+  `65,509.5` vs `60,956` (+`4,553.5`), with no `<1k`/`<10k` cases and no
+  errors, status anomalies, unaffordable orders, or animal losses. The six
+  negative cases are labor/cash tradeoffs rather than feed/starvation failures;
+  no concrete feed exception or unconstrained cash forecast is justified.
+  Stage 3 fertilizer retention remains rejected and reverted at `7204103`.
 
 ## Match Contract
 

@@ -2,6 +2,42 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-27 — Stage 5 Accepted / Current Archive Compatibility Identity
+
+The fixed Stage 5 panel is accepted by root judgment with the retained Stage 4
+life-cycle sequencing (`b9c88ff`). The isolated 24-game panel remains fully
+recorded in `research/EXECUTOR_V07_STAGE5_POST_STAGE4_REGRESSION.md`: mean
+`63,592.3` vs actual pre-behavior `60,778.1` (`+2,814.2`), median `65,509.5`
+vs `60,956` (`+4,553.5`), six negative per-game deltas, no `<1k`/`<10k`
+cases, and no errors, status anomalies, unaffordable orders, or animal losses.
+Independent paid review classified the negative cases as labor/cash tradeoffs,
+not feed/starvation failures; no concrete distinguishing feed exception exists,
+and a cash forecast would violate the stated constraints.
+
+Stage 3 fertilizer retention remains rejected and cleanly reverted at
+`7204103`: the combined Stage 3+4 experiment drove all 24 banks to zero, so
+aggressive mode again sells FERTILIZER. The combined rejection evidence and all
+negative cases remain preserved; no Stage 3 retention or strategy change was
+introduced by this compatibility update.
+
+The exact archive was intentionally rebuilt from current source revision
+`11ecead2d5efe8bf87fc0da533c739e344d7eaa6` using the authorized read-only BC-E
+checkpoint (`best.pt`, SHA-256
+`f4b029d3e463aba1db0544377d0d616e3de94aa6cc469d3446f018dddd8f6bf2`):
+
+| revision | archive SHA-256 | official seed-7/seat-1 bank | action fingerprint |
+|---|---|---:|---|
+| pre-behavior `8f716bec` | `4ccfcf25d30465661c912626a5d029210897ec5855c3dc2b55db2cdfd1a7d6cf` | `54,439.0` | `516fab6d316b76e8b93fce3b4d185e49b2df53aa742be6558574563c1929dc40` |
+| current `11ecead2` | `c12218ac1010c894ed22fd065049a290d03555c9f44ad0d6cc667fa52ee13de2` | `47,290.0` | `a38bf47884e5e6e89c2d77f7aab07819f3559e898af40372942460693c8b6afc` |
+
+The current archive remains the ignored
+`artifacts/local/submissions/bc-e-v07.tar.gz` with 50 members. The final exact
+verifier used repository-local `.venv` `kaggle-environments==1.32.7`, raw
+`get_last_callable`, strict mode, fresh extraction, repo-root import isolation,
+and a full status scan. It passed with 720 status-history entries, zero
+anomalies, 719 candidate actions, no repository-root source origins, and
+official 1.32.7 provenance.
+
 ## 2026-08-27 — Issue #13 Stage 1 Acceptance Follow-up
 
 Completed the previously partial acceptance with the repository-local
