@@ -36,6 +36,7 @@ from executor_v0.layout import (
     plan_day_layouts,
     quadrant_of,
     reconcile_crops,
+    tile_role,
 )
 from executor_v0.plan import DailyPlan
 from replay_daily.constants import ANIMALS, CROPS, LAND_ORDER, PRODUCTS
@@ -45,6 +46,7 @@ __all__ = [
     "Priority",
     "Task",
     "GenerationResult",
+    "generate_optional_idle_cleanup_tasks",
     "generate_optional_water_tasks",
     "generate_tasks",
 ]
@@ -234,12 +236,13 @@ def _at_terminal_action_horizon(obs: Mapping) -> bool:
     return step >= _FINAL_ACTIONABLE_STEP
 
 
-def generate_optional_water_tasks(obs: Mapping, seat: int) -> tuple[Task, ...]:
-    """Return safe-to-defer plant watering for an explicitly enabled caller.
+def generate_optional_idle_cleanup_tasks(obs: Mapping, seat: int) -> tuple[Task, ...]:
+    """Return weed-first, safe idle cleanup candidates for this observation.
 
-    Optional watering is intentionally separate from ``generate_tasks`` so it
-    cannot contribute to manager workload, shortage purchases, or work debt.
-    The returned tasks are only suitable for appending to a dispatch pool.
+    Cleanup is intentionally separate from ``generate_tasks`` so it cannot
+    contribute to manager workload, shortage purchases, or work debt.  The
+    caller may only assign these candidates to workers whose normal action was
+    PASS; they are never a normal foreman dispatch pool.
     """
     _validate_obs(obs, seat)
     try:
@@ -252,9 +255,15 @@ def generate_optional_water_tasks(obs: Mapping, seat: int) -> tuple[Task, ...]:
     for y, row in enumerate(state["board"]):
         for x, tile in enumerate(row):
             coord = (y, x)
-            if quadrant_of(y, x) not in unlocked \
-                    or not isinstance(tile, Mapping) \
-                    or tile.get("kind") != "PLANT":
+            if quadrant_of(y, x) not in unlocked:
+                continue
+            if tile_role(tile) == "weed":
+                optional.append(Task(
+                    key=f"DIG_CLEANUP:{y},{x}", kind="DIG",
+                    priority=Priority.OPTIONAL, tile=coord, crop="WEED",
+                    source="dig_cleanup"))
+                continue
+            if not isinstance(tile, Mapping) or tile.get("kind") != "PLANT":
                 continue
             watered_today = tile.get("watered_today")
             consecutive_unwatered = tile.get("consecutive_unwatered")
@@ -275,7 +284,18 @@ def generate_optional_water_tasks(obs: Mapping, seat: int) -> tuple[Task, ...]:
                 key=f"WATER_OPTIONAL:{y},{x}", kind="WATER",
                 priority=Priority.OPTIONAL, tile=coord, crop=crop,
                 source="water_optional_spare"))
-    return tuple(sorted(optional, key=lambda task: task.key))
+    return tuple(sorted(
+        optional,
+        key=lambda task: (0 if task.kind == "DIG" else 1, task.key),
+    ))
+
+
+def generate_optional_water_tasks(obs: Mapping, seat: int) -> tuple[Task, ...]:
+    """Backward-compatible watering-only view of idle cleanup candidates."""
+    return tuple(
+        task for task in generate_optional_idle_cleanup_tasks(obs, seat)
+        if task.kind == "WATER"
+    )
 
 
 # --------------------------------------------------------------- generation

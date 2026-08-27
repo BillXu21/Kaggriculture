@@ -11,6 +11,7 @@ import pytest
 from opening_book.trace import load_built_in_trace
 from tools.run_executor_v07_panel import (
     EvaluatorError,
+    build_parser,
     main,
     run_panel,
 )
@@ -317,6 +318,25 @@ def test_optional_spare_watering_flag_propagates_and_is_recorded(tmp_path):
     assert enabled["games"][0]["executor_diagnostics"]["config"][
         "optional_spare_watering"
     ] is True
+
+
+def test_optional_idle_cleanup_flag_propagates_and_legacy_alias_is_accepted(tmp_path):
+    enabled = _run(tmp_path, optional_idle_cleanup=True)
+    request = enabled["request"]
+    assert request["optional_idle_cleanup"] is True
+    assert request["optional_spare_watering"] is False
+    assert enabled["source_provenance"]["optional_idle_cleanup"] is True
+    assert enabled["games"][0]["optional_idle_cleanup"] is True
+    assert enabled["games"][0]["executor_diagnostics"]["config"][
+        "optional_idle_cleanup"
+    ] is True
+
+    args = build_parser().parse_args([
+        "--checkpoint", "checkpoint.pt", "--seeds", "17", "--seats", "0",
+        "--optional-idle-cleanup", "--output", "artifact.json",
+    ])
+    assert args.optional_idle_cleanup is True
+    assert args.optional_spare_watering is False
 
 
 def _backend_to_98(factory, name, config):

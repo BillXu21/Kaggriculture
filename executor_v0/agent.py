@@ -51,8 +51,12 @@ from replay_daily.constants import (
 )
 from replay_daily.lifecycle import canonical_board
 
-from .foreman import ForemanConfig, run_foreman
-from .tasks import GenerationResult, Task, generate_optional_water_tasks
+from .foreman import ForemanConfig, apply_idle_cleanup, run_foreman
+from .tasks import (
+    GenerationResult,
+    Task,
+    generate_optional_idle_cleanup_tasks,
+)
 from .manager import CheckpointPlanProvider, PlanProvider
 from .plan import SELL_BIN_ANCHORS, DailyPlan
 from .projection import clip_sell, project_plan
@@ -86,7 +90,13 @@ class AgentConfig:
     turn_trace: bool = False
     suppress_expansion_from_prior_debt: bool = True
     aggressive_sell_all: bool = False
+    optional_idle_cleanup: bool = False
     optional_spare_watering: bool = False
+
+    @property
+    def idle_cleanup_enabled(self) -> bool:
+        """Resolve the generalized flag and its legacy watering alias."""
+        return self.optional_idle_cleanup or self.optional_spare_watering
 
 
 def _require_positive_int(value: Any, what: str) -> int:
@@ -531,6 +541,7 @@ class ExecutorAgent:
         tasks: tuple[Task, ...],
         dispatch_tasks: tuple[Task, ...],
         generated_tasks: tuple[Task, ...],
+        cleanup_tasks: tuple[Task, ...],
         generation: GenerationResult,
         foreman_result: Any,
         feed: Mapping[str, int],
@@ -540,7 +551,7 @@ class ExecutorAgent:
         unaffordable_orders: list[dict[str, Any]],
     ) -> dict[str, Any]:
         task_by_key = {
-            task.key: task for task in (*tasks, *dispatch_tasks)
+            task.key: task for task in (*tasks, *dispatch_tasks, *cleanup_tasks)
         }
         assignments = []
         for assignment in foreman_result.assignments:
@@ -552,7 +563,7 @@ class ExecutorAgent:
                 "action": list(assignment.action),
                 "target": list(task.tile) if task is not None and task.tile is not None else None,
             }
-            if task is not None and task.source == "water_optional_spare":
+            if task is not None and task.source in ("water_optional_spare", "dig_cleanup"):
                 detail["source"] = task.source
             assignments.append(detail)
 
@@ -686,6 +697,7 @@ class ExecutorAgent:
         expansion_suppressed: bool,
         tasks: tuple[Task, ...],
         dispatch_tasks: tuple[Task, ...],
+        cleanup_tasks: tuple[Task, ...],
         foreman_result: Any,
         pending: list[str],
         trace_market_by_payload: Mapping[int, tuple[str, str]],
@@ -730,7 +742,7 @@ class ExecutorAgent:
 
         assignments = []
         task_by_key = {
-            task.key: task for task in (*tasks, *dispatch_tasks)
+            task.key: task for task in (*tasks, *dispatch_tasks, *cleanup_tasks)
         }
         for assignment in foreman_result.assignments:
             action = list(assignment.action)
@@ -745,7 +757,10 @@ class ExecutorAgent:
                 "op_family": action[0] if action else None,
             }
             task = task_by_key.get(assignment.task_key)
-            if task is not None and task.source == "water_optional_spare":
+            if task is not None and task.tile is not None \
+                    and task.source in ("water_optional_spare", "dig_cleanup"):
+                detail["target"] = list(task.tile)
+            if task is not None and task.source in ("water_optional_spare", "dig_cleanup"):
                 detail["source"] = task.source
             assignments.append(detail)
 
@@ -830,12 +845,16 @@ class ExecutorAgent:
             dispatch_tasks = tuple(t for t in tasks if t.tile is None or t.kind == "FEED")
         normal_dispatch_tasks = dispatch_tasks
 
+        # Normal dispatch is deliberately completed in isolation.  Cleanup is
+        # a second layer over only literal normal PASS actions.
+        normal_foreman = run_foreman(obs, seat, normal_dispatch_tasks,
+                                     config=self.config.foreman)
         optional_tasks: tuple[Task, ...] = ()
-        if self.config.optional_spare_watering:
-            optional_tasks = generate_optional_water_tasks(obs, seat)
-            dispatch_tasks = tuple(dispatch_tasks) + optional_tasks
-
-        foreman_result = run_foreman(obs, seat, dispatch_tasks, config=self.config.foreman)
+        foreman_result = normal_foreman
+        if self.config.idle_cleanup_enabled:
+            optional_tasks = generate_optional_idle_cleanup_tasks(obs, seat)
+            foreman_result = apply_idle_cleanup(
+                obs, seat, normal_foreman, optional_tasks)
 
         record = self._day_records[day]
         survival_record = record["survival"]
@@ -967,7 +986,7 @@ class ExecutorAgent:
             try:
                 self._record_turn_trace(
                     obs, seat, day, hour, feed, expansion_suppressed, tasks,
-                    dispatch_tasks, foreman_result, pending,
+                    dispatch_tasks, optional_tasks, foreman_result, pending,
                     trace_market_by_payload, included, unaffordable_orders)
             except Exception:
                 # Trace capture is strictly diagnostic and must never turn a
@@ -980,6 +999,7 @@ class ExecutorAgent:
                 hour=hour,
                 tasks=tasks,
                 dispatch_tasks=dispatch_tasks,
+                cleanup_tasks=optional_tasks,
                 generated_tasks=generated_tasks,
                 generation=generation,
                 foreman_result=foreman_result,
@@ -1014,7 +1034,11 @@ class ExecutorAgent:
                     self.config.suppress_expansion_from_prior_debt
                 ),
                 "aggressive_sell_all": self.config.aggressive_sell_all,
+                "optional_idle_cleanup": self.config.idle_cleanup_enabled,
                 "optional_spare_watering": self.config.optional_spare_watering,
+                "optional_idle_cleanup_mode": (
+                    "weed_first" if self.config.idle_cleanup_enabled else "off"
+                ),
             },
             "days": {str(day): record for day, record in sorted(self._day_records.items())},
             "illegal_actions": {

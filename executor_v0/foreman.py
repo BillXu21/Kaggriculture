@@ -38,7 +38,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from executor_v0.layout import tile_role
 from executor_v0.tasks import Task
 
 __all__ = [
@@ -47,6 +46,7 @@ __all__ = [
     "WorkerView",
     "Assignment",
     "ForemanResult",
+    "apply_idle_cleanup",
     "run_foreman",
 ]
 
@@ -457,4 +457,79 @@ def run_foreman(
         market_tasks=tuple(market_tasks),
         counts=counts,
         unassigned_reasons=unassigned_reasons,
+    )
+
+
+def apply_idle_cleanup(
+    obs: Mapping,
+    seat: int,
+    normal_result: ForemanResult,
+    cleanup_tasks: Sequence[Task],
+) -> ForemanResult:
+    """Assign weed-first cleanup only to workers normal dispatch left PASSing.
+
+    ``normal_result`` is authoritative for every non-PASS worker.  Cleanup
+    claims are made atomically in worker order and are discarded by the caller
+    after this primitive turn; no task is added to normal accounting.
+    """
+    if not cleanup_tasks:
+        return normal_result
+
+    farm = obs["farms"][seat]
+    board = farm["tiles"]
+    unlocked = list(farm["unlocked_quadrants"])
+    workers = _worker_views(obs, seat)
+    actions = [normal_result.farmer_action, *normal_result.hands_actions]
+    assignments = list(normal_result.assignments)
+    claimed: set[str] = set()
+    counts = dict(normal_result.counts)
+
+    candidates = [
+        task for task in cleanup_tasks
+        if task.kind in ("DIG", "WATER") and task.tile is not None
+    ]
+
+    for worker in workers:
+        if worker.index >= len(assignments) or actions[worker.index] != ("PASS",):
+            continue
+        available = [task for task in candidates if task.key not in claimed]
+        if not available:
+            continue
+        weed_available = [task for task in available if task.kind == "DIG"]
+        if weed_available:
+            available = weed_available
+        chosen = min(
+            available,
+            key=lambda task: (
+                abs(worker.position[0] - task.tile[0])
+                + abs(worker.position[1] - task.tile[1]),
+                task.key,
+            ),
+        )
+        if chosen.tile == worker.position:
+            action = _interaction_op(chosen)
+            reason = f"{chosen.source}_underfoot"
+        else:
+            step = _step_toward(board, unlocked, worker.position, chosen.tile)
+            if step is None:
+                continue
+            action = (step[0],)
+            reason = f"{chosen.source}_move:{step[1]}"
+        if action is None:
+            continue
+        claimed.add(chosen.key)
+        actions[worker.index] = action
+        assignments[worker.index] = Assignment(
+            worker.index, chosen.key, action, reason)
+        counts["pass"] -= 1
+        counts["interaction" if action[0] in _TILE_TASK_KINDS else "movement"] += 1
+
+    return ForemanResult(
+        farmer_action=actions[0],
+        hands_actions=tuple(actions[1:]),
+        assignments=tuple(assignments),
+        unassigned_tile_tasks=normal_result.unassigned_tile_tasks,
+        market_tasks=normal_result.market_tasks,
+        counts=counts,
+        unassigned_reasons=dict(normal_result.unassigned_reasons),
     )
