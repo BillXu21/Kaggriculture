@@ -167,3 +167,18 @@ or behavior mutation was performed here.
 - Unresolved risk: Stage 4 same-day lifecycle sequencing still needs a clean
   post-Stage-3-correction panel; the current panel cannot establish its isolated
   economic effect.
+
+## Stage 3 / issue #14C disposition
+
+- Status: **REJECTED and reverted**; do not reintroduce the fertilizer-retention
+  experiment without manager-level policy.
+- Evidence: the post-Stage-4 24-game panel produced bank `0` in all 24 games
+  versus the pre-change mean bank of `60,778.1`; the first divergence was d4h0.
+  It also recorded 27,151 unaffordable orders, 1,728 feed-shortage turns,
+  1,728 starvation turns, and 120 animals lost, with no fallback, day, or
+  status errors.
+- Rationale: retaining FERTILIZER under the current aggressive diagnostic
+  removes required liquidity and causes a total starvation cascade. No allowed
+  executor-only mechanical workaround exists under the bans on cash governors,
+  generic reserves or release rules, strategic heuristics, manager-policy
+  changes, and tuning pile-ons.

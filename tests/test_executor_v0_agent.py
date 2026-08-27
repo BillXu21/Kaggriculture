@@ -240,7 +240,7 @@ def test_default_sell_path_does_not_sell_unrequested_stock():
     assert agent.diagnostics_json()["config"]["aggressive_sell_all"] is False
 
 
-def test_aggressive_sell_all_sells_outputs_and_retains_fertilizer():
+def test_aggressive_sell_all_uses_full_shed_inventory_including_wheat_feed():
     tiles = empty_tiles()
     tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=1)
     shed = {product: index + 1 for index, product in enumerate(PRODUCTS)}
@@ -251,11 +251,7 @@ def test_aggressive_sell_all_sells_outputs_and_retains_fertilizer():
     action = agent(make_obs(day=3, hour=1, shed=shed, tiles=tiles))
 
     assert [order for order in action["market"] if order[0] == "SELL"] == [
-        ["SELL", product, shed[product]]
-        for product in PRODUCTS if product != "FERTILIZER"
-    ]
-    assert "FERTILIZER" not in [
-        order[1] for order in action["market"] if order[0] == "SELL"
+        ["SELL", product, shed[product]] for product in PRODUCTS
     ]
     assert agent.diagnostics_json()["days"]["3"]["sells"]["0"]["WHEAT"] == {
         "source": "aggressive_sell_all",
@@ -277,21 +273,6 @@ def test_aggressive_sell_all_sells_outputs_and_retains_fertilizer():
     assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 0
 
 
-def test_default_sell_path_still_sells_requested_fertilizer():
-    rows = {product: {anchor: 0 for anchor in (0, 4, 8, 12, 16, 20)}
-            for product in PRODUCTS}
-    rows["FERTILIZER"][0] = 3
-    agent = ExecutorAgent(
-        recording_provider(simple_plan(sell_quantities=rows)), seat=0)
-
-    action = agent(make_obs(day=3, hour=1, shed={"FERTILIZER": 2}))
-
-    assert action["market"] == [["SELL", "FERTILIZER", 2]]
-    assert agent.diagnostics_json()["days"]["3"]["sells"]["0"]["FERTILIZER"] == {
-        "requested": 3, "submitted": 2, "remaining": 1,
-    }
-
-
 def test_aggressive_sell_all_skips_zero_inventory():
     agent = ExecutorAgent(
         recording_provider(simple_plan()), seat=0,
@@ -303,7 +284,7 @@ def test_aggressive_sell_all_skips_zero_inventory():
     assert agent.debug_trace_turn["market"]["sell_submitted"] == []
 
 
-def test_aggressive_sell_all_retains_fertilizer_without_consuming_market_cap():
+def test_aggressive_sell_all_market_cap_reports_only_submitted_sells():
     agent = ExecutorAgent(
         recording_provider(simple_plan()), seat=0,
         config=AgentConfig(aggressive_sell_all=True, max_market_orders=3))
@@ -316,13 +297,12 @@ def test_aggressive_sell_all_retains_fertilizer_without_consuming_market_cap():
         ["SELL", product, 2] for product in PRODUCTS[:3]
     ]
     assert [item["product"] for item in trace_market["sell_submitted"]] == list(PRODUCTS[:3])
-    assert [item["product"] for item in trace_market["sell_skipped"]] == list(PRODUCTS[3:-1])
-    assert "FERTILIZER" not in [item["product"] for item in trace_market["sell_skipped"]]
+    assert [item["product"] for item in trace_market["sell_skipped"]] == list(PRODUCTS[3:])
     assert all(item["status"] == "skipped_market_order_cap"
                for item in trace_market["sell_skipped"])
     sells = agent.diagnostics_json()["days"]["3"]["sells"]["0"]
     assert [sells[product]["override_submitted"] for product in PRODUCTS] == [2, 2, 2, 0, 0, 0, 0, 0, 0]
-    assert [sells[product]["override_skipped"] for product in PRODUCTS] == [0, 0, 0, 2, 2, 2, 2, 2, 0]
+    assert [sells[product]["override_skipped"] for product in PRODUCTS] == [0, 0, 0, 2, 2, 2, 2, 2, 2]
 
 
 def test_inactive_bin_never_sells_and_new_bin_resets_ledger():
