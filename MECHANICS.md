@@ -32,6 +32,30 @@ Confidence labels:
 - Host statement: 1.32.7 should be the last balance change except game-breaking bugs
 - Status: **current source contract is known, but do not treat this repository as a complete engine lock until local source/spec hashes and behavioral tests are recorded**
 
+## Submission Runtime Invariant — Stage 1 / Issue #13
+
+- A submission is not validated by importing `make_agent` from the repository
+  or by running a separately staged directory. The acceptance artifact is the
+  exact archive produced by `tools/build_submission.py`, freshly extracted to
+  an empty directory, and raw-loaded through
+  `kaggle_environments.agent.get_last_callable` with repository-root
+  `PYTHONPATH`/`sys.path` and import-origin fallback prohibited.
+- The archive must carry the complete local runtime import closure used by the
+  tracked BC-E entrypoint: `executor_v0`, `bc_manager`, `opening_book`,
+  `oracle`, `replay_daily`, and `fast_env`; the lazy `fast_env.market` import
+  is explicitly smoke-tested before the official game. Missing that package is
+  a packaging failure, not evidence of a weak trajectory or a late bank change.
+- Verification enables strict executor diagnostics through
+  `KAGGRICULTURE_SUBMISSION_STRICT=1`, while the production template defaults
+  to the existing `strict=False` all-PASS fallback and preserves the default
+  non-aggressive executor mode outside this submission configuration.
+- The pinned pre-behavior-change check is official Kaggriculture 1.32.7,
+  seed 7, candidate seat 1 versus PASS, final candidate bank **54,439**;
+  every status in the full environment history must be `ACTIVE` or `DONE`.
+- Stage 1 local archive evidence is recorded in `HISTORY.md`. The authorized
+  BC-E input's verified SHA-256 is
+  `f4b029d3e463aba1db0544377d0d616e3de94aa6cc469d3446f018dddd8f6bf2`.
+
 ## Match Contract
 
 | Mechanic | Current understanding | Confidence |

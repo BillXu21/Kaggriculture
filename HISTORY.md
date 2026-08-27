@@ -2,6 +2,47 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-27 — Issue #13 Stage 1: Reproducible BC-E Archive Builder and Verifier
+
+Implemented the packaging/runtime invariant before any executor behavior
+change. `tools/build_submission.py` uses the tracked
+`tools/submission_main.py`, verifies the authorized BC-E checkpoint, discovers
+and enforces the six local runtime packages (`executor_v0`, `bc_manager`,
+`opening_book`, `oracle`, `replay_daily`, `fast_env`), stages the checkpoint
+only as archive-root `best.pt`, includes opening-book data, and writes a
+deterministic gzip/tar archive with normalized metadata and no caches or native
+extensions. `tools/verify_submission.py` safely extracts to a fresh directory,
+sanitizes `PYTHONPATH`, checks repository-root absence from `sys.path` and
+runtime package origins, raw-loads extracted `main.py` through
+`kaggle_environments.agent.get_last_callable`, enables the bounded strict
+diagnostic switch, scans the complete status history, and checks the pinned
+seed-7/seat-1 reference bank.
+
+- Authorized checkpoint SHA-256 verified from the read-only input:
+  `f4b029d3e463aba1db0544377d0d616e3de94aa6cc469d3446f018dddd8f6bf2`.
+  The prior durable spelling had 65 characters and one extra `D`, so it was
+  corrected here and in the current V0.7 final note to the actual 64-character
+  SHA-256 digest.
+- Build command: `python tools/build_submission.py --checkpoint
+  "C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\artifacts\local\bc-v1-E\best.pt"
+  --output "artifacts/local/submissions/bc-e-v07.tar.gz"`.
+- Output (ignored): `artifacts/local/submissions/bc-e-v07.tar.gz`, SHA-256
+  `4ccfcf25d30465661c912626a5d029210897ec5855c3dc2b55db2cdfd1a7d6cf`, 50
+  members; root members include `main.py`, `best.pt`, and
+  `submission_manifest.json`.
+- Focused tests: `tests/test_submission_tools.py` — **4 passed**; `ruff`
+  passed on all changed source/tests.
+- Exact verifier command: `python tools/verify_submission.py
+  "artifacts/local/submissions/bc-e-v07.tar.gz"`.
+  Result is **PARTIAL**, with the exact child error
+  `ModuleNotFoundError: No module named 'kaggle_environments'` after archive
+  extraction; no bank or trajectory fingerprint is claimed. The omitted-
+  `fast_env` regression fails earlier and loudly with `ModuleNotFoundError`.
+- The pre-behavior-change reference remains candidate seat 1 versus PASS,
+  final bank **54,439**; a deterministic action fingerprint is intentionally
+  not pinned until the official 1.32.7 dependency is available in the isolated
+  verifier process.
+
 ## 2026-08-25 — Executor V0.7 Frozen: R4 Rejected, Shed-Room Fix Accepted, Viewer #11 Closed
 
 Closed issue #7 / Executor V0.7 at `a7c826d` without changing code or tests in
@@ -44,7 +85,7 @@ E_VS_E banks intentionally differ from the PASS panel, and no traces were
 committed. The real BC-E validation input was externally supplied read-only
 from
 `C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\artifacts\local\bc-v1-E\best.pt`, variant E epoch 27, SHA-256
-`F4B029D3E463ABA1DBD0544377D0D616E3DE94AA6CC469D3446F018DDDD8F6BF2`.
+`F4B029D3E463ABA1DB0544377D0D616E3DE94AA6CC469D3446F018DDDD8F6BF2`.
 It is intentionally absent from this isolated worktree because local
 artifacts/checkpoints are ignored and remains uncommitted.
 

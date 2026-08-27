@@ -1,6 +1,6 @@
 # Kaggriculture Plans
 
-Last updated: 2026-08-25
+Last updated: 2026-08-27
 
 ## Strategic Objective
 
@@ -14,7 +14,9 @@ A temporary high local coding-agent-usage window is being used for large, mechan
 
 Issue #7 / Executor V0.7 is now frozen at `a7c826d`; the exact current decision, bounded PASS panel, R4 rejection, and viewer #11 closure are in [`research/EXECUTOR_V07_FINAL.md`](research/EXECUTOR_V07_FINAL.md). The real BC-E validation input was externally supplied read-only from `C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\artifacts\local\bc-v1-E\best.pt` (variant E, epoch 27) and remains uncommitted; neither issue #7 executor selection nor checkpoint availability remains a blocker.
 
-Current active packet (issue #9 Stage B2, 2026-08-24): the RL rollout/self-play/trajectory harness `rl_manager` AND the PPO V0 plumbing are implemented and locally validated — Stage A batched own-only-E JAX policy seam, lockstep N-env runner with identity-grouped day batches over `oracle.backend`, exact d4h0 opening handoff and stateless E economic history, strict-schema trajectory NPZ + JSON sidecar; Stage B1 PPO core (mutable E trunk + value head, frozen-E sell quantities, GAE, masked-AdamW update, strict RL checkpoint); Stage B2 integration (`PPOBatchedPolicy` Stage-A adapter with exact deterministic-init parity to frozen E, checkpoint-resume reconstruction, post-GAE tiny-subset selection, compact JSON-safe diagnostics artifact, guarded train/eval CLIs with fixed smoke/dev/holdout seed sets and both-seat planning). Evidence: 130 passed + 4 skipped across the rl_manager suite + focused issue-#8 JAX parity/train (~187 s); tiny live smoke = ONE complete fast game -> full-trajectory GAE -> exact stored-action logprob recompute -> ONE 4-row-minibatch update -> checkpoint roundtrip with bit-identical resume. Plumbing only, no quality claim (tiny random-init E); the next gate is the RL executor-factory swap and serious training decision against the frozen V0.7 executor. Details: `research/RL_SELFPLAY_V0.md`. The issue-#8 gates stand: real-checkpoint parity and the (unmeasured) 8-device TPU benchmark per `research/JAX_TPU_V5_RUN.md` when the documented run is scheduled.
+Current active packet (issue #13 Stage 1, 2026-08-27): reproducible BC-E archive packaging and exact extracted-archive verification are implemented before executor behavior changes. The builder is deterministic and fail-closed on the six local runtime packages/checkpoint identity; the verifier raw-loads the exact archive, isolates imports, enables strict diagnostics, exercises `fast_env.market`, scans full status history, and checks seed-7/seat-1 bank 54,439. Focused local tests pass, but the real official run is PARTIAL because `kaggle_environments` is unavailable in the sanitized child process; no Stage 2+ CARE/FERT, lifecycle, watering, PPO, or strategy work is authorized by this packet.
+
+Issue #9 Stage B2 remains implemented and locally validated as plumbing, but is not the current mutation target until the issue-#13 archive invariant is accepted.
 
 ## Phase 0 — Freeze 1.32.7, Rules, RNG, and Provenance
 
