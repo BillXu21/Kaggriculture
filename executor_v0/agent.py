@@ -327,6 +327,8 @@ class ExecutorAgent:
             bin_log = self._day_records[int(obs["day"])]
             bin_log = bin_log["sells"][str(self._bin_anchor)]
             for product in PRODUCTS:
+                if product == "FERTILIZER":
+                    continue
                 available = int(shed.get(product, 0))
                 if available <= 0:
                     continue
