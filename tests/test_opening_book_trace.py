@@ -68,7 +68,9 @@ def synthetic_replay_path(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_built_in_identities_and_default():
-    assert built_in_identities() == ("standard_mixed", "pasture_heavy")
+    assert built_in_identities() == (
+        "standard_mixed", "pasture_heavy", "carrot_start"
+    )
     assert DEFAULT_IDENTITY == "standard_mixed"
     for identity in built_in_identities():
         doc = load_built_in_trace(identity)
@@ -132,8 +134,7 @@ def test_builtin_provenance_records_source_seat_and_digest():
         assert prov["source_player"]
         assert len(prov["source_replay_sha256"]) == 64
         assert doc["content_digest"] == compute_content_digest(doc["turns"])
-    # provenance must be capable of recording either source seat; both
-    # committed traces carry valid seat metadata (both sources are seat 0).
+    # The opening book supports source traces from either seat.
     assert seen_seats <= {0, 1}
 
 
