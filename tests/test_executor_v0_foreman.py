@@ -286,6 +286,49 @@ def test_shed_lacks_item_no_illegal_pickup_pass_and_unassigned():
     assert [t.key for t in result.unassigned_tile_tasks] == ["FEED:6,6"]
 
 
+def test_same_turn_shed_pickups_reserve_shared_quantity():
+    obs = make_obs(farmer=(4, 4), hands=[[4, 4]],
+                   inventories=[{}, {}], shed={"WHEAT": 5})
+    tasks = [
+        task("FEED:6,6", "FEED", (6, 6),
+             priority=Priority.MAINTENANCE, item="WHEAT"),
+        task("FEED:7,7", "FEED", (7, 7),
+             priority=Priority.MAINTENANCE, item="WHEAT"),
+    ]
+
+    result = run_foreman(obs, 0, tasks=tasks)
+
+    pickups = [a.action for a in result.assignments
+               if a.action[0] == "PICKUP"]
+    assert pickups == [("PICKUP", "WHEAT", 5)]
+    assert result.hands_actions[0] == ("PASS",)
+    assert assignment_for(result, 1).reason == "shed_lacks_item"
+    assert len(result.unassigned_tile_tasks) == 1
+
+
+def test_same_turn_shed_pickups_use_quantity_aware_stock():
+    obs = make_obs(farmer=(4, 4), hands=[[4, 4], [4, 4]],
+                   inventories=[{}, {}, {}], shed={"WHEAT": 10})
+    tasks = [
+        task("FEED:6,6", "FEED", (6, 6),
+             priority=Priority.MAINTENANCE, item="WHEAT"),
+        task("FEED:7,7", "FEED", (7, 7),
+             priority=Priority.MAINTENANCE, item="WHEAT"),
+        task("FEED:8,8", "FEED", (8, 8),
+             priority=Priority.MAINTENANCE, item="WHEAT"),
+    ]
+
+    result = run_foreman(obs, 0, tasks=tasks)
+
+    pickups = [a.action for a in result.assignments
+               if a.action[0] == "PICKUP"]
+    assert pickups == [
+        ("PICKUP", "WHEAT", 5),
+        ("PICKUP", "WHEAT", 5),
+    ]
+    assert sum(action[2] for action in pickups) == 10
+
+
 # ------------------------------------------------------------- movement laws
 
 

@@ -282,6 +282,9 @@ def run_foreman(
     private = obs.get("private") or {}
     seed_budget = {str(k): int(v)
                    for k, v in (private.get("seeds") or {}).items()}
+    shed_budget = {str(k): max(0, int(v))
+                   for k, v in (private.get("shed") or {}).items()
+                   if int(v) > 0}
 
     def seeds_available(task_: Task) -> bool:
         if task_.kind != "PLANT":
@@ -396,8 +399,8 @@ def run_foreman(
         if needs_pickup:
             access = _nearest_access(worker.position, config)
             if worker.position == access:
-                stock = _shed_available(obs, seat, chosen.required_item)
-                if stock <= 0:
+                remaining = shed_budget.get(chosen.required_item, 0)
+                if remaining <= 0:
                     # Unreachable when the greedy filter already dropped
                     # unstockable tasks; kept as an honest safety net.
                     actions.append(("PASS",))
@@ -407,8 +410,17 @@ def run_foreman(
                     counts["pass"] += 1
                     release(chosen)
                     continue
-                quantity = min(config.pickup_batch, stock)
+                quantity = min(config.pickup_batch, remaining)
+                if quantity <= 0:
+                    actions.append(("PASS",))
+                    assignments.append(Assignment(
+                        worker.index, chosen.key, ("PASS",),
+                        "shed_lacks_item"))
+                    counts["pass"] += 1
+                    release(chosen)
+                    continue
                 op = ("PICKUP", chosen.required_item, quantity)
+                shed_budget[chosen.required_item] = remaining - quantity
                 actions.append(op)
                 assignments.append(Assignment(worker.index, chosen.key, op,
                                               "shed_bulk_pickup"))
