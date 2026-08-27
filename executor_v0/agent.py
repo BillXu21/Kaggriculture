@@ -85,6 +85,7 @@ class AgentConfig:
     strict: bool = False
     turn_trace: bool = False
     suppress_expansion_from_prior_debt: bool = True
+    aggressive_sell_all: bool = False
 
 
 def _require_positive_int(value: Any, what: str) -> int:
@@ -299,13 +300,47 @@ class ExecutorAgent:
         }
         self._bin_anchor = bin_anchor
         record = self._day_records[int(obs["day"])]
-        record["sells"][str(bin_anchor)] = {
-            product: {"requested": self._remaining_sells[product], "submitted": 0, "remaining": self._remaining_sells[product]}
-            for product in PRODUCTS
-        }
+        if self.config.aggressive_sell_all:
+            record["sells"][str(bin_anchor)] = {
+                product: {
+                    "source": "aggressive_sell_all",
+                    "requested": self._remaining_sells[product],
+                    "submitted": 0,
+                    "remaining": self._remaining_sells[product],
+                    "override_requested": 0,
+                    "override_submitted": 0,
+                    "override_skipped": 0,
+                }
+                for product in PRODUCTS
+            }
+        else:
+            record["sells"][str(bin_anchor)] = {
+                product: {"requested": self._remaining_sells[product], "submitted": 0, "remaining": self._remaining_sells[product]}
+                for product in PRODUCTS
+            }
 
     def _sell_candidates(self, obs: Mapping, seat: int) -> list[dict]:
         shed = (obs.get("private") or {}).get("shed") or {}
+        if self.config.aggressive_sell_all:
+            candidates = []
+            bin_log = self._day_records[int(obs["day"])]
+            bin_log = bin_log["sells"][str(self._bin_anchor)]
+            for product in PRODUCTS:
+                available = int(shed.get(product, 0))
+                if available <= 0:
+                    continue
+                executed, _ = clip_sell(product, available, available)
+                if executed > 0:
+                    bin_log[product]["override_requested"] += executed
+                    candidates.append({
+                        "order": ["SELL", product, executed],
+                        "product": product,
+                        "executed": executed,
+                        "source": "aggressive_sell_all",
+                        "bc_requested": self._remaining_sells.get(product, 0),
+                    })
+            return candidates
+
         feed = _animal_feed_state(obs, seat)
         candidates = []
         for product in PRODUCTS:
@@ -330,6 +365,9 @@ class ExecutorAgent:
         for item in committed:
             product = item["product"]
             executed = item["executed"]
+            if self.config.aggressive_sell_all:
+                record["sells"][str(self._bin_anchor)][product]["override_submitted"] += executed
+                continue
             self._remaining_sells[product] = self._remaining_sells.get(product, 0) - executed
             entry = bin_log[product]
             entry["submitted"] += executed
@@ -568,6 +606,27 @@ class ExecutorAgent:
                 "eod_work_debt": eod_work_debt,
             },
         }
+        if self.config.aggressive_sell_all:
+            submitted_sells = []
+            skipped_sells = []
+            for index, (kind, payload) in enumerate(candidates):
+                if kind != "sell":
+                    continue
+                detail = {
+                    "source": payload["source"],
+                    "product": payload["product"],
+                    "quantity": payload["executed"],
+                    "bc_requested": payload["bc_requested"],
+                    "order": list(payload["order"]),
+                }
+                if index < included_count:
+                    submitted_sells.append(detail)
+                else:
+                    detail["status"] = "skipped_market_order_cap"
+                    skipped_sells.append(detail)
+            snapshot["market"]["sell_mode"] = "aggressive_sell_all"
+            snapshot["market"]["sell_submitted"] = submitted_sells
+            snapshot["market"]["sell_skipped"] = skipped_sells
         return _snapshot_copy(snapshot)
 
     @staticmethod
@@ -835,6 +894,14 @@ class ExecutorAgent:
         orders = [payload["order"] if kind == "sell" else payload for kind, payload in included]
 
         self._commit_sells(obs, day, [payload for kind, payload in included if kind == "sell"])
+        if self.config.aggressive_sell_all:
+            included_sell_ids = {
+                id(payload) for kind, payload in included if kind == "sell"
+            }
+            bin_log = record["sells"][str(self._bin_anchor)]
+            for payload in sell_candidates:
+                if id(payload) not in included_sell_ids:
+                    bin_log[payload["product"]]["override_skipped"] += payload["executed"]
         submitted_hires = sum(1 for kind, _ in included if kind == "hire")
 
         for key in ("movement", "interaction", "pickup", "pass"):
@@ -920,6 +987,7 @@ class ExecutorAgent:
                 "suppress_expansion_from_prior_debt": (
                     self.config.suppress_expansion_from_prior_debt
                 ),
+                "aggressive_sell_all": self.config.aggressive_sell_all,
             },
             "days": {str(day): record for day, record in sorted(self._day_records.items())},
             "illegal_actions": {

@@ -275,6 +275,23 @@ def test_prior_debt_toggle_propagates_to_executor_config(tmp_path):
     assert artifact["games"][0]["executor_diagnostics"]["config"][
         "suppress_expansion_from_prior_debt"
     ] is False
+    assert artifact["request"]["aggressive_sell_all"] is False
+    assert artifact["request"]["configuration"]["aggressive_sell_all"] is False
+    assert artifact["games"][0]["aggressive_sell_all"] is False
+    assert artifact["games"][0]["executor_diagnostics"]["config"][
+        "aggressive_sell_all"
+    ] is False
+
+
+def test_aggressive_sell_flag_propagates_and_is_recorded(tmp_path):
+    artifact = _run(tmp_path, aggressive_sell_all=True)
+
+    assert artifact["request"]["aggressive_sell_all"] is True
+    assert artifact["request"]["configuration"]["aggressive_sell_all"] is True
+    assert artifact["games"][0]["aggressive_sell_all"] is True
+    assert artifact["games"][0]["executor_diagnostics"]["config"][
+        "aggressive_sell_all"
+    ] is True
 
 
 def _backend_to_98(factory, name, config):

@@ -482,6 +482,7 @@ def _run_one(
     opponent: str,
     prior_debt_suppression: bool,
     turn_trace: bool,
+    aggressive_sell_all: bool,
     max_transitions: int,
     backend_factory: BackendFactory,
     provider_factory: ProviderFactory | None,
@@ -494,6 +495,7 @@ def _run_one(
         strict=True,
         turn_trace=turn_trace,
         suppress_expansion_from_prior_debt=prior_debt_suppression,
+        aggressive_sell_all=aggressive_sell_all,
     )
     downstream, provider_variant = _build_downstream(
         checkpoint_path, seat, config, provider_factory
@@ -600,6 +602,7 @@ def _run_one(
         "opponent": opponent,
         "prior_debt_suppression": prior_debt_suppression,
         "turn_trace": turn_trace,
+        "aggressive_sell_all": aggressive_sell_all,
         "status": final_status,
         "transitions": transitions,
         "final": {
@@ -625,6 +628,7 @@ def _run_one(
         "opening": opening,
         "opponent": opponent,
         "prior_debt_suppression": prior_debt_suppression,
+        "aggressive_sell_all": aggressive_sell_all,
         "tested_action_trace_sha256": game["tested_action_trace_sha256"],
         "final": game["final"],
     })).hexdigest()
@@ -641,6 +645,7 @@ def run_game(
     opponent: str = DEFAULT_OPPONENT,
     prior_debt_suppression: bool = True,
     turn_trace: bool = False,
+    aggressive_sell_all: bool = False,
     max_transitions: int = DEFAULT_MAX_TRANSITIONS,
     backend_factory: BackendFactory | None = None,
     provider_factory: ProviderFactory | None = None,
@@ -655,8 +660,13 @@ def run_game(
         raise EvaluatorError(f"opening must be {DEFAULT_OPENING!r}, got {opening!r}")
     if opponent != DEFAULT_OPPONENT:
         raise EvaluatorError("this evaluator supports only the fixed PASS opponent")
-    if not isinstance(prior_debt_suppression, bool) or not isinstance(turn_trace, bool):
-        raise EvaluatorError("prior_debt_suppression and turn_trace must be booleans")
+    if not isinstance(prior_debt_suppression, bool) \
+            or not isinstance(turn_trace, bool) \
+            or not isinstance(aggressive_sell_all, bool):
+        raise EvaluatorError(
+            "prior_debt_suppression, turn_trace, and aggressive_sell_all "
+            "must be booleans"
+        )
     max_transitions = _require_int(max_transitions, "max_transitions", minimum=0)
     if max_transitions > DEFAULT_MAX_TRANSITIONS:
         raise EvaluatorError(f"max_transitions must be <= {DEFAULT_MAX_TRANSITIONS}")
@@ -676,6 +686,7 @@ def run_game(
         opponent=opponent,
         prior_debt_suppression=prior_debt_suppression,
         turn_trace=turn_trace,
+        aggressive_sell_all=aggressive_sell_all,
         max_transitions=max_transitions,
         backend_factory=backend_factory or (lambda name, config: make_backend(name, config)),
         provider_factory=provider_factory,
@@ -692,6 +703,7 @@ def run_panel(
     opponent: str = DEFAULT_OPPONENT,
     prior_debt_suppression: bool = True,
     turn_trace: bool = False,
+    aggressive_sell_all: bool = False,
     max_transitions: int = DEFAULT_MAX_TRANSITIONS,
     output_path: str | Path | None = None,
     label: str = "executor-v07-local-full-game",
@@ -733,8 +745,13 @@ def run_panel(
         raise EvaluatorError(f"opening must be {DEFAULT_OPENING!r}, got {opening!r}")
     if opponent != DEFAULT_OPPONENT:
         raise EvaluatorError("this evaluator supports only the fixed PASS opponent")
-    if not isinstance(prior_debt_suppression, bool) or not isinstance(turn_trace, bool):
-        raise EvaluatorError("prior_debt_suppression and turn_trace must be booleans")
+    if not isinstance(prior_debt_suppression, bool) \
+            or not isinstance(turn_trace, bool) \
+            or not isinstance(aggressive_sell_all, bool):
+        raise EvaluatorError(
+            "prior_debt_suppression, turn_trace, and aggressive_sell_all "
+            "must be booleans"
+        )
     repo_root = Path(__file__).resolve().parents[1]
     games = [
         _run_one(
@@ -744,6 +761,7 @@ def run_panel(
             opponent=opponent,
             prior_debt_suppression=prior_debt_suppression,
             turn_trace=turn_trace,
+            aggressive_sell_all=aggressive_sell_all,
             max_transitions=max_transitions,
             backend_factory=backend_factory or (lambda name, config: make_backend(name, config)),
             provider_factory=provider_factory,
@@ -751,7 +769,11 @@ def run_panel(
         for seed in seed_list
         for seat in seat_list
     ]
-    configuration = {"seed_selection": seed_list, "seat_selection": seat_list}
+    configuration = {
+        "seed_selection": seed_list,
+        "seat_selection": seat_list,
+        "aggressive_sell_all": aggressive_sell_all,
+    }
     document: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "artifact_type": ARTIFACT_TYPE,
@@ -773,6 +795,7 @@ def run_panel(
             "backend": backend,
             "prior_debt_suppression": prior_debt_suppression,
             "turn_trace": turn_trace,
+            "aggressive_sell_all": aggressive_sell_all,
             "max_transitions": max_transitions,
             "configuration": configuration,
         },
@@ -811,6 +834,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--opponent", default=DEFAULT_OPPONENT, choices=(DEFAULT_OPPONENT,))
     parser.add_argument("--prior-debt-suppression", choices=("on", "off"), default="on")
     parser.add_argument("--turn-trace", action="store_true")
+    parser.add_argument(
+        "--aggressive-sell-all", action="store_true",
+        help="enable the experimental literal full-shed sell override",
+    )
     parser.add_argument("--max-transitions", type=int, default=DEFAULT_MAX_TRANSITIONS)
     parser.add_argument("--output", required=True)
     parser.add_argument("--label", default="executor-v07-local-full-game")
@@ -836,6 +863,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             opponent=args.opponent,
             prior_debt_suppression=args.prior_debt_suppression == "on",
             turn_trace=args.turn_trace,
+            aggressive_sell_all=args.aggressive_sell_all,
             max_transitions=args.max_transitions,
             output_path=args.output,
             label=args.label,

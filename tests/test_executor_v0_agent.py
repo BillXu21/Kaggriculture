@@ -20,7 +20,7 @@ from executor_v0.agent import AgentConfig, ExecutorAgent, make_agent
 from executor_v0.manager import FixedPlanProvider
 from executor_v0.plan import DailyPlan
 from executor_v0.smoke import detect_engine
-from replay_daily.constants import total_hire_cost
+from replay_daily.constants import PRODUCTS, total_hire_cost
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = REPO_ROOT / "data" / "samples" / "2026-08-20" / "94735084.json"
@@ -230,6 +230,81 @@ def test_sell_clips_decrements_refills_and_waits():
     assert bin_log == {"requested": 5, "submitted": 5, "remaining": 0}
 
 
+def test_default_sell_path_does_not_sell_unrequested_stock():
+    agent = ExecutorAgent(recording_provider(simple_plan()), seat=0)
+    obs = make_obs(day=3, hour=1, shed={product: 3 for product in PRODUCTS})
+
+    action = agent(obs)
+
+    assert [order for order in action["market"] if order[0] == "SELL"] == []
+    assert agent.diagnostics_json()["config"]["aggressive_sell_all"] is False
+
+
+def test_aggressive_sell_all_uses_full_shed_inventory_including_wheat_feed():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=1)
+    shed = {product: index + 1 for index, product in enumerate(PRODUCTS)}
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(aggressive_sell_all=True))
+
+    action = agent(make_obs(day=3, hour=1, shed=shed, tiles=tiles))
+
+    assert [order for order in action["market"] if order[0] == "SELL"] == [
+        ["SELL", product, shed[product]] for product in PRODUCTS
+    ]
+    assert agent.diagnostics_json()["days"]["3"]["sells"]["0"]["WHEAT"] == {
+        "source": "aggressive_sell_all",
+        "requested": 0,
+        "submitted": 0,
+        "remaining": 0,
+        "override_requested": shed["WHEAT"],
+        "override_submitted": shed["WHEAT"],
+        "override_skipped": 0,
+    }
+    assert agent.debug_trace_turn["market"]["sell_mode"] == "aggressive_sell_all"
+    assert agent.debug_trace_turn["market"]["sell_submitted"][0] == {
+        "source": "aggressive_sell_all",
+        "product": "WHEAT",
+        "quantity": shed["WHEAT"],
+        "bc_requested": 0,
+        "order": ["SELL", "WHEAT", shed["WHEAT"]],
+    }
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 0
+
+
+def test_aggressive_sell_all_skips_zero_inventory():
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(aggressive_sell_all=True))
+
+    action = agent(make_obs(day=3, hour=1, shed={product: 0 for product in PRODUCTS}))
+
+    assert [order for order in action["market"] if order[0] == "SELL"] == []
+    assert agent.debug_trace_turn["market"]["sell_submitted"] == []
+
+
+def test_aggressive_sell_all_market_cap_reports_only_submitted_sells():
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(aggressive_sell_all=True, max_market_orders=3))
+    shed = {product: 2 for product in PRODUCTS}
+
+    action = agent(make_obs(day=3, hour=1, shed=shed))
+    trace_market = agent.debug_trace_turn["market"]
+
+    assert action["market"] == [
+        ["SELL", product, 2] for product in PRODUCTS[:3]
+    ]
+    assert [item["product"] for item in trace_market["sell_submitted"]] == list(PRODUCTS[:3])
+    assert [item["product"] for item in trace_market["sell_skipped"]] == list(PRODUCTS[3:])
+    assert all(item["status"] == "skipped_market_order_cap"
+               for item in trace_market["sell_skipped"])
+    sells = agent.diagnostics_json()["days"]["3"]["sells"]["0"]
+    assert [sells[product]["override_submitted"] for product in PRODUCTS] == [2, 2, 2, 0, 0, 0, 0, 0, 0]
+    assert [sells[product]["override_skipped"] for product in PRODUCTS] == [0, 0, 0, 2, 2, 2, 2, 2, 2]
+
+
 def test_inactive_bin_never_sells_and_new_bin_resets_ledger():
     provider = recording_provider(sell_plan())
     agent = ExecutorAgent(provider, seat=0)
@@ -333,6 +408,28 @@ def test_same_turn_sell_proceeds_fund_hires():
     action = agent(obs)
     assert ["SELL", "WHEAT", 2] in action["market"]
     assert ["HIRE"] in action["market"]
+
+
+def test_aggressive_sell_proceeds_fund_same_turn_hire_and_seed_buy():
+    provider = recording_provider(simple_plan(
+        crop_targets={"WHEAT": 10, "CARROT": 0, "TOMATO": 0,
+                      "STRAWBERRY": 0, "MELON": 0}))
+    agent = ExecutorAgent(
+        provider, seat=0, config=AgentConfig(
+            tasks_per_worker=10, aggressive_sell_all=True))
+    tiles = empty_tiles()
+    for i in range(10):
+        tiles[1][i] = None
+
+    obs = make_obs(day=3, hour=0, money=0.0, shed={"WHEAT": 20},
+                   seeds={}, tiles=tiles)
+    obs["market"]["prices"] = {"WHEAT": 25}
+
+    action = agent(obs)
+
+    assert ["SELL", "WHEAT", 20] in action["market"]
+    assert ["HIRE"] in action["market"]
+    assert ["BUY_SEED", "WHEAT", 10] in action["market"]
 
 
 # -------------------------------------------------------- shortage purchases
