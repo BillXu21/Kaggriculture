@@ -294,6 +294,31 @@ def test_aggressive_sell_flag_propagates_and_is_recorded(tmp_path):
     ] is True
 
 
+def test_optional_spare_watering_flag_propagates_and_is_recorded(tmp_path):
+    default = _run(tmp_path)
+    enabled = _run(tmp_path, optional_spare_watering=True)
+
+    assert default["request"]["optional_spare_watering"] is False
+    assert default["request"]["configuration"][
+        "optional_spare_watering"
+    ] is False
+    assert default["source_provenance"]["optional_spare_watering"] is False
+    assert default["games"][0]["optional_spare_watering"] is False
+    assert default["games"][0]["executor_diagnostics"]["config"][
+        "optional_spare_watering"
+    ] is False
+
+    assert enabled["request"]["optional_spare_watering"] is True
+    assert enabled["request"]["configuration"][
+        "optional_spare_watering"
+    ] is True
+    assert enabled["source_provenance"]["optional_spare_watering"] is True
+    assert enabled["games"][0]["optional_spare_watering"] is True
+    assert enabled["games"][0]["executor_diagnostics"]["config"][
+        "optional_spare_watering"
+    ] is True
+
+
 def _backend_to_98(factory, name, config):
     backend = factory(name, config)
     backend.terminal_step = 98

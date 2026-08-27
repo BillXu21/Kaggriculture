@@ -15,6 +15,8 @@ Priority groups (issue #1 urgency ordering):
   BUILD/PLACE deficits, CARE/FERTILIZE allocations, BUY_LAND).
 - ``LOGISTICS``: cleanup/logistics (SELL in the current bin, BUY_* shortages
   implied by active tasks only).
+- ``OPTIONAL``: config-gated spare-capacity work; never part of generated
+  manager workload or mandatory accounting.
 
 Final tie-break is the stable task key; the foreman later adds distance.
 """
@@ -32,6 +34,7 @@ from executor_v0.layout import (
     DayLayoutResult,
     plan_animal_layout,
     plan_day_layouts,
+    quadrant_of,
     reconcile_crops,
 )
 from executor_v0.plan import DailyPlan
@@ -42,6 +45,7 @@ __all__ = [
     "Priority",
     "Task",
     "GenerationResult",
+    "generate_optional_water_tasks",
     "generate_tasks",
 ]
 
@@ -55,6 +59,7 @@ class Priority(IntEnum):
     PRODUCTIVE = 1
     MANAGER = 2
     LOGISTICS = 3
+    OPTIONAL = 4
 
 
 @dataclass(frozen=True)
@@ -212,6 +217,50 @@ def _water_urgency(tile: Mapping) -> str | None:
     if dsf >= 0 and dsf % data["interval"] == 0             and dsf // data["interval"] + 1 <= data["max_yield"]:
         return "yield"
     return None
+
+
+def generate_optional_water_tasks(obs: Mapping, seat: int) -> tuple[Task, ...]:
+    """Return safe-to-defer plant watering for an explicitly enabled caller.
+
+    Optional watering is intentionally separate from ``generate_tasks`` so it
+    cannot contribute to manager workload, shortage purchases, or work debt.
+    The returned tasks are only suitable for appending to a dispatch pool.
+    """
+    _validate_obs(obs, seat)
+    try:
+        state = _canonical_own_state(obs, seat)
+    except (KeyError, TypeError, ValueError):
+        # Optional work must never turn malformed source data into a task.
+        return ()
+    unlocked = set(state["unlocked_quadrants"])
+    optional: list[Task] = []
+    for y, row in enumerate(state["board"]):
+        for x, tile in enumerate(row):
+            coord = (y, x)
+            if quadrant_of(y, x) not in unlocked \
+                    or not isinstance(tile, Mapping) \
+                    or tile.get("kind") != "PLANT":
+                continue
+            watered_today = tile.get("watered_today")
+            consecutive_unwatered = tile.get("consecutive_unwatered")
+            if not isinstance(watered_today, bool) or watered_today \
+                    or not isinstance(consecutive_unwatered, int) \
+                    or isinstance(consecutive_unwatered, bool) \
+                    or consecutive_unwatered != 0:
+                continue
+            crop = tile.get("crop")
+            derived = tile.get("derived")
+            if crop not in CROPS or not isinstance(derived, Mapping) \
+                    or not isinstance(derived.get("age_days"), int) \
+                    or isinstance(derived.get("age_days"), bool):
+                continue
+            if _water_urgency(tile) is not None:
+                continue
+            optional.append(Task(
+                key=f"WATER_OPTIONAL:{y},{x}", kind="WATER",
+                priority=Priority.OPTIONAL, tile=coord, crop=crop,
+                source="water_optional_spare"))
+    return tuple(sorted(optional, key=lambda task: task.key))
 
 
 # --------------------------------------------------------------- generation

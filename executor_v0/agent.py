@@ -52,7 +52,7 @@ from replay_daily.constants import (
 from replay_daily.lifecycle import canonical_board
 
 from .foreman import ForemanConfig, run_foreman
-from .tasks import GenerationResult, Task
+from .tasks import GenerationResult, Task, generate_optional_water_tasks
 from .manager import CheckpointPlanProvider, PlanProvider
 from .plan import SELL_BIN_ANCHORS, DailyPlan
 from .projection import clip_sell, project_plan
@@ -86,6 +86,7 @@ class AgentConfig:
     turn_trace: bool = False
     suppress_expansion_from_prior_debt: bool = True
     aggressive_sell_all: bool = False
+    optional_spare_watering: bool = False
 
 
 def _require_positive_int(value: Any, what: str) -> int:
@@ -528,6 +529,7 @@ class ExecutorAgent:
         day: int,
         hour: int,
         tasks: tuple[Task, ...],
+        dispatch_tasks: tuple[Task, ...],
         generated_tasks: tuple[Task, ...],
         generation: GenerationResult,
         foreman_result: Any,
@@ -537,17 +539,22 @@ class ExecutorAgent:
         candidates: list[tuple[str, Any]],
         unaffordable_orders: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        task_by_key = {task.key: task for task in tasks}
+        task_by_key = {
+            task.key: task for task in (*tasks, *dispatch_tasks)
+        }
         assignments = []
         for assignment in foreman_result.assignments:
             task = task_by_key.get(assignment.task_key)
-            assignments.append({
+            detail = {
                 "worker_index": assignment.worker_index,
                 "task_key": assignment.task_key,
                 "reason": assignment.reason,
                 "action": list(assignment.action),
                 "target": list(task.tile) if task is not None and task.tile is not None else None,
-            })
+            }
+            if task is not None and task.source == "water_optional_spare":
+                detail["source"] = task.source
+            assignments.append(detail)
 
         included_count = len(orders)
         skipped = [
@@ -722,9 +729,12 @@ class ExecutorAgent:
                 unaffordable["expansion"].append(key)
 
         assignments = []
+        task_by_key = {
+            task.key: task for task in (*tasks, *dispatch_tasks)
+        }
         for assignment in foreman_result.assignments:
             action = list(assignment.action)
-            assignments.append({
+            detail = {
                 "worker": "farmer" if assignment.worker_index == 0
                 else f"hand_{assignment.worker_index - 1}",
                 "worker_index": assignment.worker_index,
@@ -733,7 +743,11 @@ class ExecutorAgent:
                 "task_key": assignment.task_key,
                 "action": action,
                 "op_family": action[0] if action else None,
-            })
+            }
+            task = task_by_key.get(assignment.task_key)
+            if task is not None and task.source == "water_optional_spare":
+                detail["source"] = task.source
+            assignments.append(detail)
 
         reasons = []
         if self._suppress_expansion_today:
@@ -814,6 +828,12 @@ class ExecutorAgent:
         dispatch_tasks = tasks
         if feed["starving"]:
             dispatch_tasks = tuple(t for t in tasks if t.tile is None or t.kind == "FEED")
+        normal_dispatch_tasks = dispatch_tasks
+
+        optional_tasks: tuple[Task, ...] = ()
+        if self.config.optional_spare_watering:
+            optional_tasks = generate_optional_water_tasks(obs, seat)
+            dispatch_tasks = tuple(dispatch_tasks) + optional_tasks
 
         foreman_result = run_foreman(obs, seat, dispatch_tasks, config=self.config.foreman)
 
@@ -865,7 +885,8 @@ class ExecutorAgent:
 
         hire_orders, hires_requested = self._hire_orders(
             obs, seat,
-            [t for t in dispatch_tasks if t.tile is not None and t.kind in _foreman_mod._TILE_TASK_KINDS],
+            [t for t in normal_dispatch_tasks
+             if t.tile is not None and t.kind in _foreman_mod._TILE_TASK_KINDS],
             running_cash,
         )
         already_today = int(obs["farms"][seat].get("hires_today", 0))
@@ -907,7 +928,11 @@ class ExecutorAgent:
         for key in ("movement", "interaction", "pickup", "pass"):
             record["foreman_counts"][key] += foreman_result.counts[key]
 
-        pending = self._pending_task_keys(foreman_result)
+        optional_keys = {task.key for task in optional_tasks}
+        pending = [
+            key for key in self._pending_task_keys(foreman_result)
+            if key not in optional_keys
+        ]
         for key in pending:
             record["pending_task_turns"][key] = record["pending_task_turns"].get(key, 0) + 1
         pending_maintenance = [key for key in pending if key.startswith(("WATER:", "FEED:", "COLLECT_FERTILIZER:"))]
@@ -954,6 +979,7 @@ class ExecutorAgent:
                 day=day,
                 hour=hour,
                 tasks=tasks,
+                dispatch_tasks=dispatch_tasks,
                 generated_tasks=generated_tasks,
                 generation=generation,
                 foreman_result=foreman_result,
@@ -988,6 +1014,7 @@ class ExecutorAgent:
                     self.config.suppress_expansion_from_prior_debt
                 ),
                 "aggressive_sell_all": self.config.aggressive_sell_all,
+                "optional_spare_watering": self.config.optional_spare_watering,
             },
             "days": {str(day): record for day, record in sorted(self._day_records.items())},
             "illegal_actions": {

@@ -483,6 +483,7 @@ def _run_one(
     prior_debt_suppression: bool,
     turn_trace: bool,
     aggressive_sell_all: bool,
+    optional_spare_watering: bool,
     max_transitions: int,
     backend_factory: BackendFactory,
     provider_factory: ProviderFactory | None,
@@ -496,6 +497,7 @@ def _run_one(
         turn_trace=turn_trace,
         suppress_expansion_from_prior_debt=prior_debt_suppression,
         aggressive_sell_all=aggressive_sell_all,
+        optional_spare_watering=optional_spare_watering,
     )
     downstream, provider_variant = _build_downstream(
         checkpoint_path, seat, config, provider_factory
@@ -603,6 +605,7 @@ def _run_one(
         "prior_debt_suppression": prior_debt_suppression,
         "turn_trace": turn_trace,
         "aggressive_sell_all": aggressive_sell_all,
+        "optional_spare_watering": optional_spare_watering,
         "status": final_status,
         "transitions": transitions,
         "final": {
@@ -629,6 +632,7 @@ def _run_one(
         "opponent": opponent,
         "prior_debt_suppression": prior_debt_suppression,
         "aggressive_sell_all": aggressive_sell_all,
+        "optional_spare_watering": optional_spare_watering,
         "tested_action_trace_sha256": game["tested_action_trace_sha256"],
         "final": game["final"],
     })).hexdigest()
@@ -646,6 +650,7 @@ def run_game(
     prior_debt_suppression: bool = True,
     turn_trace: bool = False,
     aggressive_sell_all: bool = False,
+    optional_spare_watering: bool = False,
     max_transitions: int = DEFAULT_MAX_TRANSITIONS,
     backend_factory: BackendFactory | None = None,
     provider_factory: ProviderFactory | None = None,
@@ -662,9 +667,11 @@ def run_game(
         raise EvaluatorError("this evaluator supports only the fixed PASS opponent")
     if not isinstance(prior_debt_suppression, bool) \
             or not isinstance(turn_trace, bool) \
-            or not isinstance(aggressive_sell_all, bool):
+            or not isinstance(aggressive_sell_all, bool) \
+            or not isinstance(optional_spare_watering, bool):
         raise EvaluatorError(
-            "prior_debt_suppression, turn_trace, and aggressive_sell_all "
+            "prior_debt_suppression, turn_trace, aggressive_sell_all, and "
+            "optional_spare_watering "
             "must be booleans"
         )
     max_transitions = _require_int(max_transitions, "max_transitions", minimum=0)
@@ -687,6 +694,7 @@ def run_game(
         prior_debt_suppression=prior_debt_suppression,
         turn_trace=turn_trace,
         aggressive_sell_all=aggressive_sell_all,
+        optional_spare_watering=optional_spare_watering,
         max_transitions=max_transitions,
         backend_factory=backend_factory or (lambda name, config: make_backend(name, config)),
         provider_factory=provider_factory,
@@ -704,6 +712,7 @@ def run_panel(
     prior_debt_suppression: bool = True,
     turn_trace: bool = False,
     aggressive_sell_all: bool = False,
+    optional_spare_watering: bool = False,
     max_transitions: int = DEFAULT_MAX_TRANSITIONS,
     output_path: str | Path | None = None,
     label: str = "executor-v07-local-full-game",
@@ -747,9 +756,11 @@ def run_panel(
         raise EvaluatorError("this evaluator supports only the fixed PASS opponent")
     if not isinstance(prior_debt_suppression, bool) \
             or not isinstance(turn_trace, bool) \
-            or not isinstance(aggressive_sell_all, bool):
+            or not isinstance(aggressive_sell_all, bool) \
+            or not isinstance(optional_spare_watering, bool):
         raise EvaluatorError(
-            "prior_debt_suppression, turn_trace, and aggressive_sell_all "
+            "prior_debt_suppression, turn_trace, aggressive_sell_all, and "
+            "optional_spare_watering "
             "must be booleans"
         )
     repo_root = Path(__file__).resolve().parents[1]
@@ -762,6 +773,7 @@ def run_panel(
             prior_debt_suppression=prior_debt_suppression,
             turn_trace=turn_trace,
             aggressive_sell_all=aggressive_sell_all,
+            optional_spare_watering=optional_spare_watering,
             max_transitions=max_transitions,
             backend_factory=backend_factory or (lambda name, config: make_backend(name, config)),
             provider_factory=provider_factory,
@@ -773,6 +785,7 @@ def run_panel(
         "seed_selection": seed_list,
         "seat_selection": seat_list,
         "aggressive_sell_all": aggressive_sell_all,
+        "optional_spare_watering": optional_spare_watering,
     }
     document: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -782,6 +795,7 @@ def run_panel(
         "source_provenance": {
             "repo_sha": _source_repo_sha(repo_root),
             "tool": "tools.run_executor_v07_panel",
+            "optional_spare_watering": optional_spare_watering,
         },
         "checkpoint": dict(checkpoint_info),
         "backend": backend_provenance(backend, {"seed": "per_game"}),
@@ -796,6 +810,7 @@ def run_panel(
             "prior_debt_suppression": prior_debt_suppression,
             "turn_trace": turn_trace,
             "aggressive_sell_all": aggressive_sell_all,
+            "optional_spare_watering": optional_spare_watering,
             "max_transitions": max_transitions,
             "configuration": configuration,
         },
@@ -838,6 +853,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--aggressive-sell-all", action="store_true",
         help="enable the experimental literal full-shed sell override",
     )
+    parser.add_argument(
+        "--optional-spare-watering", action="store_true",
+        help="enable config-gated spare-capacity watering",
+    )
     parser.add_argument("--max-transitions", type=int, default=DEFAULT_MAX_TRANSITIONS)
     parser.add_argument("--output", required=True)
     parser.add_argument("--label", default="executor-v07-local-full-game")
@@ -864,6 +883,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             prior_debt_suppression=args.prior_debt_suppression == "on",
             turn_trace=args.turn_trace,
             aggressive_sell_all=args.aggressive_sell_all,
+            optional_spare_watering=args.optional_spare_watering,
             max_transitions=args.max_transitions,
             output_path=args.output,
             label=args.label,
