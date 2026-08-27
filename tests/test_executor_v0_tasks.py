@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from executor_v0.layout import reconcile_crops
+from executor_v0.foreman import run_foreman
 from executor_v0.plan import DailyPlan
 from executor_v0.tasks import (
     GenerationResult,
@@ -611,6 +612,86 @@ def test_generate_tasks_splits_water_classes_by_priority():
     assert [t.tile for t in yield_w] == [(0, 1)]
     # The young unfertilized TOMATO gets NO water task at all.
     assert all(t.tile != (0, 2) for t in waters)
+
+
+@pytest.mark.parametrize("crop,age_days", [("WHEAT", 2), ("CARROT", 2),
+                                            ("MELON", 10)])
+def test_harvest_waits_for_same_tile_yield_water_then_releases(crop, age_days):
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[0][0] = _plant_for_water(crop, age_days=age_days, yield_units=1)
+    obs = make_obs(day=WATER_TEST_DAY, hour=2,
+                   step=WATER_TEST_DAY * 24 + 2, tiles=tiles,
+                   farmer=(0, 0))
+
+    before = generate_tasks(obs, 0, feasible_plan=make_plan(),
+                            remaining_sells={})
+    water = next(t for t in before.tasks if t.kind == "WATER")
+    harvest = next(t for t in before.tasks if t.kind == "HARVEST")
+    assert water.source == "water_yield_window"
+    assert harvest.depends_on == (water.key,)
+    first_dispatch = run_foreman(obs, 0, before.sorted_tasks())
+    assert first_dispatch.farmer_action == ("WATER",)
+    assert all(a.action[0] != "HARVEST" for a in first_dispatch.assignments)
+
+    # The next observation contains the engine's same-day watering state;
+    # regeneration removes WATER and makes the harvest executable.
+    tiles[0][0]["watered_today"] = True
+    tiles[0][0]["yield_units"] = 2
+    after = generate_tasks(obs, 0, feasible_plan=make_plan(),
+                           remaining_sells={})
+    released = next(t for t in after.tasks if t.kind == "HARVEST")
+    assert released.depends_on == ()
+    second_dispatch = run_foreman(obs, 0, after.sorted_tasks())
+    assert second_dispatch.farmer_action == ("HARVEST",)
+
+
+def test_harvest_waiting_is_not_applied_to_ongoing_crop():
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[0][0] = _plant_for_water(
+        "TOMATO", age_days=8, yield_units=1, fertilized_until_day=25)
+    obs = make_obs(day=WATER_TEST_DAY, hour=2,
+                   step=WATER_TEST_DAY * 24 + 2, tiles=tiles,
+                   farmer=(0, 0))
+
+    result = generate_tasks(obs, 0, feasible_plan=make_plan(),
+                            remaining_sells={})
+    water = next(t for t in result.tasks if t.kind == "WATER")
+    harvest = next(t for t in result.tasks if t.kind == "HARVEST")
+    assert water.source == "water_yield_window"
+    assert harvest.depends_on == ()
+
+
+def test_terminal_action_horizon_harvests_instead_of_waiting_for_water():
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[0][0] = _plant_for_water("WHEAT", age_days=4, yield_units=1)
+    tiles[0][0]["planted_day"] = 25
+    obs = make_obs(day=29, hour=22, step=719 - 1, tiles=tiles,
+                   farmer=(0, 0))
+
+    result = generate_tasks(obs, 0, feasible_plan=make_plan(),
+                            remaining_sells={})
+    water = next(t for t in result.tasks if t.kind == "WATER")
+    harvest = next(t for t in result.tasks if t.kind == "HARVEST")
+    assert water.source == "water_yield_window"
+    assert harvest.depends_on == ()
+    dispatch = run_foreman(obs, 0, result.sorted_tasks())
+    assert dispatch.farmer_action == ("HARVEST",)
+
+
+def test_safe_harvest_without_yield_water_pending_remains_immediate():
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[0][0] = _plant_for_water(
+        "WHEAT", age_days=2, yield_units=1, watered_today=True)
+    obs = make_obs(day=WATER_TEST_DAY, hour=2,
+                   step=WATER_TEST_DAY * 24 + 2, tiles=tiles,
+                   farmer=(0, 0))
+
+    result = generate_tasks(obs, 0, feasible_plan=make_plan(),
+                            remaining_sells={})
+    harvest = next(t for t in result.tasks if t.kind == "HARVEST")
+    assert harvest.depends_on == ()
+    assert run_foreman(obs, 0, result.sorted_tasks()).farmer_action == \
+        ("HARVEST",)
 
 
 # -------------------------------------------------- issue #7 weed reclamation

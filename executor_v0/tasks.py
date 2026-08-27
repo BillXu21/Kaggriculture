@@ -52,6 +52,8 @@ __all__ = [
 _FEED_ITEM = "WHEAT"
 _FERTILIZER_ITEM = "FERTILIZER"
 _TOTAL_DAYS = 30
+_TURNS_PER_DAY = 24
+_FINAL_ACTIONABLE_STEP = _TOTAL_DAYS * _TURNS_PER_DAY - 2
 
 
 class Priority(IntEnum):
@@ -219,6 +221,19 @@ def _water_urgency(tile: Mapping) -> str | None:
     return None
 
 
+def _at_terminal_action_horizon(obs: Mapping) -> bool:
+    """Whether this action is the last one that can precede terminal state.
+
+    The pinned engine starts at step 0 and marks the state done after the
+    action at step 718 advances it to terminal step 719.  A missing step is
+    reconstructed from the validated day/hour pair for replay-shaped inputs.
+    """
+    day = int(obs["day"])
+    hour = int(obs["hour"])
+    step = int(obs.get("step", day * _TURNS_PER_DAY + hour))
+    return step >= _FINAL_ACTIONABLE_STEP
+
+
 def generate_optional_water_tasks(obs: Mapping, seat: int) -> tuple[Task, ...]:
     """Return safe-to-defer plant watering for an explicitly enabled caller.
 
@@ -349,6 +364,7 @@ def generate_tasks(
         name: [] for name in ANIMAL_ORDER}
     fert_eligible: dict[str, list[tuple[int, int]]] = {
         crop: [] for crop in CROP_ORDER}
+    terminal_action_horizon = _at_terminal_action_horizon(obs)
 
     for y, row in enumerate(board):
         for x, tile in enumerate(row):
@@ -419,9 +435,19 @@ def generate_tasks(
 
     # ---- PRODUCTIVE ---------------------------------------------------
     for coord in by_proximity(harvest_plant_targets):
+        tile = _tile_at(board, coord)
+        crop_data = CROPS.get(tile.get("crop"))
+        waits_for_water = (
+            coord in water_yield_targets
+            and crop_data is not None
+            and not crop_data["ongoing"]
+            and not terminal_action_horizon
+        )
         tasks.append(Task(key=f"HARVEST:{coord[0]},{coord[1]}",
                           kind="HARVEST", priority=Priority.PRODUCTIVE,
-                          tile=coord, crop=_tile_at(board, coord)["crop"],
+                          tile=coord, crop=tile["crop"],
+                          depends_on=(f"WATER:{coord[0]},{coord[1]}",)
+                          if waits_for_water else (),
                           source="mechanical"))
     for coord in by_proximity(harvest_animal_targets):
         tasks.append(Task(key=f"HARVEST:{coord[0]},{coord[1]}",

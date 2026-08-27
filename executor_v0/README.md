@@ -37,6 +37,14 @@ is explicit architectural debt bounded to the three-seed/two-seat PASS panel;
 it is not a learned economic policy or a generalization claim. Survival work
 and WHEAT purchases remain ahead of hiring.
 
+Stage 4 lifecycle realization: when a legally harvestable non-ongoing crop is
+inside the existing productive `water_yield_window`, its same-tile HARVEST is
+dependency-blocked until WATER is observed and tasks regenerate. The dependency
+is waived on the final actionable engine step so the only harvest is not lost;
+ongoing crops and all other watering policy are unchanged. Multi-day harvest
+deferral remains unresolved because no concrete liquidity, feed, manager, or
+rotation signal is available at this executor layer.
+
 ## Usage
 
 Fake-manager plumbing smoke (no model, no engine needed to build the agent):
