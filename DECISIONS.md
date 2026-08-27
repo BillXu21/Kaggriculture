@@ -298,3 +298,49 @@ This file records decisions that remain authoritative across chats and work sess
 - Rationale: R4 failed the real BC-E fixed-plan 7d regression. The ON setting is a bounded survivability heuristic, not learned strategy and not a universal acceptance claim.
 - Evidence: final no-R4 PASS panel, seeds 17/42/2026 x seats 0/1: ON banks `[17005,14961,23346,26587,56742,65959]`, mean `34100`, median `24966.5`, minimum `14961`; OFF banks `[265,265,30,33,0,0]`, mean `98.8`, median `31.5`, minimum `0`. Loss units are ON starvation `0` / overflow `12`, OFF starvation `38` / overflow `12`. The setting is bounded to this panel and remains architectural debt.
 - Revisit when: the next RL executor-factory swap and serious training decision supplies broader evidence; do not generalize beyond this three-seed, two-seat PASS panel.
+
+## D-038 — Validate the Exact Submission Archive Through Kaggle's Raw-Code Loader
+
+- Date: 2026-08-27
+- Status: active
+- Decision: A Kaggriculture submission is not considered validated until the **exact built archive** is freshly extracted into an empty directory, isolated from the repository root, loaded through `kaggle_environments.agent.get_last_callable`, and run on the pinned official engine with strict/debug executor behavior and full status-history validation. The archive must carry the complete runtime import closure, including lazy dependencies such as `fast_env`.
+- Rationale: the BC-E V0.7 submission omitted `fast_env`, while `executor_v0/agent.py::_buy_order_cost` lazily imported `fast_env.market`. Production `strict=False` swallowed the resulting `ModuleNotFoundError` and returned legal all-PASS actions repeatedly, producing apparent multi-day AFK behavior without useful Kaggle stderr/stdout. Source-worktree evaluation therefore did not prove submission equivalence.
+- Current pinned post-Stage-4 reference: official `kaggle-environments==1.32.7`, seed 7, candidate seat 1 versus PASS, bank `47,290`, action fingerprint `a38bf47884e5e6e89c2d77f7aab07819f3559e898af40372942460693c8b6afc`, archive SHA-256 `c12218ac1010c894ed22fd065049a290d03555c9f44ad0d6cc667fa52ee13de2`, 719 candidate actions, zero status anomalies. The earlier pre-behavior reference at `54,439` remains historical evidence rather than the current compatibility target.
+- Revisit when: the submission entrypoint/runtime import closure changes, the official engine pin moves, or the archive verifier itself changes semantics.
+
+## D-039 — Keep Same-Tile Yield WATER Before HARVEST for Non-Ongoing Crops
+
+- Date: 2026-08-27
+- Status: active
+- Decision: For non-ongoing crops, a same-tile yield-positive `WATER` is a mechanical dependency of `HARVEST`; another worker must not harvest first. The dependency is waived on the final actionable turn. This applies to WHEAT, CARROT, and MELON. Do not add a multi-day rule such as "always wait until max-yield day"; ongoing TOMATO/STRAWBERRY behavior is unchanged.
+- Rationale: the executor could legally harvest at the first harvestable age while a same-day WATER would still increase eventual yield. The manager does not express primitive same-turn sequencing, so this is executor-owned mechanics rather than a strategic crop-timing heuristic.
+- Evidence: fixed 12-seed x 2-seat PASS panel after the change: mean `63,592.3` versus actual pre-change `60,778.1` (+`2,814.2`), median `65,509.5` versus `60,956` (+`4,553.5`), min `47,290`, max `74,151`, with zero `<1k`/`<10k`, runtime/status errors, unaffordable orders, or animal losses. Six of 24 paired games declined, confirming economic consequences remain state-dependent even when sequencing is mechanically better.
+- Revisit when: engine crop lifecycle semantics change, or broader evidence proves the dependency itself is mechanically incorrect; do not revert merely because individual economic trajectories move both directions.
+
+## D-040 — Reject Blanket Fertilizer Retention; Treat Inventory Release as Strategy
+
+- Date: 2026-08-27
+- Status: active
+- Decision: Do not add a blanket executor rule that retains FERTILIZER under the aggressive-selling reference. The diagnostic/reference aggressive-sell behavior continues to sell FERTILIZER; whether and when fertilizer should be retained or sold belongs to learned strategic control rather than a fixed executor reserve heuristic.
+- Rationale: retaining fertilizer sounded locally sensible because it is an intermediate production input, but the isolated experiment destroyed liquidity: all 24 panel banks fell to zero, with `27,151` unaffordable orders, `1,728` feed-shortage/starvation turns, and `120` animals lost. Repairing this inside the executor would require a conditional cash governor/reserve-release policy, which crosses the D-011 strategy boundary.
+- Scope: aggressive sell-all remains a diagnostic/reference policy, not the intended final selling strategy. The failed retention experiment is preserved in history rather than silently erased.
+- Revisit when: the learned manager/selling policy controls state-dependent fertilizer retention, or new mechanics prove a mechanically mandatory reserve independent of economic preference.
+
+## D-041 — Do Not Patch CARE/FERT Execution Without Accepted-Action Attribution
+
+- Date: 2026-08-27
+- Status: active design constraint
+- Decision: Do not add CARE/FERTILIZE executor heuristics from current requested-versus-observed telemetry alone. First add accepted-action/completion observability capable of distinguishing manager infeasibility, inventory/buy failure, labor/dispatch shortfall, and successful actions whose effects are not represented by the current state metric.
+- Evidence: pre-behavior audit counted CARE/COW requested `2,848`, assigned `1,749`, observed-state `0`; CARE/SHEEP requested `1,731`, assigned `1,158`, observed-state `0`; FERTILIZE/STRAWBERRY requested `1,470`, assigned `731`, observed-state `3,020`. There were `1,162` requested-positive/observed-zero rows, only `23` proven manager-infeasible cases, and `1,189` unresolved cases. The "observed" metric is state-derived, not an accepted-action ledger, so most shortfalls cannot be safely attributed.
+- Rationale: patching an executor from ambiguous telemetry risks converting an observability gap into a strategic or mechanical heuristic with no proven causal defect.
+- Revisit when: accepted action/completion telemetry is available and demonstrates a concrete executor-caused shortfall.
+
+## D-042 — Idle Cleanup May Replace PASS Only; Reject Shared-Pool Optional Watering as a Valid Test
+
+- Date: 2026-08-27
+- Status: active design constraint; corrected experiment pending
+- Decision: Optional idle cleanup must be strictly subordinate to normal dispatch: run the normal foreman first, preserve every worker's non-PASS normal action exactly, and allow cleanup to replace only a worker action that would otherwise be literal `PASS`. Cleanup must not contribute to hiring/workload, prior-day debt, manager completion, shortage buys, market orders, or expansion suppression, and is recomputed from scratch every primitive turn. Candidate cleanup order is weed DIG before safe optional WATER; promotion remains pending a corrected A/B/C panel.
+- Rationale: the previous `optional_spare_watering` implementation appended OPTIONAL WATER tasks into the same foreman pool as normal work. Because foreman performs underfoot execution before global assignment, a worker standing on an optional-water tile could WATER instead of beginning higher-priority work elsewhere. Therefore the previous ON result did not isolate the intended hypothesis of consuming wasted labor.
+- Evidence: official 12-seed x 2-seat A/B with aggressive sell-all and prior-debt suppression ON reproduced OFF mean `63,592.3`, median `65,509.5`, min `47,290`, max `74,151`; old optional watering ON scored mean `60,948.5`, median `61,114`, min `46,798`, max `69,673`, with 8 wins / 16 losses, mean paired delta `-2,643.8`, worst `-18,675`, best `+21,429`. The wide paired spread justifies investigating dispatch correctness rather than promoting or permanently rejecting the underlying cleanup idea.
+- Day-boundary note: worker positions reset near the central shed at day end, hired hands disappear, and carried inventory auto-drops, so cleanup does not need an end-of-day return-home rule. Its opportunity cost is only within the current day's remaining turns, and normal dispatch must preempt it on the next primitive turn.
+- Revisit when: the true PASS-only WATER and WEED-first+WATER panels complete. Promote only if normal non-PASS actions are proven unchanged and paired outcome/tail evidence is favorable.
