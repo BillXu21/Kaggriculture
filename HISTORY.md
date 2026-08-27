@@ -2,6 +2,47 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-27 — Stage 6/7 Issue #12: PASS-Only Idle Cleanup A/B/C Evidence
+
+Recorded the official 24-game A/B/C panel for the true PASS-only cleanup layer
+at `1a0ac65` on branch `executor-v07-fixed-plan`. The earlier optional result
+was not promotion evidence: optional tasks had been placed in the normal
+foreman pool, so ordinary assignment selection (including underfoot selection)
+could change instead of replacing only a literal normal PASS; that flawed arm
+was `60,948.5` mean vs OFF `63,592.3` (`-2,643.8`, `8W/16L`).
+
+The corrected flow runs the normal foreman first, recomputes optional
+candidates from the current observation, and applies them only to workers left
+at literal PASS. Claims are discarded after the turn and excluded from normal
+task, hiring, debt, and market accounting. `optional_spare_watering` selects
+WATER-only; `optional_idle_cleanup` selects weed-first DIG plus optional WATER;
+diagnostics record `cleanup_mode`.
+
+Official panel results (same BC-E/checkpoint, official 1.32.7 backend,
+`standard_mixed`, PASS, seeds
+`7,17,42,123,2026,1013,1022,1003,1026,1011,1024,1019`, both seats, prior-debt
+ON, aggressive selling ON): OFF mean/median `63,592.3/65,509.5`; WATER-only
+`67,712.6/65,242.0`, delta `+4,120.3/-267.5`; WEED+WATER
+`66,886.3/66,662.5`, delta `+3,294.0/+1,153.0`. Both optional arms were
+`16W/0T/8L`; worst deltas were `-15,820` and `-16,669`, best deltas
+`+30,696` and `+27,821`. Full per-game banks, paired deltas, artifacts,
+telemetry, and two first-divergence timeline examples are in
+`research/EXECUTOR_V07_IDLE_CLEANUP_PASS_ONLY.md`.
+
+Telemetry confirms mechanical isolation: OFF/B/C baseline PASS actions
+`4035/3748/3558`, replacements `0/3409/3298`, replacement rates
+`0/90.96%/92.69%`, remaining PASS `4035/339/260`, cleanup movements
+`0/2973/2930`, optional WATER interactions `0/436/210`, weed DIG interactions
+`0/0/158`, and normal non-PASS actions changed `0/0/0`. Unaffordable orders
+were `0/174/168`; animal-loss events were `0/1/0`; all 72 games completed
+719 transitions without fallback/day/status errors.
+
+Interpretation: mechanical safety passed, but strategic value is mixed and
+seed-dependent. WATER-only has a slightly negative median delta and
+WEED+WATER a positive median, yet neither satisfies the strict strong-evidence
+promotion rule because of the eight losses and materially worse tails. Cleanup
+remains OFF by default; independent review is the next step, not PPO.
+
 ## 2026-08-27 — Stage 7 Issue #12C Opportunistic Watering Audit
 
 The bounded opportunistic-watering implementation passed a requirement-by-
