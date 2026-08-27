@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from rl_manager.runner import GAME_TURNS
+from rl_manager.types import E_VS_E, E_VS_PASS
 
 #: Fixed evaluation seed sets (issue #9 Evaluation section).
 SMOKE_SEEDS: tuple[int, ...] = (17, 42, 2026)
@@ -41,6 +42,7 @@ SEED_SETS: dict[str, tuple[int, ...]] = {
 
 #: Backends accepted by the rollout harness (`oracle.backend`).
 KNOWN_BACKENDS = ("fast", "official")
+DEBUG_TRACE_COMPOSITIONS = (E_VS_E, E_VS_PASS)
 
 #: Explicit executor factory registry (issue #7 swaps/adds entries here).
 EXECUTOR_FACTORIES: Mapping[str, str] = {
@@ -119,6 +121,10 @@ def build_parser() -> argparse.ArgumentParser:
     trace.add_argument("--seat", type=int, choices=(0, 1),
                        help="Single-case requested seat with --seed.")
     trace.add_argument("--backend", default="fast", choices=KNOWN_BACKENDS)
+    trace.add_argument(
+        "--composition", choices=DEBUG_TRACE_COMPOSITIONS, default=E_VS_E,
+        help="Debug composition (default: e_vs_e).",
+    )
     trace.add_argument(
         "--e-checkpoint", required=True,
         help="Path to the REAL trained BC-E torch checkpoint.",
@@ -286,6 +292,7 @@ def plan_debug_trace(args: argparse.Namespace) -> dict[str, Any]:
         "mode": "debug-trace",
         "cases": cases,
         "backend": str(args.backend),
+        "composition": str(args.composition),
         "e_checkpoint": str(checkpoint),
         "policy_seed": int(args.policy_seed),
         "num_threads": int(args.num_threads),
@@ -423,11 +430,13 @@ def execute_debug_trace(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
         SelfPlayRunner,
         build_episode_spec,
     )
-    from rl_manager.types import E_VS_E
+    from rl_manager.policy import PassPlanPolicy
 
     output_dir = Path(plan["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     policy = _make_debug_trace_policy(plan)
+    opponent_policy = (
+        PassPlanPolicy() if plan["composition"] == E_VS_PASS else policy)
     summaries: list[dict[str, Any]] = []
     for episode_index, (seed, seat) in enumerate(plan["cases"]):
         runner = SelfPlayRunner(
@@ -444,7 +453,8 @@ def execute_debug_trace(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
             master_seed=seed,
         )
         spec = build_episode_spec(
-            episode_index, seed, E_VS_E, policy, policy)
+            episode_index, seed, plan["composition"], policy,
+            opponent_policy, controlled_seat=seat)
         try:
             result = runner.run([spec])[0]
         except ModuleNotFoundError as exc:
@@ -468,6 +478,7 @@ def execute_debug_trace(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
         summary = {
             "seed": seed,
             "seat": seat,
+            "composition": plan["composition"],
             "turns": len(loaded["turns"]),
             "path": str(path),
             "bytes": size,
@@ -475,7 +486,8 @@ def execute_debug_trace(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
             "terminated": result.terminated,
         }
         print(
-            f"trace seed={seed} seat={seat} turns={summary['turns']} "
+            f"trace seed={seed} seat={seat} composition={summary['composition']} "
+            f"turns={summary['turns']} "
             f"path={path} bytes={size} winner_seat={result.winner_seat} "
             f"terminated={result.terminated}"
         )

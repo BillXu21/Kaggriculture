@@ -8,6 +8,7 @@ games/updates).
 
 from __future__ import annotations
 
+import copy
 import types
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import pytest
 
 from rl_manager.cli import (
     CONFIRM_FLAG,
+    DEBUG_TRACE_COMPOSITIONS,
     DEV_SEEDS,
     HOLDOUT_SEEDS,
     SMOKE_SEEDS,
@@ -26,6 +28,9 @@ from rl_manager.cli import (
     summarize_evaluation,
 )
 from rl_manager.debug_trace import load_trace
+from rl_manager.policy import PassPlanPolicy
+from rl_manager.runner import build_episode_spec
+from rl_manager.types import E_VS_E, E_VS_PASS
 from tests.test_rl_manager_runner import (
     _ConstantPlanPolicy,
     _TraceBackend,
@@ -123,6 +128,78 @@ def test_debug_trace_parser_supports_selected_seed_seat_cases(tmp_path):
         "--e-checkpoint", str(checkpoint),
     ])
     assert plan_debug_trace(single)["cases"] == [(42, 0)]
+
+
+def test_debug_trace_composition_defaults_to_e_and_accepts_pass(tmp_path):
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    default = build_parser().parse_args([
+        "debug-trace", "--seed", "42", "--seat", "0",
+        "--e-checkpoint", str(checkpoint),
+    ])
+    assert default.composition == E_VS_E
+    assert DEBUG_TRACE_COMPOSITIONS == (E_VS_E, E_VS_PASS)
+    assert plan_debug_trace(default)["composition"] == E_VS_E
+
+    pass_args = build_parser().parse_args([
+        "debug-trace", "--seed", "42", "--seat", "1",
+        "--composition", E_VS_PASS, "--e-checkpoint", str(checkpoint),
+    ])
+    assert plan_debug_trace(pass_args)["composition"] == E_VS_PASS
+    e_policy = _ConstantPlanPolicy("e")
+    pass_policy = PassPlanPolicy()
+    spec = build_episode_spec(
+        0, 42, E_VS_PASS, e_policy, pass_policy, controlled_seat=1)
+    assert spec.policies == (pass_policy, e_policy)
+    assert spec.controlled_seat == 1
+    assert spec.trainable_seats == ()
+
+
+def test_debug_trace_pass_wires_only_opponent_and_keeps_controlled_sidecar(
+        tmp_path, capsys, monkeypatch):
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    backends = []
+
+    class _RecordingBackend(_TraceBackend):
+        def __init__(self, configuration):
+            super().__init__(configuration)
+            self.actions = []
+
+        def step(self, actions):
+            self.actions.append(copy.deepcopy(actions))
+            return super().step(actions)
+
+    def make_backend(_name, configuration):
+        backend = _RecordingBackend(configuration)
+        backends.append(backend)
+        return backend
+
+    monkeypatch.setattr("rl_manager.runner.make_backend", make_backend)
+    monkeypatch.setattr(
+        "rl_manager.runner.make_default_executor_factory",
+        lambda: _TraceExecutorFactory(),
+    )
+    monkeypatch.setattr(
+        "rl_manager.cli._make_debug_trace_policy",
+        lambda plan: _ConstantPlanPolicy("trace"),
+    )
+    args = build_parser().parse_args([
+        "debug-trace", "--seed", "17", "--seat", "1",
+        "--composition", E_VS_PASS, "--max-turns", "97",
+        "--e-checkpoint", str(checkpoint), "--output-dir", str(tmp_path),
+    ])
+    summaries = execute_debug_trace(plan_debug_trace(args))
+    loaded = load_trace(tmp_path / "seed_17_seat_1.json")
+
+    assert summaries[0]["composition"] == E_VS_PASS
+    assert backends
+    assert all(action[0]["farmer"] == ["PASS"]
+               and all(hand == ["PASS"] for hand in action[0]["hands"])
+               for action in backends[0].actions)
+    handoff = next(turn for turn in loaded["turns"] if turn["step"] == 96)
+    assert set(handoff["executor_debug"]) == {"1"}
+    assert "composition=e_vs_pass" in capsys.readouterr().out
 
 
 def test_debug_trace_plan_rejects_invalid_cases_and_missing_checkpoint(tmp_path):

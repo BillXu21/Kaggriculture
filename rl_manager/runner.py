@@ -56,6 +56,7 @@ from rl_manager.trajectory import TrajectoryBuffer, Transition, \
 from rl_manager.types import (
     CANDIDATE_VS_FROZEN,
     E_VS_E,
+    E_VS_PASS,
     FROZEN_VS_CANDIDATE,
     BatchedPlanPolicy,
     seat_policies,
@@ -97,6 +98,7 @@ class EpisodeSpec:
     composition: str
     policies: tuple[BatchedPlanPolicy, BatchedPlanPolicy]
     trainable_seats: tuple[int, ...]
+    controlled_seat: int | None = None
 
 
 def build_episode_spec(
@@ -105,6 +107,8 @@ def build_episode_spec(
     composition: str,
     candidate: BatchedPlanPolicy,
     frozen: BatchedPlanPolicy,
+    *,
+    controlled_seat: int = 0,
 ) -> EpisodeSpec:
     """Resolve a composition into seat policies + trainable ownership.
 
@@ -112,15 +116,18 @@ def build_episode_spec(
     `rl_manager.types.seat_policies` resolver so the E-vs-E identical-
     identity guard cannot be bypassed by this entry point.
     """
-    policies = seat_policies(composition, candidate, frozen)
+    policies = seat_policies(
+        composition, candidate, frozen, controlled_seat=controlled_seat)
     trainable = {
         E_VS_E: (),
+        E_VS_PASS: (),
         CANDIDATE_VS_FROZEN: (0,),
         FROZEN_VS_CANDIDATE: (1,),
     }[composition]
     return EpisodeSpec(
         episode_index=episode_index, seed=seed, composition=composition,
-        policies=policies, trainable_seats=trainable)
+        policies=policies, trainable_seats=trainable,
+        controlled_seat=(controlled_seat if composition == E_VS_PASS else None))
 
 
 @dataclass
@@ -264,6 +271,31 @@ def build_artifact_metadata(
     }
 
 
+class _PassAgent:
+    """Primitive-action opponent that passes every available worker slot."""
+
+    debug_trace_turn = None
+
+    def __init__(self, seat: int) -> None:
+        self.seat = seat
+
+    def __call__(self, obs: Mapping[str, Any]) -> dict[str, Any]:
+        farms = obs.get("farms") if isinstance(obs, Mapping) else None
+        hands: Any = []
+        if isinstance(farms, list) and self.seat < len(farms):
+            farm = farms[self.seat]
+            if isinstance(farm, Mapping):
+                hands = farm.get("hands") or []
+        return {
+            "farmer": ["PASS"],
+            "hands": [["PASS"] for _ in hands],
+            "market": [],
+        }
+
+    def diagnostics_json(self) -> dict[str, Any]:
+        return {"composition": "pass", "days": {}}
+
+
 class _EpisodeState:
     """All per-episode/per-seat mutable state; never shared across games."""
 
@@ -283,15 +315,22 @@ class _EpisodeState:
         self.current_canonical_state: dict[str, Any] | None = None
         self.providers = [QueuedPlanProvider(), QueuedPlanProvider()]
         factory = provenance["executor_factory"]
-        self.executors = [
-            factory.create(backend_name=config.backend_name, seat=seat,
-                           configuration=configuration,
-                           provider=self.providers[seat])
-            for seat in range(2)]
-        self.openings = [
-            make_opening_agent(config.opening, downstream=self.executors[seat],
-                               seat=seat)
-            for seat in range(2)]
+        self.executors = []
+        self.openings = []
+        for seat in range(2):
+            if (spec.composition == E_VS_PASS
+                    and seat != spec.controlled_seat):
+                pass_agent = _PassAgent(seat)
+                self.executors.append(pass_agent)
+                self.openings.append(pass_agent)
+                continue
+            executor = factory.create(
+                backend_name=config.backend_name, seat=seat,
+                configuration=configuration, provider=self.providers[seat])
+            self.executors.append(executor)
+            self.openings.append(
+                make_opening_agent(config.opening, downstream=executor,
+                                   seat=seat))
         # Runner-owned per-seat tracking (exact E history semantics).
         self.last_seen_day = [-1, -1]
         self.daily_start: list[tuple[int, float] | None] = [None, None]

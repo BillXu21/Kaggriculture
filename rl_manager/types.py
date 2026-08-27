@@ -13,9 +13,11 @@ import numpy as np
 
 # Compositions (issue #9 A3). Seat 0's policy is listed first.
 E_VS_E = "e_vs_e"
+E_VS_PASS = "e_vs_pass"
 CANDIDATE_VS_FROZEN = "candidate_vs_frozen"
 FROZEN_VS_CANDIDATE = "frozen_vs_candidate"
-COMPOSITIONS = (E_VS_E, CANDIDATE_VS_FROZEN, FROZEN_VS_CANDIDATE)
+COMPOSITIONS = (E_VS_E, E_VS_PASS, CANDIDATE_VS_FROZEN,
+                FROZEN_VS_CANDIDATE)
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,8 @@ def seat_policies(
     composition: str,
     candidate: BatchedPlanPolicy,
     frozen: BatchedPlanPolicy,
+    *,
+    controlled_seat: int = 0,
 ) -> tuple[BatchedPlanPolicy, BatchedPlanPolicy]:
     """Resolve a composition name into (seat0_policy, seat1_policy)."""
     if composition == E_VS_E:
@@ -89,6 +93,12 @@ def seat_policies(
             raise ValueError(
                 "e_vs_e composition requires identical policies at both seats")
         return candidate, frozen
+    if composition == E_VS_PASS:
+        if controlled_seat not in (0, 1):
+            raise ValueError(
+                f"controlled_seat must be 0 or 1, got {controlled_seat!r}")
+        return ((candidate, frozen) if controlled_seat == 0
+                else (frozen, candidate))
     if composition == CANDIDATE_VS_FROZEN:
         return candidate, frozen
     if composition == FROZEN_VS_CANDIDATE:

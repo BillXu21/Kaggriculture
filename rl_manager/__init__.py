@@ -71,7 +71,7 @@ from rl_manager.ppo_checkpoint import (
     save_ppo_checkpoint,
 )
 from rl_manager.ppo_policy import PPOConfig, PPOPolicy
-from rl_manager.policy import JaxEPlanPolicy, params_fingerprint
+from rl_manager.policy import JaxEPlanPolicy, PassPlanPolicy, params_fingerprint
 from rl_manager.provider import QueuedPlanProvider
 from rl_manager.runner import (
     ARTIFACT_METADATA_SCHEMA_VERSION,
@@ -94,6 +94,7 @@ from rl_manager.trajectory import (
 from rl_manager.types import (
     CANDIDATE_VS_FROZEN,
     E_VS_E,
+    E_VS_PASS,
     FROZEN_VS_CANDIDATE,
     BatchedPlanPolicy,
     PolicyIdentity,
@@ -108,6 +109,7 @@ __all__ = [
     "DIAGNOSTICS_SCHEMA_VERSION",
     "DEBUG_TRACE_SCHEMA_VERSION",
     "E_VS_E",
+    "E_VS_PASS",
     "EXECUTOR_FACTORY_VERSION",
     "FROZEN_VS_CANDIDATE",
     "GAME_TURNS",
@@ -120,6 +122,7 @@ __all__ = [
     "EpisodeResult",
     "EpisodeSpec",
     "JaxEPlanPolicy",
+    "PassPlanPolicy",
     "PPOBatch",
     "PPOBatchedPolicy",
     "PPOConfig",

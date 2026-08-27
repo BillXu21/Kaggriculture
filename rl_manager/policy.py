@@ -26,6 +26,7 @@ from bc_manager_jax.model import (
 )
 
 from rl_manager.decode import (
+    ACTION_TENSOR_SHAPES,
     LOGPROB_GROUPS,
     decode_outputs_to_action_tensors,
 )
@@ -105,6 +106,39 @@ class JaxEPlanPolicy:
         zeros = np.zeros(batch_size, dtype=np.float32)
         self.call_count += 1
         self.batch_size_history.append(batch_size)
+        return PolicyOutputs(
+            action_tensors=action_tensors,
+            logprob_groups={group: zeros.copy() for group in LOGPROB_GROUPS},
+            logprob_total=zeros.copy(),
+            value=zeros.copy(),
+            batch_size=batch_size,
+        )
+
+
+class PassPlanPolicy:
+    """Fixed legal manager-plan policy for the PASS opponent composition."""
+
+    def __init__(self) -> None:
+        self.identity = PolicyIdentity(
+            name="pass",
+            version="stage-a-v1",
+            fingerprint=hashlib.sha256(b"rl_manager.pass_plan").hexdigest(),
+        )
+
+    def plan_batch(
+        self,
+        inputs: Mapping[str, np.ndarray],
+        prng_id: str,
+    ) -> PolicyOutputs:
+        if not isinstance(prng_id, str) or not prng_id:
+            raise ValueError("prng_id must be a non-empty string identifier")
+        batch_size = int(np.asarray(inputs["day"]).shape[0])
+        action_tensors = {
+            name: np.zeros((batch_size,) + shape, dtype=np.int16)
+            for name, shape in ACTION_TENSOR_SHAPES.items()
+        }
+        action_tensors["land"] = np.ones(batch_size, dtype=np.int16)
+        zeros = np.zeros(batch_size, dtype=np.float32)
         return PolicyOutputs(
             action_tensors=action_tensors,
             logprob_groups={group: zeros.copy() for group in LOGPROB_GROUPS},
