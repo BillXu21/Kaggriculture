@@ -2,6 +2,32 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-27 — Stage 7 Issue #12C Opportunistic Watering Audit
+
+The bounded opportunistic-watering implementation passed a requirement-by-
+requirement mechanical audit at repository HEAD `c676fcf53d4064667fb454bfc20b7d5d59b7f6d6`.
+Weed-boundary WATER remains `MAINTENANCE`, yield-positive WATER remains
+`PRODUCTIVE`, and optional WATER is `OPTIONAL`; candidate generation excludes
+watered, urgent, malformed, locked, and non-plant cases. `AgentConfig` defaults
+`optional_spare_watering=False`, optional dispatch is explicitly gated, all normal
+priority classes remain ahead of optional work, starvation filtering remains in
+place, Stage 4 dependencies remain keyed as `WATER:`, and optional work is absent
+from hiring/debt/pending accounting while remaining traceable.
+
+Existing focused tests cover default-off behavior, enabled spare-worker dispatch,
+priority ordering, nearest/distinct-worker selection, malformed/yield exclusions,
+and debt isolation. The only identified gap is no maximum-distance clamp: a lone
+far optional target can consume walking turns when explicitly enabled. This is a
+strategic threshold choice rather than a proven mechanical defect. No source/test/
+tool/config behavior change was made and no 24-game A/B was run.
+
+Defer the exact same fixed 24-game panel with optional watering OFF versus ON
+(seeds `7,17,42,123,2026,1013,1022,1003,1026,1011,1024,1019`, both seats, same
+BC-E checkpoint/source/config, PASS, `standard_mixed`, fast backend, prior-debt
+suppression ON, aggressive selling ON, turn trace ON). Compare banks, movement,
+missed maintenance, debt, and errors/status anomalies; consider a distance clamp
+only after that evidence. Full note: `research/EXECUTOR_V07_STAGE7_ISSUE12C_OPTIONAL_WATER_AUDIT.md`.
+
 ## 2026-08-27 — Stage 6 Issue #12B Spawn/Shed Wait Non-Reproduction
 
 The isolated Stage 4 24-game turn-trace artifact was scanned for consecutive
