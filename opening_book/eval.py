@@ -123,6 +123,28 @@ ENVELOPES: dict[str, dict[str, Any]] = {
             "money": 213, "shed_wheat": 8,
         },
     },
+    "carrot_start": {
+        "milestones": {
+            "crops": {"WHEAT": 3, "MELON": 8, "STRAWBERRY": 3},
+            "animals": {"COW": 2, "SHEEP": 2},
+            "land_count": 1,
+        },
+        "money_range": [0, 1000],
+        "shed_wheat_range": [0, 24],
+        "money_justification": (
+            "source episode 100939868 seat 1 ends d3 at money 369; this "
+            "opening is newly added from one verified replay, so the range is "
+            "intentionally broad pending official multi-seed/PASS calibration"
+        ),
+        "shed_justification": (
+            "source replay holds 7 shed WHEAT at d4h0; range is intentionally "
+            "broad pending official multi-seed/PASS calibration"
+        ),
+        "source_reference": {
+            "episode": 100939868, "seat": 1, "seed": 2084502533,
+            "money": 369, "shed_wheat": 7,
+        },
+    },
 }
 
 
