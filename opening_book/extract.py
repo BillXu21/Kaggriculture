@@ -28,6 +28,7 @@ from typing import Any
 from .trace import (
     ENGINE_VERSION,
     FIRST_DAY,
+    IDENTITIES,
     LAST_DAY,
     TURNS_PER_DAY,
     TRACE_FORMAT_VERSION,
@@ -137,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replay", required=True, help="path to one raw replay JSON")
     parser.add_argument("--seat", required=True, type=int, choices=(0, 1))
     parser.add_argument(
-        "--identity", required=True, choices=("standard_mixed", "pasture_heavy")
+        "--identity", required=True, choices=IDENTITIES
     )
     parser.add_argument("--out", required=True, help="output trace JSON path")
     args = parser.parse_args(argv)
