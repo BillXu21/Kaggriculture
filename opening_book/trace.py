@@ -30,7 +30,7 @@ EXPECTED_TURNS = (LAST_DAY - FIRST_DAY + 1) * TURNS_PER_DAY  # 96
 MAX_MARKET_ORDERS = 10
 
 DEFAULT_IDENTITY = "standard_mixed"
-IDENTITIES = ("standard_mixed", "pasture_heavy")
+IDENTITIES = ("standard_mixed", "pasture_heavy", "carrot_start")
 
 VALID_SEATS = (0, 1)
 
