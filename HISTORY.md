@@ -2,6 +2,26 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-27 — Stage 6 Issue #12B Spawn/Shed Wait Non-Reproduction
+
+The isolated Stage 4 24-game turn-trace artifact was scanned for consecutive
+per-worker `PASS` runs of at least eight turns. It contains 69 such runs: 24
+shed-zone runs, exactly one per game, all worker index 1 at `[4,5]` on
+`d4h1`–`d4h10`; the other 45 are hiring-ramp or end-game labor-surplus waits.
+The representative seed-7/seat-0 reconstruction shows an affordable d4h0
+WHEAT buy followed by fill latency while other workers clear feed/starvation
+work; the worker resumes at d4h11. There was no animal loss, critical work loss,
+unaffordable order, fallback/day/status error, or repeated pickup overdraw.
+
+The behavior is legitimate market-fill/task-availability waiting, not Kaggle
+AFK and not a bookkeeping defect. The `cf282a1` shed-budget reservation is
+present and prevents concurrent over-pickup. The artifact lacks per-turn
+`assignment.reason` and complete private shed/carried-inventory snapshots, so
+this remains a bounded classification. It is distinct from the resolved Kaggle
+AFK packaging omission. No instrumentation or executor behavior change was
+justified; detailed evidence is in
+`research/EXECUTOR_V07_STAGE6_ISSUE12B_SPAWN_SHED_WAIT.md`.
+
 ## 2026-08-27 — Stage 5 Accepted / Current Archive Compatibility Identity
 
 The fixed Stage 5 panel is accepted by root judgment with the retained Stage 4
