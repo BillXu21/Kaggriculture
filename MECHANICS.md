@@ -24,7 +24,7 @@ Confidence labels:
 - 1.32.7 situational-resources PR: `Kaggle/kaggle-environments#1399`
 - 1.32.7 situational-resources merge commit: `28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c`
 - PR #1399 head commit: `1fbd3b7571653434329d288dee9e068f54ff01c0`
-- Local package version: not installed/locked in this repository yet
+- Local package version: `1.32.7` installed in the repository `.venv` for the Stage 1 exact-archive verifier; dependency manifests remain unchanged
 - Vendored source commit: not established
 - Engine file SHA-256: not established
 - Specification file SHA-256: not established
@@ -55,6 +55,11 @@ Confidence labels:
 - Stage 1 local archive evidence is recorded in `HISTORY.md`. The authorized
   BC-E input's verified SHA-256 is
   `f4b029d3e463aba1db0544377d0d616e3de94aa6cc469d3446f018dddd8f6bf2`.
+- Exact accepted result: archive SHA-256
+  `4ccfcf25d30465661c912626a5d029210897ec5855c3dc2b55db2cdfd1a7d6cf`,
+  official provenance 1.32.7, 720 full-history entries, zero status anomalies,
+  candidate seat-1 bank `54,439.0`, and deterministic action fingerprint
+  `516fab6d316b76e8b93fce3b4d185e49b2df53aa742be6558574563c1929dc40`.
 
 ## Match Contract
 

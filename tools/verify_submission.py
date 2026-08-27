@@ -12,7 +12,9 @@ import tarfile
 import tempfile
 
 EXPECTED_BANK = 54439.0
-EXPECTED_TRACE_FINGERPRINT = ""
+EXPECTED_TRACE_FINGERPRINT = (
+    "516fab6d316b76e8b93fce3b4d185e49b2df53aa742be6558574563c1929dc40"
+)
 EXPECTED_STATUSES = {"ACTIVE", "DONE"}
 REQUIRED_PACKAGES = (
     "executor_v0",
@@ -87,6 +89,7 @@ import sys
 
 ARCHIVE_ROOT = Path(sys.argv[1]).resolve()
 REPOSITORY_ROOT = Path(sys.argv[2]).resolve()
+VENV_ROOT = REPOSITORY_ROOT / ".venv"
 REQUIRED_PACKAGES = ("executor_v0", "bc_manager", "opening_book", "oracle", "replay_daily", "fast_env")
 
 def under(path, root):
@@ -94,11 +97,15 @@ def under(path, root):
     root = Path(root).resolve()
     return path == root or root in path.parents
 
+def repository_source_path(path):
+    return under(path, REPOSITORY_ROOT) and not under(path, VENV_ROOT)
+
 def fail(message):
     raise RuntimeError(message)
 
+sys.path[:] = [entry for entry in sys.path if not entry or not repository_source_path(entry)]
 for entry in sys.path:
-    if entry and under(entry, REPOSITORY_ROOT):
+    if entry and repository_source_path(entry):
         fail(f"repository root present on sys.path: {entry}")
 
 # This is deliberately before the game: fast_env.market is the historical
@@ -113,7 +120,7 @@ if not callable(getattr(market, "market_price", None)):
     fail("fast_env.market.market_price is not callable")
 for module_name, module in list(sys.modules.items()):
     origin = getattr(module, "__file__", None)
-    if origin and under(origin, REPOSITORY_ROOT):
+    if origin and repository_source_path(origin):
         fail(f"repository import origin present: {module_name} -> {origin}")
 
 from kaggle_environments import make
@@ -161,7 +168,7 @@ result = {
     "trace_actions": len(trace),
     "trace_fingerprint": fingerprint,
     "provenance": provenance,
-    "sys_path_repository_root_present": any(entry and under(entry, REPOSITORY_ROOT) for entry in sys.path),
+    "sys_path_repository_root_present": any(entry and repository_source_path(entry) for entry in sys.path),
 }
 print(json.dumps(result, sort_keys=True))
 if result["sys_path_repository_root_present"]:

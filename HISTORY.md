@@ -2,6 +2,45 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-27 — Issue #13 Stage 1 Acceptance Follow-up
+
+Completed the previously partial acceptance with the repository-local
+`.venv`. The exact installation command was
+`& '.venv\\Scripts\\python.exe' -m pip install --disable-pip-version-check
+'kaggle-environments==1.32.7'`; it succeeded and the version check reported
+`1.32.7` from `.venv\\Lib\\site-packages\\kaggle_environments\\__init__.py`.
+The existing repository runtime command
+`& '.venv\\Scripts\\python.exe' -m pip install --disable-pip-version-check
+-r requirements.txt` was also needed for the declared `torch`/`pyarrow`
+runtime dependencies; no dependency manifests changed.
+
+Final exact command:
+`& '.venv\\Scripts\\python.exe' tools\\verify_submission.py
+artifacts\\local\\submissions\\bc-e-v07.tar.gz`
+
+Result: **PASS**. The exact ignored archive
+`artifacts/local/submissions/bc-e-v07.tar.gz` retained SHA-256
+`4ccfcf25d30465661c912626a5d029210897ec5855c3dc2b55db2cdfd1a7d6cf` and 50
+members. The raw extracted `main.py` was loaded through
+`kaggle_environments.agent.get_last_callable`; official provenance matched
+package `1.32.7`, upstream commit
+`28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c`, and the pinned interpreter file
+hashes. Strict mode was enabled with `KAGGRICULTURE_SUBMISSION_STRICT=1`.
+Candidate seat 1 versus PASS, seed 7, produced bank `54439.0`, 720 complete
+status-history entries, zero anomalies, 719 candidate actions, and action
+fingerprint
+`516fab6d316b76e8b93fce3b4d185e49b2df53aa742be6558574563c1929dc40`.
+Repository-root source paths were absent after child-path sanitization and
+all six local runtime packages loaded from the extracted archive.
+
+The first real run found and fixed the bounded verifier issue allowing the
+repository-local editable path only as `.venv` third-party site-packages; the
+final run proved the path assertion and fingerprint pin. Focused
+`tests/test_submission_tools.py` remained **4 passed**, including loud
+omitted-`fast_env` failure, and Ruff remained clean. This follow-up is the
+small tracked acceptance commit after `1d0bffd72b160a23c0122b03791900212133da9f`;
+no executor strategy or Stage 2+ behavior changed.
+
 ## 2026-08-27 — Issue #13 Stage 1: Reproducible BC-E Archive Builder and Verifier
 
 Implemented the packaging/runtime invariant before any executor behavior
