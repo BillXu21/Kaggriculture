@@ -1,8 +1,8 @@
 """Elite opening-book primitive-action traces (issue #4, stage 1).
 
 Stage 1 scope: trace contract, deterministic extraction from one raw replay,
-runtime-readable validation/loading, and two committed identities generated
-from verified local raw replays. No runtime wrapper/handoff here (stage 2).
+runtime-readable validation/loading, and committed identities generated from
+verified local raw replays. No runtime wrapper/handoff here (stage 2).
 """
 
 from .agent import OpeningAgent, make_opening_agent
