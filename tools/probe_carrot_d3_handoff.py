@@ -1,14 +1,20 @@
 """Diagnostic-only BC probe: carrot_start prefix through d2 -> BC at d3h0.
 
-This intentionally does NOT change the opening-book production contract.  The
+This intentionally does NOT change the opening-book production contract. The
 committed ``carrot_start`` identity remains a 96-turn d0-d3 opening with its
-normal d4h0 handoff.  This tool reuses only its first 72 literal actions so BC-E
+normal d4h0 handoff. This tool reuses only its first 72 literal actions so BC-E
 can be observed while the source replay's early CARROT plants are still live.
+
+By default the downstream executor uses the promoted Stage-4 economics:
+prior-debt suppression ON, aggressive sell-all ON, strict mode ON, cleanup OFF.
+Use ``--no-aggressive-sell-all`` only for an explicit diagnostic comparison.
+Full official-engine replay JSON can be emitted with ``--replay-dir``.
 
 Example::
 
     python -m tools.probe_carrot_d3_handoff \
-        --checkpoint C:/path/to/best.pt --seeds 7,42,2026 --seats 0,1
+        --checkpoint C:/path/to/best.pt --seeds 7,42,2026 --seats 0,1 \
+        --replay-dir artifacts/carrot-d3-replays
 """
 
 from __future__ import annotations
@@ -19,8 +25,9 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
+from executor_v0.agent import AgentConfig, make_agent
 from executor_v0.smoke import detect_engine
-from opening_book.eval import adapt_one_arg, make_checkpoint_downstream_factory, pass_action
+from opening_book.eval import adapt_one_arg, pass_action
 from opening_book.trace import action_for, load_built_in_trace, validate_action
 from oracle.provenance import ProvenanceError, verify_official_provenance
 
@@ -116,10 +123,42 @@ def _requested_day(diag: Mapping[str, Any], day: int) -> Mapping[str, Any]:
     return entry["requested"]
 
 
-def _run_one(checkpoint: str, device: str, seed: int, seat: int) -> dict[str, Any]:
+def _write_replay(env: Any, path: str) -> None:
+    payload = env.toJSON()
+    with open(path, "w", encoding="utf-8") as fh:
+        if isinstance(payload, str):
+            fh.write(payload)
+            if not payload.endswith("\n"):
+                fh.write("\n")
+        else:
+            json.dump(payload, fh, sort_keys=True)
+            fh.write("\n")
+
+
+def _run_one(
+    checkpoint: str,
+    device: str,
+    seed: int,
+    seat: int,
+    *,
+    aggressive_sell_all: bool,
+    replay_dir: str | None,
+) -> dict[str, Any]:
     import kaggle_environments
 
-    downstream = make_checkpoint_downstream_factory(checkpoint, device, seat)()
+    config = AgentConfig(
+        strict=True,
+        suppress_expansion_from_prior_debt=True,
+        aggressive_sell_all=aggressive_sell_all,
+        optional_idle_cleanup=False,
+        optional_spare_watering=False,
+    )
+    downstream = make_agent(
+        checkpoint=checkpoint,
+        device=device,
+        seat=seat,
+        config=config,
+    )
     wrapper = CarrotD3PrefixAgent(downstream, seat)
 
     def opponent(obs, config):  # noqa: ARG001
@@ -137,36 +176,44 @@ def _run_one(checkpoint: str, device: str, seed: int, seat: int) -> dict[str, An
     diagnostics = downstream.diagnostics_json()
     requested = dict(_requested_day(diagnostics, HANDOFF_DAY))
     final_farms = steps[-1][0].observation.farms
-    return {
+    row = {
         "seed": seed,
         "seat": seat,
         "prefix_turns": wrapper.cursor,
+        "aggressive_sell_all": aggressive_sell_all,
         "handoff": wrapper.handoff,
         "requested": requested,
         "final_bank": final_farms[seat]["money"],
+        "executor_config": diagnostics.get("config", {}),
+        "fallback_errors": diagnostics.get("fallback_errors", []),
     }
+    if replay_dir:
+        os.makedirs(replay_dir, exist_ok=True)
+        replay_path = os.path.join(
+            replay_dir,
+            f"carrot-d3-seed{seed}-seat{seat}-sell{int(aggressive_sell_all)}.json",
+        )
+        _write_replay(env, replay_path)
+        row["replay_path"] = replay_path
+    return row
 
 
 def _print_table(rows: list[dict[str, Any]]) -> None:
     header = (
-        "Seed Seat | H_Carrot H_Wheat H_Strawb H_Melon | "
-        "BC_Carrot BC_Wheat BC_Strawb BC_Melon | BC_Goose BC_Cow BC_Sheep"
+        "Seed Seat Shop            | H_Carrot Cash | "
+        "BC_Carrot BC_Strawb BC_Melon | FinalBank"
     )
     print(header)
     print("-" * len(header))
     for row in rows:
-        h = row["handoff"]["crops"]
-        plan = row["requested"]
-        crops = plan["crop_targets"]
-        animals = plan["animal_targets"]
+        h = row["handoff"]
+        crops = row["requested"]["crop_targets"]
+        shops = ",".join(h.get("town") or []) or "-"
         print(
-            f"{row['seed']:4d} {row['seat']:4d} | "
-            f"{int(h.get('CARROT', 0)):8d} {int(h.get('WHEAT', 0)):7d} "
-            f"{int(h.get('STRAWBERRY', 0)):7d} {int(h.get('MELON', 0)):7d} | "
-            f"{int(crops['CARROT']):9d} {int(crops['WHEAT']):8d} "
-            f"{int(crops['STRAWBERRY']):8d} {int(crops['MELON']):8d} | "
-            f"{int(animals['GOOSE']):8d} {int(animals['COW']):6d} "
-            f"{int(animals['SHEEP']):8d}"
+            f"{row['seed']:4d} {row['seat']:4d} {shops[:15]:15s} | "
+            f"{int(h['crops'].get('CARROT', 0)):8d} {int(h.get('money') or 0):4d} | "
+            f"{int(crops['CARROT']):9d} {int(crops['STRAWBERRY']):8d} "
+            f"{int(crops['MELON']):8d} | {int(row['final_bank']):9d}"
         )
 
 
@@ -177,6 +224,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seeds", default="7,42,2026")
     parser.add_argument("--seats", default="0,1")
     parser.add_argument("--out", default=None, help="optional JSON output path")
+    parser.add_argument(
+        "--aggressive-sell-all",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use the Stage-4 aggressive sell override (default: on)",
+    )
+    parser.add_argument(
+        "--replay-dir",
+        default=None,
+        help="optional directory for full official-engine replay JSONs",
+    )
     args = parser.parse_args(argv)
 
     if not os.path.isfile(args.checkpoint):
@@ -197,7 +255,14 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(f"official provenance mismatch: {exc}") from exc
 
     rows = [
-        _run_one(args.checkpoint, args.device, seed, seat)
+        _run_one(
+            args.checkpoint,
+            args.device,
+            seed,
+            seat,
+            aggressive_sell_all=args.aggressive_sell_all,
+            replay_dir=args.replay_dir,
+        )
         for seat in seats
         for seed in seeds
     ]
@@ -208,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
             "experiment": "carrot_start_d3h0_bc_probe",
             "engine": engine,
             "provenance": provenance,
+            "aggressive_sell_all": args.aggressive_sell_all,
             "rows": rows,
         }
         with open(args.out, "w", encoding="utf-8") as fh:
