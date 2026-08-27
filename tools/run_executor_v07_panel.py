@@ -609,6 +609,7 @@ def _run_one(
         "aggressive_sell_all": aggressive_sell_all,
         "optional_idle_cleanup": optional_idle_cleanup or optional_spare_watering,
         "optional_spare_watering": optional_spare_watering,
+        "cleanup_metrics": executor_diagnostics.get("cleanup_metrics", {}),
         "status": final_status,
         "transitions": transitions,
         "final": {

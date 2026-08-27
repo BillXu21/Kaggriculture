@@ -202,6 +202,15 @@ class ExecutorAgent:
         self._errors: list[dict[str, Any]] = []
         self._suppress_expansion_today: bool = False
         self._debug_trace_turn: dict[str, Any] | None = None
+        self._cleanup_metrics: dict[str, int] = {
+            "baseline_pass_worker_actions": 0,
+            "cleanup_replacements": 0,
+            "weed_dig_cleanup_interactions": 0,
+            "optional_water_cleanup_interactions": 0,
+            "cleanup_movement_actions": 0,
+            "remaining_pass_worker_actions": 0,
+            "normal_non_pass_actions_changed": 0,
+        }
 
     def __call__(self, obs: Mapping) -> dict[str, Any]:
         try:
@@ -816,6 +825,55 @@ class ExecutorAgent:
             trace.append(entry)
         trace.sort(key=lambda item: (int(item["day"]), int(item["hour"])))
 
+    def _record_cleanup_telemetry(
+        self,
+        normal_foreman: Any,
+        final_foreman: Any,
+        cleanup_tasks: tuple[Task, ...],
+    ) -> None:
+        """Accumulate bounded action aggregates without retaining observations."""
+        normal_actions = (
+            normal_foreman.farmer_action, *normal_foreman.hands_actions)
+        final_actions = (final_foreman.farmer_action, *final_foreman.hands_actions)
+        if len(normal_actions) != len(final_actions) \
+                or len(normal_actions) != len(normal_foreman.assignments):
+            raise ValueError("foreman returned misaligned worker actions")
+        cleanup_sources = {
+            task.key: task.source for task in cleanup_tasks
+        }
+        for normal_action, final_action, assignment in zip(
+                normal_actions, final_actions, final_foreman.assignments):
+            if normal_action != ("PASS",):
+                if final_action != normal_action:
+                    self._cleanup_metrics["normal_non_pass_actions_changed"] += 1
+                continue
+            self._cleanup_metrics["baseline_pass_worker_actions"] += 1
+            if final_action == ("PASS",):
+                self._cleanup_metrics["remaining_pass_worker_actions"] += 1
+                continue
+            source = cleanup_sources.get(assignment.task_key)
+            if source is None:
+                continue
+            self._cleanup_metrics["cleanup_replacements"] += 1
+            if final_action[0] in ("NORTH", "SOUTH", "EAST", "WEST"):
+                self._cleanup_metrics["cleanup_movement_actions"] += 1
+            elif source == "dig_cleanup" and final_action == ("DIG",):
+                self._cleanup_metrics["weed_dig_cleanup_interactions"] += 1
+            elif source == "water_optional_spare" \
+                    and final_action == ("WATER",):
+                self._cleanup_metrics["optional_water_cleanup_interactions"] += 1
+
+        if self._cleanup_metrics["normal_non_pass_actions_changed"]:
+            raise AssertionError("PASS-only cleanup changed a normal non-PASS action")
+
+    def _cleanup_diagnostics(self) -> dict[str, Any]:
+        metrics = dict(self._cleanup_metrics)
+        baseline = metrics["baseline_pass_worker_actions"]
+        metrics["cleanup_replacement_rate"] = (
+            metrics["cleanup_replacements"] / baseline if baseline else 0.0
+        )
+        return metrics
+
     def _act(self, obs: Mapping) -> dict[str, Any]:
         seat = self._resolve_seat(obs)
         day, hour = int(obs["day"]), int(obs["hour"])
@@ -855,6 +913,8 @@ class ExecutorAgent:
             optional_tasks = generate_optional_idle_cleanup_tasks(obs, seat)
             foreman_result = apply_idle_cleanup(
                 obs, seat, normal_foreman, optional_tasks)
+        self._record_cleanup_telemetry(
+            normal_foreman, foreman_result, optional_tasks)
 
         record = self._day_records[day]
         survival_record = record["survival"]
@@ -1040,6 +1100,7 @@ class ExecutorAgent:
                     "weed_first" if self.config.idle_cleanup_enabled else "off"
                 ),
             },
+            "cleanup_metrics": self._cleanup_diagnostics(),
             "days": {str(day): record for day, record in sorted(self._day_records.items())},
             "illegal_actions": {
                 "available": False,
