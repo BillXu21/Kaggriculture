@@ -20,6 +20,11 @@ Issue #13 Stage 1 and the Stage 5 post-Stage-4 archive compatibility check (2026
 
 Issue #9 Stage B2 remains implemented and locally validated as plumbing, but is not the current mutation target until the issue-#13 archive invariant is accepted.
 
+Issue #16 batched fast self-play is implemented as an additive native owner and
+opt-in runner path. Keep scalar mode as the correctness reference; future
+worker scheduling may consume `oracle.batched_backend.BatchedEngineBackend`
+without coupling to PPO or executor strategy.
+
 ## Phase 0 — Freeze 1.32.7, Rules, RNG, and Provenance
 
 ### Current engine events

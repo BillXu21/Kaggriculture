@@ -39,6 +39,8 @@ from bc_manager.live import encode_live_inputs
 from executor_v0.plan import DailyPlan
 from opening_book.agent import make_opening_agent
 from oracle.backend import EngineBackend, make_backend
+from oracle.batched_backend import BatchedEngineBackend, make_batched_backend
+from oracle.canonical import canonical_state_fast
 from replay_daily.constants import total_hire_cost
 
 from rl_manager.decode import plans_from_action_tensors
@@ -83,6 +85,7 @@ class RunnerConfig:
     manager_start_day: int = MANAGER_START_DAY
     max_turns: int = GAME_TURNS
     num_envs: int = 1  # lockstep envs per chunk (single-process mode)
+    batch_backend: bool = False  # one native fast engine for each lockstep chunk
     record_rollout: bool = False  # capture full primitive trace for parity
     record_debug_trace: bool = False  # capture canonical viewer trace opt-in
     debug_trace_seat: int | None = None  # requested private-seat/view selector
@@ -300,13 +303,14 @@ class _EpisodeState:
     """All per-episode/per-seat mutable state; never shared across games."""
 
     def __init__(self, spec: EpisodeSpec, config: RunnerConfig,
-                 provenance: Mapping[str, Any]) -> None:
+                 provenance: Mapping[str, Any],
+                 backend: EngineBackend | None = None) -> None:
         self.spec = spec
         self.config = config
         configuration = dict(config.backend_configuration)
         configuration["seed"] = int(spec.seed)
         self.configuration = configuration
-        self.backend: EngineBackend = make_backend(
+        self.backend: EngineBackend = backend or make_backend(
             config.backend_name, configuration)
         self.trace_recorder = (
             TraceRecorder(_debug_trace_metadata(
@@ -490,6 +494,39 @@ class _EpisodeState:
             self.day_digests[day] = hasher.digest()
 
 
+class _BatchedSlotBackend:
+    """Scalar-shaped view over one slot in a shared batched backend."""
+
+    name = "fast-batched"
+
+    def __init__(self, batch: BatchedEngineBackend, index: int) -> None:
+        self._observations: list[dict[str, Any]] = []
+        self._rewards = [0.0, 0.0]
+        self._statuses = ["ACTIVE", "ACTIVE"]
+
+    def update(
+        self,
+        observations: list[dict[str, Any]],
+        rewards: list[float],
+        statuses: list[str],
+    ) -> None:
+        self._observations = observations
+        self._rewards = list(rewards)
+        self._statuses = list(statuses)
+
+    def canonical_state(self) -> dict[str, Any]:
+        return canonical_state_fast(self._observations, self._rewards,
+                                    self._statuses)
+
+    @property
+    def rewards(self) -> list[float]:
+        return list(self._rewards)
+
+    @property
+    def statuses(self) -> list[str]:
+        return list(self._statuses)
+
+
 class SelfPlayRunner:
     """Batched-lockstep self-play over `oracle.backend` engine instances."""
 
@@ -524,6 +561,8 @@ class SelfPlayRunner:
             "master_seed": master_seed,
             "manager_start_day": config.manager_start_day,
         }
+        if config.batch_backend and config.backend_name != "fast":
+            raise ValueError("batch_backend currently supports backend_name='fast' only")
 
     # ---------------------------------------------------------------- run
     def run(self, specs: Sequence[EpisodeSpec]) -> list[EpisodeResult]:
@@ -537,6 +576,8 @@ class SelfPlayRunner:
 
     # ------------------------------------------------------------- lockstep
     def _run_chunk(self, specs: list[EpisodeSpec]) -> list[EpisodeResult]:
+        if self.config.batch_backend:
+            return self._run_chunk_batched(specs)
         states = [_EpisodeState(spec, self.config, self.provenance)
                   for spec in specs]
         for state in states:
@@ -590,6 +631,94 @@ class SelfPlayRunner:
                 results.append(self._finalize(state))
 
         # Turn budget exhausted without terminal status: truncate remaining.
+        for state in states:
+            if not state.finalized:
+                state.truncated = True
+                results.append(self._finalize(state))
+        return results
+
+    def _run_chunk_batched(self, specs: list[EpisodeSpec]) -> list[EpisodeResult]:
+        """Run a chunk through one native batch owner.
+
+        The executor and manager remain per-episode/per-seat Python objects;
+        only explicit action submission and native state ownership are batched.
+        Done slots receive PASS rows so a shorter episode cannot shift rows for
+        the still-active slots.
+        """
+        batch: BatchedEngineBackend = make_batched_backend(
+            self.config.backend_name, len(specs), self.config.backend_configuration
+        )
+        states: list[_EpisodeState] = []
+        for index, spec in enumerate(specs):
+            slot = _BatchedSlotBackend(batch, index)
+            states.append(_EpisodeState(spec, self.config, self.provenance, slot))
+        observations = batch.reset([state.spec.seed for state in states])
+        for index, (state, observation) in enumerate(zip(states, observations)):
+            state.backend.update(observation, batch.rewards(index),
+                                 batch.statuses(index))
+            state.obs = observation
+            if state.trace_recorder is not None:
+                state.current_canonical_state = state.backend.canonical_state()
+            for seat in range(2):
+                state._note_day_start(seat)
+
+        results: list[EpisodeResult] = []
+        pass_pair = [
+            {"farmer": ["PASS"], "hands": [], "market": []},
+            {"farmer": ["PASS"], "hands": [], "market": []},
+        ]
+        for _turn in range(self.config.max_turns):
+            active = [state for state in states if not state.done]
+            if not active:
+                break
+
+            t0 = time.perf_counter()
+            self._collect_and_apply_decisions(active)
+            t1 = time.perf_counter()
+
+            batch_actions = [pass_pair for _ in states]
+            for index, state in enumerate(states):
+                if state.done:
+                    continue
+                actions = [state.openings[seat](copy.deepcopy(state.obs[seat]))
+                           for seat in range(2)]
+                day = int(state.obs[0]["day"])
+                hour = int(state.obs[0]["hour"])
+                state.hash_joint_action(day, hour, actions)
+                if state.rollout is not None:
+                    state.rollout.joint_actions.append((
+                        int(state.obs[0]["step"]), day, hour,
+                        copy.deepcopy(dict(actions[0])),
+                        copy.deepcopy(dict(actions[1]))))
+                state.record_decision_trace(actions)
+                batch_actions[index] = actions
+            t2 = time.perf_counter()
+
+            observations, _rewards, _statuses = batch.step(batch_actions)
+            for index, state in enumerate(states):
+                state.backend.update(observations[index], batch.rewards(index),
+                                     batch.statuses(index))
+                if not state.done:
+                    state.obs = observations[index]
+                    if state.trace_recorder is not None:
+                        state.current_canonical_state = state.backend.canonical_state()
+            t3 = time.perf_counter()
+
+            newly_done: list[_EpisodeState] = []
+            for state in active:
+                state.track_post_step()
+                if state.backend.statuses == ["DONE", "DONE"]:
+                    state.done = True
+                    newly_done.append(state)
+            t4 = time.perf_counter()
+
+            self.timing_totals["manager_inference"] += t1 - t0
+            self.timing_totals["agent_actions"] += t2 - t1
+            self.timing_totals["env_step"] += t3 - t2
+            self.timing_totals["orchestration"] += t4 - t3
+            for state in newly_done:
+                results.append(self._finalize(state))
+
         for state in states:
             if not state.finalized:
                 state.truncated = True

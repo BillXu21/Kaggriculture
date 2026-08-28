@@ -188,13 +188,13 @@ def _round(value: float) -> int:
     return int(round(float(value)))
 
 
-def _tile(raw: np.ndarray, day: int) -> Any:
+def _tile(raw: np.ndarray, day: int, *, canonical: bool = False) -> Any:
     if raw[1] > 0.5:
         return "LOCKED"
     if raw[2] > 0.5:
         crop = CROPS[next(index for index in range(5) if raw[7 + index] > 0.5)]
         age = _round(raw[14] * 30.0)
-        return {
+        result = {
             "kind": "PLANT", "crop": crop, "age": age, "planted_day": day - age,
             "max_lifespan_step": _round(raw[16] * SEASON_STEPS),
             "yield_units": _round(raw[15] * 100.0),
@@ -202,20 +202,27 @@ def _tile(raw: np.ndarray, day: int) -> Any:
             "consecutive_unwatered": _round(raw[18] * 2.0),
             "fertilized_until_day": _round(raw[19] * 30.0),
         }
+        if canonical:
+            del result["age"]
+        return result
     if raw[3] > 0.5:
         return {"kind": "WEED"}
     if raw[4] > 0.5 or raw[5] > 0.5:
         result: dict[str, Any] = {"kind": "COOP" if raw[4] > 0.5 else "PASTURE"}
         if raw[11] > 0.5:
             animal = ANIMALS[next(index for index in range(3) if raw[12 + index] > 0.5)]
+            age = _round(raw[20] * 30.0)
             result.update({
                 "animal": animal, "yield_units": _round(raw[15] * 100.0),
-                "age": _round(raw[20] * 30.0), "fed_today": bool(raw[21] > 0.5),
+                "age": age, "fed_today": bool(raw[21] > 0.5),
                 "consecutive_unfed": _round(raw[22] * 2.0),
                 "cared_today": bool(raw[23] > 0.5),
                 "fertilizer_available": bool(raw[24] * 100.0 > 0.5),
                 "pending_care_bonus": _round(raw[25] * 100.0),
             })
+            if canonical:
+                result["placed_day"] = day - age
+                del result["age"]
         return result
     return None
 
@@ -224,7 +231,12 @@ def _inventory(raw: np.ndarray, start: int) -> dict[str, int]:
     return {name: _round(raw[start + index] * 100.0) for index, name in enumerate(PRODUCTS + ANIMALS)}
 
 
-def _decode_observation(raw: np.ndarray, player: int, configuration: Mapping[str, Any]) -> dict[str, Any]:
+def _decode_public(
+    raw: np.ndarray,
+    configuration: Mapping[str, Any],
+    *,
+    canonical_farms: bool = False,
+) -> dict[str, Any]:
     turns_per_day = int(configuration["turnsPerDay"])
     step = _round(raw[0] * SEASON_STEPS)
     day = step // turns_per_day
@@ -235,7 +247,11 @@ def _decode_observation(raw: np.ndarray, player: int, configuration: Mapping[str
         hands_position = OBS_HAND_POSITIONS + farm_index * (MAX_HANDS + 1)
         hand_count = max(0, min(MAX_HANDS, _round(raw[hands_position] * float(MAX_HANDS))))
         tiles = [
-            _tile(raw[62 + farm_index * 2600 + index * 26:62 + farm_index * 2600 + index * 26 + 26], day)
+            _tile(
+                raw[62 + farm_index * 2600 + index * 26:62 + farm_index * 2600 + index * 26 + 26],
+                day,
+                canonical=canonical_farms,
+            )
             for index in range(100)
         ]
         farms.append({
@@ -256,16 +272,9 @@ def _decode_observation(raw: np.ndarray, player: int, configuration: Mapping[str
             ],
             "hires_today": _round(raw[position + 3] * float(MAX_HANDS)),
         })
-    shed = _inventory(raw, OBS_SHED)
-    seeds = {name: _round(raw[OBS_SEEDS + index] * 100.0) for index, name in enumerate(CROPS)}
-    inventories = [_inventory(raw, OBS_INVENTORY)]
-    hand_count = len(farms[player]["hands"])
-    inventories.extend(_inventory(raw, OBS_HAND_INVENTORY + hand * 12) for hand in range(hand_count))
     shops = [SHOPS[_round(raw[OBS_SHOPS + slot] * 8.0) - 1] for slot in range(8) if raw[OBS_SHOPS + slot] > 0.0]
     return {
-        "player": player,
         "farms": farms,
-        "private": {"shed": shed, "seeds": seeds, "inventories": inventories},
         "market": {
             "inventory": {name: _round(raw[OBS_MARKET_INVENTORY + index] * 10000.0) for index, name in enumerate(PRODUCTS)},
             "prices": {name: _round(raw[OBS_MARKET_PRICES + index] * 1000.0) for index, name in enumerate(PRODUCTS)},
@@ -274,6 +283,52 @@ def _decode_observation(raw: np.ndarray, player: int, configuration: Mapping[str
         "day": day, "hour": hour, "step": step,
         "remainingOverageTime": 60,
     }
+
+
+def _decode_private(raw: np.ndarray, hand_count: int) -> dict[str, Any]:
+    inventories = [_inventory(raw, OBS_INVENTORY)]
+    inventories.extend(
+        _inventory(raw, OBS_HAND_INVENTORY + hand * 12)
+        for hand in range(hand_count)
+    )
+    return {
+        "shed": _inventory(raw, OBS_SHED),
+        "seeds": {
+            name: _round(raw[OBS_SEEDS + index] * 100.0)
+            for index, name in enumerate(CROPS)
+        },
+        "inventories": inventories,
+    }
+
+
+def _decode_observation(raw: np.ndarray, player: int, configuration: Mapping[str, Any]) -> dict[str, Any]:
+    observation = _decode_public(raw, configuration)
+    observation["player"] = player
+    observation["private"] = _decode_private(
+        raw, len(observation["farms"][player]["hands"])
+    )
+    return observation
+
+
+def _decode_observation_pair(
+    raw: np.ndarray,
+    configuration: Mapping[str, Any],
+    *,
+    canonical_farms: bool = False,
+) -> list[dict[str, Any]]:
+    """Decode shared public state once and each seat's private row once."""
+    public = _decode_public(
+        raw[0], configuration, canonical_farms=canonical_farms
+    )
+    observations = []
+    for player in range(2):
+        observation = dict(public)
+        observation["player"] = player
+        observation["private"] = _decode_private(
+            raw[player], len(public["farms"][player]["hands"])
+        )
+        observations.append(observation)
+    return observations
 
 
 class FastKaggricultureEnv:

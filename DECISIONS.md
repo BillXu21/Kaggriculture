@@ -344,3 +344,13 @@ This file records decisions that remain authoritative across chats and work sess
 - Evidence: official 12-seed x 2-seat A/B with aggressive sell-all and prior-debt suppression ON reproduced OFF mean `63,592.3`, median `65,509.5`, min `47,290`, max `74,151`; old optional watering ON scored mean `60,948.5`, median `61,114`, min `46,798`, max `69,673`, with 8 wins / 16 losses, mean paired delta `-2,643.8`, worst `-18,675`, best `+21,429`. The wide paired spread justifies investigating dispatch correctness rather than promoting or permanently rejecting the underlying cleanup idea.
 - Day-boundary note: worker positions reset near the central shed at day end, hired hands disappear, and carried inventory auto-drops, so cleanup does not need an end-of-day return-home rule. Its opportunity cost is only within the current day's remaining turns, and normal dispatch must preempt it on the next primitive turn.
 - Revisit when: the true PASS-only WATER and WEED-first+WATER panels complete. Promote only if normal non-PASS actions are proven unchanged and paired outcome/tail evidence is favorable.
+
+## D-043 - Use One Native Batch Owner for Opt-In Self-Play
+
+- Date: 2026-08-27
+- Status: active
+- Decision: Add `fast_env.BatchedFastEnv` and the framework-neutral `BatchedEngineBackend` interface. A batch owns N independent Rust game states, accepts explicit unsigned per-environment seeds, encodes one reusable `[N, 2, ACTION_SLOTS, 3]` tensor, and performs one native `step_into` for the chunk. `RunnerConfig(batch_backend=True)` opts the reference runner into this path; scalar mode remains the correctness reference.
+- Rationale: measured scalar environment cost is dominated by Python observation decode, canonicalization, and runner deep copies, while native transitions are below 1% of wrapper time. One batch owner removes N scalar engine instances and combines public observation decode without changing executor/PPO semantics.
+- Evidence: scalar-fast versus batched-fast exact equality for reset and 40 mixed turns over seeds 7/19; terminal episodeSteps=3 equality; action-buffer equality; private-view isolation; two-game self-play fixture equality including final banks, statuses, transitions, and trace digests. Local fixture throughput improved from 402 to 627 primitive turns/s.
+- Scope: no executor optimization, multiprocessing, IPC, worker scheduling, or live submission packaging. Batch observations default to scalar vocabulary; canonical aliases are an explicit executor adapter mode.
+- Revisit when: issue #17 defines worker ownership/scheduling or a future backend requires partial-reset/variable-configuration support.
