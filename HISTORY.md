@@ -1502,3 +1502,9 @@ The project will not rely on redistribution-license concerns as a reason to avoi
   passed with an approved temp root. Two unrelated existing tests encountered
   a Windows pytest temp-directory permission error under the default temp
   root. No executor-v07, multiprocessing, or submission files were changed.
+- Full repository validation after commit: `836 passed, 15 skipped, 1 failed`.
+  The sole failure is the existing official parity comparison: its official
+  runner has no trajectory buffer, leaving `plans={}`, while the cached fast
+  rollout includes plan records. This failure does not execute the batch path
+  and is not caused by the issue-#16 files. Focused batch/runner validation
+  remains green (`36 passed, 1 skipped`).
