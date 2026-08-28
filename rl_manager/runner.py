@@ -72,6 +72,39 @@ GAME_TURNS = 719  # post-reset primitive turns in one 720-step game
 ARTIFACT_METADATA_SCHEMA_VERSION = 1
 
 
+class _ReadOnlyDict(dict):
+    """Dict-shaped observation view that rejects accidental agent mutation."""
+
+    def __readonly(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise TypeError("self-play agent observations are read-only")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __readonly
+
+
+class _ReadOnlyList(list):
+    """List-shaped observation view preserving existing list type checks."""
+
+    def __readonly(self, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise TypeError("self-play agent observations are read-only")
+
+    __setitem__ = __delitem__ = __iadd__ = __imul__ = append = extend = insert = (
+        remove
+    ) = reverse = sort = __readonly
+
+
+def _readonly_observation(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _ReadOnlyDict({
+            key: _readonly_observation(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return _ReadOnlyList(_readonly_observation(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_readonly_observation(item) for item in value)
+    return value
+
+
 @dataclass(frozen=True)
 class RunnerConfig:
     """Knobs are explicit and small-host friendly; nothing is hard-coded."""
@@ -83,6 +116,8 @@ class RunnerConfig:
     manager_start_day: int = MANAGER_START_DAY
     max_turns: int = GAME_TURNS
     num_envs: int = 1  # lockstep envs per chunk (single-process mode)
+    low_telemetry: bool = False  # skip executor turn snapshots for training
+    read_only_agent_observations: bool = False  # avoid per-call deep copies
     record_rollout: bool = False  # capture full primitive trace for parity
     record_debug_trace: bool = False  # capture canonical viewer trace opt-in
     debug_trace_seat: int | None = None  # requested private-seat/view selector
@@ -342,6 +377,7 @@ class _EpisodeState:
         self.day_hashers: dict[int, Any] = {}
         self.day_digests: dict[int, bytes] = {}
         self.obs: list[dict[str, Any]] = []
+        self.agent_obs: list[Mapping[str, Any]] = []
         self.done = False
         self.truncated = False
         self.finalized = False
@@ -376,6 +412,8 @@ class _EpisodeState:
             view.setdefault("step", day * 24 + hour)
             view["farms"] = [copy.deepcopy(farm) for farm in canonical_farms]
             adapted.append(view)
+        if self.config.read_only_agent_observations:
+            self.agent_obs = [_readonly_observation(view) for view in adapted]
         return adapted
 
     def _executor_debug_for_turn(
@@ -508,8 +546,17 @@ class SelfPlayRunner:
                 or not config.debug_trace_view:
             raise ValueError("debug_trace_view must be a non-empty string")
         self.buffer = trajectory_buffer
-        self.executor_factory = executor_factory or \
-            make_default_executor_factory()
+        if executor_factory is None:
+            if config.low_telemetry:
+                from executor_v0.agent import AgentConfig
+
+                executor_factory = make_default_executor_factory(
+                    AgentConfig(strict=True, record_turn_snapshot=False))
+            else:
+                # Preserve the zero-argument factory seam used by callers and
+                # tests; the default factory already creates strict agents.
+                executor_factory = make_default_executor_factory()
+        self.executor_factory = executor_factory
         self.master_seed = master_seed
         self.timing_totals: dict[str, float] = {
             "manager_inference": 0.0, "agent_actions": 0.0,
@@ -554,7 +601,10 @@ class SelfPlayRunner:
 
             per_state_actions: list[list[Mapping[str, Any]]] = []
             for state in active:
-                actions = [state.openings[seat](copy.deepcopy(state.obs[seat]))
+                observations = (
+                    state.agent_obs if state.config.read_only_agent_observations
+                    else [copy.deepcopy(view) for view in state.obs])
+                actions = [state.openings[seat](observations[seat])
                            for seat in range(2)]
                 day = int(state.obs[0]["day"])
                 hour = int(state.obs[0]["hour"])

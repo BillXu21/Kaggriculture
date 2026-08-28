@@ -92,6 +92,7 @@ class AgentConfig:
     aggressive_sell_all: bool = False
     optional_idle_cleanup: bool = False
     optional_spare_watering: bool = False
+    record_turn_snapshot: bool = True
 
     @property
     def idle_cleanup_enabled(self) -> bool:
@@ -142,9 +143,16 @@ def _board_counts(board) -> tuple[dict[str, int], dict[str, int], dict[str, int]
     return crops, animals, care_done, fert_done
 
 
-def _animal_feed_state(obs: Mapping, seat: int) -> dict[str, int]:
+def _animal_feed_state(
+    obs: Mapping,
+    seat: int,
+    *,
+    board: list[list[Any]] | None = None,
+) -> dict[str, int]:
     farm = obs["farms"][seat]
-    board = canonical_board(farm["tiles"], int(obs["day"]), int(obs.get("step", 0)))
+    if board is None:
+        board = canonical_board(
+            farm["tiles"], int(obs["day"]), int(obs.get("step", 0)))
     unfed = 0
     starving = 0
     for row in board:
@@ -255,9 +263,17 @@ class ExecutorAgent:
             hands = 0
         return {"farmer": ["PASS"], "hands": [["PASS"]] * hands, "market": []}
 
-    def _new_day(self, obs: Mapping, seat: int) -> None:
+    def _new_day(
+        self,
+        obs: Mapping,
+        seat: int,
+        *,
+        board: list[list[Any]] | None = None,
+    ) -> None:
         farm = obs["farms"][seat]
-        board = canonical_board(farm["tiles"], int(obs["day"]), int(obs.get("step", 0)))
+        if board is None:
+            board = canonical_board(
+                farm["tiles"], int(obs["day"]), int(obs.get("step", 0)))
         crops, animals, care_done, fert_done = _board_counts(board)
         prior_debt = False
         if self._day is not None:
@@ -348,7 +364,13 @@ class ExecutorAgent:
                 for product in PRODUCTS
             }
 
-    def _sell_candidates(self, obs: Mapping, seat: int) -> list[dict]:
+    def _sell_candidates(
+        self,
+        obs: Mapping,
+        seat: int,
+        *,
+        feed: Mapping[str, int] | None = None,
+    ) -> list[dict]:
         shed = (obs.get("private") or {}).get("shed") or {}
         if self.config.aggressive_sell_all:
             candidates = []
@@ -370,7 +392,8 @@ class ExecutorAgent:
                     })
             return candidates
 
-        feed = _animal_feed_state(obs, seat)
+        if feed is None:
+            feed = _animal_feed_state(obs, seat)
         candidates = []
         for product in PRODUCTS:
             remaining = self._remaining_sells.get(product, 0)
@@ -886,8 +909,10 @@ class ExecutorAgent:
     def _act(self, obs: Mapping) -> dict[str, Any]:
         seat = self._resolve_seat(obs)
         day, hour = int(obs["day"]), int(obs["hour"])
+        board = canonical_board(
+            obs["farms"][seat]["tiles"], day, int(obs.get("step", 0)))
         if self._day != day:
-            self._new_day(obs, seat)
+            self._new_day(obs, seat, board=board)
         else:
             farm = obs["farms"][seat]
             raw_hires = farm.get("hires_today", 0)
@@ -898,10 +923,13 @@ class ExecutorAgent:
         if bin_anchor != self._bin_anchor:
             self._refresh_sell_ledger(obs, bin_anchor)
 
-        generation = generate_tasks(obs, seat, feasible_plan=self._feasible, remaining_sells=self._remaining_sells)
+        generation = generate_tasks(
+            obs, seat, feasible_plan=self._feasible,
+            remaining_sells=self._remaining_sells,
+            canonical_board_value=board)
         generated_tasks = generation.sorted_tasks()
         tasks = generated_tasks
-        feed = _animal_feed_state(obs, seat)
+        feed = _animal_feed_state(obs, seat, board=board)
         current_survival_pressure = bool(feed["starving"] or feed["shortage"])
         expansion_suppressed = self._suppress_expansion_today or current_survival_pressure
         if expansion_suppressed:
@@ -920,7 +948,8 @@ class ExecutorAgent:
         foreman_result = normal_foreman
         if self.config.idle_cleanup_enabled:
             optional_tasks = generate_optional_idle_cleanup_tasks(
-                obs, seat, mode=self.config.cleanup_mode)
+                obs, seat, mode=self.config.cleanup_mode,
+                canonical_board_value=board)
             foreman_result = apply_idle_cleanup(
                 obs, seat, normal_foreman, optional_tasks)
         self._record_cleanup_telemetry(
@@ -935,7 +964,7 @@ class ExecutorAgent:
         if feed["shortage"]:
             survival_record["feed_shortage_turns"] += 1
 
-        sell_candidates = self._sell_candidates(obs, seat)
+        sell_candidates = self._sell_candidates(obs, seat, feed=feed)
         money = float(obs["farms"][seat].get("money", 0.0))
         running_cash = money + self._sell_proceeds(obs, sell_candidates)
         unlocked_count = len(obs["farms"][seat]["unlocked_quadrants"])
@@ -1043,8 +1072,7 @@ class ExecutorAgent:
         record["hires"]["observed_max"] = self._max_hires_today
         record["unresolved_generator"] = list(generation.unresolved)
 
-        crops, animals, care_done, fert_done = _board_counts(
-            canonical_board(obs["farms"][seat]["tiles"], day, int(obs.get("step", 0))))
+        crops, animals, care_done, fert_done = _board_counts(board)
         record["achieved_current"] = {
             "crops": crops, "animals": animals,
             "land_count": len(obs["farms"][seat]["unlocked_quadrants"]),
@@ -1063,25 +1091,28 @@ class ExecutorAgent:
                 # successful executor decision into a fallback action.
                 pass
 
-        try:
-            self._debug_trace_turn = self._build_debug_trace_turn(
-                day=day,
-                hour=hour,
-                tasks=tasks,
-                dispatch_tasks=dispatch_tasks,
-                cleanup_tasks=optional_tasks,
-                generated_tasks=generated_tasks,
-                generation=generation,
-                foreman_result=foreman_result,
-                feed=feed,
-                expansion_suppressed=expansion_suppressed,
-                orders=orders,
-                candidates=candidates,
-                unaffordable_orders=unaffordable_orders,
-            )
-        except Exception:
-            # Diagnostics must remain passive even if an unexpected optional
-            # value cannot be rendered; the already-decided action is stable.
+        if self.config.record_turn_snapshot:
+            try:
+                self._debug_trace_turn = self._build_debug_trace_turn(
+                    day=day,
+                    hour=hour,
+                    tasks=tasks,
+                    dispatch_tasks=dispatch_tasks,
+                    cleanup_tasks=optional_tasks,
+                    generated_tasks=generated_tasks,
+                    generation=generation,
+                    foreman_result=foreman_result,
+                    feed=feed,
+                    expansion_suppressed=expansion_suppressed,
+                    orders=orders,
+                    candidates=candidates,
+                    unaffordable_orders=unaffordable_orders,
+                )
+            except Exception:
+                # Diagnostics must remain passive even if an unexpected optional
+                # value cannot be rendered; the already-decided action is stable.
+                self._debug_trace_turn = None
+        else:
             self._debug_trace_turn = None
 
         return {
@@ -1108,6 +1139,7 @@ class ExecutorAgent:
                 "optional_spare_watering": self.config.optional_spare_watering,
                 "optional_idle_cleanup_mode": self.config.cleanup_mode,
                 "cleanup_mode": self.config.cleanup_mode,
+                "record_turn_snapshot": self.config.record_turn_snapshot,
             },
             "cleanup_metrics": self._cleanup_diagnostics(),
             "days": {str(day): record for day, record in sorted(self._day_records.items())},

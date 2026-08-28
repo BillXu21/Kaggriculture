@@ -933,6 +933,41 @@ def test_debug_trace_observation_does_not_change_actions_or_ordering():
     assert observed_traces == run(read_trace=True)[1]
 
 
+def test_executor_reuses_one_canonical_board_per_turn(monkeypatch):
+    import executor_v0.agent as agent_module
+
+    original = agent_module.canonical_board
+    calls = []
+
+    def counted(tiles, day, step):
+        calls.append((day, step))
+        return original(tiles, day, step)
+
+    monkeypatch.setattr(agent_module, "canonical_board", counted)
+    agent = ExecutorAgent(recording_provider(simple_plan()), seat=0)
+    for hour in (0, 1, 2):
+        agent(make_obs(day=3, hour=hour))
+
+    assert calls == [(3, 72), (3, 73), (3, 74)]
+
+
+def test_low_telemetry_preserves_actions_and_skips_turn_snapshot():
+    obs = make_obs(day=3, hour=2)
+    normal = ExecutorAgent(recording_provider(simple_plan()), seat=0)
+    low = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(record_turn_snapshot=False))
+
+    normal_action = normal(copy.deepcopy(obs))
+    low_action = low(copy.deepcopy(obs))
+
+    assert low_action == normal_action
+    assert normal.debug_trace_turn is not None
+    assert low.debug_trace_turn is None
+    assert normal.diagnostics_json()["config"]["record_turn_snapshot"] is True
+    assert low.diagnostics_json()["config"]["record_turn_snapshot"] is False
+
+
 def test_debug_trace_failure_is_passive(monkeypatch):
     plan = simple_plan(crop_targets={"WHEAT": 1, "CARROT": 0,
                                      "TOMATO": 0, "STRAWBERRY": 0,
