@@ -10,6 +10,10 @@ def __getattr__(name: str):
         from .api import FastKaggricultureEnv
 
         return FastKaggricultureEnv
+    if name == "BatchedFastEnv":
+        from .batch import BatchedFastEnv
+
+        return BatchedFastEnv
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

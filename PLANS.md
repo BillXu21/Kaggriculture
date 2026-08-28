@@ -26,6 +26,11 @@ branch `throughput/15-agent-hotpath`; see
 the copy/diagnostic reductions are explicit training knobs. Further executor
 rewrites remain deferred until target-host integration evidence.
 
+Issue #16 batched fast self-play is implemented as an additive native owner and
+opt-in runner path. Keep scalar mode as the correctness reference; future
+worker scheduling may consume `oracle.batched_backend.BatchedEngineBackend`
+without coupling to PPO or executor strategy.
+
 ## Phase 0 — Freeze 1.32.7, Rules, RNG, and Provenance
 
 ### Current engine events

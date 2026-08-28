@@ -653,6 +653,16 @@ Current interpretation:
 
 Confidence: mostly `CONFIRMED_SOURCE`; exact RNG draw ordering still needs experimental mapping.
 
+## Native Batched Fast Backend - Issue #16
+
+- `fast_env.BatchedFastEnv(N, configuration)` owns N independent `GameState`s in one `RustBatchEnv`; `reset(seeds)` requires exactly N explicit unsigned 64-bit seeds and preserves per-environment RNG isolation.
+- Every step uses one preallocated `[N, 2, ACTION_SLOTS, 3]` i64 action buffer and one native `step_into` call. Observation, reward, and status buffers are also reused; nested Python observations are refreshed after the native call.
+- Public farms/market/town are decoded once per environment and attached to both seat views; private shed/seeds/carried inventories are decoded from the corresponding seat row only. Default observations match scalar-fast exactly. The adapter's `canonical_observations=True` mode emits executor-compatible planted/placed-day fields.
+- `oracle.batched_backend.BatchedEngineBackend` is the framework-neutral rollout seam. `rl_manager.RunnerConfig(batch_backend=True)` uses one adapter per lockstep chunk, while the existing scalar runner remains the reference path.
+- Evidence: `tests/test_fast_batched_env.py` and the native batch runner test prove fixed-seed scalar parity, terminal status/reward parity, action encoding parity, private-view isolation, and self-play trace/bank/status equality. Quantitative local measurements are recorded in `docs/benchmarks/ISSUE16_BATCHED_FASTENV.md`.
+
+Confidence: `CONFIRMED_EXPERIMENT` for the exercised default-contract traces; no universal claim for unsupported non-default layout configurations.
+
 ## Required First Regression Tests
 
 1. 720-turn episode termination and terminal reward.

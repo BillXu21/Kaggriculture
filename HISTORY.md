@@ -1507,3 +1507,39 @@ The project will not rely on redistribution-license concerns as a reason to avoi
 - Rejected experiments: persistent task ownership hint (wealth 894->864 regardless of bonus size); travel-aware hiring over all tasks (+5.5%->+1.5%); both reverted with evidence.
 - Expanded paired result: mean one-day wealth delta 1879 -> 1981 (+5.4%), candidate better on 24/38 slices, day-end weeds 53 -> 22, harvestable leftovers 1 -> 0. Worst regression traced to genuinely saturated single days (crew capacity < interaction+travel demand).
 - Tests: 461 passed / 108 skipped locally (full suite incl. jax train/parity/benchmark). Artifacts: research/EXECUTOR_V05_OVERNIGHT.md + three paired day-slice JSONs.
+
+## 2026-08-27 - Issue #16 Native Batched Fast-Environment Path
+
+- Base commit: `e63e8337ba9e30a6f394d69da23da538ed7ad6c2`; isolated branch:
+  `throughput/16-batched-fastenv`.
+- Profiled the scalar path at N=1/N=2. Per environment-turn costs in us were
+  action encoding 8.19/8.81, native transition 0.33/0.14, native observation
+  writing 2.88/2.79, observation decode 220.20/223.49, canonicalization
+  31.66/33.07, runner farm copies 114.66/116.26, and total wrapper step
+  225.58/236.65. Native transition mechanics are not the bottleneck.
+- Added `fast_env.BatchedFastEnv`, which owns one native Rust batch engine for
+  N games, accepts explicit seeds, and reuses action/observation/reward/status
+  buffers. Added `oracle.batched_backend.BatchedEngineBackend` and the
+  `FastBatchedBackendAdapter` rollout seam.
+- Added opt-in `RunnerConfig(batch_backend=True)`. Existing executor/opening/
+  manager/PPO interfaces and the scalar runner remain unchanged; only native
+  environment ownership and the per-turn environment call are batched.
+- Parity evidence: reset plus 40 mixed turns for seeds 7/19, episodeSteps=3
+  terminal behavior, direct action-buffer encoding, private-view isolation,
+  and a two-game 130-turn runner fixture all passed. Runner final banks,
+  statuses, transition counts, and trace digests matched scalar mode.
+- Local benchmark: raw native `step_into` reached 232k/257k/267k transitions/s
+  at N=1/2/8 with one thread. Full Python batch wrapper reached 7,570/7,752/
+  7,636 transitions/s versus scalar 4,210/4,193/2,901. The self-play fixture
+  improved from 402 to 627 primitive turns/s and `env_step` 0.303 to 0.089 s.
+  Results and caveats: `docs/benchmarks/ISSUE16_BATCHED_FASTENV.md`.
+- Focused result: 20 batch/scalar fast tests passed; the combined runner test
+  passed with an approved temp root. Two unrelated existing tests encountered
+  a Windows pytest temp-directory permission error under the default temp
+  root. No executor-v07, multiprocessing, or submission files were changed.
+- Full repository validation after commit: `836 passed, 15 skipped, 1 failed`.
+  The sole failure is the existing official parity comparison: its official
+  runner has no trajectory buffer, leaving `plans={}`, while the cached fast
+  rollout includes plan records. This failure does not execute the batch path
+  and is not caused by the issue-#16 files. Focused batch/runner validation
+  remains green (`36 passed, 1 skipped`).

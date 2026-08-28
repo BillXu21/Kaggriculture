@@ -18,6 +18,27 @@ existing `farms`/`market`/`town`/time fields and each seat receives only its
 own `private` shed, seeds, and carried inventories. `state_snapshot()` returns
 the latest decoded pair for later differential tooling.
 
+## Native batched self-play path
+
+`BatchedFastEnv` owns one `RustBatchEnv` containing multiple simultaneous games:
+
+```python
+from fast_env import BatchedFastEnv
+
+batch = BatchedFastEnv(32, configuration={"numThreads": 4})
+observations = batch.reset(range(32))  # explicit per-game seeds
+observations, rewards, statuses = batch.step([actions] * 32)
+```
+
+The action, observation, reward, and status arrays are allocated once and reused
+for every step. The native engine receives one `[N, 2, ACTION_SLOTS, 3]`
+action tensor per call. The default observation mode exactly matches the scalar
+wrapper. `canonical_observations=True` removes fast-only tile aliases for the
+executor-facing path. `oracle.batched_backend.make_batched_backend` is the
+framework-neutral adapter, and `RunnerConfig(batch_backend=True)` enables the
+shared-native path in the reference self-play runner; the default scalar mode
+remains available for correctness comparisons.
+
 Build/install from the repository root:
 
 ```text

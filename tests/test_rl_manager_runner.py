@@ -374,6 +374,33 @@ def test_batching_e_vs_e_one_call_per_day_across_two_envs():
     assert len(policy.calls) == 2  # two days, NOT 2 envs x 2 seats x 2 days
 
 
+def test_native_batch_runner_matches_scalar_runner_on_truncated_chunk():
+    scalar_policy = _ConstantPlanPolicy("scalar")
+    scalar_runner, scalar_results = _run_truncated(
+        E_VS_E, scalar_policy, scalar_policy)
+
+    batch_policy = _ConstantPlanPolicy("batch")
+    config = _runner_config(num_envs=2, max_turns=_TRUNCATED_TURNS,
+                            batch_backend=True)
+    batch_runner = SelfPlayRunner(config, master_seed=MASTER_SEED)
+    batch_results = batch_runner.run(
+        _truncated_specs(E_VS_E, batch_policy, batch_policy, (0, 1)))
+
+    assert len(batch_results) == len(scalar_results) == 2
+    for scalar, batched in zip(scalar_results, batch_results):
+        assert batched.final_banks == scalar.final_banks
+        assert batched.margin == scalar.margin
+        assert batched.rewards == scalar.rewards
+        assert batched.statuses == scalar.statuses
+        assert batched.transitions == scalar.transitions
+        assert batched.trace_digest == scalar.trace_digest
+    assert batch_runner.timing_totals["env_step"] > 0.0
+    assert batch_policy.calls == [
+        (batch_policy.identity.identity_id(), 4, 4),
+        (batch_policy.identity.identity_id(), 5, 4),
+    ]
+
+
 def test_batching_candidate_vs_frozen_two_calls_per_day():
     candidate = _ConstantPlanPolicy("candidate")
     frozen = _ConstantPlanPolicy("frozen")

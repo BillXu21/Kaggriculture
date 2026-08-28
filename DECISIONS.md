@@ -353,3 +353,13 @@ This file records decisions that remain authoritative across chats and work sess
 - Rationale: profiling found repeated canonicalization, per-turn snapshot construction, and runner deep copies in the dominant CPU-side `agent_actions` bucket. Canonical reuse is safe for all callers; copy/diagnostic removal needs an explicit contract so custom agents and normal debugging behavior are not silently changed.
 - Evidence: fixed-seed base/optimized 719-joint-action fingerprints, banks, statuses, and trace digests match exactly. Local median training-mode gains versus base were 59.0%/55.1%/49.8% games/s at N=1/2/8; default-mode gains were measured at N=2/N=8, while N=1 was noisy and not claimed as an improvement. Full attribution and commands: `research/EXECUTOR_HOTPATH_ISSUE15.md`.
 - Revisit when: issue #17 supplies the rollout topology and can measure the explicit options on the target host, or a repository-wide no-mutation agent contract is adopted that makes the read-only mode the default.
+
+## D-043 - Use One Native Batch Owner for Opt-In Self-Play
+
+- Date: 2026-08-27
+- Status: active
+- Decision: Add `fast_env.BatchedFastEnv` and the framework-neutral `BatchedEngineBackend` interface. A batch owns N independent Rust game states, accepts explicit unsigned per-environment seeds, encodes one reusable `[N, 2, ACTION_SLOTS, 3]` tensor, and performs one native `step_into` for the chunk. `RunnerConfig(batch_backend=True)` opts the reference runner into this path; scalar mode remains the correctness reference.
+- Rationale: measured scalar environment cost is dominated by Python observation decode, canonicalization, and runner deep copies, while native transitions are below 1% of wrapper time. One batch owner removes N scalar engine instances and combines public observation decode without changing executor/PPO semantics.
+- Evidence: scalar-fast versus batched-fast exact equality for reset and 40 mixed turns over seeds 7/19; terminal episodeSteps=3 equality; action-buffer equality; private-view isolation; two-game self-play fixture equality including final banks, statuses, transitions, and trace digests. Local fixture throughput improved from 402 to 627 primitive turns/s.
+- Scope: no executor optimization, multiprocessing, IPC, worker scheduling, or live submission packaging. Batch observations default to scalar vocabulary; canonical aliases are an explicit executor adapter mode.
+- Revisit when: issue #17 defines worker ownership/scheduling or a future backend requires partial-reset/variable-configuration support.
