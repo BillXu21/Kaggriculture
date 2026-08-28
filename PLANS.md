@@ -20,6 +20,12 @@ Issue #13 Stage 1 and the Stage 5 post-Stage-4 archive compatibility check (2026
 
 Issue #9 Stage B2 remains implemented and locally validated as plumbing, but is not the current mutation target until the issue-#13 archive invariant is accepted.
 
+Issue #15 executor hot-path profiling/optimization is complete on isolated
+branch `throughput/15-agent-hotpath`; see
+`research/EXECUTOR_HOTPATH_ISSUE15.md`. Canonical snapshot reuse is default and
+the copy/diagnostic reductions are explicit training knobs. Further executor
+rewrites remain deferred until target-host integration evidence.
+
 ## Phase 0 — Freeze 1.32.7, Rules, RNG, and Provenance
 
 ### Current engine events

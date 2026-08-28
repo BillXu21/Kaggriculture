@@ -143,14 +143,20 @@ def _validate_obs(obs: Mapping, seat: int) -> None:
         raise ValueError("own board must be 10x10")
 
 
-def _canonical_own_state(obs: Mapping, seat: int) -> dict[str, Any]:
+def _canonical_own_state(
+    obs: Mapping,
+    seat: int,
+    *,
+    board: list[list[Any]] | None = None,
+) -> dict[str, Any]:
     """Canonicalize own board/state exactly like replay_daily.extractor."""
     day = int(obs["day"])
     step = int(obs.get("step", 0))
     farm = obs["farms"][seat]
     private = obs.get("private") or {}
     return {
-        "board": canonical_board(farm["tiles"], day, step),
+        "board": board if board is not None
+        else canonical_board(farm["tiles"], day, step),
         "unlocked_quadrants": list(farm["unlocked_quadrants"]),
         "farmer": list(farm["farmer"]),
         "money": farm["money"],
@@ -240,6 +246,8 @@ def generate_optional_idle_cleanup_tasks(
     obs: Mapping,
     seat: int,
     mode: str = "weed_water",
+    *,
+    canonical_board_value: list[list[Any]] | None = None,
 ) -> tuple[Task, ...]:
     """Return safe PASS-only cleanup candidates for the requested mode.
 
@@ -256,7 +264,8 @@ def generate_optional_idle_cleanup_tasks(
         return ()
     _validate_obs(obs, seat)
     try:
-        state = _canonical_own_state(obs, seat)
+        state = _canonical_own_state(
+            obs, seat, board=canonical_board_value)
     except (KeyError, TypeError, ValueError):
         # Optional work must never turn malformed source data into a task.
         return ()
@@ -318,6 +327,7 @@ def generate_tasks(
     remaining_sells: Mapping[str, int],
     reconcile_result: CropReconciliationResult | None = None,
     animal_layout_result: AnimalLayoutResult | None = None,
+    canonical_board_value: list[list[Any]] | None = None,
 ) -> GenerationResult:
     """Regenerate the full V0 task set from the current observation.
 
@@ -332,7 +342,8 @@ def generate_tasks(
             raise ValueError(
                 f"remaining_sells has unknown product {product!r}; expected "
                 f"one of {list(PRODUCTS)}")
-    state = _canonical_own_state(obs, seat)
+    state = _canonical_own_state(
+        obs, seat, board=canonical_board_value)
     board = state["board"]
     unlocked = state["unlocked_quadrants"]
     # Layout/proximity anchor is the persistent central logistics hub, never

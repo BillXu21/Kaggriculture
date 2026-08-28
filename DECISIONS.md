@@ -344,3 +344,12 @@ This file records decisions that remain authoritative across chats and work sess
 - Evidence: official 12-seed x 2-seat A/B with aggressive sell-all and prior-debt suppression ON reproduced OFF mean `63,592.3`, median `65,509.5`, min `47,290`, max `74,151`; old optional watering ON scored mean `60,948.5`, median `61,114`, min `46,798`, max `69,673`, with 8 wins / 16 losses, mean paired delta `-2,643.8`, worst `-18,675`, best `+21,429`. The wide paired spread justifies investigating dispatch correctness rather than promoting or permanently rejecting the underlying cleanup idea.
 - Day-boundary note: worker positions reset near the central shed at day end, hired hands disappear, and carried inventory auto-drops, so cleanup does not need an end-of-day return-home rule. Its opportunity cost is only within the current day's remaining turns, and normal dispatch must preempt it on the next primitive turn.
 - Revisit when: the true PASS-only WATER and WEED-first+WATER panels complete. Promote only if normal non-PASS actions are proven unchanged and paired outcome/tail evidence is favorable.
+
+## D-043 - Keep Executor Hot-Path Optimizations Behavior-Preserving and Training-Explicit
+
+- Date: 2026-08-27
+- Status: active
+- Decision: Reuse one canonical own-board snapshot across executor subsystems by default. Keep normal per-turn diagnostics and defensive observation deep copies unchanged by default. Expose `low_telemetry=True` plus `read_only_agent_observations=True` as explicit training-rollout options; the latter uses dict/list-shaped read-only views and rejects agent mutation.
+- Rationale: profiling found repeated canonicalization, per-turn snapshot construction, and runner deep copies in the dominant CPU-side `agent_actions` bucket. Canonical reuse is safe for all callers; copy/diagnostic removal needs an explicit contract so custom agents and normal debugging behavior are not silently changed.
+- Evidence: fixed-seed base/optimized 719-joint-action fingerprints, banks, statuses, and trace digests match exactly. Local median training-mode gains versus base were 59.0%/55.1%/49.8% games/s at N=1/2/8; default-mode gains were measured at N=2/N=8, while N=1 was noisy and not claimed as an improvement. Full attribution and commands: `research/EXECUTOR_HOTPATH_ISSUE15.md`.
+- Revisit when: issue #17 supplies the rollout topology and can measure the explicit options on the target host, or a repository-wide no-mutation agent contract is adopted that makes the read-only mode the default.

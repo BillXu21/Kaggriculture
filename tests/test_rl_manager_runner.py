@@ -521,6 +521,19 @@ class _TraceExecutorFactory:
         return _TraceExecutor(seat)
 
 
+class _MutatingTraceExecutor(_TraceExecutor):
+    def __call__(self, obs):
+        if int(obs["day"]) >= 4:
+            obs["farms"][self.seat]["money"] = 1
+        return super().__call__(obs)
+
+
+class _MutatingTraceExecutorFactory(_TraceExecutorFactory):
+    def create(self, *, backend_name, seat, configuration, provider):
+        del backend_name, configuration, provider
+        return _MutatingTraceExecutor(seat)
+
+
 def _debug_trace_run(*, max_turns: int, enabled: bool, monkeypatch):
     monkeypatch.setattr(
         "rl_manager.runner.make_backend",
@@ -565,7 +578,24 @@ def test_debug_trace_executor_sidecars_attach_to_same_turn_and_seat(monkeypatch)
     assert all(snapshot["day"] == 4 and snapshot["hour"] == 0
                for snapshot in handoff["executor_debug"].values())
     assert all("executor_debug" not in turn
-               for turn in trace["turns"] if turn["step"] < 96)
+                for turn in trace["turns"] if turn["step"] < 96)
+
+
+def test_read_only_agent_observation_view_rejects_mutation(monkeypatch):
+    monkeypatch.setattr(
+        "rl_manager.runner.make_backend",
+        lambda name, configuration: _TraceBackend(configuration),
+    )
+    policy = _ConstantPlanPolicy("readonly")
+    runner = SelfPlayRunner(
+        _runner_config(
+            max_turns=97, read_only_agent_observations=True),
+        executor_factory=_MutatingTraceExecutorFactory(),
+        master_seed=MASTER_SEED,
+    )
+    spec = build_episode_spec(0, MASTER_SEED, E_VS_E, policy, policy)
+    with pytest.raises(TypeError, match="read-only"):
+        runner.run([spec])
 
 
 def test_debug_trace_is_deterministic_and_behavior_matches_disabled_capture(monkeypatch):

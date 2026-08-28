@@ -2,6 +2,41 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-27 - Issue #15 Executor Hot-Path Profile and Optimization
+
+Created isolated worktree/branch `throughput/15-agent-hotpath` from base
+`e63e8337ba9e30a6f394d69da23da538ed7ad6c2` under
+`.worktrees/throughput-15-agent-hotpath`. The dedicated profiler measured the
+complete BC-E self-play agent path at N=1/N=2 before and after optimization.
+Before optimization, ordinary turns repeatedly built canonical boards (5,036
+calls over one N=1 profile), runner observation deep copies were the largest
+single cProfile family, and per-turn debug snapshots were the next meaningful
+diagnostic cost. Opening wrapper work was not material.
+
+Accepted changes reuse one canonical own-board snapshot through task
+generation, feed state, sells, optional cleanup, day setup, and achieved
+diagnostics. Existing standalone task APIs still canonicalize when no snapshot
+is supplied. `AgentConfig.record_turn_snapshot` preserves the old default;
+`RunnerConfig.low_telemetry=True` disables that expensive snapshot for explicit
+training runs. `RunnerConfig.read_only_agent_observations=True` provides safe
+dict/list-shaped read-only views, avoiding per-call deep copies while rejecting
+accidental nested mutation; the old deep-copy path remains default.
+
+Local uninstrumented medians (one warmup, two repeats, fixed seeds, fast engine,
+`numThreads=1`) were base versus optimized default: N=1 `3.681 -> 4.357` s
+(`0.272 -> 0.229` games/s, noisy regression not claimed), N=2
+`7.656 -> 6.892` s (`0.261 -> 0.290`), and N=8 `28.630 -> 20.605` s
+(`0.279 -> 0.388`). Explicit low-telemetry/read-only training mode measured
+N=1/2/8 at `2.315/4.933/19.118` s and `0.432/0.405/0.418` games/s. No TPU
+claim is made.
+
+Parity passed: base and optimized seed-17 complete games both ended
+`DONE/DONE`, final banks `[28505.0, 25662.0]`, and 719-joint-action SHA256
+`897ba48bed992da5461a826a621077bc1a5af76c719a92718303d77882f83ad8`; the
+N=2 seed-42 bank/digest also matched. Focused executor/runner tests passed
+`51`, with one existing skip; Ruff and compile checks passed. No issue #16/#17
+files or interfaces were changed.
+
 ## 2026-08-27 — Stage 6/7 Issue #12: PASS-Only Idle Cleanup A/B/C Evidence
 
 Recorded the official 24-game A/B/C panel for the true PASS-only cleanup layer
