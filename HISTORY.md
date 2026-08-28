@@ -36,6 +36,32 @@ Parity passed: base and optimized seed-17 complete games both ended
 N=2 seed-42 bank/digest also matched. Focused executor/runner tests passed
 `51`, with one existing skip; Ruff and compile checks passed. No issue #16/#17
 files or interfaces were changed.
+## 2026-08-27 — Issue #17: Parallel Rollouts with One JAX Owner
+
+Implemented the local multiprocessing topology on branch
+`throughput/17-parallel-rollouts` from `e63e8337`. The parent retains policy
+snapshots and central inference; Python `spawn` workers build independent
+backend/opening/executor state and exchange only encoded manager-day NumPy
+rows through bounded queues. Requests are routed by stable
+`episode/seat/day/policy` IDs, centrally sorted and batched by policy identity
+and day, and worker trajectory shards/results are normalized by episode/seat/day.
+
+The lazy `rl_manager` package initializer and worker startup guard prevent
+`jax`, `jaxlib`, `torch_xla`, `bc_manager_jax`, and `optax` from loading in CPU
+workers. Worker exceptions, abnormal exits, missing/duplicate episodes, and
+duplicate trajectory rows fail loudly and all children are joined. The default
+executor factory is reconstructed inside workers; custom factories must be
+spawn-pickleable. PPO's optional row-aware policy seam derives stable sampling
+seeds from logical row IDs.
+
+Tests: the focused CLI/process suite passed `20 passed, 1 skipped` before the
+native extension was copied into the isolated worktree; with the freshly built
+local extension, the spawned parallel smoke passed `4 passed`, including two
+workers with two environments per worker, central batching, deterministic
+result normalization, trajectory-row completeness, and worker import
+isolation. TPU throughput was not measured locally. The exact Kaggle command,
+benchmark script, and scaling fields are documented in
+`research/RL_MANAGER_PARALLEL_ROLLOUTS.md`.
 
 ## 2026-08-27 — Stage 6/7 Issue #12: PASS-Only Idle Cleanup A/B/C Evidence
 

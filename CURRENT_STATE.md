@@ -2,6 +2,9 @@
 
 Last updated: 2026-08-27
 
+## Issue #17
+- Parallel rollout topology is implemented on this branch: the parent is the sole policy/JAX/libtpu owner; `spawn` workers own independent engine/opening/executor state and exchange only encoded manager-day NumPy rows through bounded queues. Owner batching is canonical by policy identity/day, results and trajectory shards normalize by episode/seat/day, and worker failures or missing/duplicate rows fail loudly. The lazy `rl_manager` initializer plus worker startup guard prevents accelerator imports in CPU workers. Local deterministic fast-engine truncated smoke passed for 2 workers with `num_envs=2`; TPU throughput remains unmeasured. Runbook: `research/RL_MANAGER_PARALLEL_ROLLOUTS.md`.
+
 ## Snapshot
 - Issue #16 batched-fastenv is implemented on branch `throughput/16-batched-fastenv`: `fast_env.BatchedFastEnv` owns one native `RustBatchEnv` for N simultaneous seeded games, reuses action/observation/reward/status buffers, and `RunnerConfig(batch_backend=True)` routes self-play through one native batch step. Scalar-fast parity passed for 2 seeds x 40 turns plus terminal/encoder/privacy checks; a two-game 130-turn runner fixture matched banks, statuses, transition counts, and trace digests. Local fixture throughput improved 402 -> 627 primitive turns/s and runner `env_step` 0.303 -> 0.089 s; detailed profiling/results are in `docs/benchmarks/ISSUE16_BATCHED_FASTENV.md`. No TPU claim; #15 executor and #17 multiprocessing remain independent.
 - Issue #16 validation after commit: focused suite `36 passed, 1 skipped`; full repository suite `836 passed, 15 skipped, 1 failed`. The one failure is the existing official parity test comparing a buffered fast rollout with an official run created without a trajectory buffer, which necessarily has `plans={}`; it does not exercise the new batch path.

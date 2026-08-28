@@ -258,12 +258,12 @@ def test_train_plan_fails_loud_when_checkpoint_missing():
         plan_training(_train_args())
 
 
-def test_train_plan_rejects_unsafe_knobs(tmp_path):
+def test_train_plan_accepts_parallel_worker_knob(tmp_path):
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"placeholder")
     base = {"e_checkpoint": str(checkpoint)}
-    with pytest.raises(NotImplementedError, match="num-workers"):
-        plan_training(_train_args(**base, num_workers=96))
+    assert plan_training(_train_args(**base, num_workers=96))["knobs"][
+        "num_workers"] == 96
     with pytest.raises(ValueError, match="threads"):
         plan_training(_train_args(**base, num_threads=0))
     with pytest.raises(ValueError, match="master-seed"):

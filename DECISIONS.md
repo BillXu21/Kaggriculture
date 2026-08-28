@@ -354,7 +354,7 @@ This file records decisions that remain authoritative across chats and work sess
 - Evidence: fixed-seed base/optimized 719-joint-action fingerprints, banks, statuses, and trace digests match exactly. Local median training-mode gains versus base were 59.0%/55.1%/49.8% games/s at N=1/2/8; default-mode gains were measured at N=2/N=8, while N=1 was noisy and not claimed as an improvement. Full attribution and commands: `research/EXECUTOR_HOTPATH_ISSUE15.md`.
 - Revisit when: issue #17 supplies the rollout topology and can measure the explicit options on the target host, or a repository-wide no-mutation agent contract is adopted that makes the read-only mode the default.
 
-## D-043 - Use One Native Batch Owner for Opt-In Self-Play
+## D-044 - Use One Native Batch Owner for Opt-In Self-Play
 
 - Date: 2026-08-27
 - Status: active
@@ -363,3 +363,13 @@ This file records decisions that remain authoritative across chats and work sess
 - Evidence: scalar-fast versus batched-fast exact equality for reset and 40 mixed turns over seeds 7/19; terminal episodeSteps=3 equality; action-buffer equality; private-view isolation; two-game self-play fixture equality including final banks, statuses, transitions, and trace digests. Local fixture throughput improved from 402 to 627 primitive turns/s.
 - Scope: no executor optimization, multiprocessing, IPC, worker scheduling, or live submission packaging. Batch observations default to scalar vocabulary; canonical aliases are an explicit executor adapter mode.
 - Revisit when: issue #17 defines worker ownership/scheduling or a future backend requires partial-reset/variable-configuration support.
+
+## D-045 — Keep One JAX Owner and Spawn CPU Rollout Workers
+
+- Date: 2026-08-27
+- Status: active
+- Decision: The parallel rollout coordinator keeps policy objects and all JAX/libtpu initialization in the parent process. It starts `spawn` workers that receive serializable episode/policy identities, build independent engine/opening/executor state, and exchange only manager-day encoded NumPy rows through bounded queues. Requests are canonically sorted by policy identity/day/episode/seat; trajectory shards and results are normalized before return.
+- Rationale: the scalar rollout bottleneck is CPU executor/environment work, while multiple JAX-owning processes have caused TPU initialization conflicts. A simple local process boundary provides CPU overlap without changing executor or native-engine semantics.
+- Guarantees: worker startup fails if accelerator modules are loaded; worker exceptions, dead exits, missing episodes, duplicate episodes, and duplicate trajectory rows fail loudly; the default executor factory is resolved inside each child rather than pickled from its nested implementation class. Stable row identifiers are available to future stochastic batched policies.
+- Evidence boundary: deterministic truncated fast-engine smoke passed with two spawned workers and two environments per worker, including central request batching and trajectory normalization. TPU throughput and full real-checkpoint scaling remain unmeasured; use `research/RL_MANAGER_PARALLEL_ROLLOUTS.md`.
+- Revisit when: issue #15 changes the executor factory contract, issue #16 supplies a native batched backend, or measured host profiling justifies a different transport.

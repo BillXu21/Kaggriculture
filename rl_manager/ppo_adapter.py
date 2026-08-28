@@ -26,7 +26,7 @@ Contract implemented here:
 from __future__ import annotations
 
 import hashlib
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import jax
 import numpy as np
@@ -95,6 +95,36 @@ class PPOBatchedPolicy:
         rng = prng_key_from_id(prng_id)
         result = self._policy.act(
             inputs, deterministic=self._deterministic, rng=rng)
+        self.call_count += 1
+        self.batch_size_history.append(int(result["batch_size"]))
+        return PolicyOutputs(
+            action_tensors=result["action_tensors"],
+            logprob_groups=result["logprob_groups"],
+            logprob_total=result["logprob_total"],
+            value=result["value"],
+            batch_size=int(result["batch_size"]),
+        )
+
+    def plan_batch_with_row_ids(
+        self,
+        inputs: Mapping[str, np.ndarray],
+        row_ids: Sequence[str],
+        prng_id: str,
+    ) -> PolicyOutputs:
+        """Sample a central batch with stable seeds for each logical row."""
+        if not isinstance(prng_id, str) or not prng_id:
+            raise ValueError("prng_id must be a non-empty string identifier")
+        batch_size = int(np.asarray(next(iter(inputs.values()))).shape[0])
+        if len(row_ids) != batch_size or any(
+                not isinstance(row_id, str) or not row_id for row_id in row_ids):
+            raise ValueError("row_ids must contain one non-empty string per row")
+        seeds = np.asarray([
+            int.from_bytes(hashlib.sha256(row_id.encode("utf-8")).digest()[:4],
+                           "big")
+            for row_id in row_ids], dtype=np.uint32)
+        result = self._policy.act(
+            inputs, deterministic=self._deterministic,
+            rng=prng_key_from_id(prng_id), decision_seeds=seeds)
         self.call_count += 1
         self.batch_size_history.append(int(result["batch_size"]))
         return PolicyOutputs(

@@ -32,6 +32,23 @@ Confidence labels:
 - Host statement: 1.32.7 should be the last balance change except game-breaking bugs
 - Status: **current source contract is known, but do not treat this repository as a complete engine lock until local source/spec hashes and behavioral tests are recorded**
 
+## Rollout Process Boundary — Issue #17
+
+- `CONFIRMED_EXPERIMENT`: the issue #17 coordinator uses Python `spawn`; the
+  parent owns policy objects and JAX/libtpu, while workers own independent
+  scalar engine/opening/executor state. Workers exchange encoded manager-day
+  NumPy rows only; primitive engine state remains process-local.
+- `CONFIRMED_EXPERIMENT`: worker startup rejects loaded `jax`, `jaxlib`,
+  `torch_xla`, `bc_manager_jax`, or `optax`; the lazy `rl_manager` initializer
+  permits importing the worker protocol without those modules.
+- `CONFIRMED_EXPERIMENT`: deterministic truncated fast-engine runs with two
+  workers and two environments per worker preserve episode seeds, result
+  ordering, central request batching, and complete normalized trajectory rows.
+- `UNKNOWN`: Kaggle TPU steady-state throughput/scaling for the real BC-E
+  checkpoint. It must be measured with the fixed command in
+  `research/RL_MANAGER_PARALLEL_ROLLOUTS.md`; local CPU/mock numbers are not a
+  TPU claim.
+
 ## Submission Runtime Invariant — Stage 1 / Issue #13
 
 - A submission is not validated by importing `make_agent` from the repository

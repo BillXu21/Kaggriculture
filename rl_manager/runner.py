@@ -813,6 +813,11 @@ class SelfPlayRunner:
                 batch[key] = np.concatenate(
                     [encodings[(id(state), seat, day)][key]
                      for state, seat, day in group], axis=0)
+            set_context = getattr(policy, "set_request_context", None)
+            if callable(set_context):
+                set_context([
+                    (state.spec.episode_index, seat, request_day)
+                    for state, seat, request_day in group])
             prng_id = f"episode={group[0][0].spec.episode_index}/day={day}/" \
                       f"policy={identity_id}"
             outputs = policy.plan_batch(batch, prng_id)
