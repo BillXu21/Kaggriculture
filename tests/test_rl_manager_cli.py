@@ -93,6 +93,9 @@ def test_parser_defaults_are_safe_single_process():
     assert not args.low_telemetry
     assert not args.read_only_agent_observations
     assert not args.batch_backend
+    assert args.inference_batch_scope == "policy_day"
+    assert args.fixed_inference_batch_size is None
+    assert args.inference_batch_wait_ms == 20.0
     # Safe small default: 8 divides the expected complete-game row count
     # for the default episodes_per_update=8 (8 * 26 = 208).
     assert args.minibatch_size == 8
@@ -113,12 +116,17 @@ def test_parser_and_plan_expose_integrated_runner_options(tmp_path):
         "--executor-factory", "executor_v0@stage-a-v1", "--master-seed", "17",
         "--output-dir", "out", "--checkpoint", "out/ppo.npz",
         "--low-telemetry", "--read-only-agent-observations", "--batch-backend",
+        "--inference-batch-scope", "policy", "--fixed-inference-batch-size",
+        "16", "--inference-batch-wait-ms", "2",
     ])
     plan = plan_training(args)
     assert plan["runner_options"] == {
         "low_telemetry": True,
         "read_only_agent_observations": True,
         "batch_backend": True,
+        "inference_batch_scope": "policy",
+        "fixed_inference_batch_size": 16,
+        "inference_batch_wait_seconds": 0.002,
     }
 
 

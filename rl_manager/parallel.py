@@ -3,12 +3,14 @@
 The parent process owns the policy objects and is the only process allowed to
 load JAX/libtpu.  Spawned workers receive only episode descriptors and local
 CPU state.  Their manager-day NumPy requests are coalesced here, then routed
-back by a stable ``episode/seat/day/policy`` identifier.
+back by a stable ``episode/seat/day/policy`` identifier. The default scope is
+policy/day; mixed-day policy scope and fixed physical padding are opt-ins.
 """
 
 from __future__ import annotations
 
 import copy
+import math
 import multiprocessing as mp
 import pickle
 import time
@@ -48,6 +50,15 @@ from rl_manager.types import BatchedPlanPolicy, PolicyIdentity, PolicyOutputs
 
 class ParallelRolloutError(RuntimeError):
     """A worker or inference-owner protocol failure."""
+
+
+BatchKey = PolicyIdentity | tuple[PolicyIdentity, int]
+
+
+def _batch_key_sort_key(key: BatchKey) -> tuple[str, int]:
+    if isinstance(key, PolicyIdentity):
+        return (key.identity_id(), -1)
+    return (key[0].identity_id(), int(key[1]))
 
 
 def _factory_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
@@ -149,14 +160,18 @@ class ParallelSelfPlayRunner:
         executor_factory: Any | None = None,
         master_seed: int | None = None,
         request_queue_size: int | None = None,
-        inference_batch_wait_seconds: float = 0.02,
+        inference_batch_wait_seconds: float | None = None,
         max_inference_batch_size: int | None = None,
     ) -> None:
         if isinstance(num_workers, bool) or not isinstance(num_workers, int) \
                 or num_workers < 1:
             raise ValueError(f"num_workers must be a positive int, got {num_workers!r}")
-        if inference_batch_wait_seconds < 0:
-            raise ValueError("inference_batch_wait_seconds must be >= 0")
+        batch_wait = (config.inference_batch_wait_seconds
+                      if inference_batch_wait_seconds is None
+                      else inference_batch_wait_seconds)
+        if not math.isfinite(batch_wait) or batch_wait < 0:
+            raise ValueError(
+                "inference_batch_wait_seconds must be finite and >= 0")
         if max_inference_batch_size is not None \
                 and max_inference_batch_size < 1:
             raise ValueError("max_inference_batch_size must be >= 1")
@@ -174,8 +189,17 @@ class ParallelSelfPlayRunner:
         self.executor_factory = executor_factory
         self.master_seed = master_seed
         self.request_queue_size = int(request_queue_size or max(4, num_workers * 4))
-        self.batch_wait = float(inference_batch_wait_seconds)
-        self.max_batch = max_inference_batch_size
+        fixed_batch = config.fixed_inference_batch_size
+        if (fixed_batch is not None and max_inference_batch_size is not None
+                and fixed_batch != max_inference_batch_size):
+            raise ValueError(
+                "max_inference_batch_size conflicts with configured "
+                "fixed_inference_batch_size")
+        self.batch_wait = float(batch_wait)
+        self.max_batch = (fixed_batch if fixed_batch is not None
+                          else max_inference_batch_size)
+        self.fixed_batch = fixed_batch
+        self.batch_scope = config.inference_batch_scope
         self.provenance: dict[str, Any] = {
             "opening": opening_provenance(config.opening),
             "backend": backend_provenance(config.backend_name,
@@ -185,9 +209,16 @@ class ParallelSelfPlayRunner:
                 self.executor_factory, "version", "unknown"),
             "master_seed": master_seed,
             "manager_start_day": config.manager_start_day,
+            "inference_batch_scope": self.batch_scope,
+            "fixed_inference_batch_size": self.fixed_batch,
+            "inference_batch_wait_seconds": self.batch_wait,
         }
         self.inference_metrics: dict[str, Any] = {
-            "requests": 0, "batches": 0, "batch_sizes": [],
+            "requests": 0, "real_requests": 0,
+            "batches": 0, "physical_inference_calls": 0,
+            "batch_sizes": [], "real_batch_sizes": [],
+            "physical_batch_sizes": [], "physical_rows": 0,
+            "padding_rows": 0, "occupancy": 0.0,
             "queue_wait_seconds": 0.0, "inference_seconds": 0.0,
         }
 
@@ -201,8 +232,9 @@ class ParallelSelfPlayRunner:
                 master_seed=self.master_seed)
             self.provenance = runner.provenance
             results = runner.run(specs)
-            self.inference_metrics["requests"] = sum(
-                result.transitions for result in results)
+            request_count = sum(result.transitions for result in results)
+            self.inference_metrics["requests"] = request_count
+            self.inference_metrics["real_requests"] = request_count
             return results
 
         if self.buffer is not None and len(self.buffer):
@@ -255,9 +287,10 @@ class ParallelSelfPlayRunner:
             task_queues[worker_id].put(task)
             process.start()
 
-        pending: dict[tuple[PolicyIdentity, int], list[InferenceRequest]] = \
+        pending: dict[BatchKey, list[InferenceRequest]] = \
             defaultdict(list)
-        pending_since: dict[tuple[PolicyIdentity, int], float] = {}
+        pending_since: dict[BatchKey, float] = {}
+        request_ids_seen: set[str] = set()
         try:
             while len(results_by_worker) < self.num_workers:
                 try:
@@ -265,7 +298,14 @@ class ParallelSelfPlayRunner:
                 except Empty:
                     message = None
                 if isinstance(message, InferenceRequest):
-                    key = (message.policy_identity, int(message.day))
+                    if message.request_id in request_ids_seen:
+                        raise ParallelRolloutError(
+                            f"duplicate inference request {message.request_id!r}")
+                    request_ids_seen.add(message.request_id)
+                    key: BatchKey = (
+                        message.policy_identity
+                        if self.batch_scope == "policy"
+                        else (message.policy_identity, int(message.day)))
                     pending[key].append(message)
                     pending_since.setdefault(key, time.perf_counter())
                 elif message is not None:
@@ -274,7 +314,7 @@ class ParallelSelfPlayRunner:
                         f"{type(message).__name__}")
 
                 now = time.perf_counter()
-                for key in list(pending):
+                for key in sorted(pending, key=_batch_key_sort_key):
                     if (now - pending_since[key] >= self.batch_wait
                             or (self.max_batch is not None
                                 and len(pending[key]) >= self.max_batch)):
@@ -353,7 +393,7 @@ class ParallelSelfPlayRunner:
 
     def _dispatch(
         self,
-        key: tuple[PolicyIdentity, int],
+        key: BatchKey,
         requests: list[InferenceRequest],
         _first_queued: float,
         policy_by_identity: Mapping[PolicyIdentity, BatchedPlanPolicy],
@@ -361,26 +401,47 @@ class ParallelSelfPlayRunner:
     ) -> None:
         if not requests:
             return
+        # Sort before chunking. Queue arrival order is scheduler-dependent and
+        # must never decide which rows share a physical policy call.
+        requests = sorted(requests, key=lambda request: (
+            request.episode_index, request.seat, request.day,
+            request.request_id))
         if self.max_batch is not None and len(requests) > self.max_batch:
             for start in range(0, len(requests), self.max_batch):
                 self._dispatch(key, requests[start:start + self.max_batch],
                                _first_queued, policy_by_identity,
                                response_queues)
             return
-        identity, day = key
+        identity = key if isinstance(key, PolicyIdentity) else key[0]
         policy = policy_by_identity.get(identity)
         if policy is None:
             raise ParallelRolloutError(f"no owner policy for identity {identity}")
-        requests.sort(key=lambda request: (
-            request.episode_index, request.seat, request.day,
-            request.request_id))
+        real_count = len(requests)
+        physical_count = self.fixed_batch or real_count
+        if physical_count < real_count:
+            raise ParallelRolloutError(
+                f"fixed inference batch size {physical_count} is smaller than "
+                f"real request batch {real_count}")
         keys = sorted(requests[0].inputs)
         batch = {name: np.concatenate(
             [np.asarray(request.inputs[name]) for request in requests], axis=0)
                  for name in keys}
         row_ids = [request.request_id for request in requests]
-        prng_id = (f"parallel/day={day}/policy={identity.identity_id()}/"
-                   f"rows={'|'.join(row_ids)}")
+        padding_count = physical_count - real_count
+        if padding_count:
+            for name in keys:
+                source = np.asarray(batch[name])[0:1]
+                padding = np.repeat(source, padding_count, axis=0)
+                batch[name] = np.concatenate((batch[name], padding), axis=0)
+            padding_prefix = "|".join(row_ids)
+            row_ids.extend(
+                f"padding/policy={identity.identity_id()}/"
+                f"batch={padding_prefix}/slot={slot}"
+                for slot in range(padding_count))
+        # Row-aware policies derive stochasticity from each request ID. The
+        # root remains snapshot-scoped so batch composition and padding do not
+        # alter a real row's result.
+        prng_id = f"parallel/policy={identity.identity_id()}"
         t0 = time.perf_counter()
         row_aware = getattr(policy, "plan_batch_with_row_ids", None)
         try:
@@ -390,17 +451,26 @@ class ParallelSelfPlayRunner:
                 outputs = policy.plan_batch(batch, prng_id)
         except Exception as exc:  # noqa: BLE001 - add owner-side context
             raise ParallelRolloutError(
-                f"central policy {identity.identity_id()} failed for day "
-                f"{day}: {exc}") from exc
+                f"central policy {identity.identity_id()} failed: {exc}") from exc
         inference_seconds = time.perf_counter() - t0
-        if outputs.batch_size != len(requests):
+        if outputs.batch_size != physical_count:
             raise ParallelRolloutError(
                 f"policy {identity.identity_id()} returned batch "
-                f"{outputs.batch_size}, expected {len(requests)}")
-        self.inference_metrics["requests"] += len(requests)
+                f"{outputs.batch_size}, expected {physical_count}")
+        self.inference_metrics["requests"] += real_count
+        self.inference_metrics["real_requests"] += real_count
         self.inference_metrics["batches"] += 1
-        self.inference_metrics["batch_sizes"].append(len(requests))
+        self.inference_metrics["physical_inference_calls"] += 1
+        self.inference_metrics["batch_sizes"].append(real_count)
+        self.inference_metrics["real_batch_sizes"].append(real_count)
+        self.inference_metrics["physical_batch_sizes"].append(physical_count)
+        self.inference_metrics["physical_rows"] += physical_count
+        self.inference_metrics["padding_rows"] += padding_count
         self.inference_metrics["inference_seconds"] += inference_seconds
+        physical_rows = self.inference_metrics["physical_rows"]
+        self.inference_metrics["occupancy"] = (
+            self.inference_metrics["real_requests"] / physical_rows
+            if physical_rows else 0.0)
         self.inference_metrics["queue_wait_seconds"] += sum(
             max(0.0, time.perf_counter() - request.queued_at)
             for request in requests)

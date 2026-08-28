@@ -176,6 +176,44 @@ def test_adapter_stochastic_seeds_deterministic_in_prng_id(smoke):
         prng_key_from_id("")
 
 
+def test_row_aware_sampling_is_invariant_to_neighbors_and_padding(smoke):
+    policy = PPOPolicy(smoke.frozen_params, smoke.config, seed=19)
+    adapter = PPOBatchedPolicy(policy, name="row-aware", version="v-test")
+    batch = _fixed_batch()
+    target_index = 1
+    target_id = "episode=42/seat=1/day=5/policy=row-aware"
+    target = {key: np.ascontiguousarray(value[target_index:target_index + 1])
+              for key, value in batch.items()}
+    alone = adapter.plan_batch_with_row_ids(
+        target, [target_id], "scheduler/group-alone")
+    composed = {
+        key: np.ascontiguousarray(np.concatenate(
+            [value[target_index:target_index + 1], value[0:1]], axis=0))
+        for key, value in batch.items()}
+    together = adapter.plan_batch_with_row_ids(
+        composed, [target_id, "neighbor"], "scheduler/group-together")
+    padded = {
+        key: np.ascontiguousarray(np.concatenate(
+            [value[target_index:target_index + 1], value[0:1], value[0:1]],
+            axis=0))
+        for key, value in batch.items()}
+    with_padding = adapter.plan_batch_with_row_ids(
+        padded, [target_id, "neighbor", "padding/0"],
+        "scheduler/group-padding")
+    for name in ACTION_TENSOR_SHAPES:
+        assert np.array_equal(alone.action_tensors[name],
+                              together.action_tensors[name][0:1]), name
+        assert np.array_equal(alone.action_tensors[name],
+                              with_padding.action_tensors[name][0:1]), name
+    for name in LOGPROB_GROUPS:
+        assert np.array_equal(alone.logprob_groups[name],
+                              together.logprob_groups[name][0:1]), name
+        assert np.array_equal(alone.logprob_groups[name],
+                              with_padding.logprob_groups[name][0:1]), name
+    assert np.array_equal(alone.logprob_total, together.logprob_total[0:1])
+    assert np.allclose(alone.value, together.value[0:1], rtol=0, atol=1e-6)
+
+
 def test_adapter_deterministic_mode_reproduces_frozen_e_exactly(smoke):
     greedy = ppo_batched_policy_from_state(
         smoke.state, smoke.config, ppo_config=smoke.ppo_config,

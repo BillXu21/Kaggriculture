@@ -38,6 +38,56 @@ The JSON output records games/sec, manager request count, owner inference
 batch sizes, inference time, and queue wait time. No TPU performance result is
 claimed by the local benchmark.
 
+## Central batching controls
+
+The default remains `policy_day`, variable-size calls, and a 20 ms maximum
+wait. For mixed-day experiments, pass these options to `train` or `eval`:
+
+```text
+--inference-batch-scope policy_day|policy
+--fixed-inference-batch-size B
+--inference-batch-wait-ms M
+```
+
+`policy` groups requests only by immutable policy identity. Real rows are
+sorted by episode, seat, day, and request ID before dispatch. With fixed B, a
+short batch repeats its first real encoded row to reach exactly B; padding IDs
+are deterministic and padding outputs never reach workers or trajectories.
+Row-aware PPO sampling keys real rows from policy identity plus request ID.
+The owner JSON reports `real_requests`, `physical_inference_calls`,
+`real_batch_sizes`, `physical_batch_sizes`, `padding_rows`, `occupancy`,
+`queue_wait_seconds`, and `inference_seconds`.
+
+The benchmark helper can sweep the full CPU/mock matrix in one foreground run:
+
+```bash
+python tools/benchmark_parallel_rollouts.py --episodes 8 --num-envs 1 \
+  --num-threads 1 --low-telemetry --read-only-agent-observations \
+  --batch-backend --sweep-workers 32,64,96 \
+  --sweep-fixed-batch-sizes 4,8,16,32 \
+  --sweep-batch-waits-ms 0.5,1,2,5 \
+  --sweep-batch-scopes policy --output-json /kaggle/working/issue17-sweep.json
+```
+
+This helper uses a deterministic CPU/mock policy and is not a TPU result.
+For the real BC-E/PPO TPU evaluation, run the following 96-cell bash sweep
+after replacing the two checkpoint paths:
+
+```bash
+for W in 32 64 96; do for B in 4 8 16 32; do for M in 0.5 1 2 5; do
+  python -m rl_manager.cli eval \
+    --checkpoint /kaggle/input/ppo/ppo.npz \
+    --e-checkpoint /kaggle/input/bc-e/best.pt \
+    --executor-factory executor_v0@stage-a-v1 --backend fast \
+    --num-workers "$W" --num-envs 1 --num-threads 1 \
+    --low-telemetry --read-only-agent-observations --batch-backend \
+    --seed-set smoke \
+    --inference-batch-scope policy --fixed-inference-batch-size "$B" \
+    --inference-batch-wait-ms "$M" \
+    --output-json "/kaggle/working/issue17-w${W}-b${B}-m${M}.json"
+done; done; done
+```
+
 ## Ownership checks
 
 The worker entrypoint fails before constructing CPU state if `jax`, `jaxlib`,

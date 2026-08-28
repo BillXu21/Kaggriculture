@@ -12,6 +12,7 @@ runbook for the real BC-E/JAX measurement.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -60,15 +61,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--low-telemetry", action="store_true")
     parser.add_argument("--read-only-agent-observations", action="store_true")
     parser.add_argument("--batch-backend", action="store_true")
+    parser.add_argument("--inference-batch-scope", choices=("policy_day", "policy"),
+                        default="policy_day")
+    parser.add_argument("--fixed-inference-batch-size", type=int)
+    parser.add_argument("--inference-batch-wait-ms", type=float, default=20.0)
+    parser.add_argument(
+        "--sweep-workers",
+        help="Comma-separated worker counts; overrides --num-workers.")
+    parser.add_argument(
+        "--sweep-fixed-batch-sizes",
+        help="Comma-separated physical batch sizes; overrides the fixed size.")
+    parser.add_argument(
+        "--sweep-batch-waits-ms",
+        help="Comma-separated batch waits in milliseconds; overrides the wait.")
+    parser.add_argument(
+        "--sweep-batch-scopes",
+        help="Comma-separated policy_day,policy scopes; overrides the scope.")
     parser.add_argument("--output-json", type=Path)
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-    if args.episodes < 1 or args.num_workers < 1 or args.num_envs < 1 \
-            or args.num_threads < 1 or args.max_turns < 0:
-        raise SystemExit("episode/worker/env/thread/turn values must be valid")
+def _csv_values(value: str | None, *, cast, label: str) -> list:
+    if value is None:
+        return []
+    try:
+        values = [cast(item.strip()) for item in value.split(",")
+                  if item.strip()]
+    except ValueError as exc:
+        raise SystemExit(f"invalid {label} sweep: {value!r}") from exc
+    if not values:
+        raise SystemExit(f"{label} sweep must not be empty")
+    return values
+
+
+def _run_case(args, *, num_workers: int, fixed_batch_size: int | None,
+              wait_ms: float, scope: str) -> dict:
     policy = BenchmarkPolicy()
     seeds = SeedStream(args.master_seed)
     specs = [build_episode_spec(
@@ -80,32 +107,87 @@ def main() -> None:
         num_envs=args.num_envs, max_turns=args.max_turns,
         low_telemetry=args.low_telemetry,
         read_only_agent_observations=args.read_only_agent_observations,
-        batch_backend=args.batch_backend)
+        batch_backend=args.batch_backend,
+        inference_batch_scope=scope,
+        fixed_inference_batch_size=fixed_batch_size,
+        inference_batch_wait_seconds=wait_ms / 1000.0)
     runner = ParallelSelfPlayRunner(
-        config, num_workers=args.num_workers, master_seed=args.master_seed)
+        config, num_workers=num_workers, master_seed=args.master_seed)
     started = time.perf_counter()
     results = runner.run(specs)
     elapsed = time.perf_counter() - started
-    record = {
-        "schema_version": 1,
-        "backend": "fast",
-        "policy": policy.identity.to_json_dict(),
+    inference = runner.inference_metrics
+    trace_signature = hashlib.sha256(
+        "|".join(result.trace_digest for result in results).encode("ascii")
+    ).hexdigest()
+    real_batches = inference.get("real_batch_sizes", [])
+    return {
+        "num_workers": num_workers,
+        "fixed_inference_batch_size": fixed_batch_size,
+        "inference_batch_wait_ms": wait_ms,
+        "inference_batch_scope": scope,
         "episodes": len(results),
         "max_turns": args.max_turns,
-        "num_workers": args.num_workers,
         "num_envs": args.num_envs,
         "num_threads": args.num_threads,
         "master_seed": args.master_seed,
+        "policy": policy.identity.to_json_dict(),
         "elapsed_seconds": elapsed,
         "games_per_second": len(results) / elapsed if elapsed else None,
         "primitive_turns_per_second": (
-            len(results) * args.max_turns / elapsed if elapsed else None),
+            sum(result.transitions for result in results) / elapsed
+            if elapsed else None),
         "manager_requests_per_second": (
             sum(result.transitions for result in results) / elapsed
             if elapsed else None),
-        "inference": runner.inference_metrics,
+        "inference_seconds": inference["inference_seconds"],
+        "inference_percent": (
+            100.0 * inference["inference_seconds"] / elapsed
+            if elapsed else None),
+        "call_count": inference.get("physical_inference_calls", 0),
+        "real_batch_histogram": {
+            str(size): real_batches.count(size)
+            for size in sorted(set(real_batches))},
+        "occupancy": inference.get("occupancy", 0.0),
+        "inference": inference,
+        "deterministic_signature": trace_signature,
         "result_seeds": [result.seed for result in results],
     }
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.episodes < 1 or args.num_workers < 1 or args.num_envs < 1 \
+            or args.num_threads < 1 or args.max_turns < 0 \
+            or args.inference_batch_wait_ms < 0:
+        raise SystemExit("episode/worker/env/thread/turn values must be valid")
+    if args.fixed_inference_batch_size is not None \
+            and args.fixed_inference_batch_size < 1:
+        raise SystemExit("--fixed-inference-batch-size must be >= 1")
+    workers = _csv_values(args.sweep_workers, cast=int, label="workers") \
+        or [args.num_workers]
+    batch_sizes = (_csv_values(args.sweep_fixed_batch_sizes, cast=int,
+                               label="fixed batch sizes")
+                   or [args.fixed_inference_batch_size])
+    waits = (_csv_values(args.sweep_batch_waits_ms, cast=float,
+                         label="batch waits") or [args.inference_batch_wait_ms])
+    scopes = (_csv_values(args.sweep_batch_scopes, cast=str,
+                          label="batch scopes") or [args.inference_batch_scope])
+    if any(value < 1 for value in workers) or any(
+            value is not None and value < 1 for value in batch_sizes):
+        raise SystemExit("worker and fixed batch sweep values must be >= 1")
+    if any(value < 0 for value in waits):
+        raise SystemExit("batch wait sweep values must be >= 0")
+    if any(value not in ("policy_day", "policy") for value in scopes):
+        raise SystemExit("batch scopes must be policy_day or policy")
+    cases = [_run_case(
+        args, num_workers=workers_value, fixed_batch_size=batch_size,
+        wait_ms=wait, scope=scope)
+        for workers_value in workers for batch_size in batch_sizes
+        for wait in waits for scope in scopes]
+    record = {"schema_version": 2, "backend": "fast", "cases": cases}
+    if len(cases) == 1:
+        record.update(cases[0])
     text = json.dumps(record, sort_keys=True, indent=2, allow_nan=False)
     print(text)
     if args.output_json:

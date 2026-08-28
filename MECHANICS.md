@@ -49,6 +49,29 @@ Confidence labels:
   `research/RL_MANAGER_PARALLEL_ROLLOUTS.md`; local CPU/mock numbers are not a
   TPU claim.
 
+## Central Inference Batching — Issue #17 Extension (2026-08-28)
+
+- `CONFIRMED_EXPERIMENT`: the existing `policy_day` owner grouping remains the
+  default. `RunnerConfig.inference_batch_scope="policy"` groups only by the
+  immutable `PolicyIdentity`, so rows with different days can share a call;
+  each encoded row is passed unchanged.
+- `CONFIRMED_EXPERIMENT`: `fixed_inference_batch_size=B` dispatches sorted real
+  requests in deterministic B-sized chunks. A short chunk is padded by
+  repeating its first real encoded row, never by a synthetic observation.
+  Padding receives deterministic `padding/...` row IDs for the row-aware seam;
+  padding outputs are neither sent to workers nor appended to trajectories.
+- Owner metrics now distinguish real requests/batch sizes from physical call
+  sizes/rows and padding, and report aggregate occupancy, queue wait, and
+  inference seconds. Existing `requests`, `batches`, and `batch_sizes` fields
+  remain real-row-compatible.
+- `CONFIRMED_EXPERIMENT`: `PPOBatchedPolicy.plan_batch_with_row_ids` hashes the
+  immutable policy identity for the root key and folds in each stable row ID.
+  Real stochastic action/logprob outputs are invariant to neighboring rows and
+  padding in the focused CPU test. This is not a guarantee for policies that
+  implement only the legacy `plan_batch` seam.
+- `UNKNOWN`: TPU speedup, occupancy, and real-checkpoint behavior. The local
+  mock/fast-engine smoke is correctness and observability evidence only.
+
 ## Submission Runtime Invariant — Stage 1 / Issue #13
 
 - A submission is not validated by importing `make_agent` from the repository

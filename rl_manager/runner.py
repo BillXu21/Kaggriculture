@@ -26,11 +26,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -67,6 +68,8 @@ from rl_manager.types import (
 MANAGER_START_DAY = 4
 TOTAL_MANAGER_DAYS = TOTAL_DAYS - MANAGER_START_DAY  # 26 decisions/seat
 GAME_TURNS = 719  # post-reset primitive turns in one 720-step game
+INFERENCE_BATCH_SCOPES = ("policy_day", "policy")
+InferenceBatchScope = Literal["policy_day", "policy"]
 
 # Artifact provenance sidecar schema (issue #9 A1 correction): the
 # `run_metadata` block written by `build_artifact_metadata` carries its own
@@ -121,10 +124,28 @@ class RunnerConfig:
     low_telemetry: bool = False  # skip executor turn snapshots for training
     read_only_agent_observations: bool = False  # avoid per-call deep copies
     batch_backend: bool = False  # one native fast engine for each lockstep chunk
+    inference_batch_scope: InferenceBatchScope = "policy_day"
+    fixed_inference_batch_size: int | None = None
+    inference_batch_wait_seconds: float = 0.02
     record_rollout: bool = False  # capture full primitive trace for parity
     record_debug_trace: bool = False  # capture canonical viewer trace opt-in
     debug_trace_seat: int | None = None  # requested private-seat/view selector
     debug_trace_view: str = "joint"
+
+    def __post_init__(self) -> None:
+        if self.inference_batch_scope not in INFERENCE_BATCH_SCOPES:
+            raise ValueError(
+                "inference_batch_scope must be one of "
+                f"{INFERENCE_BATCH_SCOPES}, got {self.inference_batch_scope!r}")
+        size = self.fixed_inference_batch_size
+        if (size is not None
+                and (isinstance(size, bool) or not isinstance(size, int)
+                     or size < 1)):
+            raise ValueError("fixed_inference_batch_size must be a positive int")
+        if (not math.isfinite(self.inference_batch_wait_seconds)
+                or self.inference_batch_wait_seconds < 0):
+            raise ValueError(
+                "inference_batch_wait_seconds must be finite and >= 0")
 
 
 @dataclass(frozen=True)

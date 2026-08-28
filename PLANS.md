@@ -36,6 +36,11 @@ and #16 batched backend. Keep one JAX/libtpu-owning parent, spawn CPU workers,
 and use the scalar/default path as the correctness reference for any future
 target-host measurement.
 
+The issue #17 batching extension is now implemented additively: retain
+`policy_day`/variable-size defaults, and benchmark opt-in mixed-day
+`policy` scope with fixed physical sizes through the RL manager CLI. Validate
+deterministic signatures and occupancy before making any default change.
+
 ## Phase 0 — Freeze 1.32.7, Rules, RNG, and Provenance
 
 ### Current engine events

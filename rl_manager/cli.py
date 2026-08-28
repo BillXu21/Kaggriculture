@@ -23,12 +23,14 @@ Design rules enforced here:
 from __future__ import annotations
 
 import argparse
+import math
 from importlib import import_module
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from rl_manager.runner import GAME_TURNS
+from rl_manager.runner import INFERENCE_BATCH_SCOPES
 from rl_manager.types import E_VS_E, E_VS_PASS
 
 #: Fixed evaluation seed sets (issue #9 Evaluation section).
@@ -52,6 +54,17 @@ EXECUTOR_FACTORIES: Mapping[str, str] = {
 }
 
 CONFIRM_FLAG = "--confirm-expensive"
+
+
+def _add_inference_batch_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--inference-batch-scope", choices=INFERENCE_BATCH_SCOPES,
+                        default="policy_day",
+                        help="Group central requests by policy/day (default) or "
+                             "policy across days.")
+    parser.add_argument("--fixed-inference-batch-size", type=int, default=None,
+                        help="Physical central batch size; pad valid rows to B.")
+    parser.add_argument("--inference-batch-wait-ms", type=float, default=20.0,
+                        help="Maximum central batch wait before dispatch (ms).")
 
 
 # --------------------------------------------------------------- parser
@@ -84,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Use safe read-only executor observation views.")
     train.add_argument("--batch-backend", action="store_true",
                        help="Use the native batched fast backend.")
+    _add_inference_batch_options(train)
     train.add_argument("--episodes-per-update", type=int, default=8)
     train.add_argument("--updates", type=int, default=1)
     train.add_argument("--epochs", type=int, default=4)
@@ -112,6 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--low-telemetry", action="store_true")
     ev.add_argument("--read-only-agent-observations", action="store_true")
     ev.add_argument("--batch-backend", action="store_true")
+    _add_inference_batch_options(ev)
     ev.add_argument("--seed-set", required=True, choices=sorted(SEED_SETS))
     ev.add_argument("--output-json", required=True)
     ev.add_argument(CONFIRM_FLAG, action="store_true",
@@ -175,12 +190,28 @@ def _validate_common(args: argparse.Namespace) -> dict[str, Any]:
         raise FileNotFoundError(
             f"--e-checkpoint {e_checkpoint} does not exist; the real BC-E "
             f"checkpoint is required and is never committed to the repository")
+    scope = str(getattr(args, "inference_batch_scope", "policy_day"))
+    if scope not in INFERENCE_BATCH_SCOPES:
+        raise ValueError(
+            f"--inference-batch-scope must be one of {INFERENCE_BATCH_SCOPES}")
+    fixed_size = getattr(args, "fixed_inference_batch_size", None)
+    if (fixed_size is not None
+            and (isinstance(fixed_size, bool)
+                 or not isinstance(fixed_size, int) or fixed_size < 1)):
+        raise ValueError("--fixed-inference-batch-size must be >= 1")
+    wait_ms = float(getattr(args, "inference_batch_wait_ms", 20.0))
+    if not math.isfinite(wait_ms) or wait_ms < 0:
+        raise ValueError("--inference-batch-wait-ms must be finite and >= 0")
     return {"knobs": knobs,
             "runner_options": {
                 "low_telemetry": bool(getattr(args, "low_telemetry", False)),
                 "read_only_agent_observations": bool(
                     getattr(args, "read_only_agent_observations", False)),
                 "batch_backend": bool(getattr(args, "batch_backend", False)),
+                "inference_batch_scope": scope,
+                "fixed_inference_batch_size": (
+                    None if fixed_size is None else int(fixed_size)),
+                "inference_batch_wait_seconds": wait_ms / 1000.0,
             },
             "executor_factory": args.executor_factory,
             "backend": args.backend}

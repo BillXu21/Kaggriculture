@@ -9,9 +9,9 @@ deterministic subset selection over an already-GAE-normalized batch).
 Contract implemented here:
 
 - consumes contiguous own-only E input arrays plus an explicit string
-  `prng_id`; the id is hashed into one root JAX key whose per-row decision
-  seeds are `fold_in(root, row_index)` inside `PPOPolicy.act` (sampling
-  attaches to row identity, never batch position);
+  `prng_id`; row-aware calls hash the immutable policy identity into one
+  root JAX key and fold in each stable row id (sampling attaches to row
+  identity, never batch composition or position);
 - stochastic mode samples through the B1 vmap; deterministic mode is the
   exact argmax/logit>0 decode and reproduces the frozen JAX-E decode before
   any policy drift;
@@ -124,7 +124,12 @@ class PPOBatchedPolicy:
             for row_id in row_ids], dtype=np.uint32)
         result = self._policy.act(
             inputs, deterministic=self._deterministic,
-            rng=prng_key_from_id(prng_id), decision_seeds=seeds)
+            # `prng_id` is still validated as part of the policy protocol, but
+            # row-aware sampling must not depend on the scheduler's grouping.
+            rng=prng_key_from_id(
+                f"policy={self.identity.name}@{self.identity.version}:"
+                f"{self.identity.fingerprint}"),
+            decision_seeds=seeds)
         self.call_count += 1
         self.batch_size_history.append(int(result["batch_size"]))
         return PolicyOutputs(

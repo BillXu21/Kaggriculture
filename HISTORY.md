@@ -1,5 +1,29 @@
 # Kaggriculture Historical Record
 
+## 2026-08-28 — Issue #17 Central Mixed-Day Inference Batching
+
+Added opt-in central inference batching for `ParallelSelfPlayRunner` without
+changing the worker/JAX ownership topology or defaults. `RunnerConfig` now
+accepts `inference_batch_scope` (`policy_day` default or `policy`),
+`fixed_inference_batch_size` (`None` default or positive B), and
+`inference_batch_wait_seconds` (20 ms default). The owner sorts real requests
+by episode/seat/day/request ID before deterministic B-sized chunking, duplicates
+the first valid real row for short physical batches, assigns deterministic
+padding row IDs, and routes/records only real rows. Metrics retain the old
+fields and add real/physical counts and histograms, padding, occupancy, queue
+wait, and inference timing.
+
+`PPOBatchedPolicy.plan_batch_with_row_ids` now uses a policy-snapshot root plus
+stable row-ID seeds, so stochastic real-row action/logprob results do not vary
+with neighboring rows, padding, arrival order, or scheduler grouping. Train/eval
+CLI flags and the CPU benchmark helper expose scope, fixed size, wait, and
+Cartesian sweeps. Focused validation passed **37**, skipped **2**; the full
+`test_rl_manager_*.py` suite passed **130**, skipped **3**. A local spawned
+fast/mock smoke with 2 workers, policy scope, B=4, wait=2 ms completed 4
+truncated episodes with 16 real rows in four physical B=4 calls at occupancy
+1.0; direct CPU mixed-day tests coalesced days 8/15/21 into one real batch.
+No TPU speedup or real-checkpoint throughput claim is made.
+
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
 ## 2026-08-27 — Throughput Branch Integration

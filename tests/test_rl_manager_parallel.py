@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+from queue import Queue
 import sys
 from importlib.util import find_spec
 
@@ -11,7 +12,7 @@ import pytest
 
 from rl_manager.parallel import ParallelSelfPlayRunner
 from rl_manager.parallel import ParallelRolloutError
-from rl_manager.parallel_protocol import policy_row_request_id
+from rl_manager.parallel_protocol import InferenceRequest, policy_row_request_id
 from rl_manager.parallel_worker import FORBIDDEN_ACCELERATOR_MODULES
 from rl_manager.runner import RunnerConfig, SelfPlayRunner, \
     build_episode_spec
@@ -47,6 +48,48 @@ class _ConstantPlanPolicy:
                 "crop", "animal", "land", "fertilizer", "care",
                 "sell_presence")},
             logprob_total=zeros.copy(), value=zeros.copy(), batch_size=batch)
+
+
+class _RecordingRowAwarePolicy(_ConstantPlanPolicy):
+    def __init__(self, name: str = "parallel-row-aware") -> None:
+        super().__init__(name)
+        self.row_ids: list[list[str]] = []
+        self.physical_days: list[list[int]] = []
+
+    def plan_batch_with_row_ids(self, inputs, row_ids, prng_id):
+        del prng_id
+        days = np.asarray(inputs["day"]).reshape(-1).astype(np.int16)
+        self.calls.append((len(row_ids), "row-aware"))
+        self.row_ids.append(list(row_ids))
+        self.physical_days.append(days.tolist())
+        outputs = super().plan_batch(inputs, "row-aware")
+        outputs.action_tensors["crop"][:, 0] = days
+        return outputs
+
+
+def _dispatch_request(policy, *, episode: int, seat: int, day: int,
+                      worker_id: int = 0) -> InferenceRequest:
+    identity = policy.identity
+    return InferenceRequest(
+        request_id=policy_row_request_id(episode, seat, day, identity),
+        worker_id=worker_id, episode_index=episode, seat=seat, day=day,
+        policy_identity=identity, prng_id="worker-prng",
+        inputs={"day": np.asarray([[day]], dtype=np.int16)},
+        queued_at=0.0)
+
+
+def _dispatch_direct(config, policy, requests):
+    runner = ParallelSelfPlayRunner(config, num_workers=1)
+    response_queues = [Queue()]
+    runner._dispatch(
+        policy.identity if config.inference_batch_scope == "policy" else
+        (policy.identity, requests[0].day), requests, 0.0,
+        {policy.identity: policy}, response_queues)
+    responses = {}
+    while not response_queues[0].empty():
+        response = response_queues[0].get()
+        responses[response.request_id] = response.outputs
+    return runner, responses
 
 
 class _FailingExecutorFactory:
@@ -89,6 +132,89 @@ def test_worker_import_boundary_has_no_accelerator_modules():
 def test_parallel_requires_positive_worker_count():
     with pytest.raises(ValueError, match="num_workers"):
         ParallelSelfPlayRunner(_config(), num_workers=0)
+
+
+def test_default_policy_day_scope_does_not_mix_days():
+    policy = _RecordingRowAwarePolicy()
+    requests = [_dispatch_request(policy, episode=17, seat=0, day=8),
+                _dispatch_request(policy, episode=42, seat=1, day=15)]
+    runner, _ = _dispatch_direct(
+        _config(inference_batch_scope="policy_day"), policy, requests[:1])
+    runner._dispatch((policy.identity, requests[1].day), requests[1:], 0.0,
+                     {policy.identity: policy}, [Queue()])
+    assert [days for days in policy.physical_days] == [[8], [15]]
+
+
+def test_policy_scope_coalesces_mixed_days_and_routes_real_rows_only():
+    policy = _RecordingRowAwarePolicy()
+    requests = [_dispatch_request(policy, episode=93, seat=0, day=21),
+                _dispatch_request(policy, episode=17, seat=0, day=8),
+                _dispatch_request(policy, episode=42, seat=1, day=15)]
+    runner, responses = _dispatch_direct(
+        _config(inference_batch_scope="policy"), policy, requests)
+    assert policy.physical_days == [[8, 15, 21]]
+    assert len(responses) == len(requests)
+    assert runner.inference_metrics["real_batch_sizes"] == [3]
+    assert runner.inference_metrics["physical_batch_sizes"] == [3]
+    assert runner.inference_metrics["padding_rows"] == 0
+    assert runner.inference_metrics["occupancy"] == 1.0
+    for request in requests:
+        output = responses[request.request_id]
+        assert int(output.action_tensors["crop"][0, 0]) == request.day
+
+
+def test_fixed_physical_batch_pads_without_routing_or_recording_padding():
+    policy = _RecordingRowAwarePolicy()
+    requests = [_dispatch_request(policy, episode=17, seat=0, day=8),
+                _dispatch_request(policy, episode=42, seat=1, day=15)]
+    runner, responses = _dispatch_direct(
+        _config(inference_batch_scope="policy", fixed_inference_batch_size=4),
+        policy, requests)
+    assert policy.physical_days == [[8, 15, 8, 8]]
+    assert len(responses) == 2
+    assert all("padding/" not in request_id for request_id in responses)
+    assert runner.inference_metrics["physical_batch_sizes"] == [4]
+    assert runner.inference_metrics["real_batch_sizes"] == [2]
+    assert runner.inference_metrics["padding_rows"] == 2
+    assert runner.inference_metrics["occupancy"] == 0.5
+
+
+def test_fixed_batch_chunks_after_canonical_sorting():
+    policy = _RecordingRowAwarePolicy()
+    requests = [_dispatch_request(policy, episode=episode, seat=0, day=4)
+                for episode in (4, 1, 3, 2, 6)]
+    runner, responses = _dispatch_direct(
+        _config(inference_batch_scope="policy", fixed_inference_batch_size=2),
+        policy, requests)
+    assert policy.physical_days == [[4, 4], [4, 4], [4, 4]]
+    assert [[int(row) for row in days]
+            for days in policy.physical_days] == [[4, 4], [4, 4], [4, 4]]
+    assert policy.row_ids[:2] == [
+        [requests[1].request_id, requests[3].request_id],
+        [requests[2].request_id, requests[0].request_id],
+    ]
+    assert policy.row_ids[2][0] == requests[4].request_id
+    assert policy.row_ids[2][1].startswith("padding/")
+    assert len(responses) == 5
+    assert runner.inference_metrics["physical_inference_calls"] == 3
+    assert runner.inference_metrics["padding_rows"] == 1
+
+
+def test_different_policy_identities_never_share_dispatch():
+    first = _RecordingRowAwarePolicy("first")
+    second = _RecordingRowAwarePolicy("second")
+    requests = [_dispatch_request(first, episode=1, seat=0, day=8),
+                _dispatch_request(second, episode=2, seat=0, day=8)]
+    runner = ParallelSelfPlayRunner(_config(inference_batch_scope="policy"),
+                                    num_workers=1)
+    queues = [Queue()]
+    runner._dispatch(first.identity, [requests[0]], 0.0,
+                     {first.identity: first, second.identity: second}, queues)
+    runner._dispatch(second.identity, [requests[1]], 0.0,
+                     {first.identity: first, second.identity: second}, queues)
+    assert first.physical_days == [[8]]
+    assert second.physical_days == [[8]]
+    assert runner.inference_metrics["physical_inference_calls"] == 2
 
 
 @pytest.mark.skipif(

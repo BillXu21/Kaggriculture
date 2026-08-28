@@ -345,6 +345,15 @@ This file records decisions that remain authoritative across chats and work sess
 - Day-boundary note: worker positions reset near the central shed at day end, hired hands disappear, and carried inventory auto-drops, so cleanup does not need an end-of-day return-home rule. Its opportunity cost is only within the current day's remaining turns, and normal dispatch must preempt it on the next primitive turn.
 - Revisit when: the true PASS-only WATER and WEED-first+WATER panels complete. Promote only if normal non-PASS actions are proven unchanged and paired outcome/tail evidence is favorable.
 
+## D-046 — Keep Central Inference Scope Opt-In and Row-Identity Deterministic
+
+- Date: 2026-08-28
+- Status: active
+- Decision: `ParallelSelfPlayRunner` keeps `policy_day` variable-size batching as the default. `RunnerConfig.inference_batch_scope="policy"` may combine different manager days for one immutable `PolicyIdentity`; `fixed_inference_batch_size=B` makes every owner policy call physically B rows by duplicating the first real row as valid deterministic padding. Requests are sorted by episode/seat/day/request ID before fixed-size chunking, and only real rows are routed or recorded.
+- Stochastic contract: policies exposing `plan_batch_with_row_ids` must derive each real row's sampling from the immutable policy snapshot identity and stable request row ID, not root group composition, position, padding, arrival order, or worker count. The PPO adapter now satisfies this contract; policies without the seam remain limited to their existing batch-dependent `plan_batch` behavior.
+- Evidence: direct CPU owner tests cover default separation, mixed-day coalescing, policy identity isolation, exact physical B, deterministic >B chunks, real-row-only routing/metrics, and worker import isolation. PPO row-aware action/logprob invariance passes. TPU throughput is not measured.
+- Revisit when: TPU validation selects a default scope/physical size, or a policy implementation needs a stronger row-key contract.
+
 ## D-043 - Keep Executor Hot-Path Optimizations Behavior-Preserving and Training-Explicit
 
 - Date: 2026-08-27
