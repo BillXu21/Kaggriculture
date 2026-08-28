@@ -90,6 +90,9 @@ def test_parser_defaults_are_safe_single_process():
         "out/ppo.npz"])
     assert (args.num_workers, args.num_envs, args.num_threads) == (1, 1, 1)
     assert args.backend == "fast"
+    assert not args.low_telemetry
+    assert not args.read_only_agent_observations
+    assert not args.batch_backend
     # Safe small default: 8 divides the expected complete-game row count
     # for the default episodes_per_update=8 (8 * 26 = 208).
     assert args.minibatch_size == 8
@@ -100,6 +103,23 @@ def test_parser_defaults_are_safe_single_process():
         "--seed-set", "smoke", "--output-json", "eval.json"])
     assert (ev.num_workers, ev.num_envs, ev.num_threads) == (1, 1, 1)
     assert ev.confirm_expensive is False
+
+
+def test_parser_and_plan_expose_integrated_runner_options(tmp_path):
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    args = build_parser().parse_args([
+        "train", "--e-checkpoint", str(checkpoint),
+        "--executor-factory", "executor_v0@stage-a-v1", "--master-seed", "17",
+        "--output-dir", "out", "--checkpoint", "out/ppo.npz",
+        "--low-telemetry", "--read-only-agent-observations", "--batch-backend",
+    ])
+    plan = plan_training(args)
+    assert plan["runner_options"] == {
+        "low_telemetry": True,
+        "read_only_agent_observations": True,
+        "batch_backend": True,
+    }
 
 
 def test_parser_requires_explicit_executor_and_subcommand():

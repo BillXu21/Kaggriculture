@@ -139,10 +139,16 @@ def _stack_row_outputs(outputs: Sequence[PolicyOutputs]) -> PolicyOutputs:
         batch_size=len(outputs))
 
 
-def _factory_from_wire(factory: Any) -> Any:
+def _factory_from_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
     if factory == "executor_v0@default":
         from rl_manager.executor_factory import make_default_executor_factory
         return make_default_executor_factory()
+    if factory == "executor_v0@default-low-telemetry":
+        from executor_v0.agent import AgentConfig
+        from rl_manager.executor_factory import make_default_executor_factory
+
+        return make_default_executor_factory(
+            AgentConfig(strict=True, record_turn_snapshot=False))
     return factory
 
 
@@ -186,7 +192,9 @@ def worker_main(task_queue: Any, request_queue: Any, response_queue: Any,
                 capacity=int(task.trajectory_capacity), input_spec=e_input_spec())
         runner = SelfPlayRunner(
             task.runner_config, trajectory_buffer=trajectory,
-            executor_factory=_factory_from_wire(task.executor_factory),
+            executor_factory=_factory_from_wire(
+                task.executor_factory,
+                low_telemetry=task.runner_config.low_telemetry),
             master_seed=task.master_seed)
         results = tuple(runner.run(specs))
         result_queue.put(WorkerFinished(task.worker_id, results, trajectory))

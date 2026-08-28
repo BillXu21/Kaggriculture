@@ -706,9 +706,7 @@ class SelfPlayRunner:
         for index, (state, observation) in enumerate(zip(states, observations)):
             state.backend.update(observation, batch.rewards(index),
                                  batch.statuses(index))
-            state.obs = observation
-            if state.trace_recorder is not None:
-                state.current_canonical_state = state.backend.canonical_state()
+            state.obs = state._adapt_observations(observation)
             for seat in range(2):
                 state._note_day_start(seat)
 
@@ -730,7 +728,11 @@ class SelfPlayRunner:
             for index, state in enumerate(states):
                 if state.done:
                     continue
-                actions = [state.openings[seat](copy.deepcopy(state.obs[seat]))
+                observations = (
+                    state.agent_obs
+                    if state.config.read_only_agent_observations
+                    else [copy.deepcopy(view) for view in state.obs])
+                actions = [state.openings[seat](observations[seat])
                            for seat in range(2)]
                 day = int(state.obs[0]["day"])
                 hour = int(state.obs[0]["hour"])
@@ -749,9 +751,7 @@ class SelfPlayRunner:
                 state.backend.update(observations[index], batch.rewards(index),
                                      batch.statuses(index))
                 if not state.done:
-                    state.obs = observations[index]
-                    if state.trace_recorder is not None:
-                        state.current_canonical_state = state.backend.canonical_state()
+                    state.obs = state._adapt_observations(observations[index])
             t3 = time.perf_counter()
 
             newly_done: list[_EpisodeState] = []

@@ -2,6 +2,31 @@
 
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
+## 2026-08-27 — Throughput Branch Integration
+
+Created clean worktree `Kaggriculture-throughput-integration` on branch
+`throughput/integration` from base
+`e63e8337ba9e30a6f394d69da23da538ed7ad6c2`, then merged issue #15, issue #16,
+and issue #17 in the requested order with normal merge commits. The only
+source conflicts were additive runner/documentation overlaps: both executor
+flags and the native batch flag were retained, and the parallel worker hook
+was retained. Batch workers now use the shared observation adaptation path;
+the spawned default factory preserves low-telemetry configuration; train/eval
+CLI plans expose low-telemetry, read-only, and batch-backend options.
+
+Focused validation passed `150 passed, 3 skipped`; normal full validation passed
+`757 passed, 104 skipped`. The official-capable full run passed `844` and
+skipped `15`, with the pre-existing unbuffered-official plan-sidecar parity
+failure plus a separate editable-venv submission-path failure. A bounded
+constant-policy complete-game parity run matched all three scalar/batched
+configurations at 719 primitive actions, 52 manager rows, `DONE/DONE`, final
+banks `[3.0, 3.0]`, and action SHA256
+`0139dfc0e76755c7c8227a1b4475900026ca1a40bffd46adad4d5c07acbb9869`.
+The two-worker integrated smoke returned 4/4 episodes, 16 manager requests,
+two owner batches of 8, and no routing or worker errors. Local CPU benchmark
+results and the exact TPU command are recorded in the final integration
+report; no TPU result is claimed.
+
 ## 2026-08-27 - Issue #15 Executor Hot-Path Profile and Optimization
 
 Created isolated worktree/branch `throughput/15-agent-hotpath` from base

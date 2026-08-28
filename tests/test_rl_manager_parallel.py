@@ -100,14 +100,17 @@ def test_parallel_truncated_e_vs_e_routes_and_normalizes_results():
     specs = [build_episode_spec(
         index, seeds.episode_seed(index), E_VS_E, policy, policy)
         for index in range(4)]
-    serial = SelfPlayRunner(_config(num_envs=2), master_seed=17).run(specs)
+    integrated_config = _config(
+        num_envs=2, batch_backend=True, low_telemetry=True,
+        read_only_agent_observations=True)
+    serial = SelfPlayRunner(integrated_config, master_seed=17).run(specs)
     policy.calls.clear()
     destination = __import__("rl_manager.trajectory", fromlist=[
         "TrajectoryBuffer", "e_input_spec"])
     parallel_buffer = destination.TrajectoryBuffer(
         capacity=32, input_spec=destination.e_input_spec())
     parallel = ParallelSelfPlayRunner(
-        _config(num_envs=2), num_workers=2, master_seed=17,
+        integrated_config, num_workers=2, master_seed=17,
         trajectory_buffer=parallel_buffer,
         inference_batch_wait_seconds=1.0).run(specs)
     assert [result.episode_index for result in parallel] == list(range(4))

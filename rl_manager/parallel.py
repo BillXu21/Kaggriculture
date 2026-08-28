@@ -50,11 +50,12 @@ class ParallelRolloutError(RuntimeError):
     """A worker or inference-owner protocol failure."""
 
 
-def _factory_wire(factory: Any) -> Any:
+def _factory_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
     """Use a child-local default factory; require custom factories to pickle."""
     if (getattr(factory, "name", None) == "executor_v0"
             and getattr(factory, "version", None) == EXECUTOR_FACTORY_VERSION):
-        return "executor_v0@default"
+        return ("executor_v0@default-low-telemetry"
+                if low_telemetry else "executor_v0@default")
     try:
         pickle.dumps(factory)
     except Exception as exc:  # noqa: BLE001 - turn pickle detail into API error
@@ -162,7 +163,15 @@ class ParallelSelfPlayRunner:
         self.config = config
         self.num_workers = int(num_workers)
         self.buffer = trajectory_buffer
-        self.executor_factory = executor_factory or make_default_executor_factory()
+        if executor_factory is None:
+            if config.low_telemetry:
+                from executor_v0.agent import AgentConfig
+
+                executor_factory = make_default_executor_factory(
+                    AgentConfig(strict=True, record_turn_snapshot=False))
+            else:
+                executor_factory = make_default_executor_factory()
+        self.executor_factory = executor_factory
         self.master_seed = master_seed
         self.request_queue_size = int(request_queue_size or max(4, num_workers * 4))
         self.batch_wait = float(inference_batch_wait_seconds)
@@ -208,7 +217,8 @@ class ParallelSelfPlayRunner:
                     # prevents scheduling from selecting a different snapshot.
                     continue
                 policy_by_identity[policy.identity] = policy
-        factory_wire = _factory_wire(self.executor_factory)
+        factory_wire = _factory_wire(
+            self.executor_factory, low_telemetry=self.config.low_telemetry)
         ctx = mp.get_context("spawn")
         request_queue = ctx.Queue(maxsize=self.request_queue_size)
         result_queue = ctx.Queue()

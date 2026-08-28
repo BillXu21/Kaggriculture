@@ -380,8 +380,9 @@ def test_native_batch_runner_matches_scalar_runner_on_truncated_chunk():
         E_VS_E, scalar_policy, scalar_policy)
 
     batch_policy = _ConstantPlanPolicy("batch")
-    config = _runner_config(num_envs=2, max_turns=_TRUNCATED_TURNS,
-                            batch_backend=True)
+    config = _runner_config(
+        num_envs=2, max_turns=_TRUNCATED_TURNS, batch_backend=True,
+        low_telemetry=True, read_only_agent_observations=True)
     batch_runner = SelfPlayRunner(config, master_seed=MASTER_SEED)
     batch_results = batch_runner.run(
         _truncated_specs(E_VS_E, batch_policy, batch_policy, (0, 1)))

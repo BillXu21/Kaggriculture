@@ -78,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Lockstep envs per worker chunk (default 1).")
     train.add_argument("--num-threads", type=int, default=1,
                        help="Engine Rayon threads per env (default 1).")
+    train.add_argument("--low-telemetry", action="store_true",
+                       help="Disable per-turn executor snapshots.")
+    train.add_argument("--read-only-agent-observations", action="store_true",
+                       help="Use safe read-only executor observation views.")
+    train.add_argument("--batch-backend", action="store_true",
+                       help="Use the native batched fast backend.")
     train.add_argument("--episodes-per-update", type=int, default=8)
     train.add_argument("--updates", type=int, default=1)
     train.add_argument("--epochs", type=int, default=4)
@@ -103,6 +109,9 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--num-workers", type=int, default=1)
     ev.add_argument("--num-envs", type=int, default=1)
     ev.add_argument("--num-threads", type=int, default=1)
+    ev.add_argument("--low-telemetry", action="store_true")
+    ev.add_argument("--read-only-agent-observations", action="store_true")
+    ev.add_argument("--batch-backend", action="store_true")
     ev.add_argument("--seed-set", required=True, choices=sorted(SEED_SETS))
     ev.add_argument("--output-json", required=True)
     ev.add_argument(CONFIRM_FLAG, action="store_true",
@@ -167,11 +176,18 @@ def _validate_common(args: argparse.Namespace) -> dict[str, Any]:
             f"--e-checkpoint {e_checkpoint} does not exist; the real BC-E "
             f"checkpoint is required and is never committed to the repository")
     return {"knobs": knobs,
+            "runner_options": {
+                "low_telemetry": bool(getattr(args, "low_telemetry", False)),
+                "read_only_agent_observations": bool(
+                    getattr(args, "read_only_agent_observations", False)),
+                "batch_backend": bool(getattr(args, "batch_backend", False)),
+            },
             "executor_factory": args.executor_factory,
             "backend": args.backend}
 
 
-def _resolve_executor_factory(identifier: str) -> Any:
+def _resolve_executor_factory(
+        identifier: str, *, low_telemetry: bool = False) -> Any:
     """Resolve the explicit registry entry in the owner before spawning."""
     try:
         target = EXECUTOR_FACTORIES[identifier]
@@ -181,6 +197,10 @@ def _resolve_executor_factory(identifier: str) -> Any:
         raise ValueError(
             f"cannot resolve executor factory {identifier!r} from registry") \
             from exc
+    if low_telemetry and identifier == "executor_v0@stage-a-v1":
+        from executor_v0.agent import AgentConfig
+
+        return builder(AgentConfig(strict=True, record_turn_snapshot=False))
     return builder()
 
 
@@ -349,8 +369,11 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
             backend_name=plan["backend"],
             backend_configuration={"seed": 0,
                                    "numThreads": plan["knobs"]["num_threads"]},
-            num_envs=plan["knobs"]["num_envs"])
-        executor_factory = _resolve_executor_factory(plan["executor_factory"])
+            num_envs=plan["knobs"]["num_envs"],
+            **plan["runner_options"])
+        executor_factory = _resolve_executor_factory(
+            plan["executor_factory"],
+            low_telemetry=plan["runner_options"]["low_telemetry"])
         runner = (ParallelSelfPlayRunner(
             runner_config, num_workers=plan["knobs"]["num_workers"],
             trajectory_buffer=buffer, executor_factory=executor_factory,
@@ -407,8 +430,11 @@ def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no
         backend_name=plan["backend"],
         backend_configuration={"seed": 0,
                                "numThreads": plan["knobs"]["num_threads"]},
-        num_envs=plan["knobs"]["num_envs"])
-    executor_factory = _resolve_executor_factory(plan["executor_factory"])
+        num_envs=plan["knobs"]["num_envs"],
+        **plan["runner_options"])
+    executor_factory = _resolve_executor_factory(
+        plan["executor_factory"],
+        low_telemetry=plan["runner_options"]["low_telemetry"])
     runner = (ParallelSelfPlayRunner(
         runner_config, num_workers=plan["knobs"]["num_workers"],
         executor_factory=executor_factory)

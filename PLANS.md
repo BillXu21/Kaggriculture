@@ -31,6 +31,11 @@ opt-in runner path. Keep scalar mode as the correctness reference; future
 worker scheduling may consume `oracle.batched_backend.BatchedEngineBackend`
 without coupling to PPO or executor strategy.
 
+Issue #17 parallel rollout workers are integrated with the #15 executor knobs
+and #16 batched backend. Keep one JAX/libtpu-owning parent, spawn CPU workers,
+and use the scalar/default path as the correctness reference for any future
+target-host measurement.
+
 ## Phase 0 — Freeze 1.32.7, Rules, RNG, and Provenance
 
 ### Current engine events

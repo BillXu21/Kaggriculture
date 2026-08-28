@@ -57,6 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-threads", type=int, default=1)
     parser.add_argument("--max-turns", type=int, default=GAME_TURNS)
     parser.add_argument("--master-seed", type=int, default=17)
+    parser.add_argument("--low-telemetry", action="store_true")
+    parser.add_argument("--read-only-agent-observations", action="store_true")
+    parser.add_argument("--batch-backend", action="store_true")
     parser.add_argument("--output-json", type=Path)
     return parser
 
@@ -74,7 +77,10 @@ def main() -> None:
     config = RunnerConfig(
         backend_name="fast",
         backend_configuration={"seed": 0, "numThreads": args.num_threads},
-        num_envs=args.num_envs, max_turns=args.max_turns)
+        num_envs=args.num_envs, max_turns=args.max_turns,
+        low_telemetry=args.low_telemetry,
+        read_only_agent_observations=args.read_only_agent_observations,
+        batch_backend=args.batch_backend)
     runner = ParallelSelfPlayRunner(
         config, num_workers=args.num_workers, master_seed=args.master_seed)
     started = time.perf_counter()

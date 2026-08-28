@@ -28,7 +28,7 @@ PPO checkpoints at the explicit paths. The policy/JAX setup must happen in the
 main process before the rollout coordinator starts children:
 
 ```bash
-python -m rl_manager.cli eval --checkpoint /kaggle/input/ppo/ppo.npz --e-checkpoint /kaggle/input/bc-e/best.pt --executor-factory executor_v0@stage-a-v1 --backend fast --num-workers 4 --num-envs 1 --num-threads 1 --seed-set smoke --output-json /kaggle/working/issue17-smoke.json
+python -m rl_manager.cli eval --checkpoint /kaggle/input/ppo/ppo.npz --e-checkpoint /kaggle/input/bc-e/best.pt --executor-factory executor_v0@stage-a-v1 --backend fast --num-workers 4 --num-envs 1 --num-threads 1 --low-telemetry --read-only-agent-observations --batch-backend --seed-set smoke --output-json /kaggle/working/issue17-smoke.json
 ```
 
 For scaling, repeat the same fixed seed set and immutable checkpoints with
@@ -51,8 +51,7 @@ results are also fatal.
 
 - Issue #15 can replace the registered executor factory or its `create()`
   implementation; no worker protocol change is needed.
-- Issue #16 can provide a backend/factory implementation behind the existing
-  `RunnerConfig`/executor seams; this branch does not implement native batched
-  engine behavior.
+- Issue #16's native batched backend composes through `RunnerConfig` in each
+  CPU worker; the parent remains the only JAX/libtpu owner.
 - A future learner remains in the parent owner process, reusing the same
   policy identity and inference dispatch boundary.
