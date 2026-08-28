@@ -23,6 +23,7 @@ Design rules enforced here:
 from __future__ import annotations
 
 import argparse
+from importlib import import_module
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -72,8 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--backend", default="fast", choices=KNOWN_BACKENDS)
     train.add_argument("--master-seed", type=int, required=True)
     train.add_argument("--num-workers", type=int, default=1,
-                       help="Rollout worker processes (default 1; >1 not "
-                            "implemented yet and fails loud).")
+                       help="Rollout worker processes (default 1).")
     train.add_argument("--num-envs", type=int, default=1,
                        help="Lockstep envs per worker chunk (default 1).")
     train.add_argument("--num-threads", type=int, default=1,
@@ -161,11 +161,6 @@ def _validate_common(args: argparse.Namespace) -> dict[str, Any]:
         if value < 1:
             raise ValueError(f"--{label.replace('_', '-')} must be >= 1")
         knobs[arg_name] = value
-    if knobs["num_workers"] > 1:
-        raise NotImplementedError(
-            "multi-process rollout workers are design-only until the Kaggle "
-            "run; keep --num-workers 1 (fail loud instead of silently "
-            "running single-process)")
     e_checkpoint = Path(args.e_checkpoint)
     if not e_checkpoint.is_file():
         raise FileNotFoundError(
@@ -174,6 +169,19 @@ def _validate_common(args: argparse.Namespace) -> dict[str, Any]:
     return {"knobs": knobs,
             "executor_factory": args.executor_factory,
             "backend": args.backend}
+
+
+def _resolve_executor_factory(identifier: str) -> Any:
+    """Resolve the explicit registry entry in the owner before spawning."""
+    try:
+        target = EXECUTOR_FACTORIES[identifier]
+        module_name, attribute = target.split(":", 1)
+        builder = getattr(import_module(module_name), attribute)
+    except (KeyError, ImportError, AttributeError, ValueError) as exc:
+        raise ValueError(
+            f"cannot resolve executor factory {identifier!r} from registry") \
+            from exc
+    return builder()
 
 
 def plan_training(args: argparse.Namespace) -> dict[str, Any]:
@@ -318,6 +326,7 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         build_episode_spec
     from rl_manager.seeds import SeedStream
     from rl_manager.trajectory import TrajectoryBuffer, e_input_spec
+    from rl_manager.parallel import ParallelSelfPlayRunner
 
     frozen_params, metadata = load_torch_checkpoint(plan["e_checkpoint"])
     config = ManagerConfig(**metadata["model_config"])
@@ -336,13 +345,20 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         buffer = TrajectoryBuffer(
             capacity=plan["episodes_per_update"] * 2 * 26,
             input_spec=e_input_spec())
-        runner = SelfPlayRunner(
-            RunnerConfig(
-                backend_name=plan["backend"],
-                backend_configuration={"seed": 0,
-                                       "numThreads": plan["knobs"]["num_threads"]},
-                num_envs=plan["knobs"]["num_envs"]),
-            trajectory_buffer=buffer, master_seed=plan["master_seed"])
+        runner_config = RunnerConfig(
+            backend_name=plan["backend"],
+            backend_configuration={"seed": 0,
+                                   "numThreads": plan["knobs"]["num_threads"]},
+            num_envs=plan["knobs"]["num_envs"])
+        executor_factory = _resolve_executor_factory(plan["executor_factory"])
+        runner = (ParallelSelfPlayRunner(
+            runner_config, num_workers=plan["knobs"]["num_workers"],
+            trajectory_buffer=buffer, executor_factory=executor_factory,
+            master_seed=plan["master_seed"])
+            if plan["knobs"]["num_workers"] > 1 else SelfPlayRunner(
+                runner_config, trajectory_buffer=buffer,
+                executor_factory=executor_factory,
+                master_seed=plan["master_seed"]))
         # Seat randomization: alternate orientation by episode parity while
         # evaluation below always pairs both seats explicitly.
         specs = []
@@ -379,6 +395,7 @@ def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no
     from rl_manager.policy import JaxEPlanPolicy
     from rl_manager.runner import RunnerConfig, SelfPlayRunner, \
         build_episode_spec
+    from rl_manager.parallel import ParallelSelfPlayRunner
 
     frozen_params, metadata = load_torch_checkpoint(plan["e_checkpoint"])
     config = ManagerConfig(**metadata["model_config"])
@@ -386,12 +403,17 @@ def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no
     candidate = ppo_batched_policy_from_state(
         state, config, name="ppo_candidate", deterministic=True)
     frozen_policy = JaxEPlanPolicy(frozen_params, config, name="frozen_e")
-    runner = SelfPlayRunner(
-        RunnerConfig(
-            backend_name=plan["backend"],
-            backend_configuration={"seed": 0,
-                                   "numThreads": plan["knobs"]["num_threads"]},
-            num_envs=plan["knobs"]["num_envs"]))
+    runner_config = RunnerConfig(
+        backend_name=plan["backend"],
+        backend_configuration={"seed": 0,
+                               "numThreads": plan["knobs"]["num_threads"]},
+        num_envs=plan["knobs"]["num_envs"])
+    executor_factory = _resolve_executor_factory(plan["executor_factory"])
+    runner = (ParallelSelfPlayRunner(
+        runner_config, num_workers=plan["knobs"]["num_workers"],
+        executor_factory=executor_factory)
+        if plan["knobs"]["num_workers"] > 1 else SelfPlayRunner(
+            runner_config, executor_factory=executor_factory))
     specs = []
     for seed in plan["seeds"]:
         for orientation in plan["seat_orientations"]:

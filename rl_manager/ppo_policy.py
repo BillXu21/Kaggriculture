@@ -315,14 +315,21 @@ def deterministic_action_indices(
 
 
 def sample_action_indices(logits: dict[str, jax.Array],
-                          rng: jax.Array) -> dict[str, jax.Array]:
+                          rng: jax.Array,
+                          decision_seeds: jax.Array | None = None
+                          ) -> dict[str, jax.Array]:
     """Vmapped stochastic sampling keyed by explicit per-row decision seeds.
 
     `rng` is the root key; each row's key is `fold_in(rng, decision_seed)`
     so samples attach to row identity (seed), never batch position or env
     scheduling order. One vmap over rows; no Python example loop.
     """
-    seeds = jnp.arange(logits["crop"].shape[0], dtype=jnp.uint32)
+    seeds = (jnp.arange(logits["crop"].shape[0], dtype=jnp.uint32)
+             if decision_seeds is None else jnp.asarray(
+                 decision_seeds, dtype=jnp.uint32))
+    if seeds.ndim != 1 or seeds.shape[0] != logits["crop"].shape[0]:
+        raise ValueError(
+            "decision_seeds must be one uint32 seed per policy row")
     keys = jax.vmap(lambda s: jax.random.fold_in(rng, s))(seeds)
 
     def one(key, crop_l, animal_l, land_l, fert_l, care_l, sell_l):
@@ -450,7 +457,9 @@ class PPOPolicy:
     # -------------------------------------------------------------- act
     def act(self, inputs: Mapping[str, np.ndarray], *,
             deterministic: bool = False,
-            rng: jax.Array | None = None) -> dict[str, np.ndarray]:
+            rng: jax.Array | None = None,
+            decision_seeds: jax.Array | None = None
+            ) -> dict[str, np.ndarray]:
         """Batched action sampling/decoding for one contiguous request batch.
 
         Deterministic mode reproduces the frozen JAX-E decode exactly while
@@ -470,7 +479,7 @@ class PPOPolicy:
         if deterministic:
             indices = deterministic_action_indices(logits)
         else:
-            indices = sample_action_indices(logits, rng)
+            indices = sample_action_indices(logits, rng, decision_seeds)
 
         batch = int(prepared["board_kind"].shape[0])
         presence_bits = np.asarray(indices["sell_presence"], dtype=np.int64) \

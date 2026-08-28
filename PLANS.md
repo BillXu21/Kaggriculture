@@ -370,7 +370,7 @@ Do not start here before a functioning RL baseline.
 - large architecture sweeps before interface/reward contracts are stable;
 - expensive training before engine lock and throughput measurements;
 - sophisticated PFSP/league matchmaking before fixed-mixture self-play works;
-- distributed rollout infrastructure before local throughput is profiled;
+- distributed rollout infrastructure beyond the local single-owner `spawn` topology before local throughput is profiled;
 - approximate/vectorized custom simulation before scalar differential parity.
 
 ## Rejected or Unsupported Assumptions

@@ -344,3 +344,13 @@ This file records decisions that remain authoritative across chats and work sess
 - Evidence: official 12-seed x 2-seat A/B with aggressive sell-all and prior-debt suppression ON reproduced OFF mean `63,592.3`, median `65,509.5`, min `47,290`, max `74,151`; old optional watering ON scored mean `60,948.5`, median `61,114`, min `46,798`, max `69,673`, with 8 wins / 16 losses, mean paired delta `-2,643.8`, worst `-18,675`, best `+21,429`. The wide paired spread justifies investigating dispatch correctness rather than promoting or permanently rejecting the underlying cleanup idea.
 - Day-boundary note: worker positions reset near the central shed at day end, hired hands disappear, and carried inventory auto-drops, so cleanup does not need an end-of-day return-home rule. Its opportunity cost is only within the current day's remaining turns, and normal dispatch must preempt it on the next primitive turn.
 - Revisit when: the true PASS-only WATER and WEED-first+WATER panels complete. Promote only if normal non-PASS actions are proven unchanged and paired outcome/tail evidence is favorable.
+
+## D-043 — Keep One JAX Owner and Spawn CPU Rollout Workers
+
+- Date: 2026-08-27
+- Status: active
+- Decision: The parallel rollout coordinator keeps policy objects and all JAX/libtpu initialization in the parent process. It starts `spawn` workers that receive serializable episode/policy identities, build independent engine/opening/executor state, and exchange only manager-day encoded NumPy rows through bounded queues. Requests are canonically sorted by policy identity/day/episode/seat; trajectory shards and results are normalized before return.
+- Rationale: the scalar rollout bottleneck is CPU executor/environment work, while multiple JAX-owning processes have caused TPU initialization conflicts. A simple local process boundary provides CPU overlap without changing executor or native-engine semantics.
+- Guarantees: worker startup fails if accelerator modules are loaded; worker exceptions, dead exits, missing episodes, duplicate episodes, and duplicate trajectory rows fail loudly; the default executor factory is resolved inside each child rather than pickled from its nested implementation class. Stable row identifiers are available to future stochastic batched policies.
+- Evidence boundary: deterministic truncated fast-engine smoke passed with two spawned workers and two environments per worker, including central request batching and trajectory normalization. TPU throughput and full real-checkpoint scaling remain unmeasured; use `research/RL_MANAGER_PARALLEL_ROLLOUTS.md`.
+- Revisit when: issue #15 changes the executor factory contract, issue #16 supplies a native batched backend, or measured host profiling justifies a different transport.
