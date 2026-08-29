@@ -73,6 +73,27 @@ truncated episodes with 16 real rows in four physical B=4 calls at occupancy
 1.0; direct CPU mixed-day tests coalesced days 8/15/21 into one real batch.
 No TPU speedup or real-checkpoint throughput claim is made.
 
+## 2026-08-28 — Issue #18 Evaluation and Promotion Hardening
+
+Added the framework-neutral `rl_manager.evaluation` module. Evaluation now
+separates fatal health failures from retained opening and executor diagnostics,
+detects missing/duplicate fixed-panel results, and reports candidate/opponent
+bank distributions, low-bank fractions, paired margin tails, W/L/T, and
+candidate seat splits. The default typed promotion gate requires `W-L >= 6`,
+positive mean margin, nonnegative median margin, and zero fatal anomalies;
+optional bank floors and strict diagnostic gates are configurable. Every HOLD
+contains machine-readable conditions and exact reasons. The CLI applies the
+gate and persists the decision rather than emitting an unexplained hold.
+
+Focused validation was limited to the requested two pytest invocations; the
+second reached 21 passed before corrected test expectations, followed by a
+direct run of eight evaluation checks and targeted compilation. No full suite,
+integration panel, executor strategy, PPO, or fast-environment changes were
+run.
+
+The implementation is isolated on `codex/issue-18-promotion-eval` from base
+`c14b327f0705536ee264ae08ddd9de08f39365ce`.
+
 This file is append-only except for correcting factual errors. New entries are added in reverse chronological order.
 
 ## 2026-08-27 — Throughput Branch Integration

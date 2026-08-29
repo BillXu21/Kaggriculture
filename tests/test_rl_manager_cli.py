@@ -439,7 +439,7 @@ def _result(seed, composition, banks, statuses=("DONE", "DONE"),
         episode_index=seed, seed=seed, composition=composition,
         final_banks=banks, margin=margin, winner_seat=winner,
         rewards=rewards, statuses=list(statuses), transitions=52,
-        terminated=statuses == ("DONE", "DONE"),
+        terminated=list(statuses) == ["DONE", "DONE"],
         opening_diagnostics=opening or [], trace_digest="x" * 64,
         rollout=None, timing_seconds={}, policy_identities=({}, {}))
 
@@ -474,5 +474,7 @@ def test_summarize_evaluation_flags_anomalies():
                 opening=[{"delegated_permanently": True}]),
     ]
     summary = summarize_evaluation(results)
-    kinds = {entry["kind"] for entry in summary["anomalies"]}
-    assert kinds == {"statuses", "opening"}
+    kinds = {entry["kind"] for entry in summary["fatal_anomalies"]}
+    assert kinds == {"statuses"}
+    assert len(summary["opening_diagnostics"]) == 1
+    assert summary["anomalies"] == summary["fatal_anomalies"]

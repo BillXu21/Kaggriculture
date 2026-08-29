@@ -230,6 +230,8 @@ class EpisodeResult:
     # artifact metadata never depends on caller-side policy bookkeeping.
     policy_identities: tuple[dict[str, Any], ...]
     debug_trace: dict[str, Any] | None = None
+    # Keep runtime failures separate from informational opening handoff data.
+    executor_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _executor_factory_provenance(factory: Any) -> dict[str, Any]:
@@ -960,6 +962,25 @@ class SelfPlayRunner:
 
         opening_diagnostics = [agent.diagnostics_json()
                                for agent in state.openings]
+        executor_diagnostics: list[dict[str, Any]] = []
+        for seat, executor in enumerate(state.executors):
+            try:
+                diagnostics_fn = getattr(executor, "diagnostics_json", None)
+                diagnostics = diagnostics_fn() if callable(diagnostics_fn) else {}
+                compact = {
+                    "seat": seat,
+                    "fallback_errors": copy.deepcopy(
+                        diagnostics.get("fallback_errors", [])),
+                }
+                for key in ("runtime_errors", "runtime_error", "exception",
+                            "illegal_actions", "provider_diagnostics"):
+                    if key in diagnostics:
+                        compact[key] = copy.deepcopy(diagnostics[key])
+                executor_diagnostics.append(compact)
+            except Exception as exc:  # noqa: BLE001 - report diagnostic failure
+                executor_diagnostics.append({
+                    "seat": seat, "runtime_error": repr(exc),
+                })
         if state.rollout is not None:
             state.rollout.opening_handoff = copy.deepcopy(opening_diagnostics)
             state.rollout.plans = {
@@ -997,6 +1018,7 @@ class SelfPlayRunner:
                 }
                 for seat in range(2)),
             debug_trace=debug_trace,
+            executor_diagnostics=executor_diagnostics,
         )
 
     # ------------------------------------------------------------- artifact

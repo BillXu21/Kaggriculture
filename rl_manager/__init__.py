@@ -28,6 +28,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "rl_manager.executor_factory", "EXECUTOR_FACTORY_VERSION"),
     "EpisodeResult": ("rl_manager.runner", "EpisodeResult"),
     "EpisodeSpec": ("rl_manager.runner", "EpisodeSpec"),
+    "PromotionConfig": ("rl_manager.evaluation", "PromotionConfig"),
+    "PromotionDecision": ("rl_manager.evaluation", "PromotionDecision"),
     "FROZEN_VS_CANDIDATE": (
         "rl_manager.types", "FROZEN_VS_CANDIDATE"),
     "GAME_TURNS": ("rl_manager.runner", "GAME_TURNS"),
@@ -74,6 +76,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "rl_manager.decode", "decode_outputs_to_action_tensors"),
     "decode_outputs_to_plans": (
         "rl_manager.decode", "decode_outputs_to_plans"),
+    "evaluate_promotion": (
+        "rl_manager.evaluation", "evaluate_promotion"),
     "init_train_state": ("rl_manager.ppo", "init_train_state"),
     "load_ppo_checkpoint": (
         "rl_manager.ppo_checkpoint", "load_ppo_checkpoint"),
@@ -94,6 +98,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "seat_policies": ("rl_manager.types", "seat_policies"),
     "select_ppo_subset": ("rl_manager.ppo_adapter", "select_ppo_subset"),
     "validate_trace": ("rl_manager.debug_trace", "validate_trace"),
+    "summarize_evaluation": (
+        "rl_manager.evaluation", "summarize_evaluation"),
     "write_diagnostics": ("rl_manager.diagnostics", "write_diagnostics"),
 }
 
