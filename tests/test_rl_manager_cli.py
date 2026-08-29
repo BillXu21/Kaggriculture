@@ -9,9 +9,11 @@ games/updates).
 from __future__ import annotations
 
 import copy
+import dataclasses
 import types
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from rl_manager.cli import (
@@ -22,6 +24,7 @@ from rl_manager.cli import (
     SMOKE_SEEDS,
     build_parser,
     execute_debug_trace,
+    _rollout_candidate_from_state,
     plan_debug_trace,
     plan_evaluation,
     plan_training,
@@ -29,6 +32,9 @@ from rl_manager.cli import (
 )
 from rl_manager.debug_trace import load_trace
 from rl_manager.policy import PassPlanPolicy
+from rl_manager.policy import params_fingerprint
+from rl_manager.ppo import init_train_state
+from rl_manager.ppo_policy import PPOConfig
 from rl_manager.runner import build_episode_spec
 from rl_manager.types import E_VS_E, E_VS_PASS
 from tests.test_rl_manager_runner import (
@@ -325,6 +331,39 @@ def test_train_plan_full_fields(tmp_path):
     assert plan["executor_factory"] == "executor_v0@stage-a-v1"
     assert plan["ppo"]["epochs"] == 4
     assert Path(plan["e_checkpoint"]) == checkpoint
+
+
+def test_training_rebinds_next_rollout_candidate_to_returned_state():
+    from bc_manager_jax.model import init_params, tiny_manager_config
+    from tests.test_rl_manager_ppo_policy import _encoded
+
+    config = tiny_manager_config()
+    ppo_config = PPOConfig(minibatch_size=1, epochs=1)
+    state = init_train_state(
+        init_params(config, seed=22, model_variant="E"), config,
+        seed=23, ppo_config=ppo_config)
+    candidate = _rollout_candidate_from_state(
+        state, config, ppo_config, deterministic=True)
+    old_candidate = candidate
+    old_actions = candidate.plan_batch(_encoded(), "rollout").action_tensors
+
+    # Stand in for the functional state returned by ppo_update with a
+    # deliberately behavior-changing land-head bias.
+    params = copy.deepcopy(state.params)
+    params["base"]["heads"]["land"]["bias"] = \
+        params["base"]["heads"]["land"]["bias"].at[:].set(
+            [-100.0, -100.0, -100.0, 100.0])
+    new_state = dataclasses.replace(state, params=params, step=state.step + 1)
+    candidate = _rollout_candidate_from_state(
+        new_state, config, ppo_config, previous=candidate)
+    new_actions = candidate.plan_batch(_encoded(), "rollout").action_tensors
+
+    assert candidate is not old_candidate
+    assert candidate.identity.name == old_candidate.identity.name
+    assert candidate.identity.version == old_candidate.identity.version
+    assert candidate.identity.fingerprint == params_fingerprint(new_state.params)
+    assert candidate.identity.fingerprint != old_candidate.identity.fingerprint
+    assert not np.array_equal(new_actions["land"], old_actions["land"])
 
 
 # ------------------------------------------------------------ eval planning

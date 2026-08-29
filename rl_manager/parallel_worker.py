@@ -140,6 +140,11 @@ def _stack_row_outputs(outputs: Sequence[PolicyOutputs]) -> PolicyOutputs:
 
 
 def _factory_from_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
+    if (isinstance(factory, tuple) and len(factory) == 2
+            and factory[0] == "executor_v0@config"):
+        from rl_manager.executor_factory import make_default_executor_factory
+
+        return make_default_executor_factory(factory[1])
     if factory == "executor_v0@default":
         from rl_manager.executor_factory import make_default_executor_factory
         return make_default_executor_factory()

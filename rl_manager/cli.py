@@ -365,12 +365,36 @@ def plan_debug_trace(args: argparse.Namespace) -> dict[str, Any]:
 # locally. Kept as thin compositions of the tested rl_manager primitives.
 
 
+def _rollout_candidate_from_state(
+    state: Any,
+    config: Any,
+    ppo_config: Any,
+    previous: Any | None = None,
+    deterministic: bool | None = None,
+) -> Any:
+    """Build a rollout adapter bound to the exact returned train state."""
+    from rl_manager.ppo_adapter import ppo_batched_policy_from_state
+
+    if deterministic is None:
+        deterministic = (previous.deterministic if previous is not None
+                         else False)
+    return ppo_batched_policy_from_state(
+        state,
+        config,
+        ppo_config=ppo_config,
+        name=(previous.identity.name if previous is not None
+              else "ppo_candidate"),
+        version=(previous.identity.version if previous is not None
+                 else "ppo-v0"),
+        deterministic=deterministic,
+    )
+
+
 def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no cover
     from bc_manager_jax.checkpoint import load_torch_checkpoint
     from bc_manager_jax.model import ManagerConfig
 
     from rl_manager.ppo import build_ppo_batch, init_train_state, ppo_update
-    from rl_manager.ppo_adapter import ppo_batched_policy_from_state
     from rl_manager.ppo_policy import PPOConfig
     from rl_manager.policy import JaxEPlanPolicy
     from rl_manager.runner import RunnerConfig, SelfPlayRunner, \
@@ -384,8 +408,7 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
     ppo_config = PPOConfig(**plan["ppo"])
     state = init_train_state(frozen_params, config,
                              seed=plan["master_seed"], ppo_config=ppo_config)
-    candidate = ppo_batched_policy_from_state(
-        state, config, ppo_config=ppo_config, name="ppo_candidate")
+    candidate = _rollout_candidate_from_state(state, config, ppo_config)
     frozen_policy = JaxEPlanPolicy(frozen_params, config, name="frozen_e")
     output_dir = Path(plan["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -428,7 +451,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         batch = build_ppo_batch(buffer.finalize(), gamma=ppo_config.gamma,
                                 gae_lambda=ppo_config.gae_lambda)
         state, metrics = ppo_update(state, batch, config, ppo_config)
-        candidate.refresh_identity()
+        candidate = _rollout_candidate_from_state(
+            state, config, ppo_config, previous=candidate)
         from rl_manager.ppo_checkpoint import save_ppo_checkpoint
 
         path = save_ppo_checkpoint(

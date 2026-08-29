@@ -45,10 +45,10 @@ from bc_manager_jax.model import (
     ECONOMIC_CONTEXT_KEY,
     ManagerConfig,
     OWN_INPUT_KEYS,
-    _forward_eval,
-    _forward_eval_with_representation,
     _prepare_inputs,
     empty_params,
+    forward,
+    forward_with_representation,
     resolve_model_variant,
 )
 
@@ -471,10 +471,13 @@ class PPOPolicy:
         if not deterministic and rng is None:
             raise ValueError("stochastic act() requires an explicit rng key")
         prepared = _prepare_inputs(inputs)
-        frozen_outputs = _forward_eval(self.frozen_params, prepared,
-                                       self._config, self._variant)
-        mut_outputs, representation = _forward_eval_with_representation(
-            self.params["base"], prepared, self._config, self._variant)
+        # Use the same compiled public seams as JaxEPlanPolicy. The private
+        # functions remain for the enclosing jitted PPO loss/update path.
+        frozen_outputs = forward(self.frozen_params, inputs, self._config,
+                                 model_variant=self._variant)
+        mut_outputs, representation = forward_with_representation(
+            self.params["base"], inputs, self._config,
+            model_variant=self._variant)
         logits = distribution_logits(mut_outputs)
         if deterministic:
             indices = deterministic_action_indices(logits)
@@ -526,8 +529,9 @@ class PPOPolicy:
         """Exact stored-action logprob recomputation under current params."""
         enforce_own_only_e_inputs(inputs)
         prepared = _prepare_inputs(inputs)
-        mut_outputs, representation = _forward_eval_with_representation(
-            self.params["base"], prepared, self._config, self._variant)
+        mut_outputs, representation = forward_with_representation(
+            self.params["base"], inputs, self._config,
+            model_variant=self._variant)
         logits = distribution_logits(mut_outputs)
         batch = int(prepared["board_kind"].shape[0])
         indices = action_index_tensors(action_tensors, batch)
@@ -552,9 +556,8 @@ class PPOPolicy:
     def frozen_decode(self, inputs: Mapping[str, np.ndarray]) -> dict:
         """Frozen-snapshot forward outputs (host NumPy) for diagnostics."""
         enforce_own_only_e_inputs(inputs)
-        prepared = _prepare_inputs(inputs)
-        outputs = _forward_eval(self.frozen_params, prepared, self._config,
-                                self._variant)
+        outputs = forward(self.frozen_params, inputs, self._config,
+                          model_variant=self._variant)
         return {name: np.asarray(array) for name, array in outputs.items()}
 
     def parity_check_deterministic(self, inputs: Mapping[str, np.ndarray],

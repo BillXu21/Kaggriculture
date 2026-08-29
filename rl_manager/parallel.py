@@ -62,11 +62,15 @@ def _batch_key_sort_key(key: BatchKey) -> tuple[str, int]:
 
 
 def _factory_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
-    """Use a child-local default factory; require custom factories to pickle."""
+    """Use a child-local default factory with its complete config."""
     if (getattr(factory, "name", None) == "executor_v0"
             and getattr(factory, "version", None) == EXECUTOR_FACTORY_VERSION):
-        return ("executor_v0@default-low-telemetry"
-                if low_telemetry else "executor_v0@default")
+        del low_telemetry
+        config = getattr(factory, "agent_config", None)
+        if config is None:
+            raise ValueError(
+                "registered executor_v0 factory is missing agent_config")
+        return ("executor_v0@config", config)
     try:
         pickle.dumps(factory)
     except Exception as exc:  # noqa: BLE001 - turn pickle detail into API error

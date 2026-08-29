@@ -345,6 +345,22 @@ This file records decisions that remain authoritative across chats and work sess
 - Day-boundary note: worker positions reset near the central shed at day end, hired hands disappear, and carried inventory auto-drops, so cleanup does not need an end-of-day return-home rule. Its opportunity cost is only within the current day's remaining turns, and normal dispatch must preempt it on the next primitive turn.
 - Revisit when: the true PASS-only WATER and WEED-first+WATER panels complete. Promote only if normal non-PASS actions are proven unchanged and paired outcome/tail evidence is favorable.
 
+## D-043 - Bind Rollouts to Returned PPO State and Preserve Factory Config
+
+- Date: 2026-08-29
+- Status: active
+- Decision: Every training rollout after a functional PPO update must use a
+  newly bound adapter for the returned train state. Spawned workers must
+  reconstruct registered default executor factories from the factory's exact
+  `AgentConfig`, not from runner-level telemetry defaults. Host-facing PPO
+  inference uses the compiled public BC-E forward seams for deterministic parity.
+- Rationale: refreshing an adapter fingerprint without replacing its parameter
+  tree leaves collection stale; name/version matching alone silently drops
+  custom executor settings; and eager/private inference introduced a tiny raw
+  logit discrepancy against BC-E despite equal decoded actions.
+- Evidence: focused stale-state and factory wire tests, including a spawned
+  config probe, plus the B=1/B=24 CPU diagnostic. No TPU behavior is claimed.
+
 ## D-046 — Keep Central Inference Scope Opt-In and Row-Identity Deterministic
 
 - Date: 2026-08-28

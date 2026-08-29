@@ -20,6 +20,7 @@ from rl_manager.ppo_policy import (
     categorical_entropy,
     categorical_logprobs,
 )
+from rl_manager.decode import ACTION_TENSOR_SHAPES
 from rl_manager.policy import JaxEPlanPolicy
 
 
@@ -78,6 +79,58 @@ def test_deterministic_policy_equals_frozen_jax_e_decode(tiny_e, batch):
     for name, expected in reference.action_tensors.items():
         assert np.array_equal(result["action_tensors"][name],
                               np.asarray(expected)), name
+
+
+def _initialization_parity_diagnostic(params, config, row):
+    """Compare BC-E and a fresh deterministic PPO wrapper at B=1 and B=24."""
+    reports = []
+    for batch_size in (1, 24):
+        batch = {key: np.repeat(value, batch_size, axis=0)
+                 for key, value in row.items()}
+        bc_policy = JaxEPlanPolicy(params, config, name="diagnostic-bc")
+        ppo_policy = PPOPolicy(params, config, seed=0)
+        bc_result = bc_policy.plan_batch(batch, "diagnostic/parity")
+        ppo_result = ppo_policy.act(batch, deterministic=True)
+        action_difference = next(
+            (name for name in ACTION_TENSOR_SHAPES
+             if not np.array_equal(
+                 bc_result.action_tensors[name],
+                 ppo_result["action_tensors"][name])), None)
+
+        # Raw output comparison identifies a forward-path mismatch before
+        # decode thresholding can hide it.
+        bc_outputs = jax_forward(params, batch, config, model_variant="E")
+        ppo_outputs = ppo_policy.frozen_decode(batch)
+        first_logit_difference = None
+        for head in bc_outputs:
+            left = np.asarray(bc_outputs[head])
+            right = np.asarray(ppo_outputs[head])
+            if not np.array_equal(left, right):
+                index = tuple(np.argwhere(left != right)[0])
+                first_logit_difference = {
+                    "head": head,
+                    "index": index,
+                    "bc": float(left[index]),
+                    "ppo": float(right[index]),
+                }
+                break
+        report = {
+            "batch_size": batch_size,
+            "action_difference": action_difference,
+            "first_logit_difference": first_logit_difference,
+        }
+        print(f"issue22 parity {report}")
+        reports.append(report)
+    return reports
+
+
+def test_fresh_ppo_deterministic_parity_diagnostic_at_b1_and_b24(tiny_e):
+    params, config = tiny_e
+    reports = _initialization_parity_diagnostic(params, config, _encoded())
+    assert [report["batch_size"] for report in reports] == [1, 24]
+    assert all(report["action_difference"] is None for report in reports)
+    assert all(report["first_logit_difference"] is None
+               for report in reports)
 
 
 def test_value_head_init_does_not_alter_base_tree(tiny_e, batch):

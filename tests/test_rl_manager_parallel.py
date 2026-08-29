@@ -10,10 +10,13 @@ from importlib.util import find_spec
 import numpy as np
 import pytest
 
+from executor_v0.agent import AgentConfig
 from rl_manager.parallel import ParallelSelfPlayRunner
-from rl_manager.parallel import ParallelRolloutError
+from rl_manager.parallel import ParallelRolloutError, _factory_wire
 from rl_manager.parallel_protocol import InferenceRequest, policy_row_request_id
-from rl_manager.parallel_worker import FORBIDDEN_ACCELERATOR_MODULES
+from rl_manager.parallel_worker import FORBIDDEN_ACCELERATOR_MODULES, \
+    _factory_from_wire
+from rl_manager.executor_factory import make_default_executor_factory
 from rl_manager.runner import RunnerConfig, SelfPlayRunner, \
     build_episode_spec
 from rl_manager.seeds import SeedStream
@@ -27,6 +30,19 @@ def _spawn_import_probe(queue):
         if name in sys.modules or any(
             module_name.startswith(name + ".") for module_name in sys.modules))
     queue.put(loaded)
+
+
+def _spawn_factory_config_probe(wire, queue):
+    factory = _factory_from_wire(wire)
+    config = factory.agent_config
+    queue.put({
+        "tasks_per_worker": config.tasks_per_worker,
+        "hire_cost_mult": config.hire_cost_mult,
+        "shed_capacity": config.shed_capacity,
+        "strict": config.strict,
+        "record_turn_snapshot": config.record_turn_snapshot,
+        "max_carried_item_types": config.foreman.max_carried_item_types,
+    })
 
 
 class _ConstantPlanPolicy:
@@ -132,6 +148,43 @@ def test_worker_import_boundary_has_no_accelerator_modules():
 def test_parallel_requires_positive_worker_count():
     with pytest.raises(ValueError, match="num_workers"):
         ParallelSelfPlayRunner(_config(), num_workers=0)
+
+
+@pytest.mark.parametrize("config", [
+    pytest.param(None, id="default"),
+    pytest.param(AgentConfig(strict=True, record_turn_snapshot=False),
+                 id="low-telemetry"),
+    pytest.param(AgentConfig(tasks_per_worker=3, shed_capacity=17,
+                             aggressive_sell_all=True), id="custom"),
+])
+def test_default_factory_wire_preserves_exact_agent_config(config):
+    factory = make_default_executor_factory(config)
+    wire = _factory_wire(factory)
+    rebuilt = _factory_from_wire(wire)
+    assert rebuilt.agent_config == factory.agent_config
+
+
+def test_default_factory_wire_preserves_config_in_spawned_worker():
+    config = AgentConfig(
+        tasks_per_worker=3, hire_cost_mult=2, shed_capacity=17,
+        strict=True, record_turn_snapshot=False)
+    wire = _factory_wire(make_default_executor_factory(config))
+    context = mp.get_context("spawn")
+    result = context.Queue()
+    process = context.Process(target=_spawn_factory_config_probe,
+                              args=(wire, result))
+    process.start()
+    assert result.get(timeout=10) == {
+        "tasks_per_worker": 3,
+        "hire_cost_mult": 2,
+        "shed_capacity": 17,
+        "strict": True,
+        "record_turn_snapshot": False,
+        "max_carried_item_types": 2,
+    }
+    process.join(timeout=10)
+    assert process.exitcode == 0
+    result.close()
 
 
 def test_default_policy_day_scope_does_not_mix_days():
