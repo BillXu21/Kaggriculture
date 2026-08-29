@@ -2,6 +2,32 @@
 
 This file records decisions that remain authoritative across chats and work sessions. A decision should include the reason, evidence, and conditions for revisiting it.
 
+## D-045 - Bind Confirmed Plant Watering to the Planting Worker
+
+- Date: 2026-08-29
+- Status: active
+- Decision: After the next observation confirms that an exact submitted PLANT
+  created the matching fresh unwatered crop, reserve the generated hard WATER
+  task for that same worker for the next executor action. Keep one short-lived
+  continuation per worker; discard it when the step, tile, crop, worker, or
+  unwatered-plant state no longer matches. The executor flag is enabled by
+  default, with an explicit OFF setting only for paired evaluation.
+- Rationale: WATER task generation already handled crop lifecycle legality, but
+  global rematching allowed an earlier worker to take the task. A worker-bound
+  continuation fixes identity without changing manager outputs or generic
+  WATER priority.
+- Safety interaction: active starvation still removes non-FEED tile work, so
+  FEED remains ahead of this continuation. The continuation is retained and
+  revalidated after starvation pressure clears; no starvation protection is
+  weakened.
+- Evidence: focused synthetic regressions cover all five crops, failed/stale
+  plants, multiple workers, no repeated WATER, and starvation. The bounded
+  fast-engine BC-E A/B on seeds 7/17/42/123 in both seats completed with zero
+  fallback/status errors.
+- Revisit when: engine observations stop exposing reliable fresh-plant state,
+  worker actions can be displaced between observations, or broader official
+  evidence contradicts the sequencing value.
+
 ## D-044 - Preserve Ready Animal Placement During Capital Suppression
 
 - Date: 2026-08-29

@@ -1,6 +1,19 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-28
+Last updated: 2026-08-29
+
+## Issue #28 Run Setup
+- Branch `codex/issue-28-immediate-plant-water`, base `feaf6ccfb4ac37380d9644f73d2cd7f2fb35474a`.
+- Testing the executor-only confirmed same-worker PLANT -> WATER continuation. The bounded A/B uses the frozen BC-E checkpoint from the Stage 1 sibling artifact, seeds `7,17,42,123`, both seats, PASS opponent, aggressive sell reference, and fast engine because official `kaggle_environments==1.32.7` is unavailable in this worktree.
+- Expected outputs: two evaluator JSON artifacts under the approved OpenCode temp directory; stop after the 8-game OFF/ON pair completes or the fast engine reports a status/fallback error.
+- Implementation and validation are complete. The focused suite passed `138
+  passed, 2 skipped`; broader touched-module tests passed `193 passed, 6
+  skipped`. The full suite passed `808 passed, 104 skipped` with two unrelated
+  host-sensitive failures recorded in `HISTORY.md`.
+- Fast-engine A/B completed all 8 paired games per arm with zero fallback or
+  status errors. ON versus OFF mean/median bank was `72,762.75/74,746.5` vs
+  `55,885.0/55,901.0`; mean paired delta `+16,877.75`, median `+13,249`.
+  Mean final weeds/work debt were `9.25/358.5` ON vs `13.5/417.0` OFF.
 
 ## Issue #25
 - On isolated branch `codex/issues-25-preventive-watering` from

@@ -1,6 +1,12 @@
 # Kaggriculture Plans
 
 Last updated: 2026-08-28
+## Issue #28 Status
+- Immediate same-worker watering is implemented on
+  `codex/issue-28-immediate-plant-water` and enabled by default. Keep the
+  explicit OFF evaluator arm for attribution only; do not promote the fast
+  engine A/B as an official-engine result because `kaggle_environments==1.32.7`
+  was unavailable locally.
 ## Issue #25 Current Gate
 
 The bounded executor correction is under review on

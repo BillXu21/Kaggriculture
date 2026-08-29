@@ -54,6 +54,22 @@ Confidence labels:
 - `OUTDATED`: known to describe an older engine or contract.
 - `UNKNOWN`: unresolved or insufficiently specified.
 
+## Executor Continuation - Issue #28 (2026-08-29)
+
+- `CONFIRMED_EXPERIMENT`: task generation already emits a maintenance WATER
+  for a fresh observed plant, but global foreman matching can give that task to
+  an earlier worker instead of the planter.
+- `CONFIRMED_EXPERIMENT`: the executor now records exact submitted PLANT
+  assignments, confirms the matching crop and `watered_today == False` at the
+  immediate next observation, and binds the existing generated
+  `water_must_weed_boundary` task to the same worker. The binding is independent
+  for each worker and is removed after success or stale/invalid state.
+- `CONFIRMED_EXPERIMENT`: active starvation retains the existing FEED-only
+  dispatch preemption. Immediate watering is deferred during that safety state,
+  not allowed to displace FEED.
+- Official engine A/B was unavailable on the host. Fast-engine paired results
+  are recorded in `HISTORY.md` and are not official-engine evidence.
+
 ## Engine Identity
 
 - Latest confirmed upstream package version: `1.32.7`

@@ -92,6 +92,7 @@ class AgentConfig:
     aggressive_sell_all: bool = False
     optional_idle_cleanup: bool = False
     optional_spare_watering: bool = False
+    immediate_plant_water: bool = True
     record_turn_snapshot: bool = True
 
     @property
@@ -196,6 +197,14 @@ def _snapshot_copy(value: Any) -> Any:
     return None
 
 
+@dataclass(frozen=True)
+class _PlantAttempt:
+    worker_index: int
+    tile: tuple[int, int]
+    crop: str
+    expected_step: int
+
+
 class ExecutorAgent:
     def __init__(self, provider: PlanProvider, *, seat: int | None = None,
                  config: AgentConfig | None = None) -> None:
@@ -219,6 +228,8 @@ class ExecutorAgent:
         self._errors: list[dict[str, Any]] = []
         self._suppress_expansion_today: bool = False
         self._debug_trace_turn: dict[str, Any] | None = None
+        self._plant_attempts: dict[int, _PlantAttempt] = {}
+        self._plant_water_continuations: dict[int, Task] = {}
         self._cleanup_metrics: dict[str, int] = {
             "baseline_pass_worker_actions": 0,
             "cleanup_replacements": 0,
@@ -228,6 +239,76 @@ class ExecutorAgent:
             "remaining_pass_worker_actions": 0,
             "normal_non_pass_actions_changed": 0,
         }
+
+    @staticmethod
+    def _valid_unwatered_plant(
+        board: list[list[Any]], tile: tuple[int, int], crop: str, day: int,
+    ) -> bool:
+        y, x = tile
+        if not (0 <= y < len(board) and 0 <= x < len(board[y])):
+            return False
+        value = board[y][x]
+        return isinstance(value, Mapping) \
+            and value.get("kind") == "PLANT" \
+            and value.get("crop") == crop \
+            and value.get("planted_day") == day \
+            and value.get("watered_today") is False
+
+    def _refresh_plant_water_continuations(
+        self,
+        obs: Mapping,
+        seat: int,
+        board: list[list[Any]],
+    ) -> None:
+        if not self.config.immediate_plant_water:
+            self._plant_attempts.clear()
+            self._plant_water_continuations.clear()
+            return
+
+        step = int(obs.get("step", 0))
+        for attempt in self._plant_attempts.values():
+            if attempt.expected_step == step and self._valid_unwatered_plant(
+                    board, attempt.tile, attempt.crop, int(obs["day"])):
+                y, x = attempt.tile
+                self._plant_water_continuations[attempt.worker_index] = Task(
+                    key=f"WATER:{y},{x}", kind="WATER",
+                    priority=Priority.MAINTENANCE, tile=attempt.tile,
+                    crop=attempt.crop, source="plant_water_continuation",
+                )
+        self._plant_attempts.clear()
+
+        worker_count = 1 + len(obs["farms"][seat].get("hands") or [])
+        self._plant_water_continuations = {
+            worker_index: task
+            for worker_index, task in self._plant_water_continuations.items()
+            if worker_index < worker_count
+            and task.tile is not None
+            and task.crop is not None
+            and self._valid_unwatered_plant(
+                board, task.tile, task.crop, int(obs["day"]))
+        }
+
+    def _record_plant_attempts(
+        self,
+        obs: Mapping,
+        tasks: tuple[Task, ...],
+        foreman_result: Any,
+    ) -> None:
+        self._plant_attempts.clear()
+        if not self.config.immediate_plant_water:
+            return
+        task_by_key = {task.key: task for task in tasks}
+        expected_step = int(obs.get("step", 0)) + 1
+        for assignment in foreman_result.assignments:
+            if not assignment.action or assignment.action[0] != "PLANT":
+                continue
+            task = task_by_key.get(assignment.task_key)
+            if task is None or task.tile is None or task.crop is None:
+                continue
+            if tuple(assignment.action) != ("PLANT", task.crop):
+                continue
+            self._plant_attempts[assignment.worker_index] = _PlantAttempt(
+                assignment.worker_index, task.tile, task.crop, expected_step)
 
     def __call__(self, obs: Mapping) -> dict[str, Any]:
         try:
@@ -911,6 +992,7 @@ class ExecutorAgent:
         day, hour = int(obs["day"]), int(obs["hour"])
         board = canonical_board(
             obs["farms"][seat]["tiles"], day, int(obs.get("step", 0)))
+        self._refresh_plant_water_continuations(obs, seat, board)
         if self._day != day:
             self._new_day(obs, seat, board=board)
         else:
@@ -928,7 +1010,36 @@ class ExecutorAgent:
             remaining_sells=self._remaining_sells,
             canonical_board_value=board)
         generated_tasks = generation.sorted_tasks()
-        tasks = generated_tasks
+        worker_positions = [
+            (int(obs["farms"][seat]["farmer"][1]),
+             int(obs["farms"][seat]["farmer"][0])),
+            *((int(hand[1]), int(hand[0]))
+              for hand in obs["farms"][seat].get("hands") or []),
+        ]
+        self._plant_water_continuations = {
+            worker_index: task
+            for worker_index, task in self._plant_water_continuations.items()
+            if worker_index < len(worker_positions)
+            and task.tile == worker_positions[worker_index]
+        }
+        generated_by_key = {task.key: task for task in generated_tasks}
+        self._plant_water_continuations = {
+            worker_index: generated_by_key[task.key]
+            for worker_index, task in self._plant_water_continuations.items()
+            if task.key in generated_by_key
+            and generated_by_key[task.key].kind == "WATER"
+            and generated_by_key[task.key].source == "water_must_weed_boundary"
+        }
+        continuation_keys = {
+            task.key for task in self._plant_water_continuations.values()
+        }
+        tasks = tuple(sorted(
+            (task for task in generated_tasks if task.key not in continuation_keys),
+            key=lambda task: task.sort_key,
+        )) + tuple(sorted(
+            self._plant_water_continuations.values(),
+            key=lambda task: task.sort_key,
+        ))
         feed = _animal_feed_state(obs, seat, board=board)
         current_survival_pressure = bool(feed["starving"] or feed["shortage"])
         expansion_suppressed = self._suppress_expansion_today or current_survival_pressure
@@ -948,12 +1059,17 @@ class ExecutorAgent:
         dispatch_tasks = tasks
         if feed["starving"]:
             dispatch_tasks = tuple(t for t in tasks if t.tile is None or t.kind == "FEED")
-        normal_dispatch_tasks = dispatch_tasks
+        normal_dispatch_tasks = tuple(
+            task for task in dispatch_tasks if task.key not in continuation_keys)
+        worker_continuations = (
+            {} if feed["starving"] else self._plant_water_continuations
+        )
 
         # Normal dispatch is deliberately completed in isolation.  Cleanup is
         # a second layer over only literal normal PASS actions.
         normal_foreman = run_foreman(obs, seat, normal_dispatch_tasks,
-                                     config=self.config.foreman)
+                                     config=self.config.foreman,
+                                     worker_continuations=worker_continuations)
         optional_tasks: tuple[Task, ...] = ()
         foreman_result = normal_foreman
         if self.config.idle_cleanup_enabled:
@@ -1125,6 +1241,8 @@ class ExecutorAgent:
         else:
             self._debug_trace_turn = None
 
+        self._record_plant_attempts(obs, tasks, foreman_result)
+
         return {
             "farmer": list(foreman_result.farmer_action),
             "hands": [list(a) for a in foreman_result.hands_actions],
@@ -1149,6 +1267,7 @@ class ExecutorAgent:
                 "optional_spare_watering": self.config.optional_spare_watering,
                 "optional_idle_cleanup_mode": self.config.cleanup_mode,
                 "cleanup_mode": self.config.cleanup_mode,
+                "immediate_plant_water": self.config.immediate_plant_water,
                 "record_turn_snapshot": self.config.record_turn_snapshot,
             },
             "cleanup_metrics": self._cleanup_diagnostics(),

@@ -1,5 +1,46 @@
 # Kaggriculture Historical Record
 
+## 2026-08-29 - Issue #28 Immediate Plant Watering
+
+Implemented on `codex/issue-28-immediate-plant-water` from
+`feaf6ccfb4ac37380d9644f73d2cd7f2fb35474a`.
+
+- Root cause: task generation already produced the correct hard WATER after a
+  fresh plant was observed, but the foreman rematched globally each turn. An
+  earlier worker could claim that WATER before the worker that planted the
+  tile, losing same-worker continuity.
+- The executor now retains only the prior turn's exact underfoot PLANT
+  assignments, confirms the matching fresh unwatered crop in the next
+  observation, and binds the existing generated `water_must_weed_boundary`
+  WATER task to that worker. The continuation is per-worker, short-lived, and
+  discarded on a stale/invalid/already-watered tile or missing next step.
+- Active starvation remains FEED-only preemption. A confirmed plant
+  continuation is deferred while starvation is present, rather than weakening
+  the existing animal safety guard; it remains eligible after the safety
+  pressure clears.
+- Regression coverage includes WHEAT, CARROT, TOMATO, STRAWBERRY, and MELON;
+  failed and stale plants; independent simultaneous workers; no repeated
+  WATER; starvation priority; and evaluator flag propagation.
+- Focused executor/evaluator tests passed `141 passed, 2 skipped`; broader
+  touched-module tests passed `193 passed, 6 skipped`. The full repository
+  suite passed `808 passed, 104 skipped` with two unrelated existing failures:
+  PPO integration metrics contain a list-valued diagnostic, and the omitted
+  `fast_env` archive test does not see the expected `ModuleNotFoundError` in
+  this host environment.
+- Official `kaggle_environments==1.32.7` was unavailable, so the required
+  bounded A/B used the fast engine and is not an official-engine claim. The
+  frozen BC-E instant-sell checkpoint was paired over seeds `7,17,42,123` and
+  both seats, with PASS opponent, aggressive selling, and turn traces.
+  OFF/ON mean and median banks were `55,885.0/55,901.0` and
+  `72,762.75/74,746.5`; paired deltas were
+  `+11,661,+39,721,+5,429,+6,262,+10,182,+14,837,+23,465,+23,465`
+  (mean `+16,877.75`, median `+13,249`). Mean final weeds were `13.5` vs
+  `9.25`, weed tiles created `74.62` vs `47.0`, movement `2796.75` vs
+  `2887.62`, PASS `294.25` vs `269.25`, and work debt `417.0` vs `358.5`.
+  Both arms had zero fallback errors and zero observed animal escapes; ON had
+  no surprising land-count change (all games ended at two unlocked
+  quadrants), while animal target/inventory residue varied by seed.
+
 ## 2026-08-29 - Issue #25 Animal Placement and Preventive Watering
 
 Implemented on isolated branch `codex/issues-25-preventive-watering` from
