@@ -26,35 +26,51 @@ import tempfile
 
 LEGACY_RUNNER_SHA = "45f88001b6cc14f802f10668179a68f6fe3c2bf5"
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_RUNTIME_DEPENDENCIES = (
-    Path("fast_env/__init__.py"),
-    Path("fast_env/market.py"),
-)
+_MARKET_SOURCE = _REPO_ROOT / "fast_env" / "market.py"
+_MARKET_DESTINATION = Path("executor_v0/_submission_market.py")
+_OLD_MARKET_IMPORT = "from fast_env.market import market_price"
+_NEW_MARKET_IMPORT = "from executor_v0._submission_market import market_price"
 
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _bundle_runtime_dependencies(root: Path) -> None:
-    """Copy submission-time pure-Python dependencies absent from old archives.
+def _vendor_market_helper(root: Path) -> None:
+    """Make executor market pricing self-contained inside its existing package.
 
-    executor_v0 imports ``fast_env.market.market_price`` lazily in the
-    survival-feed affordability path. Local archive tests can accidentally hide
-    the missing package when the repository is already importable, while the
-    Kaggle submission sandbox contains only the archive. Bundle the two
-    pure-Python files required for this import; do not bundle the native fast
-    engine extension or its API modules.
+    Kaggle's submission sandbox must not depend on a separately added top-level
+    ``fast_env`` package. Copy only the pure-Python market helper into the
+    already-packaged ``executor_v0`` package and rewrite the executor's lazy
+    import to point at it. This avoids the native extension entirely and makes
+    the survival-feed affordability branch self-contained.
     """
-    for relative in _RUNTIME_DEPENDENCIES:
-        source = _REPO_ROOT / relative
-        if not source.is_file():
-            raise FileNotFoundError(
-                f"required submission runtime dependency missing: {source}"
-            )
-        destination = root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+    if not _MARKET_SOURCE.is_file():
+        raise FileNotFoundError(
+            f"required market helper missing from repository: {_MARKET_SOURCE}"
+        )
+
+    agent_path = root / "executor_v0" / "agent.py"
+    if not agent_path.is_file():
+        raise FileNotFoundError(
+            f"base archive is missing executor runtime: {agent_path}"
+        )
+
+    agent_text = agent_path.read_text(encoding="utf-8")
+    replacements = agent_text.count(_OLD_MARKET_IMPORT)
+    if replacements != 1:
+        raise RuntimeError(
+            "expected exactly one fast_env.market import in packaged "
+            f"executor_v0/agent.py, found {replacements}"
+        )
+    agent_path.write_text(
+        agent_text.replace(_OLD_MARKET_IMPORT, _NEW_MARKET_IMPORT),
+        encoding="utf-8",
+    )
+
+    destination = root / _MARKET_DESTINATION
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(_MARKET_SOURCE, destination)
 
 
 def _submission_main(*, aggressive_sell_all: bool) -> str:
@@ -165,7 +181,7 @@ def build_submission(
             _submission_main(aggressive_sell_all=aggressive_sell_all),
             encoding="utf-8",
         )
-        _bundle_runtime_dependencies(root)
+        _vendor_market_helper(root)
 
         manifest_path = root / "submission_manifest.json"
         if manifest_path.exists():
@@ -177,9 +193,12 @@ def build_submission(
             manifest["submission_fix"] = "legacy_runner_economic_context_parity"
             manifest["legacy_runner_sha"] = LEGACY_RUNNER_SHA
             manifest["aggressive_sell_all"] = aggressive_sell_all
-            manifest["bundled_runtime_dependencies"] = [
-                path.as_posix() for path in _RUNTIME_DEPENDENCIES
+            manifest["vendored_runtime_dependencies"] = [
+                _MARKET_DESTINATION.as_posix()
             ]
+            manifest["patched_runtime_imports"] = {
+                _OLD_MARKET_IMPORT: _NEW_MARKET_IMPORT,
+            }
             for record in manifest.get("files", []):
                 member = root / record["path"]
                 if member.exists():
@@ -212,9 +231,8 @@ def build_submission(
         "aggressive_sell_all": aggressive_sell_all,
         "label": label,
         "legacy_runner_sha": LEGACY_RUNNER_SHA,
-        "bundled_runtime_dependencies": [
-            path.as_posix() for path in _RUNTIME_DEPENDENCIES
-        ],
+        "vendored_runtime_dependencies": [_MARKET_DESTINATION.as_posix()],
+        "patched_market_import": _NEW_MARKET_IMPORT,
     }
 
 
