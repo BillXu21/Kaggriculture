@@ -2,9 +2,9 @@
 
 This builder is intentionally for checkpoints trained/evaluated with the
 legacy rl_manager.runner economic-context behavior present at integration SHA
-45f88001b6cc14f802f10668179a68f6fe3c2bf5.  That runner passes the current
+45f88001b6cc14f802f10668179a68f6fe3c2bf5. That runner passes the current
 (day, money) pair as economic_prev_start, so bc_manager.live marks the cash
-delta invalid and emits a zero/invalid previous-day delta.  The normal Torch
+delta invalid and emits a zero/invalid previous-day delta. The normal Torch
 CheckpointPlanProvider uses EconomicHistory and therefore supplies the real
 previous-day delta; using it for those checkpoints creates a severe train /
 deploy feature-distribution mismatch.
@@ -25,10 +25,36 @@ import tarfile
 import tempfile
 
 LEGACY_RUNNER_SHA = "45f88001b6cc14f802f10668179a68f6fe3c2bf5"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_RUNTIME_DEPENDENCIES = (
+    Path("fast_env/__init__.py"),
+    Path("fast_env/market.py"),
+)
 
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _bundle_runtime_dependencies(root: Path) -> None:
+    """Copy submission-time pure-Python dependencies absent from old archives.
+
+    executor_v0 imports ``fast_env.market.market_price`` lazily in the
+    survival-feed affordability path. Local archive tests can accidentally hide
+    the missing package when the repository is already importable, while the
+    Kaggle submission sandbox contains only the archive. Bundle the two
+    pure-Python files required for this import; do not bundle the native fast
+    engine extension or its API modules.
+    """
+    for relative in _RUNTIME_DEPENDENCIES:
+        source = _REPO_ROOT / relative
+        if not source.is_file():
+            raise FileNotFoundError(
+                f"required submission runtime dependency missing: {source}"
+            )
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
 
 
 def _submission_main(*, aggressive_sell_all: bool) -> str:
@@ -139,6 +165,7 @@ def build_submission(
             _submission_main(aggressive_sell_all=aggressive_sell_all),
             encoding="utf-8",
         )
+        _bundle_runtime_dependencies(root)
 
         manifest_path = root / "submission_manifest.json"
         if manifest_path.exists():
@@ -150,6 +177,9 @@ def build_submission(
             manifest["submission_fix"] = "legacy_runner_economic_context_parity"
             manifest["legacy_runner_sha"] = LEGACY_RUNNER_SHA
             manifest["aggressive_sell_all"] = aggressive_sell_all
+            manifest["bundled_runtime_dependencies"] = [
+                path.as_posix() for path in _RUNTIME_DEPENDENCIES
+            ]
             for record in manifest.get("files", []):
                 member = root / record["path"]
                 if member.exists():
@@ -182,6 +212,9 @@ def build_submission(
         "aggressive_sell_all": aggressive_sell_all,
         "label": label,
         "legacy_runner_sha": LEGACY_RUNNER_SHA,
+        "bundled_runtime_dependencies": [
+            path.as_posix() for path in _RUNTIME_DEPENDENCIES
+        ],
     }
 
 
