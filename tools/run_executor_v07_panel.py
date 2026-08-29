@@ -220,6 +220,42 @@ def _animal_snapshot(state: Mapping[str, Any], seat: int) -> dict[str, Any]:
     }
 
 
+def _farm_evaluation_snapshot(state: Mapping[str, Any], seat: int) -> dict[str, Any]:
+    """Extract bounded own-farm outcome counters without retaining states."""
+    farms = state.get("farms") or []
+    farm = farms[seat] if len(farms) > seat and isinstance(farms[seat], Mapping) else {}
+    animal_counts = {animal: 0 for animal in sorted(ANIMAL_NAMES)}
+    crop_counts: dict[str, int] = {}
+    weed_count = 0
+    for row in farm.get("tiles") or []:
+        for tile in row if isinstance(row, list) else ():
+            if isinstance(tile, Mapping) and tile.get("animal") in animal_counts:
+                animal_counts[tile["animal"]] += 1
+            elif isinstance(tile, Mapping) and tile.get("kind") == "PLANT":
+                crop = str(tile.get("crop"))
+                crop_counts[crop] = crop_counts.get(crop, 0) + 1
+            elif tile == "WEED" or (
+                    isinstance(tile, Mapping) and tile.get("kind") == "WEED"):
+                weed_count += 1
+    privates = state.get("privates") or []
+    private = privates[seat] if len(privates) > seat and isinstance(privates[seat], Mapping) else {}
+    shed = private.get("shed") if isinstance(private.get("shed"), Mapping) else {}
+    inventories = private.get("inventories") if isinstance(private.get("inventories"), list) else []
+    inventory_animals = {
+        animal: int(shed.get(animal, 0) or 0) + sum(
+            int(inv.get(animal, 0) or 0) for inv in inventories
+            if isinstance(inv, Mapping)
+        )
+        for animal in sorted(ANIMAL_NAMES)
+    }
+    return {
+        "board_animals": animal_counts,
+        "board_crops": crop_counts,
+        "weed_tiles": weed_count,
+        "inventory_animals": inventory_animals,
+    }
+
+
 def _trace_for_turn(diagnostics: Any, day: int, hour: int) -> dict[str, Any] | None:
     if not isinstance(diagnostics, Mapping):
         return None
@@ -518,6 +554,10 @@ def _run_one(
     animal_events: list[dict[str, Any]] = []
     tested_trace: list[dict[str, Any]] = []
     opponent_trace: list[dict[str, Any]] = []
+    purchased_animals = {animal: 0 for animal in sorted(ANIMAL_NAMES)}
+    placed_animals = {animal: 0 for animal in sorted(ANIMAL_NAMES)}
+    weed_tiles_created = 0
+    action_counts: dict[str, int] = {}
     transitions = 0
     terminal = False
 
@@ -535,6 +575,14 @@ def _run_one(
             raise EvaluatorError(f"executor returned {type(tested_action).__name__}")
         tested_action = copy.deepcopy(dict(tested_action))
         validate_action(tested_action, label=f"tested action transition {transition}")
+        for order in tested_action.get("market") or []:
+            if len(order) >= 3 and order[0] == "BUY_ANIMAL" \
+                    and order[1] in purchased_animals:
+                purchased_animals[order[1]] += int(order[2])
+        for action in [tested_action.get("farmer", []),
+                       *(tested_action.get("hands") or [])]:
+            if action:
+                action_counts[action[0]] = action_counts.get(action[0], 0) + 1
         opponent_action = _pass_action(opponent_observation, 1 - seat)
         validate_action(opponent_action, label=f"PASS action transition {transition}")
         pair: list[Mapping[str, Any]] = [dict(tested_action), dict(opponent_action)]
@@ -568,6 +616,15 @@ def _run_one(
         if callable(validate_history):
             validate_history()
         after_state = copy.deepcopy(backend.canonical_state())
+        before_farm = _farm_evaluation_snapshot(before_state, seat)
+        after_farm = _farm_evaluation_snapshot(after_state, seat)
+        for animal in placed_animals:
+            placed_animals[animal] += max(
+                0, after_farm["board_animals"].get(animal, 0)
+                - before_farm["board_animals"].get(animal, 0)
+            )
+        weed_tiles_created += max(
+            0, after_farm["weed_tiles"] - before_farm["weed_tiles"])
         entry, event = _timeline_entry(
             before_state, after_state, tested_action, seat, transition, trace_entry
         )
@@ -599,6 +656,18 @@ def _run_one(
     executor_diagnostics = downstream.diagnostics_json() if callable(getattr(downstream, "diagnostics_json", None)) else {}
     final_farm = (final_state.get("farms") or [])[seat]
     final_bank = final_farm.get("money") if isinstance(final_farm, Mapping) else None
+    final_farm_metrics = _farm_evaluation_snapshot(final_state, seat)
+    final_day = executor_diagnostics.get("days", {}).get(str(final_state.get("day")), {})
+    target_animals = (final_day.get("feasible") or {}).get("animal_targets", {})
+    target_error = {
+        animal: int(final_farm_metrics["board_animals"].get(animal, 0))
+        - int(target_animals.get(animal, 0))
+        for animal in sorted(ANIMAL_NAMES)
+    }
+    work_debt = sum(
+        len((record.get("end_of_day_work_debt") or {}).get("all") or [])
+        for record in (executor_diagnostics.get("days") or {}).values()
+    )
     final_status = "complete" if terminal else "partial"
     game: dict[str, Any] = {
         "seed": seed,
@@ -612,6 +681,22 @@ def _run_one(
         "optional_spare_watering": optional_spare_watering,
         "cleanup_mode": cleanup_mode,
         "cleanup_metrics": executor_diagnostics.get("cleanup_metrics", {}),
+        "evaluation_metrics": {
+            "purchased_animals": purchased_animals,
+            "placed_animals": placed_animals,
+            "animals_left_in_inventories": final_farm_metrics["inventory_animals"],
+            "final_animal_target_error": target_error,
+            "animal_escapes": sum(
+                int(event.get("decrease", 0)) for event in animal_events),
+            "weed_tiles_created": weed_tiles_created,
+            "final_weed_tiles": final_farm_metrics["weed_tiles"],
+            "action_counts": action_counts,
+            "worker_pass_count": action_counts.get("PASS", 0),
+            "movement_count": sum(action_counts.get(name, 0) for name in (
+                "NORTH", "SOUTH", "EAST", "WEST")),
+            "unfinished_work_debt": work_debt,
+            "fallback_errors": len(executor_diagnostics.get("fallback_errors", [])),
+        },
         "status": final_status,
         "transitions": transitions,
         "final": {

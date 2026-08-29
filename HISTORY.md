@@ -1,5 +1,38 @@
 # Kaggriculture Historical Record
 
+## 2026-08-29 - Issue #25 Animal Placement and Preventive Watering
+
+Implemented on isolated branch `codex/issues-25-preventive-watering` from
+`origin/throughput/integration` at `45f8800`.
+
+- The first incorrect animal transition was agent-side filtering: layout and
+  task generation emitted a dependency-free PLACE for an owned animal in an
+  existing compatible empty structure, but prior-day/current capital
+  suppression removed every PLACE as expansion before foreman dispatch. The
+  fix suppresses BUILD/BUY_ANIMAL/BUY_LAND and dependent PLACE tasks, while
+  preserving ready existing-structure PLACE. The foreman also prevents an
+  underfoot PLACE from bypassing a higher-priority hard WATER; FEED/starvation
+  still uses the existing FEED-only preemption.
+- The optional watering machinery was already mechanically PASS-only and
+  isolated from hiring/debt/manager accounting. Its normal production default
+  was false. `tools/submission_main.py` and the default scalar/parallel RL
+  factories now enable `optional_spare_watering=True`; direct `AgentConfig`
+  remains false for isolated tests. Optional cleanup movement is bounded by
+  same-day reachability, avoiding an unfinishable hour-23 trip.
+- Added deterministic tests for empty pasture COW placement, multiple distinct
+  claims, carried livestock, priority/preemption, no duplicate BUY_ANIMAL,
+  official/fast private-inventory shapes, drought reset/weed boundary, late
+  optional-water movement, and default RL-factory propagation. The panel tool
+  now reports purchased/placed animals, inventory residue, target error,
+  escapes, weeds, action counts, PASS, movement, work debt, and fallbacks.
+- Focused validation: 176 passed, 3 skipped. A local fast wheel was built from
+  this source; the pinned official package is not installed. The bounded
+  frozen BC-E panel (seeds `7,17`, seats `0,1`, PASS, 719 transitions) measured
+  OFF versus WATER-only: bank `198,872` vs `286,766`, final WEED tiles `53` vs
+  `39`, PASS `1,178` vs `601`, movement `10,581` vs `11,975`, fallback errors
+  `0/0`, and animal escapes `0/0`. Animal residue/target error/work debt were
+  mixed, so no promotion claim is made and no RL retraining was run.
+
 ## 2026-08-29 - Issue #22 RL Correctness Hotfixes
 
 On `codex/issue-22-rl-hotfixes` at the requested `throughput/integration`

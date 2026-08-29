@@ -34,6 +34,7 @@ def agent(obs, configuration=None):
                 strict=_strict_from_environment(),
                 suppress_expansion_from_prior_debt=True,
                 aggressive_sell_all=True,
+                optional_spare_watering=True,
             ),
         )
         _agent = make_opening_agent(

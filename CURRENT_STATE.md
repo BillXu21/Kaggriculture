@@ -2,6 +2,26 @@
 
 Last updated: 2026-08-28
 
+## Issue #25
+- On isolated branch `codex/issues-25-preventive-watering` from
+  `origin/throughput/integration` (`45f8800`), `PLACE` into an existing
+  compatible empty structure now survives prior-debt capital suppression;
+  dependent PLACE tasks for suppressed BUILDs do not leak through; and
+  underfoot PLACE cannot bypass higher-priority hard WATER. The existing
+  PASS-only spare-water path is enabled for the production submission and
+  default RL executor factory, with a same-day remaining-distance bound.
+  Direct `AgentConfig` remains opt-in/off by default for isolated tests.
+- Focused validation passes 176 tests with 3 skips across the executor,
+  animal-placement, optional-water, cleanup, panel, and RL-factory paths.
+  A bounded fast panel used the frozen BC-E epoch-27 checkpoint at
+  `C:\Users\liuyi\VSCodeProjecs\Kaggriculture\Kaggriculture\artifacts\local\bc-v1-E\best.pt`,
+  seeds `7,17`, seats `0,1`, PASS opponent, `standard_mixed`, 719
+  transitions. OFF versus WATER-only: aggregate final bank `198,872` vs
+  `286,766`; final WEED tiles `53` vs `39`; worker PASS `1,178` vs `601`;
+  movement `10,581` vs `11,975`; fallback errors `0/0`; animal escapes `0/0`.
+  Candidate animal residue/target error and work debt were mixed by seed.
+  This is fast-engine plumbing evidence only; official 1.32.7 is absent.
+
 ## Issue #22
  - RL correctness hotfixes are implemented on `codex/issue-22-rl-hotfixes` from
    `c14b327`: training rebuilds the PPO rollout adapter from every returned

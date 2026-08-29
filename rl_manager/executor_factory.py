@@ -39,7 +39,8 @@ def make_default_executor_factory(
 
     from executor_v0.agent import AgentConfig, make_agent
 
-    resolved_config = agent_config or AgentConfig(strict=True)
+    resolved_config = agent_config or AgentConfig(
+        strict=True, optional_spare_watering=True)
     if not isinstance(resolved_config, AgentConfig):
         raise TypeError(
             "agent_config must be an executor_v0.agent.AgentConfig instance")

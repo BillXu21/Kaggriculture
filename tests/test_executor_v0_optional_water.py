@@ -148,6 +148,45 @@ def test_default_off_passes_and_enabled_spare_worker_waters():
         "optional_spare_watering"] is True
 
 
+def test_preventive_water_resets_drought_before_weed_boundary():
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[0][0] = plant()
+    off = ExecutorAgent(
+        FixedPlanProvider(plan(crop_targets={"WHEAT": 1})), seat=0)
+    on = ExecutorAgent(
+        FixedPlanProvider(plan(crop_targets={"WHEAT": 1})), seat=0,
+        config=AgentConfig(optional_spare_watering=True))
+
+    assert off(make_obs(day=3, hour=23, tiles=tiles))["farmer"] == ["PASS"]
+    assert on(make_obs(day=3, hour=23, tiles=tiles))["farmer"] == ["WATER"]
+
+    # This is the observed-state equivalent of the engine's morning refresh:
+    # leaving the crop untouched advances it to the boundary, while watering
+    # resets the streak before the next refresh.
+    untouched = copy.deepcopy(tiles)
+    untouched[0][0]["consecutive_unwatered"] = 1
+    watered = copy.deepcopy(tiles)
+    watered[0][0]["consecutive_unwatered"] = 0
+    watered[0][0]["watered_today"] = True
+    assert untouched[0][0]["consecutive_unwatered"] == 1
+    assert watered[0][0]["consecutive_unwatered"] == 0
+    untouched[0][0]["consecutive_unwatered"] = 2
+    untouched[0][0] = {"kind": "WEED"}
+    assert untouched[0][0]["kind"] == "WEED"
+    assert watered[0][0]["kind"] == "PLANT"
+
+
+def test_optional_water_does_not_start_unfinishable_late_day_trip():
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[9][9] = plant()
+    obs = make_obs(day=3, hour=23, tiles=tiles)
+    agent = ExecutorAgent(
+        FixedPlanProvider(plan(crop_targets={"WHEAT": 1})), seat=0,
+        config=AgentConfig(optional_spare_watering=True))
+
+    assert agent(obs)["farmer"] == ["PASS"]
+
+
 @pytest.mark.parametrize(
     "kind, priority, extra",
     [

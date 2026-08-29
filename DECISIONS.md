@@ -2,6 +2,88 @@
 
 This file records decisions that remain authoritative across chats and work sessions. A decision should include the reason, evidence, and conditions for revisiting it.
 
+## D-044 - Preserve Ready Animal Placement During Capital Suppression
+
+- Date: 2026-08-29
+- Status: active issue #25 correction
+- Decision: prior-day debt or current capital suppression removes new
+  BUILD/BUY_ANIMAL/BUY_LAND work, but does not remove a dependency-free PLACE
+  into an already-existing compatible empty structure. A PLACE dependent on a
+  suppressed BUILD is removed with that BUILD, so no invalid placement leaks
+  through. True starvation dispatch remains FEED-only, and hard weed-boundary
+  WATER retains priority over an underfoot PLACE.
+- Rationale: the layout/task generator correctly planned a ready placement and
+  counted shed/carried animals, but the agent filtered every PLACE as
+  expansion before foreman dispatch. This stranded purchased livestock even
+  though its mechanical commitment was already funded and structurally ready.
+- Evidence: `tests/test_executor_v0_animal_placement.py` traces empty PASTURE,
+  carried/zero-filled inventory, generated dependencies, foreman action, and
+  next observed board state; focused executor suite passes.
+- Revisit when: engine placement or survival semantics change, or a bounded
+  panel identifies a separate executor-owned placement failure.
+
+## D-045 - Enable Existing PASS-Only Preventive Watering in Production
+
+- Date: 2026-08-29
+- Status: active issue #25 correction
+- Decision: retain the existing strict optional-water candidate generation and
+  PASS-only replacement scheduler; enable `optional_spare_watering` in the
+  production submission and default RL executor factory. Do not enable blanket
+  daily watering or alter manager targets. Optional movement is rejected when
+  the target cannot be reached within the remaining same-day turns.
+- Rationale: the existing machinery already excluded hard/yield-positive water,
+  preserved normal non-PASS assignments, and isolated optional work from debt,
+  hiring, and manager accounting. The production default was simply false;
+  the small distance guard prevents pointless late-day trips.
+- Evidence: existing optional-water/idle-cleanup tests plus new deterministic
+  drought and late-day tests. The bounded fast BC-E panel reduced final WEED
+  tiles `53 -> 39` and PASS actions `1,178 -> 601`, but increased movement
+  `10,581 -> 11,975` and changed animal/work outcomes by seed. Direct
+  `AgentConfig` remains false by default so the mechanism is testable in
+  isolation.
+- Revisit when: official-engine validation or a broader paired panel shows a
+  harmful lower-tail effect, or the engine changes daily watering/weed timing.
+
+## D-044 - Preserve Ready Animal Placement During Capital Suppression
+
+- Date: 2026-08-29
+- Status: active issue #25 correction
+- Decision: prior-day debt or current capital suppression removes new
+  BUILD/BUY_ANIMAL/BUY_LAND work, but does not remove a dependency-free PLACE
+  into an already-existing compatible empty structure. A PLACE dependent on a
+  suppressed BUILD is removed with that BUILD, so no invalid placement leaks
+  through. True starvation dispatch remains FEED-only, and hard weed-boundary
+  WATER retains priority over an underfoot PLACE.
+- Rationale: the layout/task generator correctly planned a ready placement and
+  counted shed/carried animals, but the agent filtered every PLACE as
+  expansion before foreman dispatch. This stranded purchased livestock even
+  though its mechanical commitment was already funded and structurally ready.
+- Evidence: `tests/test_executor_v0_animal_placement.py` traces empty PASTURE,
+  carried/zero-filled inventory, generated dependencies, foreman action, and
+  next observed board state; focused executor suite passes.
+- Revisit when: engine placement or survival semantics change, or a bounded
+  panel identifies a separate executor-owned placement failure.
+
+## D-045 - Enable Existing PASS-Only Preventive Watering in Production
+
+- Date: 2026-08-29
+- Status: active issue #25 correction
+- Decision: retain the existing strict optional-water candidate generation and
+  PASS-only replacement scheduler; enable `optional_spare_watering` in the
+  production submission and default RL executor factory. Do not enable blanket
+  daily watering or alter manager targets. Optional movement is rejected when
+  the target cannot be reached within the remaining same-day turns.
+- Rationale: the existing machinery already excluded hard/yield-positive water,
+  preserved normal non-PASS assignments, and isolated optional work from debt,
+  hiring, and manager accounting. The production default was simply false;
+  the small distance guard prevents pointless late-day trips.
+- Evidence: existing optional-water/idle-cleanup tests plus new deterministic
+  drought and late-day tests; bounded candidate-versus-OFF evaluation remains
+  pending. Direct `AgentConfig` remains false by default so the mechanism is
+  testable in isolation.
+- Revisit when: bounded fixed-seed evidence shows a harmful lower-tail effect,
+  or the engine changes daily watering/weed timing.
+
 ## D-043 — Keep Multi-Trainer TPU Ownership in One Python Process
 
 - Date: 2026-08-28

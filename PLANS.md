@@ -1,6 +1,18 @@
 # Kaggriculture Plans
 
 Last updated: 2026-08-28
+## Issue #25 Current Gate
+
+The bounded executor correction is under review on
+`codex/issues-25-preventive-watering`, based directly on
+`origin/throughput/integration`. Preserve direct `AgentConfig` optional-water
+OFF semantics for unit isolation, but use PASS-only spare watering in the
+production submission and default RL factory. Do not retrain RL or broaden
+the panel until the fixed-seed fast comparison and focused regressions are
+reviewed. The fast panel reduced aggregate WEEDs but increased movement and
+had mixed animal/work outcomes; it is not a promotion result. Official-engine
+validation is blocked locally by the absent pinned package.
+
 ## Issue #21 Current Gate
 
 The multi-trainer TPU question has a bounded standalone prototype. First run
