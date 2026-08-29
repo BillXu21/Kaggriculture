@@ -72,9 +72,16 @@ def test_builder_hardcodes_runner_compat_and_strict_runtime(tmp_path: Path) -> N
     assert "aggressive_sell_all=False" in main
     assert "KAGGRICULTURE_SUBMISSION_STRICT" not in main
     assert (extracted / "best.pt").read_bytes() == checkpoint.read_bytes()
+    assert (extracted / "fast_env" / "__init__.py").is_file()
+    assert (extracted / "fast_env" / "market.py").is_file()
+    assert "def market_price(" in (extracted / "fast_env" / "market.py").read_text()
     assert manifest["submission_variant"] == "rl-u50"
     assert manifest["submission_fix"] == "legacy_runner_economic_context_parity"
     assert manifest["aggressive_sell_all"] is False
+    assert manifest["bundled_runtime_dependencies"] == [
+        "fast_env/__init__.py",
+        "fast_env/market.py",
+    ]
     assert result["checkpoint_sha256"] == hashlib.sha256(
         checkpoint.read_bytes()
     ).hexdigest()
@@ -103,4 +110,5 @@ def test_builder_can_emit_instant_sell_control(tmp_path: Path) -> None:
     manifest = json.loads((extracted / "submission_manifest.json").read_text())
 
     assert "aggressive_sell_all=True" in main
+    assert (extracted / "fast_env" / "market.py").is_file()
     assert manifest["aggressive_sell_all"] is True
