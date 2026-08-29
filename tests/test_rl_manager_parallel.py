@@ -41,6 +41,7 @@ def _spawn_factory_config_probe(wire, queue):
         "shed_capacity": config.shed_capacity,
         "strict": config.strict,
         "record_turn_snapshot": config.record_turn_snapshot,
+        "optional_spare_watering": config.optional_spare_watering,
         "max_carried_item_types": config.foreman.max_carried_item_types,
     })
 
@@ -164,6 +165,12 @@ def test_default_factory_wire_preserves_exact_agent_config(config):
     assert rebuilt.agent_config == factory.agent_config
 
 
+def test_default_factory_enables_pass_only_preventive_watering():
+    factory = make_default_executor_factory()
+    assert factory.agent_config.optional_spare_watering is True
+    assert factory.agent_config.optional_idle_cleanup is False
+
+
 def test_default_factory_wire_preserves_config_in_spawned_worker():
     config = AgentConfig(
         tasks_per_worker=3, hire_cost_mult=2, shed_capacity=17,
@@ -180,6 +187,7 @@ def test_default_factory_wire_preserves_config_in_spawned_worker():
         "shed_capacity": 17,
         "strict": True,
         "record_turn_snapshot": False,
+        "optional_spare_watering": False,
         "max_carried_item_types": 2,
     }
     process.join(timeout=10)

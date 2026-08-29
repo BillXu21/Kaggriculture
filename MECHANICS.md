@@ -2,6 +2,45 @@
 
 Last updated: 2026-08-28
 
+## Issue #25 Executor Evidence (2026-08-29)
+
+- `PLACE` is a completion action for an already-owned animal, not a new
+  capital commitment. Suppressing BUILD/BUY/LAND work must therefore preserve
+  dependency-free placement into an existing compatible empty COOP/PASTURE;
+  dependent placement remains blocked with its BUILD prerequisite.
+- The foreman aligns private inventories as farmer then hands and routes a
+  carried animal directly to PLACE. Empty structures are claimed once per
+  generated task, and the next observation removes the placement task after
+  the board contains the animal. These claims are covered by deterministic
+  executor tests; no official-engine package is installed locally.
+- Optional spare WATER remains the existing PASS-only layer. Production
+  submission/RL default factories now enable it, while direct `AgentConfig`
+  defaults remain false. A candidate WATER movement is allowed only when its
+  target is reachable within the remaining same-day turns; mandatory hard
+  WATER, FEED, HARVEST, manager, and logistics work still runs first.
+- Bounded fast evidence with frozen BC-E, seeds `7,17`, both seats, and PASS
+  measured OFF versus WATER-only final WEED tiles `53 -> 39`, PASS actions
+  `1,178 -> 601`, and movement `10,581 -> 11,975`; no fallback or animal
+  escapes occurred. The candidate's animal target and work-debt outcomes were
+  mixed, so this does not establish competitive promotion or official parity.
+
+## Issue #25 Executor Evidence (2026-08-29)
+
+- `PLACE` is a completion action for an already-owned animal, not a new
+  capital commitment. Suppressing BUILD/BUY/LAND work must therefore preserve
+  dependency-free placement into an existing compatible empty COOP/PASTURE;
+  dependent placement remains blocked with its BUILD prerequisite.
+- The foreman aligns private inventories as farmer then hands and routes a
+  carried animal directly to PLACE. Empty structures are claimed once per
+  generated task, and the next observation removes the placement task after
+  the board contains the animal. These claims are covered by deterministic
+  executor tests; no official-engine package is installed locally.
+- Optional spare WATER remains the existing PASS-only layer. Production
+  submission/RL default factories now enable it, while direct `AgentConfig`
+  defaults remain false. A candidate WATER movement is allowed only when its
+  target is reachable within the remaining same-day turns; mandatory hard
+  WATER, FEED, HARVEST, manager, and logistics work still runs first.
+
 ## Purpose
 
 This file separates verified engine behavior from documentation, discussion claims, and stale assumptions.

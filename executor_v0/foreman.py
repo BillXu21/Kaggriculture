@@ -316,12 +316,23 @@ def run_foreman(
     for worker in workers:
         chosen: Task | None = None
         reason = ""
+        feasible_priorities = [
+            int(task.priority) for task in tile_tasks
+            if task.key not in claimed
+            and task.tile is not None
+            and _carried(worker, task.required_item)
+            and _interaction_op(task) is not None
+        ]
+        best_feasible_priority = min(feasible_priorities, default=None)
 
         # 1. Underfoot: highest-priority actionable task at our tile.
         for task in tile_tasks:
             if task.key in claimed or task.tile != worker.position:
                 continue
             if not _carried(worker, task.required_item):
+                continue
+            if task.kind == "PLACE" and best_feasible_priority is not None \
+                    and int(task.priority) > best_feasible_priority:
                 continue
             if not seeds_available(task):
                 unassigned_reasons.setdefault(task.key, "no_global_seeds")
@@ -488,6 +499,7 @@ def apply_idle_cleanup(
         task for task in cleanup_tasks
         if task.kind in ("DIG", "WATER") and task.tile is not None
     ]
+    remaining_turns = max(0, 23 - int(obs.get("hour", 23)))
 
     for worker in workers:
         if worker.index >= len(assignments) or actions[worker.index] != ("PASS",):
@@ -506,6 +518,10 @@ def apply_idle_cleanup(
                 task.key,
             ),
         )
+        distance = abs(worker.position[0] - chosen.tile[0]) \
+            + abs(worker.position[1] - chosen.tile[1])
+        if distance > remaining_turns:
+            continue
         if chosen.tile == worker.position:
             action = _interaction_op(chosen)
             reason = f"{chosen.source}_underfoot"

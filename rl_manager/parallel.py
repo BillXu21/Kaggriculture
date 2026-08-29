@@ -187,7 +187,8 @@ class ParallelSelfPlayRunner:
                 from executor_v0.agent import AgentConfig
 
                 executor_factory = make_default_executor_factory(
-                    AgentConfig(strict=True, record_turn_snapshot=False))
+                    AgentConfig(strict=True, record_turn_snapshot=False,
+                                optional_spare_watering=True))
             else:
                 executor_factory = make_default_executor_factory()
         self.executor_factory = executor_factory
