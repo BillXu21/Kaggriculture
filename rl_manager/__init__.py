@@ -39,6 +39,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "PPOConfig": ("rl_manager.ppo_policy", "PPOConfig"),
     "PPOPolicy": ("rl_manager.ppo_policy", "PPOPolicy"),
     "PPOTrainState": ("rl_manager.ppo", "PPOTrainState"),
+    "BestCheckpointRetention": (
+        "rl_manager.ppo_retention", "BestCheckpointRetention"),
     "PassPlanPolicy": ("rl_manager.policy", "PassPlanPolicy"),
     "ParallelRolloutError": (
         "rl_manager.parallel", "ParallelRolloutError"),

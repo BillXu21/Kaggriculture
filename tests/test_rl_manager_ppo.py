@@ -100,7 +100,9 @@ def test_tiny_update_finite_changes_expected_params(tiny_e):
     state = init_train_state(params, config, seed=42, ppo_config=ppo_config)
     new_state, metrics = ppo_update(state, batch, config, ppo_config)
 
-    assert all(np.isfinite(v) for v in metrics.values())
+    assert all(np.isfinite(metrics[key]) for key in (
+        "loss", "pi_loss", "value_loss", "entropy", "approx_kl",
+        "clip_fraction", "kl_to_frozen", "explained_variance"))
 
     def leaves(tree):
         return [np.asarray(a) for a in jax.tree_util.tree_leaves(tree)]
@@ -120,6 +122,46 @@ def test_tiny_update_finite_changes_expected_params(tiny_e):
         leaves(new_state.params["value"]), leaves(state.params["value"])))
     assert trunk_changed and value_changed
     assert new_state.step == ppo_config.epochs * 1
+
+
+def test_target_kl_stops_after_first_epoch_and_reports_counts(tiny_e):
+    params, config = tiny_e
+    batch_inputs = _two_row_inputs()
+    policy = PPOPolicy(params, config, seed=17)
+    batch = _make_batch(policy, batch_inputs)
+    ppo_config = PPOConfig(minibatch_size=2, epochs=4, lr=1e-3,
+                           target_kl=1e-12)
+    state = init_train_state(params, config, seed=42, ppo_config=ppo_config)
+    new_state, metrics = ppo_update(state, batch, config, ppo_config)
+
+    assert metrics["accepted"] is True
+    assert metrics["stop_reason"] == "target_kl"
+    assert metrics["epochs_ran"] == 1
+    assert metrics["minibatches_ran"] == 1
+    assert len(metrics["epoch_metrics"]) == 1
+    assert metrics["epoch_metrics"][0]["approx_kl"] > ppo_config.target_kl
+    assert new_state.step == 1
+
+
+def test_pathological_kl_rejection_returns_exact_previous_state(tiny_e):
+    params, config = tiny_e
+    batch_inputs = _two_row_inputs()
+    policy = PPOPolicy(params, config, seed=17)
+    batch = _make_batch(policy, batch_inputs)
+    ppo_config = PPOConfig(minibatch_size=2, epochs=2, lr=1e-3,
+                           reject_update_kl=1e-12)
+    state = init_train_state(params, config, seed=42, ppo_config=ppo_config)
+    new_state, metrics = ppo_update(state, batch, config, ppo_config)
+
+    assert metrics["accepted"] is False
+    assert metrics["stop_reason"] == "rejected_kl"
+    assert metrics["rejection_reason"]
+    assert new_state is state
+    assert new_state.step == state.step
+    assert np.array_equal(np.asarray(new_state.rng), np.asarray(state.rng))
+    for got, want in zip(jax.tree_util.tree_leaves(new_state.params),
+                         jax.tree_util.tree_leaves(state.params)):
+        assert np.array_equal(got, want)
 
 
 def test_sell_freeze_with_aggressive_weight_decay(tiny_e):

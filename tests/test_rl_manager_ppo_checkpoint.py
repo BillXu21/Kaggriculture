@@ -12,6 +12,7 @@ from rl_manager.ppo_checkpoint import (
     load_ppo_checkpoint,
     save_ppo_checkpoint,
 )
+from rl_manager.ppo_retention import BestCheckpointRetention
 from rl_manager.ppo_policy import PPOConfig, PPOPolicy
 
 
@@ -130,3 +131,32 @@ def test_save_rejects_non_e_variant(env, tmp_path):
     with pytest.raises(ValueError, match="variant E"):
         save_ppo_checkpoint(tmp_path / "v0.npz", state, config, ppo_config,
                             model_variant="V0")
+
+
+def test_best_checkpoint_retention_is_strict_and_round_trips_evaluation(
+        env, tmp_path):
+    config, ppo_config, _batch, state = env
+    retention = BestCheckpointRetention(tmp_path)
+    evaluation = {"pass_mean": 123.5, "seeds": [17, 42]}
+    source = {"run_id": "synthetic-1", "policy_version": "p7"}
+
+    assert retention.consider(
+        "pass_mean", 123.5, state, config, ppo_config,
+        evaluation=evaluation, provenance=source)
+    path = retention.path_for("pass_mean")
+    _loaded, meta = load_ppo_checkpoint(path)
+    retained = meta["provenance"]["best_retention"]
+    assert retained["name"] == "pass_mean"
+    assert retained["score"] == 123.5
+    assert retained["evaluation"] == evaluation
+    assert retained["source_provenance"] == source
+
+    assert not retention.consider(
+        "pass_mean", 123.5, state, config, ppo_config,
+        evaluation={"pass_mean": 123.5, "seeds": [99]}, provenance=source)
+    assert retention.consider(
+        "pass_mean", 124.0, state, config, ppo_config,
+        evaluation={"pass_mean": 124.0, "seeds": [17, 42]},
+        provenance={"run_id": "synthetic-2"})
+    _loaded, meta = load_ppo_checkpoint(path)
+    assert meta["provenance"]["best_retention"]["score"] == 124.0
