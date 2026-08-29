@@ -29,6 +29,9 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from rl_manager.evaluation import evaluate_promotion
+from rl_manager.evaluation import format_promotion_result
+from rl_manager.evaluation import summarize_evaluation
 from rl_manager.runner import GAME_TURNS
 from rl_manager.runner import INFERENCE_BATCH_SCOPES
 from rl_manager.types import E_VS_E, E_VS_PASS
@@ -477,7 +480,18 @@ def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no
             specs.append(build_episode_spec(len(specs), seed, orientation,
                                             candidate, frozen_policy))
     results = runner.run(specs)
-    summary = summarize_evaluation(results)
+    summary = summarize_evaluation(
+        results,
+        expected_seeds=plan["seeds"],
+        provenance={
+            "seed_set": plan["seed_set"],
+            "candidate_identity": candidate.identity.to_json_dict(),
+            "opponent_identity": frozen_policy.identity.to_json_dict(),
+        },
+    )
+    decision = evaluate_promotion(summary)
+    summary["promotion"] = decision.to_dict()
+    print(format_promotion_result(summary, decision))
     from rl_manager.diagnostics import write_diagnostics
 
     write_diagnostics(plan["output_json"], summary)
@@ -572,93 +586,6 @@ def execute_debug_trace(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
         )
         summaries.append(summary)
     return summaries
-
-
-# ---------------------------------------------------------- aggregation
-
-
-def summarize_evaluation(results: Sequence[Any]) -> dict[str, Any]:
-    """Fixed evaluation output schema over EpisodeResult-like records.
-
-    Pure aggregation — infrastructure only; callers supply real games.
-    """
-    wins = losses = ties = 0
-    margins: list[float] = []
-    candidate_banks: list[float] = []
-    opponent_banks: list[float] = []
-    per_orientation: dict[str, dict[str, int]] = {}
-    anomalies: list[dict[str, Any]] = []
-    seed_margins: list[tuple[int, str, float]] = []
-
-    for result in results:
-        composition = str(result.composition)
-        candidate_seat = 0 if composition == "candidate_vs_frozen" else 1
-        banks = [float(bank) for bank in result.final_banks]
-        margin = banks[candidate_seat] - banks[1 - candidate_seat]
-        margins.append(margin)
-        candidate_banks.append(banks[candidate_seat])
-        opponent_banks.append(banks[1 - candidate_seat])
-        if margin > 0:
-            wins += 1
-        elif margin < 0:
-            losses += 1
-        else:
-            ties += 1
-        bucket = per_orientation.setdefault(
-            composition, {"games": 0, "W": 0, "L": 0, "T": 0})
-        bucket["games"] += 1
-        bucket["W" if margin > 0 else "L" if margin < 0 else "T"] += 1
-        statuses = [str(status) for status in result.statuses]
-        if statuses != ["DONE", "DONE"]:
-            anomalies.append({"seed": int(result.seed),
-                              "kind": "statuses", "detail": statuses})
-        for record in result.opening_diagnostics or []:
-            if any(bool(value) for key, value in record.items()
-                   if any(tag in key for tag in
-                          ("fallback", "guard", "error", "delegat"))):
-                anomalies.append({"seed": int(result.seed),
-                                  "kind": "opening", "detail": record})
-        seed_margins.append((int(result.seed), composition, margin))
-
-    ordered = sorted(margins)
-    n = len(ordered)
-    median_margin = (ordered[n // 2] if n % 2
-                     else 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])) \
-        if n else None
-    worst = sorted(seed_margins, key=lambda entry: entry[2])[:5]
-
-    def _mean(values: list[float]) -> float | None:
-        return sum(values) / len(values) if values else None
-
-    return {
-        "evaluation_schema_version": 1,
-        "games": len(results),
-        "wlt": {"W": wins, "L": losses, "T": ties},
-        "win_rate": (wins / len(results)) if results else None,
-        "paired_margins": margins,
-        "median_margin": median_margin,
-        "mean_margin": _mean(margins),
-        "banks": {
-            "candidate_median": _median(candidate_banks),
-            "candidate_mean": _mean(candidate_banks),
-            "opponent_median": _median(opponent_banks),
-            "opponent_mean": _mean(opponent_banks),
-        },
-        "per_orientation": per_orientation,
-        "anomalies": anomalies,
-        "worst_seeds": [{"seed": seed, "orientation": orientation,
-                         "margin": margin} for seed, orientation, margin
-                        in worst],
-    }
-
-
-def _median(values: list[float]) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    n = len(ordered)
-    return ordered[n // 2] if n % 2 \
-        else 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])
 
 
 def main(argv: Sequence[str] | None = None) -> int:

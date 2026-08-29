@@ -1,6 +1,12 @@
 # Kaggriculture Plans
 
-Last updated: 2026-08-27
+Last updated: 2026-08-28
+
+Issue #18 evaluation hardening is implemented. Future rollout/self-play
+drivers should call `summarize_evaluation` and `evaluate_promotion` rather
+than reimplementing bank statistics or promotion gates. Keep opening guard
+records informational by default; only explicit runtime/fallback failures,
+invalid or incomplete games, and panel completeness failures block promotion.
 
 ## Strategic Objective
 

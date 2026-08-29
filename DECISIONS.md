@@ -382,3 +382,25 @@ This file records decisions that remain authoritative across chats and work sess
 - Guarantees: worker startup fails if accelerator modules are loaded; worker exceptions, dead exits, missing episodes, duplicate episodes, and duplicate trajectory rows fail loudly; the default executor factory is resolved inside each child rather than pickled from its nested implementation class. Stable row identifiers are available to future stochastic batched policies.
 - Evidence boundary: deterministic truncated fast-engine smoke passed with two spawned workers and two environments per worker, including central request batching and trajectory normalization. TPU throughput and full real-checkpoint scaling remain unmeasured; use `research/RL_MANAGER_PARALLEL_ROLLOUTS.md`.
 - Revisit when: issue #15 changes the executor factory contract, issue #16 supplies a native batched backend, or measured host profiling justifies a different transport.
+
+## D-047 — Make Evaluation Health and Promotion Decisions Explicit
+
+- Date: 2026-08-28
+- Status: active
+- Decision: Keep evaluation aggregation and promotion in the narrow,
+  framework-neutral `rl_manager.evaluation` module. Fatal anomalies are
+  non-DONE/incomplete or invalid results, missing/duplicate fixed-panel
+  results, and explicit runtime/fallback errors. Opening guard/delegation and
+  executor diagnostic records remain visible but do not block the default
+  gate. The default gate is `W-L >= 6`, mean margin `> 0`, median margin `>= 0`,
+  and zero fatal anomalies; optional bank floors and stricter diagnostic gates
+  are opt-in.
+- Rationale: one overloaded anomaly list previously allowed benign opening
+  diagnostics to veto a completed positive panel. Typed conditions and exact
+  failed reasons make promotion auditable and prevent unexplained HOLD output.
+- Evidence: focused synthetic tests cover a 64-0 positive-margin panel with
+  benign opening diagnostics, exact economic percentiles/fractions, both seat
+  orientations, missing/duplicate results, runtime fallback failures,
+  independent threshold failures, and result-order-independent decisions.
+- Revisit when: a league driver needs additional explicit gates or the fixed
+  evaluation panel/provenance contract changes.

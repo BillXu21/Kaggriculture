@@ -1,6 +1,16 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-27
+Last updated: 2026-08-28
+
+## Issue #18
+- Evaluation/promotion hardening is implemented in `rl_manager/evaluation.py`:
+  fatal anomalies are separate from informational opening/executor diagnostics;
+  fixed panels detect missing/duplicate results; economic bank/margin metrics,
+  W/L/T, and candidate seat splits are first-class. `PromotionConfig` defaults
+  to `W-L >= 6`, mean margin `> 0`, median margin `>= 0`, and zero fatal
+  anomalies. The CLI persists exact PASS/HOLD conditions and reasons. Focused
+  validation was bounded to two pytest invocations plus direct checks and
+  targeted compilation; no full suite or panel was run.
 
 ## Issue #17
 - Parallel rollout topology is implemented on this branch: the parent is the sole policy/JAX/libtpu owner; `spawn` workers own independent engine/opening/executor state and exchange only encoded manager-day NumPy rows through bounded queues. Default owner batching remains canonical by policy identity/day; opt-in `RunnerConfig(inference_batch_scope="policy")` mixes days, and `fixed_inference_batch_size=B` pads valid rows to exactly B while routing only real rows. Results and trajectory shards normalize by episode/seat/day, and worker failures or missing/duplicate rows fail loudly. The lazy `rl_manager` initializer plus worker startup guard prevents accelerator imports in CPU workers. Focused batching/CLI/PPO validation passes `37 passed, 2 skipped`; the full RL-manager suite passes `130 passed, 3 skipped`; TPU throughput remains unmeasured. Runbook: `research/RL_MANAGER_PARALLEL_ROLLOUTS.md`.
