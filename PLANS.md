@@ -2,6 +2,13 @@
 
 Last updated: 2026-08-27
 
+## Issue #22 Status
+- The bounded RL correctness packet is implemented on
+  `codex/issue-22-rl-hotfixes`: returned-state rollout rebinding, exact
+  spawned default-factory configuration, and compiled B=1/B=24 PPO-vs-BC
+  parity. No PPO algorithm, reward, executor strategy, promotion, or TPU
+  throughput work is added; merge remains an operator decision after review.
+
 ## Strategic Objective
 
 Build a competitive Kaggriculture agent in which **reinforcement learning owns meaningful farm and market decisions**, while deterministic infrastructure handles exact mechanics that are poor uses of learning capacity: legality, pathfinding, task execution, state bookkeeping, and prevention of meaningless invalid-action cascades.

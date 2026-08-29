@@ -72,6 +72,21 @@ Confidence labels:
 - `UNKNOWN`: TPU speedup, occupancy, and real-checkpoint behavior. The local
   mock/fast-engine smoke is correctness and observability evidence only.
 
+## PPO/BC Initialization Diagnostic - Issue #22 (2026-08-29)
+
+- `CONFIRMED_EXPERIMENT`: the same encoded E row passed through
+  `JaxEPlanPolicy` and a fresh deterministic `PPOPolicy` produced identical
+  action tensors at B=1 and at fixed padded B=24 on the local CPU.
+- Before the bounded alignment, the first raw-only difference was
+  `animal_logits[0,0,10]` at approximately `5.8e-11` for both batch sizes;
+  decoded actions still matched. The cause was the PPO wrapper's eager/private
+  forward path versus the BC wrapper's compiled public path, not decode
+  thresholding or batch-shape behavior.
+- The PPO wrapper now uses public compiled `forward` and
+  `forward_with_representation` for host-facing inference. The enclosing
+  jitted PPO loss/update continues to use its private computational seams.
+- Evidence is local CPU only; no TPU numerical or performance claim follows.
+
 ## Submission Runtime Invariant — Stage 1 / Issue #13
 
 - A submission is not validated by importing `make_agent` from the repository

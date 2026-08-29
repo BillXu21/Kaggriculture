@@ -1,5 +1,33 @@
 # Kaggriculture Historical Record
 
+## 2026-08-29 - Issue #22 RL Correctness Hotfixes
+
+On `codex/issue-22-rl-hotfixes` at the requested `throughput/integration`
+base `c14b327`:
+
+- `rl_manager/cli.py` now rebuilds the candidate adapter from the exact state
+  returned by every functional `ppo_update`, preserving its identity name and
+  version while changing the parameter fingerprint. The focused test forces a
+  land-head change and proves the next rollout uses a new adapter and action.
+- `rl_manager/executor_factory.py`, `parallel.py`, and `parallel_worker.py`
+  now serialize the actual default factory `AgentConfig` payload. Default,
+  low-telemetry, nested/custom, and spawned-worker round trips are covered;
+  no executor flag is special-cased.
+- `rl_manager/ppo_policy.py` now routes host-facing frozen/mutable inference
+  through the same compiled public BC-E seams as `JaxEPlanPolicy`. The narrow
+  diagnostic compares the same encoded row at B=1 and fixed padded B=24:
+  action tensors and raw logits match exactly after this safe alignment. Before
+  it, the first raw-only CPU difference was `animal_logits[0,0,10]`, about
+  `5.8e-11`, with no action difference, caused by eager/private versus compiled
+  public forward paths.
+
+ Targeted pytest invocations were capped at two as required. The first
+ invocation had 18 passed and 2 skipped but was blocked for tmp-path tests by
+  a protected host temp directory, and the second had 4 passed before exposing
+  two test-only issues corrected afterward. Final direct stale-policy,
+  factory-wire, parity, compile, and diff checks were run without a further
+  pytest invocation. No full suite or TPU measurement was run.
+
 ## 2026-08-28 — Issue #17 Central Mixed-Day Inference Batching
 
 Added opt-in central inference batching for `ParallelSelfPlayRunner` without
