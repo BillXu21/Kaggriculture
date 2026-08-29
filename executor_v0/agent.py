@@ -71,7 +71,7 @@ _INTERACTION_OPS = frozenset({
     "PLACE", "FEED", "CARE", "FERTILIZE", "COLLECT_FERTILIZER",
 })
 _EXPANSION_TASK_KINDS = frozenset({
-    "BUILD_COOP", "BUILD_PASTURE", "PLACE", "BUY_ANIMAL", "BUY_LAND",
+    "BUILD_COOP", "BUILD_PASTURE", "BUY_ANIMAL", "BUY_LAND",
 })
 
 
@@ -933,7 +933,17 @@ class ExecutorAgent:
         current_survival_pressure = bool(feed["starving"] or feed["shortage"])
         expansion_suppressed = self._suppress_expansion_today or current_survival_pressure
         if expansion_suppressed:
-            tasks = tuple(t for t in tasks if t.kind not in _EXPANSION_TASK_KINDS)
+            suppressed_keys = {
+                t.key for t in tasks if t.kind in _EXPANSION_TASK_KINDS
+            }
+            tasks = tuple(
+                t for t in tasks
+                if t.kind not in _EXPANSION_TASK_KINDS
+                and not (
+                    t.kind == "PLACE"
+                    and any(dep in suppressed_keys for dep in t.depends_on)
+                )
+            )
 
         dispatch_tasks = tasks
         if feed["starving"]:
