@@ -1,6 +1,6 @@
 # Kaggriculture Mechanics Ledger
 
-Last updated: 2026-08-23
+Last updated: 2026-08-28
 
 ## Purpose
 
@@ -71,6 +71,25 @@ Confidence labels:
   implement only the legacy `plan_batch` seam.
 - `UNKNOWN`: TPU speedup, occupancy, and real-checkpoint behavior. The local
   mock/fast-engine smoke is correctness and observability evidence only.
+
+## Multi-Trainer TPU Prototype — Issue #21 (2026-08-28)
+
+- `CONFIRMED_EXPERIMENT`: `rl_manager/multitrainer_benchmark.py` keeps JAX and
+  libtpu in one Python process, creates independent PPO state/optimizer/RNG
+  trees, and assigns trainer `i` explicitly to `jax.devices()[i]`. It refuses
+  to reuse a device when N exceeds visible devices.
+- `CONFIRMED_EXPERIMENT`: placement diagnostics cover params, optimizer state,
+  RNG, inference inputs/outputs, PPO action/index arrays, and PPO scalar arrays.
+  First-call compile timing is synchronized separately from steady-state
+  inference and PPO update timing; update dispatch is compared sequentially
+  and dispatch-all-then-block.
+- `CONFIRMED_EXPERIMENT`: `rl_manager/multitrainer.py` routes by exact immutable
+  `PolicyIdentity` and rejects unknown or cross-trainer trainable rows. This
+  seam is JAX-free so CPU workers remain accelerator-unaware.
+- `UNKNOWN`: TPU utilization, async overlap, memory behavior, and scaling for
+  N=1/2/4/8 with the real BC-E checkpoint. Local CPU output is plumbing only;
+  run the commands in `research/RL_MULTI_TRAINER_TPU.md` before making a TPU
+  claim.
 
 ## Submission Runtime Invariant — Stage 1 / Issue #13
 

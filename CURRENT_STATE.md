@@ -1,6 +1,22 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-27
+Last updated: 2026-08-28
+
+## Issue #21
+- A standalone one-process multi-trainer prototype is implemented in
+  `rl_manager/multitrainer_benchmark.py`. It creates independent PPO states,
+  optimizer trees, RNGs, inference/PPO arrays, and explicit assignments
+  `trainer i -> jax.devices()[i]`; it refuses device reuse and records visible
+  devices, actual placements, compile latency, synchronized steady-state
+  inference/update timings, and sequential versus async-dispatch timing.
+- `rl_manager/multitrainer.py` adds a JAX-free identity router that groups
+  requests by exact `PolicyIdentity` and rejects unknown or cross-policy
+  trainable trajectory rows. Rollout workers remain CPU-only and
+  `parallel.py` is unchanged.
+- Local tiny CPU smoke is placement/routing evidence only: the default
+  unsharded single trainer used one visible CPU device. No TPU scaling or
+  real-checkpoint measurement exists. Exact N=1/N=2/N=4 and optional N=8 Kaggle
+  commands are in `research/RL_MULTI_TRAINER_TPU.md`.
 
 ## Issue #17
 - Parallel rollout topology is implemented on this branch: the parent is the sole policy/JAX/libtpu owner; `spawn` workers own independent engine/opening/executor state and exchange only encoded manager-day NumPy rows through bounded queues. Default owner batching remains canonical by policy identity/day; opt-in `RunnerConfig(inference_batch_scope="policy")` mixes days, and `fixed_inference_batch_size=B` pads valid rows to exactly B while routing only real rows. Results and trajectory shards normalize by episode/seat/day, and worker failures or missing/duplicate rows fail loudly. The lazy `rl_manager` initializer plus worker startup guard prevents accelerator imports in CPU workers. Focused batching/CLI/PPO validation passes `37 passed, 2 skipped`; the full RL-manager suite passes `130 passed, 3 skipped`; TPU throughput remains unmeasured. Runbook: `research/RL_MANAGER_PARALLEL_ROLLOUTS.md`.

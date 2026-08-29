@@ -1,6 +1,14 @@
 # Kaggriculture Plans
 
-Last updated: 2026-08-27
+Last updated: 2026-08-28
+
+## Issue #21 Current Gate
+
+The multi-trainer TPU question has a bounded standalone prototype. First run
+the documented one-process Kaggle N=1/N=2/N=4 matrix, optionally N=8 only after
+N=4 is clean, and inspect placements/memory/compile behavior before changing
+the rollout coordinator. Do not add a scheduler, league, or TPU worker
+processes; no scaling claim follows from local CPU output.
 
 ## Strategic Objective
 
