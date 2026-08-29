@@ -125,6 +125,36 @@ For the instant-sell BC control, only `aggressive_sell_all=True` changes.
 
 This strictness mismatch was not the measured cause of the 745-bank collapse, but it made the pre-submission verification non-representative and should not be repeated.
 
+## Third deployment mismatch: lazy `fast_env.market` import
+
+The first fixed archives later failed in the real Kaggle sandbox when a game
+entered the survival-feed affordability path. The traceback ended at:
+
+```text
+from fast_env.market import market_price
+ModuleNotFoundError: No module named 'fast_env'
+```
+
+Earlier exact-archive game panels had not happened to execute this lazy branch,
+so the missing dependency remained latent. A follow-up attempt that added a
+separate top-level `fast_env` package still produced the same live sandbox
+error, so the deployment builder should not rely on a newly added top-level
+package being available.
+
+The compatibility builder now makes this path self-contained inside the
+already-packaged executor package:
+
+1. copy pure-Python `fast_env/market.py` to
+   `executor_v0/_submission_market.py`;
+2. rewrite the packaged executor import from
+   `from fast_env.market import market_price` to
+   `from executor_v0._submission_market import market_price`.
+
+The market helper is framework-independent and does not require the native fast
+engine extension. Pre-submission tests must explicitly force a `BUY_PRODUCT`
+`_buy_order_cost` call so the lazy import is executed rather than hoping a
+small gameplay seed panel reaches emergency feed buying.
+
 ## Compatibility policy
 
 ### Existing checkpoints trained at / before the legacy runner semantics
@@ -152,9 +182,10 @@ Before uploading any archive:
 
 1. extract the exact `.tar.gz` into a clean temporary directory;
 2. import that extracted `main.py` rather than repository code;
-3. run both seat orientations over a small official seed panel;
-4. require zero invalid/error/timeout statuses;
-5. compare bank distribution and W/L against a known baseline;
-6. only then submit the exact tested archive bytes.
+3. force-call the packaged `ExecutorAgent._buy_order_cost` `BUY_PRODUCT` branch;
+4. run both seat orientations over a small official seed panel;
+5. require zero invalid/error/timeout statuses;
+6. compare bank distribution and W/L against a known baseline;
+7. only then submit the exact tested archive bytes.
 
-On 2026-08-29 both the fixed RL u50 archive and the runner-compatible BC-E instant-sell control passed their exact-archive official tests and were selected for submission. The detailed instant-sell control metrics were not copied into this experiment log.
+On 2026-08-29 both the fixed RL u50 archive and the runner-compatible BC-E instant-sell control passed their initial exact-archive official gameplay panels, but live submission exposed the additional lazy-import packaging fault described above. Daily submission quota was exhausted before the self-contained executor-vendored fix could be re-submitted.
