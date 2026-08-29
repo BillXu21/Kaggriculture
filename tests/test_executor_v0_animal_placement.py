@@ -164,6 +164,25 @@ def test_carried_animal_never_returns_to_pickup_and_spare_worker_does_not_pass()
     assert dispatched.assignments[1].action[0] != "PICKUP"
 
 
+def test_shed_owned_animal_pickup_then_regenerated_place():
+    board = [[None] * 10 for _ in range(10)]
+    board[1][1] = {"kind": "PASTURE"}
+    obs = make_obs(farmer=(4, 4), tiles=board, shed={"COW": 1})
+    expected = make_plan(animals={"COW": 1})
+    generated = generate_tasks(obs, 0, feasible_plan=expected,
+                                remaining_sells={})
+
+    pickup = run_foreman(obs, 0, generated.sorted_tasks())
+    assert pickup.farmer_action == ("PICKUP", "COW", 1)
+
+    carried = copy.deepcopy(obs)
+    carried["private"]["shed"]["COW"] = 0
+    carried["private"]["inventories"][0]["COW"] = 1
+    placed = run_foreman(carried, 0, generated.sorted_tasks())
+    assert placed.farmer_action == ("NORTH",)
+    assert placed.assignments[0].task_key == "PLACE:COW:1,1"
+
+
 def test_hard_water_beats_underfoot_place():
     board = [[None] * 10 for _ in range(10)]
     board[4][4] = {"kind": "PASTURE"}
