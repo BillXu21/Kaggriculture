@@ -2,6 +2,24 @@
 
 This file records decisions that remain authoritative across chats and work sessions. A decision should include the reason, evidence, and conditions for revisiting it.
 
+## D-043 — Keep Multi-Trainer TPU Ownership in One Python Process
+
+- Date: 2026-08-28
+- Status: active prototype constraint
+- Decision: Independent PPO trainers may share one JAX/libtpu owner only when
+  each trainer has an explicit device assignment, independent state/optimizer/
+  RNG, and identity-routed rows. Rollout workers remain CPU-only; never launch
+  one TPU Python process per trainer.
+- Rationale: libtpu/JAX ownership must be unambiguous, while independent
+  policy states must not alias or receive another trainer's trajectories. A
+  small standalone benchmark is safer than rewriting the current parallel
+  rollout coordinator.
+- Evidence: local tiny CPU smoke reports one device for the existing default
+  single-trainer path and placement checks pass; TPU utilization, overlap, and
+  scaling are unknown until the exact Kaggle commands are run.
+- Revisit when: real Kaggle artifacts show a placement, memory, compilation, or
+  dispatch issue, or a later scheduler design has a concrete bounded need.
+
 ## D-001 — Use Planning-First Development
 
 - Date: 2026-08-06

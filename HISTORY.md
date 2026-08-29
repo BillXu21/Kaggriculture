@@ -48,6 +48,27 @@ tests/test_rl_manager_ppo_checkpoint.py tests/test_rl_manager_cli.py -q` ->
 **34 passed**. A synthetic `target_kl=1e-12` update ran one minibatch/epoch,
 reported `stop_reason="target_kl"`, and did not run the remaining epochs. No
  TPU benchmark or policy-quality claim was made.
+## 2026-08-28 — Issue #21 Multi-Trainer TPU Prototype
+
+Added `rl_manager/multitrainer_benchmark.py`, a standalone one-process JAX
+benchmark for independent PPO trainers at N=1/2/4 (optional N=8). Each trainer
+gets a separate state/optimizer/RNG and is explicitly assigned to
+`jax.devices()[i]`; parameters, optimizer state, inference outputs, and PPO
+arrays are placement-checked. The report separates first-call compilation from
+synchronized steady state and compares sequential updates with dispatch-all-
+then-block timing. N greater than visible devices is skipped explicitly rather
+than reusing a device.
+
+Added `rl_manager/multitrainer.py` as a JAX-free identity routing seam. Requests
+are grouped by exact `PolicyIdentity`, and trainable trajectory rows are
+partitioned only when sidecar identity fields match a registered trainer;
+unknown, duplicate, mismatched, or contaminated rows fail loudly. No changes
+were made to `parallel.py`, and no rollout worker imports JAX/libtpu.
+
+Focused CPU routing/configuration validation passed **5 tests**. A tiny CPU
+benchmark smoke completed and reported one device for the existing unsharded
+single-trainer path. TPU throughput, overlap, and scaling remain unmeasured.
+The exact Kaggle commands are in `research/RL_MULTI_TRAINER_TPU.md`.
 
 ## 2026-08-28 — Issue #17 Central Mixed-Day Inference Batching
 
