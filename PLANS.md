@@ -1,6 +1,6 @@
 # Kaggriculture Plans
 
-Last updated: 2026-08-27
+Last updated: 2026-08-28
 
 ## Issue #22 Status
 - The bounded RL correctness packet is implemented on
@@ -26,6 +26,12 @@ Issue #13 Stage 1 and the Stage 5 post-Stage-4 archive compatibility check (2026
 - Stage 6/7 issue #12 idle cleanup is now a measured PASS-only layer, fully documented in `research/EXECUTOR_V07_IDLE_CLEANUP_PASS_ONLY.md`. The normal foreman runs first; optional work is recomputed per turn and can replace only literal normal PASS actions, with no persistence or normal accounting contamination. Keep `optional_spare_watering` (WATER-only) distinct from `optional_idle_cleanup` (WEED+WATER). The official A/B/C panel is mean-positive and majority-winning for both arms but has 8 losses each and materially worse tails; WATER-only median delta is negative while WEED+WATER median delta is positive. Leave cleanup OFF by default and require independent review before any promotion; the next step is not PPO.
 
 Issue #9 Stage B2 remains implemented and locally validated as plumbing, but is not the current mutation target until the issue-#13 archive invariant is accepted.
+
+Issue #23 PPO stability controls are implemented: target-KL epoch stopping and
+opt-in pathological-update rollback are available without changing defaults;
+per-epoch diagnostics and evaluation-driven named best retention are now the
+required training-run seams. TPU values remain unmeasured; the next step is
+target-host training configuration and evaluation, not local tuning.
 
 Issue #15 executor hot-path profiling/optimization is complete on isolated
 branch `throughput/15-agent-hotpath`; see

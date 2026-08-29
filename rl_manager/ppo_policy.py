@@ -26,6 +26,7 @@ Architecture decisions implemented here (packet root decisions 3/4/6/7/9):
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Mapping
 
 import jax
@@ -98,6 +99,9 @@ class PPOConfig:
     advantage_epsilon: float = 1e-8
     kl_to_frozen_coef: float = 0.0
     value_init_scale: float = 0.01
+    target_kl: float | None = None
+    # Setting the ceiling opts into rejection of nonfinite or high-KL updates.
+    reject_update_kl: float | None = None
 
     def __post_init__(self) -> None:
         if self.clip_eps <= 0.0:
@@ -128,6 +132,15 @@ class PPOConfig:
             raise ValueError("kl_to_frozen_coef must be >= 0")
         if self.value_init_scale < 0.0:
             raise ValueError("value_init_scale must be >= 0")
+        if (self.target_kl is not None and
+                (not math.isfinite(self.target_kl) or self.target_kl <= 0.0)):
+            raise ValueError(f"target_kl must be positive, got {self.target_kl}")
+        if (self.reject_update_kl is not None and
+                (not math.isfinite(self.reject_update_kl) or
+                 self.reject_update_kl <= 0.0)):
+            raise ValueError(
+                "reject_update_kl must be positive, got "
+                f"{self.reject_update_kl}")
 
 
 # ------------------------------------------------------ distribution math

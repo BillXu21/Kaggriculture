@@ -107,6 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
                             "plan time before any rollout.")
     train.add_argument("--lr", type=float, default=3e-4)
     train.add_argument("--kl-to-frozen-coef", type=float, default=0.0)
+    train.add_argument("--target-kl", type=float, default=None,
+                       help="Stop remaining PPO epochs after this KL.")
+    train.add_argument("--reject-update-kl", type=float, default=None,
+                       help="Reject the whole update on nonfinite metrics or "
+                            "post-epoch KL above this ceiling.")
     train.add_argument("--output-dir", required=True)
     train.add_argument("--checkpoint", required=True,
                        help="Output RL PPO checkpoint path (.npz).")
@@ -268,7 +273,11 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
         "ppo": {"epochs": int(args.epochs),
                 "minibatch_size": int(args.minibatch_size),
                 "lr": float(args.lr),
-                "kl_to_frozen_coef": float(args.kl_to_frozen_coef)},
+                "kl_to_frozen_coef": float(args.kl_to_frozen_coef),
+                "target_kl": (None if args.target_kl is None
+                              else float(args.target_kl)),
+                "reject_update_kl": (None if args.reject_update_kl is None
+                                     else float(args.reject_update_kl))},
         "output_dir": str(Path(args.output_dir)),
         "checkpoint": str(Path(args.checkpoint)),
     })
@@ -451,8 +460,9 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         batch = build_ppo_batch(buffer.finalize(), gamma=ppo_config.gamma,
                                 gae_lambda=ppo_config.gae_lambda)
         state, metrics = ppo_update(state, batch, config, ppo_config)
-        candidate = _rollout_candidate_from_state(
-            state, config, ppo_config, previous=candidate)
+        if metrics["accepted"]:
+            candidate = _rollout_candidate_from_state(
+                state, config, ppo_config, previous=candidate)
         from rl_manager.ppo_checkpoint import save_ppo_checkpoint
 
         path = save_ppo_checkpoint(

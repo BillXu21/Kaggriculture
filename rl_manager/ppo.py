@@ -216,6 +216,38 @@ def _compiled_update(config: ManagerConfig, ppo_config: PPOConfig,
     return jax.jit(core)
 
 
+@functools.lru_cache(maxsize=None)
+def _compiled_epoch_metrics(config: ManagerConfig, ppo_config: PPOConfig,
+                            model_variant: str = "E"):
+    """JIT'd full-batch diagnostics evaluated after each PPO epoch."""
+    def evaluate(params, frozen_params, prepared_inputs, indices,
+                 old_logprob, advantages, returns):
+        mut_outputs, representation = _forward_eval_with_representation(
+            params["base"], prepared_inputs, config, model_variant)
+        logits = distribution_logits(mut_outputs)
+        stats = group_logprob_and_entropy(logits, indices)
+        value = value_from_representation(representation, params["value"])
+        terms = clipped_surrogate_terms(stats["logprob_total"] - old_logprob,
+                                        advantages, ppo_config.clip_eps)
+        frozen_logits = distribution_logits(_forward_eval(
+            frozen_params, prepared_inputs, config, model_variant))
+        metrics = {
+            "loss": terms["pi_loss"],
+            "pi_loss": terms["pi_loss"],
+            "value_loss": jnp.mean(jnp.square(value - returns)),
+            "entropy": jnp.mean(stats["entropy_total"]),
+            "approx_kl": terms["approx_kl"],
+            "clip_fraction": terms["clip_fraction"],
+            "kl_to_frozen": jnp.mean(kl_to_frozen(logits, frozen_logits)),
+            "explained_variance": explained_variance(value, returns),
+        }
+        metrics.update({f"entropy_{name}": jnp.mean(array) for name, array
+                        in stats["entropy_groups"].items()})
+        return metrics
+
+    return jax.jit(evaluate)
+
+
 # ------------------------------------------------------------ host loop
 
 
@@ -233,7 +265,10 @@ def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
     Shuffle uses an explicit deterministic PRNG stream carried in the train
     state; N must be divisible by minibatch_size (fail loud rather than
     silently dropping rows). Returns the advanced state plus size-weighted
-    metric means and full-batch advantage stats.
+    metric means and full-batch advantage stats. Epoch diagnostics are
+    evaluated after each epoch; target-KL stopping and pathological rejection
+    are reported in the returned metadata. A rejected update returns ``state``
+    itself, preserving its parameters, optimizer state, RNG, and step.
     """
     n = batch.size
     mb = ppo_config.minibatch_size
@@ -256,7 +291,19 @@ def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
     params, opt_state = state.params, state.opt_state
     sums = {key: 0.0 for key in _METRIC_KEYS}
     total_rows = 0
-    for _epoch in range(ppo_config.epochs):
+    epoch_metrics: list[dict[str, float]] = []
+    epochs_ran = 0
+    minibatches_ran = 0
+    stop_reason = "completed"
+    rejection_reason: str | None = None
+    epoch_core = _compiled_epoch_metrics(config, ppo_config, variant)
+
+    def finite_tree(tree) -> bool:
+        return all(np.all(np.isfinite(np.asarray(leaf))) for leaf in
+                   jax.tree_util.tree_leaves(tree))
+
+    for epoch in range(ppo_config.epochs):
+        rejected_metric: str | None = None
         for start in range(0, n, mb):
             sel = perm[start:start + mb]
             gather = lambda array: array[jnp.asarray(sel)]  # noqa: E731
@@ -265,16 +312,85 @@ def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
                 {k: gather(v) for k, v in dev_inputs.items()},
                 {k: gather(v) for k, v in dev_indices.items()},
                 gather(dev_old), gather(dev_adv), gather(dev_ret))
+            minibatches_ran += 1
+            rejected_metric = (next(
+                (key for key, value in metrics.items()
+                 if not np.all(np.isfinite(np.asarray(value)))), None)
+                if ppo_config.reject_update_kl is not None else None)
+            if rejected_metric is not None:
+                stop_reason = "rejected_nonfinite"
+                rejection_reason = f"nonfinite minibatch metric: {rejected_metric}"
+                break
             weight = len(sel)
             total_rows += weight
             for key in _METRIC_KEYS:
                 sums[key] += float(metrics[key]) * weight
+            if (ppo_config.reject_update_kl is not None and
+                    (not finite_tree(params) or not finite_tree(opt_state))):
+                stop_reason = "rejected_nonfinite"
+                rejection_reason = "nonfinite parameter or optimizer state"
+                break
+        if rejection_reason is not None:
+            break
+
+        full_metrics = epoch_core(
+            params, state.frozen_params, dev_inputs, dev_indices,
+            dev_old, dev_adv, dev_ret)
+        epoch_metric = {key: float(value) for key, value in full_metrics.items()}
+        rejected_metric = (next(
+            (key for key, value in epoch_metric.items()
+             if not np.isfinite(value)), None)
+            if ppo_config.reject_update_kl is not None else None)
+        if (rejected_metric is not None or
+                (ppo_config.reject_update_kl is not None and
+                 (not finite_tree(params) or not finite_tree(opt_state)))):
+            stop_reason = "rejected_nonfinite"
+            rejection_reason = (f"nonfinite epoch metric: {rejected_metric}"
+                                if rejected_metric is not None
+                                else "nonfinite parameter or optimizer state")
+            break
+        epoch_metric["epoch"] = float(epoch + 1)
+        epoch_metric["minibatches"] = float(n // mb)
+        epoch_metrics.append(epoch_metric)
+        epochs_ran += 1
+
+        if (ppo_config.reject_update_kl is not None and
+                epoch_metric["approx_kl"] > ppo_config.reject_update_kl):
+            stop_reason = "rejected_kl"
+            rejection_reason = (
+                f"approx_kl {epoch_metric['approx_kl']:.6g} exceeds "
+                f"reject_update_kl {ppo_config.reject_update_kl:.6g}")
+            break
+        if (ppo_config.target_kl is not None and
+                epoch_metric["approx_kl"] > ppo_config.target_kl):
+            stop_reason = "target_kl"
+            break
+
+    if rejection_reason is not None:
+        metrics_out = {key: sums[key] / total_rows for key in _METRIC_KEYS} \
+            if total_rows else {}
+        metrics_out.update({"epoch_metrics": epoch_metrics,
+                            "epochs_ran": epochs_ran,
+                            "minibatches_ran": minibatches_ran,
+                            "rows_ran": total_rows,
+                            "stop_reason": stop_reason,
+                            "rejection_reason": rejection_reason,
+                            "accepted": False})
+        return state, metrics_out
+
     metrics_out = {key: sums[key] / total_rows for key in _METRIC_KEYS}
     metrics_out.update(advantage_stats(batch.advantages))
+    metrics_out.update({"epoch_metrics": epoch_metrics,
+                        "epochs_ran": epochs_ran,
+                        "minibatches_ran": minibatches_ran,
+                        "rows_ran": total_rows,
+                        "stop_reason": stop_reason,
+                        "rejection_reason": None,
+                        "accepted": True})
     new_state = PPOTrainState(params=params, opt_state=opt_state,
                               frozen_params=state.frozen_params,
                               rng=next_rng, step=state.step
-                              + ppo_config.epochs * (n // mb),
+                              + minibatches_ran,
                               rollout_seed=state.rollout_seed)
     return new_state, metrics_out
 

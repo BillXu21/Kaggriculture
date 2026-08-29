@@ -114,6 +114,17 @@ def _update_metrics(metrics: Mapping[str, Any] | None,
     if kl_frozen is None:
         missing["action_drift_kl_to_frozen"] = (
             "kl_to_frozen metric absent; drift vs frozen snapshot unmeasured")
+    section["epochs_ran"] = _finite(metrics.get("epochs_ran"))
+    section["minibatches_ran"] = _finite(metrics.get("minibatches_ran"))
+    section["rows_ran"] = _finite(metrics.get("rows_ran"))
+    section["accepted"] = bool(metrics.get("accepted", True))
+    section["stop_reason"] = metrics.get("stop_reason", "completed")
+    section["rejection_reason"] = metrics.get("rejection_reason")
+    raw_epochs = metrics.get("epoch_metrics", [])
+    section["epoch_metrics"] = [
+        {key: (_finite(value) if key not in ("epoch", "minibatches")
+               else int(value)) for key, value in epoch.items()}
+        for epoch in raw_epochs if isinstance(epoch, Mapping)]
     payload["ppo_metrics"] = section
 
 

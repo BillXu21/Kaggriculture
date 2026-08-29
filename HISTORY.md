@@ -26,7 +26,28 @@ base `c14b327`:
   a protected host temp directory, and the second had 4 passed before exposing
   two test-only issues corrected afterward. Final direct stale-policy,
   factory-wire, parity, compile, and diff checks were run without a further
-  pytest invocation. No full suite or TPU measurement was run.
+   pytest invocation. No full suite or TPU measurement was run.
+
+## 2026-08-28 — Issue #23 PPO Stability Controls
+
+Implemented on isolated branch `codex/issue-23-ppo-stability` from base
+`c14b327f0705536ee264ae08ddd9de08f39365ce`. `PPOConfig` now exposes
+disabled-by-default `target_kl` and opt-in `reject_update_kl`. PPO evaluates
+full-batch approximate KL and clip fraction after each completed epoch, stops
+remaining epochs at the target, and reports per-epoch metrics plus actual
+epoch/minibatch/row counts and stop reason. The rejection guard returns the
+unchanged prior `PPOTrainState` for nonfinite or over-ceiling updates, and the
+training CLI does not refresh policy identity after rejection.
+
+Added `rl_manager/ppo_retention.py::BestCheckpointRetention` for strict-score,
+evaluation-driven named best checkpoints. The saved PPO metadata records the
+evaluation payload and source provenance that caused replacement. CLI plumbing
+exposes both thresholds, while diagnostics includes the new update controls.
+Focused validation: `python -m pytest tests/test_rl_manager_ppo.py
+tests/test_rl_manager_ppo_checkpoint.py tests/test_rl_manager_cli.py -q` ->
+**34 passed**. A synthetic `target_kl=1e-12` update ran one minibatch/epoch,
+reported `stop_reason="target_kl"`, and did not run the remaining epochs. No
+ TPU benchmark or policy-quality claim was made.
 
 ## 2026-08-28 — Issue #17 Central Mixed-Day Inference Batching
 

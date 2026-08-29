@@ -398,3 +398,11 @@ This file records decisions that remain authoritative across chats and work sess
 - Guarantees: worker startup fails if accelerator modules are loaded; worker exceptions, dead exits, missing episodes, duplicate episodes, and duplicate trajectory rows fail loudly; the default executor factory is resolved inside each child rather than pickled from its nested implementation class. Stable row identifiers are available to future stochastic batched policies.
 - Evidence boundary: deterministic truncated fast-engine smoke passed with two spawned workers and two environments per worker, including central request batching and trajectory normalization. TPU throughput and full real-checkpoint scaling remain unmeasured; use `research/RL_MANAGER_PARALLEL_ROLLOUTS.md`.
 - Revisit when: issue #15 changes the executor factory contract, issue #16 supplies a native batched backend, or measured host profiling justifies a different transport.
+
+## D-047 — Keep PPO Stability Guards Opt-In and Evaluation-Driven
+
+- Date: 2026-08-28
+- Status: active
+- Decision: Preserve the existing PPO optimizer behavior when `target_kl` and `reject_update_kl` are unset. When configured, evaluate stored-action approximate KL and clip fraction over the full batch after every completed epoch; stop remaining epochs on `target_kl`, and reject the update on nonfinite values or `reject_update_kl` exceedance by returning the exact prior train state. Retain named best checkpoints only after deterministic caller-owned evaluation, storing its payload and provenance in checkpoint metadata.
+- Rationale: observed TPU KL/clip excursions and economic oscillation require bounded, inspectable update control without redesigning PPO or silently changing old runs. Evaluation-driven retention prevents final-state regression from erasing the best known policy.
+- Evidence boundary: focused synthetic CPU tests pass; no TPU throughput or policy-quality claim is made.

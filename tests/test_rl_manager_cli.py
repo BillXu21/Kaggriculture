@@ -60,6 +60,8 @@ def _train_args(**overrides):
         "minibatch_size": 8,
         "lr": 3e-4,
         "kl_to_frozen_coef": 0.0,
+        "target_kl": None,
+        "reject_update_kl": None,
         "output_dir": "artifacts/local/ppo-smoke",
         "checkpoint": "artifacts/local/ppo-smoke/ppo.npz",
     }
@@ -105,6 +107,8 @@ def test_parser_defaults_are_safe_single_process():
     # Safe small default: 8 divides the expected complete-game row count
     # for the default episodes_per_update=8 (8 * 26 = 208).
     assert args.minibatch_size == 8
+    assert args.target_kl is None
+    assert args.reject_update_kl is None
 
     ev = build_parser().parse_args([
         "eval", "--checkpoint", "ppo.npz", "--e-checkpoint", "ck.pt",
@@ -134,6 +138,21 @@ def test_parser_and_plan_expose_integrated_runner_options(tmp_path):
         "fixed_inference_batch_size": 16,
         "inference_batch_wait_seconds": 0.002,
     }
+
+
+def test_plan_exposes_ppo_stability_controls(tmp_path):
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    args = build_parser().parse_args([
+        "train", "--e-checkpoint", str(checkpoint),
+        "--executor-factory", "executor_v0@stage-a-v1", "--master-seed", "17",
+        "--episodes-per-update", "1", "--minibatch-size", "26",
+        "--target-kl", "0.03", "--reject-update-kl", "2.0",
+        "--output-dir", "out", "--checkpoint", "out/ppo.npz",
+    ])
+    plan = plan_training(args)
+    assert plan["ppo"]["target_kl"] == 0.03
+    assert plan["ppo"]["reject_update_kl"] == 2.0
 
 
 def test_parser_requires_explicit_executor_and_subcommand():

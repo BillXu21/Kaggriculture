@@ -1,6 +1,9 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-27
+Last updated: 2026-08-28
+
+## Issue #23
+- PPO stability controls are implemented on `codex/issue-23-ppo-stability`: `PPOConfig.target_kl` is disabled by default and stops after a completed epoch when full-batch stored-action approximate KL exceeds the threshold. `reject_update_kl` is opt-in and rejects nonfinite or over-ceiling updates by returning the exact prior `PPOTrainState`. Update metrics record per-epoch KL/clip diagnostics, actual epoch/minibatch/row counts, acceptance, and stop/rejection reason. `BestCheckpointRetention` maintains evaluation-driven named best `.npz` checkpoints and stores the replacing evaluation/source provenance in checkpoint metadata. Focused validation passed `34`; no TPU benchmark was run.
 
 ## Issue #22
 - RL correctness hotfixes are implemented on `codex/issue-22-rl-hotfixes` from
