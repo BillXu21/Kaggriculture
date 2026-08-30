@@ -1,5 +1,27 @@
 # Kaggriculture Historical Record
 
+## 2026-08-30 - Animal Crop-Sacrifice Placement Correction
+
+On `codex/fix-animal-crop-sacrifice-placement`, based on
+`codex/promotion-ratchet-minimal` at `ce4f0e4ef19d5e073dbe348d4233dc4eb7b74fe8`:
+
+- Root cause confirmed in `executor_v0/layout.py` and `tasks.py`: coordinated
+  planning masks animal-claimed crop tiles from crop reconciliation, while
+  animal task generation emitted no DIG for `crop_sacrifice`. A purchased
+  animal could therefore create BUY_ANIMAL demand while BUILD repeatedly faced
+  a living crop.
+- `crop_sacrifice` now validates the current canonical tile, emits/reuses the
+  coordinate DIG with the actual crop, and gates BUILD on it; PLACE remains
+  dependent on BUILD. Empty structures, new builds, and weed reclamation retain
+  their prior chains. Stale claims are reported unresolved.
+- Added task-generation regressions for the old missing-DIG failure, exact
+  dependency keys, shared DIG keys, stale claims, and an owned-COW observed
+  DIG -> BUILD_PASTURE -> PLACE completion sequence.
+- Validation: focused executor/layout/task suite passed `161`, with `4`
+  expected official-engine skips; executor smoke passed `28`, with `2`
+  expected skips. Ruff, compilation, and diff checks passed. No official
+  engine package or closed-loop checkpoint smoke was available or run.
+
 ## 2026-08-30 - Minimal PPO Promotion Ratchet
 
 On `codex/promotion-ratchet-minimal` from base `88dd39365f20f7935a0449980689f5e86ed0b66b`:

@@ -14,7 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from executor_v0.layout import reconcile_crops
+from executor_v0.layout import (
+    AnimalLayoutResult,
+    AnimalSlotPlan,
+    CropReconciliationResult,
+    DigIntent,
+    plan_day_layouts,
+)
 from executor_v0.foreman import run_foreman
 from executor_v0.plan import DailyPlan
 from executor_v0.tasks import (
@@ -23,7 +29,7 @@ from executor_v0.tasks import (
     Task,
     generate_tasks,
 )
-from replay_daily.constants import ANIMALS, CROPS, LAND_ORDER
+from replay_daily.constants import ANIMALS, LAND_ORDER
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = REPO_ROOT / "data" / "samples" / "2026-08-20" / "94735084.json"
@@ -740,6 +746,79 @@ def test_animal_shortage_reclaims_weeds_before_sacrificing_crops():
     assert places and places[0].depends_on == (builds[0].key,)
     # The living WHEAT crop is never sacrificed while a weed is reclaimable.
     assert all(t.tile != (0, 2) for t in digs + builds + places)
+
+
+def test_animal_crop_sacrifice_clears_living_crop_before_build():
+    tiles = [[None] * 10 for _ in range(10)]
+    _saturate_nw_except(tiles, set())
+    obs = make_obs(day=WATER_TEST_DAY, step=WATER_TEST_DAY * 24,
+                   tiles=tiles, shed={"COW": 1})
+    plan = make_plan(crop_targets={"TOMATO": 25},
+                     animal_targets={"COW": 1})
+
+    layout = plan_day_layouts(
+        tiles, unlocked_quadrants=("NW",),
+        crop_targets=plan.crop_targets_dict,
+        animals_needed={"COW": 1})
+    assert len(layout.animals.placements) == 1
+    slot = layout.animals.placements[0]
+    assert slot.source == "crop_sacrifice"
+    assert tiles[slot.coord[0]][slot.coord[1]]["kind"] == "PLANT"
+
+    result = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
+    y, x = slot.coord
+    dig_key = f"DIG:{y},{x}"
+    build_key = f"BUILD_PASTURE:{y},{x}"
+    place_key = f"PLACE:COW:{y},{x}"
+    tasks = {task.key: task for task in result.tasks}
+    assert tasks[dig_key].crop == "TOMATO"
+    assert tasks[build_key].depends_on == (dig_key,)
+    assert tasks[place_key].depends_on == (build_key,)
+    assert len(tasks) == len(result.tasks)
+
+
+def test_animal_crop_sacrifice_reuses_existing_coordinate_dig():
+    tiles = [[None] * 10 for _ in range(10)]
+    _saturate_nw_except(tiles, set())
+    obs = make_obs(day=WATER_TEST_DAY, step=WATER_TEST_DAY * 24,
+                   tiles=tiles, shed={"COW": 1})
+    plan = make_plan(crop_targets={"TOMATO": 25},
+                     animal_targets={"COW": 1})
+    slot = AnimalSlotPlan("COW", "PASTURE", (4, 4), "crop_sacrifice")
+    result = generate_tasks(
+        obs, 0, feasible_plan=plan, remaining_sells={},
+        reconcile_result=CropReconciliationResult(
+            digs=(DigIntent((4, 4), "TOMATO"),), plants=(),
+            unresolved_deficits=()),
+        animal_layout_result=AnimalLayoutResult(
+            placements=(slot,), unresolved=()),
+    )
+
+    digs = [task for task in result.tasks if task.kind == "DIG"]
+    build = next(task for task in result.tasks if task.kind == "BUILD_PASTURE")
+    place = next(task for task in result.tasks if task.kind == "PLACE")
+    assert [(task.key, task.crop) for task in digs] == [("DIG:4,4", "TOMATO")]
+    assert build.depends_on == ("DIG:4,4",)
+    assert place.depends_on == (build.key,)
+    assert len({task.key for task in result.tasks}) == len(result.tasks)
+
+
+def test_stale_animal_crop_sacrifice_is_reported_without_building():
+    tiles = [[None] * 10 for _ in range(10)]
+    obs = make_obs(tiles=tiles, shed={"COW": 1})
+    plan = make_plan(animal_targets={"COW": 1})
+    result = generate_tasks(
+        obs, 0, feasible_plan=plan, remaining_sells={},
+        animal_layout_result=AnimalLayoutResult(
+            placements=(AnimalSlotPlan(
+                "COW", "PASTURE", (4, 4), "crop_sacrifice"),),
+            unresolved=()),
+    )
+
+    assert by_kind(result, "DIG") == []
+    assert by_kind(result, "BUILD_PASTURE") == []
+    assert by_kind(result, "PLACE") == []
+    assert result.unresolved == ("animal_crop_sacrifice_stale:COW:4,4",)
 
 
 def test_build_deferred_when_animal_neither_owned_nor_affordable():

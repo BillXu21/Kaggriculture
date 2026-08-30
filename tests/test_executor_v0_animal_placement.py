@@ -6,7 +6,7 @@ import pytest
 
 from executor_v0.agent import AgentConfig, ExecutorAgent
 from executor_v0.foreman import run_foreman
-from executor_v0.layout import plan_animal_layout
+from executor_v0.layout import plan_animal_layout, tile_role
 from executor_v0.manager import FixedPlanProvider
 from executor_v0.plan import DailyPlan
 from executor_v0.tasks import generate_tasks
@@ -18,11 +18,13 @@ CROPS = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")
 PRODUCTS = (*CROPS, "EGG", "MILK", "WOOL", "FERTILIZER")
 
 
-def make_plan(*, animals=None):
+def make_plan(*, animals=None, crops=None):
     targets = {name: 0 for name in ANIMALS}
     targets.update(animals or {})
+    crop_targets = {name: 0 for name in CROPS}
+    crop_targets.update(crops or {})
     return DailyPlan.create(
-        crop_targets={name: 0 for name in CROPS},
+        crop_targets=crop_targets,
         animal_targets=targets,
         land_count=4,
         fertilizer_by_crop={name: 0 for name in CROPS},
@@ -91,6 +93,19 @@ def hard_water_tile():
     }
 
 
+def living_wheat_tile():
+    return {
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "planted_day": 4,
+        "yield_units": 0,
+        "watered_today": True,
+        "consecutive_unwatered": 0,
+        "fertilized_until_day": -1,
+        "max_lifespan_step": 500,
+    }
+
+
 @pytest.mark.parametrize("zero_filled", [False, True])
 def test_empty_pasture_carried_cow_traces_through_next_observed_state(zero_filled):
     board = [[None] * 10 for _ in range(10)]
@@ -126,6 +141,52 @@ def test_empty_pasture_carried_cow_traces_through_next_observed_state(zero_fille
     next_obs["private"]["inventories"][0]["COW"] = 0
     after = generate_tasks(next_obs, 0, feasible_plan=plan, remaining_sells={})
     assert not any(task.kind in ("PLACE", "BUY_ANIMAL") for task in after.tasks)
+
+
+def test_purchased_cow_crop_sacrifice_completes_across_regenerated_tasks():
+    board = [[None] * 10 for _ in range(10)]
+    for y in range(5):
+        for x in range(5):
+            board[y][x] = living_wheat_tile()
+    obs = make_obs(tiles=board, farmer=(4, 4), shed={})
+    obs["farms"][0]["unlocked_quadrants"] = ["NW"]
+    plan = make_plan(animals={"COW": 1}, crops={"WHEAT": 25})
+
+    first = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
+    assert any(task.source == "crop_sacrifice" for task in first.tasks)
+    assert [(task.key, task.quantity) for task in first.tasks
+            if task.kind == "BUY_ANIMAL"] == [("BUY_ANIMAL:COW", 1)]
+    assert run_foreman(obs, 0, first.sorted_tasks()).farmer_action == ("DIG",)
+    target = next(task.tile for task in first.tasks if task.kind == "DIG")
+    assert target == (4, 4)
+
+    dug = copy.deepcopy(obs)
+    dug["farms"][0]["tiles"][4][4] = None
+    dug["private"]["shed"]["COW"] = 1
+    second = generate_tasks(dug, 0, feasible_plan=plan, remaining_sells={})
+    assert run_foreman(dug, 0, second.sorted_tasks()).farmer_action == (
+        "BUILD_PASTURE",)
+
+    built = copy.deepcopy(dug)
+    built["farms"][0]["tiles"][4][4] = {"kind": "PASTURE"}
+    built["private"]["shed"]["COW"] = 0
+    built["private"]["inventories"][0]["COW"] = 1
+    third = generate_tasks(built, 0, feasible_plan=plan, remaining_sells={})
+    assert run_foreman(built, 0, third.sorted_tasks()).farmer_action == (
+        "PLACE", "COW", 1)
+
+    placed = copy.deepcopy(built)
+    placed["private"]["inventories"][0]["COW"] = 0
+    placed["farms"][0]["tiles"][4][4] = animal_tile("COW")
+    final = generate_tasks(placed, 0, feasible_plan=plan, remaining_sells={})
+    assert sum(
+        tile_role(tile) == "animal_structure"
+        and tile.get("animal") == "COW"
+        for row in placed["farms"][0]["tiles"] for tile in row
+        if isinstance(tile, dict)
+    ) == 1
+    assert not any(task.kind in ("BUILD_PASTURE", "PLACE", "BUY_ANIMAL")
+                   for task in final.tasks)
 
 
 def test_multiple_livestock_claim_distinct_compatible_structures():

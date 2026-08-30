@@ -2,6 +2,13 @@
 
 Last updated: 2026-08-30
 
+## Animal Crop-Sacrifice Placement Correction
+- The bounded executor correction is implemented on
+  `codex/fix-animal-crop-sacrifice-placement` from
+  `codex/promotion-ratchet-minimal` at `ce4f0e4`. Validate the focused
+  executor/layout/task suites, commit, and stop. Do not broaden into layout
+  strategy, manager changes, or self-play.
+
 ## Promotion Ratchet Status
 - The minimal opt-in PPO ratchet is implemented on
   `codex/promotion-ratchet-minimal`: every configured cadence evaluates a

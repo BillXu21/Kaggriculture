@@ -2,6 +2,26 @@
 
 This file records decisions that remain authoritative across chats and work sessions. A decision should include the reason, evidence, and conditions for revisiting it.
 
+## D-050 - Clear Living Crops Before Animal Crop-Sacrifice Builds
+
+- Date: 2026-08-30
+- Status: active executor mechanical correction
+- Decision: An animal layout slot with `source="crop_sacrifice"` must use the
+  current canonical board to identify the living crop at its coordinate, emit
+  or reuse `DIG:y,x`, and make `BUILD_COOP`/`BUILD_PASTURE` depend on that DIG.
+  `PLACE` continues to depend on BUILD. If the current tile is no longer a
+  living PLANT, report the slot unresolved and emit neither BUILD nor PLACE.
+- Rationale: `plan_day_layouts()` masks animal claims before crop
+  reconciliation, so the crop reconciler cannot clear the claimed crop. The
+  missing animal DIG left BUILD illegal while PLACE still contributed
+  BUY_ANIMAL demand, stranding purchased livestock.
+- Evidence: deterministic task-generation regressions and an observed-state
+  COW sequence cover exact keys, shared DIG reuse, stale claims, crop removal,
+  pasture construction, and final placement. No manager, layout strategy, or
+  self-play behavior changes.
+- Revisit when: the engine placement/build contract or canonical board schema
+  changes.
+
 ## D-049 - Ratchet Only the Frozen Rollout Opponent
 
 - Date: 2026-08-30

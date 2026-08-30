@@ -496,11 +496,14 @@ def generate_tasks(
                           source="mechanical"))
 
     # ---- MANAGER: crop reconciliation ---------------------------------
+    dig_keys_by_coord: dict[tuple[int, int], str] = {}
     for dig in reconcile_result.digs:
-        tasks.append(Task(key=f"DIG:{dig.coord[0]},{dig.coord[1]}",
-                          kind="DIG", priority=Priority.MANAGER,
-                          tile=dig.coord, crop=dig.crop,
-                          source="manager_reconciliation"))
+        dig_key = f"DIG:{dig.coord[0]},{dig.coord[1]}"
+        if dig.coord not in dig_keys_by_coord:
+            tasks.append(Task(key=dig_key, kind="DIG", priority=Priority.MANAGER,
+                              tile=dig.coord, crop=dig.crop,
+                              source="manager_reconciliation"))
+            dig_keys_by_coord[dig.coord] = dig_key
     for intent in reconcile_result.plants:
         depends = []
         if any(d.coord == intent.coord for d in reconcile_result.digs):
@@ -544,9 +547,28 @@ def generate_tasks(
         build_deps: list[str] = []
         if slot.source == "weed_reclaim":
             dig_key = f"DIG:{slot.coord[0]},{slot.coord[1]}"
-            tasks.append(Task(key=dig_key, kind="DIG",
-                              priority=Priority.MANAGER, tile=slot.coord,
-                              crop="WEED", source="weed_reclaim"))
+            if slot.coord not in dig_keys_by_coord:
+                tasks.append(Task(key=dig_key, kind="DIG",
+                                  priority=Priority.MANAGER, tile=slot.coord,
+                                  crop="WEED", source="weed_reclaim"))
+                dig_keys_by_coord[slot.coord] = dig_key
+            build_deps.append(dig_key)
+        elif slot.source == "crop_sacrifice":
+            current_tile = _tile_at(board, slot.coord)
+            if tile_role(current_tile) != "plant" \
+                    or not current_tile.get("crop"):
+                unresolved.append(
+                    f"animal_crop_sacrifice_stale:{slot.animal}:"
+                    f"{slot.coord[0]},{slot.coord[1]}")
+                continue
+            dig_key = dig_keys_by_coord.get(slot.coord)
+            if dig_key is None:
+                dig_key = f"DIG:{slot.coord[0]},{slot.coord[1]}"
+                tasks.append(Task(key=dig_key, kind="DIG",
+                                  priority=Priority.MANAGER, tile=slot.coord,
+                                  crop=current_tile["crop"],
+                                  source="crop_sacrifice"))
+                dig_keys_by_coord[slot.coord] = dig_key
             build_deps.append(dig_key)
         build_kind = ("BUILD_COOP" if slot.structure == "COOP"
                       else "BUILD_PASTURE")

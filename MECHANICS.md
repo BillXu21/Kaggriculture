@@ -2,6 +2,22 @@
 
 Last updated: 2026-08-30
 
+## Animal Crop-Sacrifice Placement Correction (2026-08-30)
+
+- `CONFIRMED_EXPERIMENT`: an animal `crop_sacrifice` slot must clear its
+  claimed living PLANT before building its compatible structure. Because
+  `plan_day_layouts()` masks animal claims from crop reconciliation, the
+  executor task generator now emits/reuses `DIG:y,x` using the current tile's
+  crop, then `BUILD_COOP`/`BUILD_PASTURE:y,x`, then `PLACE:ANIMAL:y,x`.
+- `CONFIRMED_EXPERIMENT`: if a supplied slot claims `crop_sacrifice` but the
+  current canonical tile is not a living PLANT, the executor reports the slot
+  unresolved and does not issue a stale DIG, BUILD, or PLACE. Existing
+  `empty_structure`, `new_build`, and `weed_reclaim` chains are unchanged.
+- Regression coverage is in `tests/test_executor_v0_tasks.py` and
+  `tests/test_executor_v0_animal_placement.py`; no official package is
+  installed locally, so this is executor/task evidence rather than official
+  differential evidence.
+
 ## Issue #33 Fast/Official Parity Audit (2026-08-30)
 
 - `CONFIRMED_EXPERIMENT`: after rebuilding the native extension from the audit

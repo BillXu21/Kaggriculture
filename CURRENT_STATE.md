@@ -2,6 +2,18 @@
 
 Last updated: 2026-08-30
 
+## Animal Crop-Sacrifice Placement Correction
+- On `codex/fix-animal-crop-sacrifice-placement`, based on
+  `codex/promotion-ratchet-minimal` at `ce4f0e4`, animal
+  `crop_sacrifice` slots now clear their currently observed living crop before
+  BUILD. The resulting chain is `DIG:y,x -> BUILD_*:y,x -> PLACE:ANIMAL:y,x`;
+  stale/non-PLANT claims are reported unresolved rather than executed.
+- Focused regressions cover the old missing-DIG failure, exact keys,
+  duplicate-DIG reuse, stale claims, and an owned-COW three-observation
+  completion sequence. Focused executor/layout/task validation passes `161`
+  with `4` expected official-engine skips; executor smoke passes `28` with `2`
+  expected skips. Ruff, compilation, and diff checks pass.
+
 ## Promotion Ratchet
 - The bounded `codex/promotion-ratchet-minimal` patch adds opt-in PPO
   promotion checks (`--promotion-every`) on fixed seeds `3000..3031`, both seat
