@@ -2,6 +2,41 @@
 
 This file records decisions that remain authoritative across chats and work sessions. A decision should include the reason, evidence, and conditions for revisiting it.
 
+## D-046 - Aggressive Sell Must Preserve Feed-Reserve WHEAT
+
+- Date: 2026-08-30
+- Status: active
+- Decision: `aggressive_sell_all` preserves `min(shed[WHEAT], feed["shed_reserve"])` units of WHEAT, where `shed_reserve = max(0, unfed - carried_wheat)` from `_animal_feed_state`. Only `available-protected` WHEAT is sold; all other products remain fully aggressive. The protected amount is recorded in `feed_reserve_protected_units`.
+- Rationale: The aggressive path bypassed the normal-path reserve, allowing `SELL WHEAT` of survival feed while `consecutive_unfed >=1`, contributing to official 1.32.7 escapes (`6 vs 0`). This is a survival guardrail, not strategy.
+- Evidence: 7 new regressions; fast sanity 4/4 with 0 escapes and `--turn-trace` compatible; official promotion remains blocked pending retest.
+- Revisit when: feed semantics change or official evidence shows a different reserve is required.
+
+## D-045 - Bind Confirmed Plant Watering to the Planting Worker
+
+- Date: 2026-08-29
+- Status: active
+- Decision: After the next observation confirms that an exact submitted PLANT
+  created the matching fresh unwatered crop, reserve the generated hard WATER
+  task for that same worker for the next executor action. Keep one short-lived
+  continuation per worker; discard it when the step, tile, crop, worker, or
+  unwatered-plant state no longer matches. The executor flag is enabled by
+  default, with an explicit OFF setting only for paired evaluation.
+- Rationale: WATER task generation already handled crop lifecycle legality, but
+  global rematching allowed an earlier worker to take the task. A worker-bound
+  continuation fixes identity without changing manager outputs or generic
+  WATER priority.
+- Safety interaction: active starvation still removes non-FEED tile work, so
+  FEED remains ahead of this continuation. The continuation is retained and
+  revalidated after starvation pressure clears; no starvation protection is
+  weakened.
+- Evidence: focused synthetic regressions cover all five crops, failed/stale
+  plants, multiple workers, no repeated WATER, and starvation. The bounded
+  fast-engine BC-E A/B on seeds 7/17/42/123 in both seats completed with zero
+  fallback/status errors. Fast result was misleading; official 1.32.7 showed escapes, see D-046.
+- Revisit when: engine observations stop exposing reliable fresh-plant state,
+  worker actions can be displaced between observations, or broader official
+  evidence contradicts the sequencing value.
+
 ## D-044 - Preserve Ready Animal Placement During Capital Suppression
 
 - Date: 2026-08-29

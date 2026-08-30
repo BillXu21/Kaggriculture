@@ -243,6 +243,7 @@ def run_foreman(
     tasks: Sequence[Task],
     *,
     config: ForemanConfig = ForemanConfig(),
+    worker_continuations: Mapping[int, Task] | None = None,
 ) -> ForemanResult:
     """Run one greedy dispatch turn. Pure; inputs never mutated."""
     farm = obs["farms"][seat]
@@ -325,8 +326,16 @@ def run_foreman(
         ]
         best_feasible_priority = min(feasible_priorities, default=None)
 
+        continuation = (worker_continuations or {}).get(worker.index)
+        if continuation is not None \
+                and continuation.kind == "WATER" \
+                and continuation.tile is not None \
+                and continuation.tile == worker.position \
+                and _interaction_op(continuation) is not None:
+            chosen, reason = continuation, "same_worker_plant_continuation"
+
         # 1. Underfoot: highest-priority actionable task at our tile.
-        for task in tile_tasks:
+        for task in tile_tasks if chosen is None else ():
             if task.key in claimed or task.tile != worker.position:
                 continue
             if not _carried(worker, task.required_item):

@@ -519,6 +519,7 @@ def _run_one(
     prior_debt_suppression: bool,
     turn_trace: bool,
     aggressive_sell_all: bool,
+    immediate_plant_water: bool,
     optional_idle_cleanup: bool,
     optional_spare_watering: bool,
     max_transitions: int,
@@ -534,6 +535,7 @@ def _run_one(
         turn_trace=turn_trace,
         suppress_expansion_from_prior_debt=prior_debt_suppression,
         aggressive_sell_all=aggressive_sell_all,
+        immediate_plant_water=immediate_plant_water,
         optional_idle_cleanup=optional_idle_cleanup,
         optional_spare_watering=optional_spare_watering,
     )
@@ -677,6 +679,7 @@ def _run_one(
         "prior_debt_suppression": prior_debt_suppression,
         "turn_trace": turn_trace,
         "aggressive_sell_all": aggressive_sell_all,
+        "immediate_plant_water": immediate_plant_water,
         "optional_idle_cleanup": optional_idle_cleanup or optional_spare_watering,
         "optional_spare_watering": optional_spare_watering,
         "cleanup_mode": cleanup_mode,
@@ -723,6 +726,7 @@ def _run_one(
         "opponent": opponent,
         "prior_debt_suppression": prior_debt_suppression,
         "aggressive_sell_all": aggressive_sell_all,
+        "immediate_plant_water": immediate_plant_water,
         "optional_idle_cleanup": optional_idle_cleanup or optional_spare_watering,
         "optional_spare_watering": optional_spare_watering,
         "cleanup_mode": cleanup_mode,
@@ -743,6 +747,7 @@ def run_game(
     prior_debt_suppression: bool = True,
     turn_trace: bool = False,
     aggressive_sell_all: bool = False,
+    immediate_plant_water: bool = True,
     optional_idle_cleanup: bool = False,
     optional_spare_watering: bool = False,
     max_transitions: int = DEFAULT_MAX_TRANSITIONS,
@@ -762,10 +767,12 @@ def run_game(
     if not isinstance(prior_debt_suppression, bool) \
             or not isinstance(turn_trace, bool) \
             or not isinstance(aggressive_sell_all, bool) \
+            or not isinstance(immediate_plant_water, bool) \
             or not isinstance(optional_idle_cleanup, bool) \
             or not isinstance(optional_spare_watering, bool):
         raise EvaluatorError(
-            "prior_debt_suppression, turn_trace, aggressive_sell_all, and "
+            "prior_debt_suppression, turn_trace, aggressive_sell_all, "
+            "immediate_plant_water, and "
             "optional_idle_cleanup, optional_spare_watering "
             "must be booleans"
         )
@@ -789,6 +796,7 @@ def run_game(
         prior_debt_suppression=prior_debt_suppression,
         turn_trace=turn_trace,
         aggressive_sell_all=aggressive_sell_all,
+        immediate_plant_water=immediate_plant_water,
         optional_idle_cleanup=optional_idle_cleanup,
         optional_spare_watering=optional_spare_watering,
         max_transitions=max_transitions,
@@ -808,6 +816,7 @@ def run_panel(
     prior_debt_suppression: bool = True,
     turn_trace: bool = False,
     aggressive_sell_all: bool = False,
+    immediate_plant_water: bool = True,
     optional_idle_cleanup: bool = False,
     optional_spare_watering: bool = False,
     max_transitions: int = DEFAULT_MAX_TRANSITIONS,
@@ -854,10 +863,12 @@ def run_panel(
     if not isinstance(prior_debt_suppression, bool) \
             or not isinstance(turn_trace, bool) \
             or not isinstance(aggressive_sell_all, bool) \
+            or not isinstance(immediate_plant_water, bool) \
             or not isinstance(optional_idle_cleanup, bool) \
             or not isinstance(optional_spare_watering, bool):
         raise EvaluatorError(
-            "prior_debt_suppression, turn_trace, aggressive_sell_all, and "
+            "prior_debt_suppression, turn_trace, aggressive_sell_all, "
+            "immediate_plant_water, and "
             "optional_idle_cleanup, optional_spare_watering "
             "must be booleans"
         )
@@ -875,6 +886,7 @@ def run_panel(
             prior_debt_suppression=prior_debt_suppression,
             turn_trace=turn_trace,
             aggressive_sell_all=aggressive_sell_all,
+            immediate_plant_water=immediate_plant_water,
             optional_idle_cleanup=optional_idle_cleanup,
             optional_spare_watering=optional_spare_watering,
             max_transitions=max_transitions,
@@ -888,6 +900,7 @@ def run_panel(
         "seed_selection": seed_list,
         "seat_selection": seat_list,
         "aggressive_sell_all": aggressive_sell_all,
+        "immediate_plant_water": immediate_plant_water,
         "optional_idle_cleanup": optional_idle_cleanup or optional_spare_watering,
         "optional_spare_watering": optional_spare_watering,
         "cleanup_mode": (
@@ -903,6 +916,7 @@ def run_panel(
         "source_provenance": {
             "repo_sha": _source_repo_sha(repo_root),
             "tool": "tools.run_executor_v07_panel",
+            "immediate_plant_water": immediate_plant_water,
             "optional_idle_cleanup": optional_idle_cleanup or optional_spare_watering,
             "optional_spare_watering": optional_spare_watering,
             "cleanup_mode": cleanup_mode,
@@ -920,6 +934,7 @@ def run_panel(
             "prior_debt_suppression": prior_debt_suppression,
             "turn_trace": turn_trace,
             "aggressive_sell_all": aggressive_sell_all,
+            "immediate_plant_water": immediate_plant_water,
             "optional_idle_cleanup": optional_idle_cleanup or optional_spare_watering,
             "optional_spare_watering": optional_spare_watering,
             "cleanup_mode": cleanup_mode,
@@ -966,6 +981,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="enable the experimental literal full-shed sell override",
     )
     parser.add_argument(
+        "--immediate-plant-water", choices=("on", "off"), default="on",
+        help="water a confirmed newly planted tile with its planting worker next turn",
+    )
+    parser.add_argument(
         "--optional-idle-cleanup", action="store_true",
         help="enable weed-first then water PASS-only cleanup",
     )
@@ -999,6 +1018,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             prior_debt_suppression=args.prior_debt_suppression == "on",
             turn_trace=args.turn_trace,
             aggressive_sell_all=args.aggressive_sell_all,
+            immediate_plant_water=args.immediate_plant_water == "on",
             optional_idle_cleanup=args.optional_idle_cleanup,
             optional_spare_watering=args.optional_spare_watering,
             max_transitions=args.max_transitions,

@@ -128,6 +128,144 @@ def assert_legal_shape(action, obs, seat=0):
         assert all(isinstance(tok, (str, int)) for tok in order)
 
 
+@pytest.mark.parametrize("crop", ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON"))
+def test_confirmed_plant_is_watered_by_same_worker_next_turn(crop):
+    plan = simple_plan(crop_targets={
+        name: int(name == crop)
+        for name in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")
+    })
+    agent = ExecutorAgent(FixedPlanProvider(plan), seat=0)
+    first = make_obs(day=3, hour=2, farmer=(4, 4), seeds={crop: 1})
+
+    assert agent(first)["farmer"] == ["PLANT", crop]
+
+    planted = empty_tiles()
+    planted[4][4] = plant_tile(
+        crop, planted_day=3, consecutive_unwatered=1, watered_today=False)
+    second = make_obs(
+        day=3, hour=3, farmer=(4, 4), seeds={}, tiles=planted)
+    assert agent(second)["farmer"] == ["WATER"]
+
+    watered = copy.deepcopy(planted)
+    watered[4][4]["watered_today"] = True
+    third = make_obs(
+        day=3, hour=4, farmer=(4, 4), seeds={}, tiles=watered)
+    assert third and agent(third)["farmer"] != ["WATER"]
+
+
+def test_failed_plant_does_not_create_phantom_water_continuation():
+    plan = simple_plan(crop_targets={
+        "WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    agent = ExecutorAgent(FixedPlanProvider(plan), seat=0)
+    first = make_obs(day=3, hour=2, farmer=(4, 4), seeds={"WHEAT": 1})
+    assert agent(first)["farmer"] == ["PLANT", "WHEAT"]
+
+    # The engine silently no-ops an invalid PLANT; the tile remains empty.
+    second = make_obs(day=3, hour=3, farmer=(4, 4), seeds={"WHEAT": 1})
+    assert agent(second)["farmer"] == ["PLANT", "WHEAT"]
+    assert agent.diagnostics_json()["fallback_errors"] == []
+
+
+def test_failed_plant_does_not_match_an_older_same_crop():
+    plan = simple_plan(crop_targets={
+        "WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    agent = ExecutorAgent(FixedPlanProvider(plan), seat=0)
+    first_tiles = empty_tiles()
+    first_tiles[4][5] = plant_tile("CARROT", watered_today=False)
+    first = make_obs(
+        day=3, hour=2, farmer=(5, 4), hands=[(4, 4)],
+        seeds={"WHEAT": 1}, inventories=[{}, {}], tiles=first_tiles)
+    action = agent(first)
+    assert action["farmer"] == ["WATER"]
+    assert action["hands"] == [["PLANT", "WHEAT"]]
+
+    second_tiles = empty_tiles()
+    second_tiles[4][4] = plant_tile(
+        "WHEAT", planted_day=2, consecutive_unwatered=1,
+        watered_today=False)
+    second = make_obs(
+        day=3, hour=3, farmer=(5, 4), hands=[(4, 4)], seeds={},
+        inventories=[{}, {}], tiles=second_tiles)
+    action = agent(second)
+    assert action["hands"] == [["PASS"]]
+
+
+@pytest.mark.parametrize("stale_tile", ("WEED", {"kind": "PLANT", "crop": "WHEAT",
+                                                    "watered_today": True}))
+def test_stale_or_already_watered_tile_drops_continuation(stale_tile):
+    plan = simple_plan(crop_targets={
+        "WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    agent = ExecutorAgent(FixedPlanProvider(plan), seat=0)
+    first = make_obs(day=3, hour=2, farmer=(4, 4), seeds={"WHEAT": 1})
+    assert agent(first)["farmer"] == ["PLANT", "WHEAT"]
+
+    tiles = empty_tiles()
+    tiles[4][4] = stale_tile
+    second = make_obs(day=3, hour=3, farmer=(4, 4), seeds={}, tiles=tiles)
+    assert agent(second)["farmer"] != ["WATER"]
+
+
+def test_plant_water_continuations_are_independent_per_worker():
+    plan = simple_plan(crop_targets={
+        "WHEAT": 2, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    agent = ExecutorAgent(FixedPlanProvider(plan), seat=0)
+    first = make_obs(
+        day=3, hour=2, farmer=(4, 4), hands=[(4, 3)],
+        seeds={"WHEAT": 2}, inventories=[{}, {}])
+    action = agent(first)
+    assert action["farmer"] == ["PLANT", "WHEAT"]
+    assert action["hands"] == [["PLANT", "WHEAT"]]
+
+    planted = empty_tiles()
+    planted[4][4] = plant_tile("WHEAT", planted_day=3,
+                               consecutive_unwatered=1, watered_today=False)
+    planted[3][4] = plant_tile("WHEAT", planted_day=3,
+                               consecutive_unwatered=1, watered_today=False)
+    second = make_obs(
+        day=3, hour=3, farmer=(4, 4), hands=[(4, 3)], seeds={},
+        inventories=[{}, {}], tiles=planted)
+    water_action = agent(second)
+    assert water_action["farmer"] == ["WATER"]
+    assert water_action["hands"] == [["WATER"]]
+
+
+def test_starvation_preemption_remains_ahead_of_plant_water_continuation():
+    plan = simple_plan(crop_targets={
+        "WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    agent = ExecutorAgent(FixedPlanProvider(plan), seat=0)
+    first_tiles = empty_tiles()
+    first_tiles[4][5] = plant_tile("CARROT", watered_today=False)
+    first = make_obs(
+        day=3, hour=2, farmer=(5, 4), hands=[(4, 4)],
+        seeds={"WHEAT": 1}, inventories=[{}, {}], tiles=first_tiles)
+    action = agent(first)
+    assert action["farmer"] == ["WATER"]
+    assert action["hands"] == [["PLANT", "WHEAT"]]
+
+    second_tiles = empty_tiles()
+    second_tiles[4][5] = pasture_tile("GOOSE", fed_today=False,
+                                      consecutive_unfed=1)
+    second_tiles[4][4] = plant_tile(
+        "WHEAT", planted_day=3, consecutive_unwatered=1,
+        watered_today=False)
+    second = make_obs(
+        day=3, hour=3, farmer=(5, 4), hands=[(4, 4)], seeds={},
+        inventories=[{"WHEAT": 1}, {}], tiles=second_tiles)
+    action = agent(second)
+    assert action["farmer"] == ["FEED"]
+    assert action["hands"] == [["PASS"]]
+
+
 # ------------------------------------------------------- manager once / days
 
 
@@ -241,6 +379,8 @@ def test_default_sell_path_does_not_sell_unrequested_stock():
 
 
 def test_aggressive_sell_all_uses_full_shed_inventory_including_wheat_feed():
+    # Bugfix: aggressive sell-all must still protect shed_reserve WHEAT for
+    # currently unfed animals; the old test encoded the unsafe behavior.
     tiles = empty_tiles()
     tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=1)
     shed = {product: index + 1 for index, product in enumerate(PRODUCTS)}
@@ -250,27 +390,23 @@ def test_aggressive_sell_all_uses_full_shed_inventory_including_wheat_feed():
 
     action = agent(make_obs(day=3, hour=1, shed=shed, tiles=tiles))
 
+    # WHEAT reserve = 1 (1 unfed, 0 carried) so only non-reserved WHEAT would
+    # be sold; with exactly 1 in shed, no WHEAT sell is emitted.
     assert [order for order in action["market"] if order[0] == "SELL"] == [
-        ["SELL", product, shed[product]] for product in PRODUCTS
+        ["SELL", product, shed[product]] for product in PRODUCTS if product != "WHEAT"
     ]
     assert agent.diagnostics_json()["days"]["3"]["sells"]["0"]["WHEAT"] == {
         "source": "aggressive_sell_all",
         "requested": 0,
         "submitted": 0,
         "remaining": 0,
-        "override_requested": shed["WHEAT"],
-        "override_submitted": shed["WHEAT"],
+        "override_requested": 0,
+        "override_submitted": 0,
         "override_skipped": 0,
     }
     assert agent.debug_trace_turn["market"]["sell_mode"] == "aggressive_sell_all"
-    assert agent.debug_trace_turn["market"]["sell_submitted"][0] == {
-        "source": "aggressive_sell_all",
-        "product": "WHEAT",
-        "quantity": shed["WHEAT"],
-        "bc_requested": 0,
-        "order": ["SELL", "WHEAT", shed["WHEAT"]],
-    }
-    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 0
+    assert all(item["product"] != "WHEAT" for item in agent.debug_trace_turn["market"]["sell_submitted"])
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 1
 
 
 def test_aggressive_sell_all_skips_zero_inventory():
@@ -303,6 +439,96 @@ def test_aggressive_sell_all_market_cap_reports_only_submitted_sells():
     sells = agent.diagnostics_json()["days"]["3"]["sells"]["0"]
     assert [sells[product]["override_submitted"] for product in PRODUCTS] == [2, 2, 2, 0, 0, 0, 0, 0, 0]
     assert [sells[product]["override_skipped"] for product in PRODUCTS] == [0, 0, 0, 2, 2, 2, 2, 2, 2]
+
+
+def test_aggressive_sell_all_with_no_unfed_sells_all_wheat():
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(aggressive_sell_all=True))
+    action = agent(make_obs(day=3, hour=1, shed={"WHEAT": 5}))
+    assert ["SELL", "WHEAT", 5] in action["market"]
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 0
+
+
+def test_aggressive_sell_all_protects_exact_shed_reserve():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=0)
+    tiles[4][5] = pasture_tile(fed_today=False, consecutive_unfed=0)
+    # 2 unfed => reserve 2
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(aggressive_sell_all=True))
+    action = agent(make_obs(day=3, hour=1, shed={"WHEAT": 5}, tiles=tiles))
+    assert ["SELL", "WHEAT", 3] in action["market"]
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 2
+    assert agent.diagnostics_json()["days"]["3"]["sells"]["0"]["WHEAT"]["override_requested"] == 3
+
+
+def test_aggressive_sell_all_shed_at_or_below_reserve_sells_no_wheat():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=1)
+    tiles[4][5] = pasture_tile(fed_today=False, consecutive_unfed=1)
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(aggressive_sell_all=True))
+    action = agent(make_obs(day=3, hour=1, shed={"WHEAT": 2}, tiles=tiles))
+    assert all(order[1] != "WHEAT" for order in action["market"] if order[0] == "SELL")
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 2
+
+
+def test_aggressive_sell_all_non_wheat_products_remain_fully_sold():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=1)
+    shed = {"WHEAT": 10, "CARROT": 4, "TOMATO": 7, "EGG": 3}
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(aggressive_sell_all=True))
+    action = agent(make_obs(day=3, hour=1, shed=shed, tiles=tiles))
+    sells = {order[1]: order[2] for order in action["market"] if order[0] == "SELL"}
+    assert sells["CARROT"] == 4
+    assert sells["TOMATO"] == 7
+    assert sells["EGG"] == 3
+    # WHEAT protected by 1
+    assert sells["WHEAT"] == 9
+
+
+def test_aggressive_sell_all_carried_wheat_reduces_shed_reserve():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=0)
+    tiles[4][5] = pasture_tile(fed_today=False, consecutive_unfed=0)
+    # 2 unfed, 1 carried WHEAT => shed_reserve 1
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(aggressive_sell_all=True))
+    action = agent(make_obs(day=3, hour=1, shed={"WHEAT": 5},
+                            inventories=[{"WHEAT": 1}], tiles=tiles))
+    assert ["SELL", "WHEAT", 4] in action["market"]
+    assert agent.debug_trace_turn["survival"]["protected_reserve"] == 1
+
+
+def test_non_aggressive_sell_still_protects_reserve():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=0)
+    # non-aggressive path clips to BC request; ensure reserve still applied
+    plan = sell_plan(wheat_bin0=10, wheat_bin1=0)
+    agent = ExecutorAgent(recording_provider(plan), seat=0)
+    action = agent(make_obs(day=3, hour=1, shed={"WHEAT": 5}, tiles=tiles))
+    # 1 unfed, reserve 1, available 4, BC wants 10 => should sell only 4
+    assert ["SELL", "WHEAT", 4] in action["market"]
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 1
+
+
+def test_aggressive_sell_all_does_not_dump_survival_wheat_with_starving_animal():
+    # Repro of the failure pattern: starving animal (consecutive_unfed>=1)
+    # plus limited shed WHEAT must not be dumped.
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile(animal="GOOSE", fed_today=False, consecutive_unfed=1)
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(aggressive_sell_all=True))
+    action = agent(make_obs(day=3, hour=1, shed={"WHEAT": 1}, tiles=tiles))
+    assert not any(order == ["SELL", "WHEAT", 1] for order in action["market"])
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 1
 
 
 def test_inactive_bin_never_sells_and_new_bin_resets_ledger():

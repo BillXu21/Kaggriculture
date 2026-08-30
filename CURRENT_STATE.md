@@ -1,6 +1,13 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-28
+Last updated: 2026-08-29
+
+## Issue #28 Run Setup
+- Branch `codex/issue-28-immediate-plant-water`, base `feaf6ccfb4ac37380d9644f73d2cd7f2fb35474a`.
+- Executor-only confirmed same-worker PLANT -> WATER continuation. Initial focused/broader suites passed `141/193` tests; full suite `808 passed, 104 skipped` with two host-sensitive failures.
+- Initial fast-engine A/B (8 games, aggressive sell) was misleadingly positive (`72,762.75` vs `55,885.0`, `+16,877.75`).
+- Official 1.32.7 A/B exposed 6 animal escapes in ON (OFF 0) with mean delta `-4,975` (`70,017.75` vs `65,042.75`); weeds/work debt still improved.
+- Root cause: aggressive sell-all bypassed `feed["shed_reserve"]` protection for WHEAT, enabling `SELL WHEAT -> BUY WHEAT` churn while starving. Fix protects `min(shed[WHEAT], shed_reserve)` in aggressive mode. Small fast sanity (seeds 7,17 both seats, aggressive+plant-water+spare-water, `--turn-trace`) now passes 4/4 with 0 escapes, 0 fallbacks. Promotion remains blocked pending official retest.
 
 ## Issue #25
 - On isolated branch `codex/issues-25-preventive-watering` from

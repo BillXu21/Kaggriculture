@@ -295,6 +295,22 @@ def test_aggressive_sell_flag_propagates_and_is_recorded(tmp_path):
     ] is True
 
 
+def test_immediate_plant_water_flag_propagates_and_is_recorded(tmp_path):
+    off = _run(tmp_path, immediate_plant_water=False)
+    on = _run(tmp_path, immediate_plant_water=True)
+
+    assert off["request"]["immediate_plant_water"] is False
+    assert off["request"]["configuration"]["immediate_plant_water"] is False
+    assert off["games"][0]["immediate_plant_water"] is False
+    assert off["games"][0]["executor_diagnostics"]["config"][
+        "immediate_plant_water"
+    ] is False
+    assert on["request"]["immediate_plant_water"] is True
+    assert on["games"][0]["executor_diagnostics"]["config"][
+        "immediate_plant_water"
+    ] is True
+
+
 def test_optional_spare_watering_flag_propagates_and_is_recorded(tmp_path):
     default = _run(tmp_path)
     enabled = _run(tmp_path, optional_spare_watering=True)
