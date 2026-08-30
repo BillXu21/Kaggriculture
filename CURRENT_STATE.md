@@ -1,6 +1,26 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-29
+Last updated: 2026-08-30
+
+## Issue #33 Fast/Official Parity Audit
+- On isolated branch `codex/issue-33-fast-official-parity-audit`, anchored at
+  `57db920689ef80fb373128d4b8129054816d133f`, the rebuilt current Rust
+  extension was audited against pinned official `kaggle_environments==1.32.7`.
+- Reset underlying state and policy-visible observations matched for seeds
+  `7,17,42,123`. Eight seat-swapped current BC-E vs PASS traces and one active
+  BC-E vs BC-E trace each passed 719 accepted post-reset transitions to
+  terminal with exact same-action state and independent observation/action
+  parity. Existing 8-seed legal-ish corpus rerun: 5,752 action pairs, 33
+  families, zero divergence.
+- Native identity: `fast_env/_kaggriculture_env.cp313-win_amd64.pyd`, SHA-256
+  `c71fc02cd7acbce2c2cc8a950f894311bcc7b2b3385880fe26e7f49f99a64ffa`, Rust
+  source commit `63c8113585575fd6c3edf1417795eb553b44ddae`. Official provenance
+  passed version `1.32.7`, upstream `28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c`.
+- No semantic divergence or fix was identified. Classification is
+  **provisionally training-safe for tested paths**, not universal parity and
+  not permission to use fast score magnitude for promotion. Detail and local
+  machine-readable artifacts: `research/FAST_OFFICIAL_PARITY_AUDIT_ISSUE33.md`
+  and ignored `artifacts/local/fast_official_parity/`.
 
 ## Issue #28 Run Setup
 - Branch `codex/issue-28-immediate-plant-water`, base `feaf6ccfb4ac37380d9644f73d2cd7f2fb35474a`.

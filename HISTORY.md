@@ -1,5 +1,34 @@
 # Kaggriculture Historical Record
 
+## 2026-08-30 - Issue #33 Fast/Official Parity Audit
+
+On isolated branch `codex/issue-33-fast-official-parity-audit` from the Stage-2
+handoff anchor `57db920689ef80fb373128d4b8129054816d133f`:
+
+- Rebuilt the PyO3 extension from the current worktree with `maturin
+  develop --release`; native identity was
+  `fast_env/_kaggriculture_env.cp313-win_amd64.pyd`, SHA-256
+  `c71fc02cd7acbce2c2cc8a950f894311bcc7b2b3385880fe26e7f49f99a64ffa`.
+- Official provenance passed exactly for `kaggle_environments==1.32.7`,
+  upstream `28b6d8af3ce73926b3d0fda1410c1ddd8384ab8c`, using the known temp
+  official interpreter. Reset semantic state and policy-visible observations
+  matched for seeds `7,17,42,123`.
+- The new narrow audit command captured current BC-E + `standard_mixed` +
+  repaired executor + PASS actions from official, persisted the exact joint
+  actions, and replayed them through both backends. Eight traces (both seats,
+  seeds `7,17,42,123`) passed all 719 accepted post-reset transitions. An
+  escalation trace with current BC-E on both seats also passed all 719 turns,
+  including active shared-market interaction.
+- Existing `scripts/run_parity_corpus.py` was rerun after the rebuild: seeds
+  `0,1,2,7,17,42,123,999`, 5,752 action pairs, 33 families, 29 day boundaries
+  per episode, and zero first divergence. Focused official suite: `102 passed,
+  1 skipped`.
+- No first divergence, root cause, regression, or fast-engine fix was found.
+  The bounded classification is **provisionally training-safe for tested
+  paths**; this is not universal parity or a competitive promotion claim.
+  Report: `research/FAST_OFFICIAL_PARITY_AUDIT_ISSUE33.md`; ignored traces:
+  `artifacts/local/fast_official_parity/`.
+
 ## 2026-08-30 - Issue #28 Follow-up: Aggressive Sell WHEAT Reserve Fix
 
 On `codex/issue-28-immediate-plant-water` after `6eb8e1fd8b03a6c37295a91035a453b53424f0f3`:

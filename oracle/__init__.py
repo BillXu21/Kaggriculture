@@ -21,6 +21,7 @@ from .closed_loop import (
     ClosedLoopDivergenceReport,
     ClosedLoopResult,
     make_checkpoint_executor_factory,
+    make_current_control_factory,
     make_deterministic_executor_factory,
     run_closed_loop,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "ClosedLoopDivergenceReport",
     "ClosedLoopResult",
     "make_checkpoint_executor_factory",
+    "make_current_control_factory",
     "make_deterministic_executor_factory",
     "run_closed_loop",
 ]

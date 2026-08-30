@@ -219,6 +219,47 @@ def make_checkpoint_executor_factory(
     return factory
 
 
+def make_current_control_factory(
+    checkpoint_path: str,
+    *,
+    device: str = "cpu",
+) -> AgentFactory:
+    """Build fresh agents matching the current BC-E production control."""
+
+    from executor_v0.agent import AgentConfig, make_agent
+    from opening_book.agent import make_opening_agent
+
+    def factory(
+        backend_name: str, seat: int, configuration: Mapping[str, Any]
+    ) -> StatefulAgent:
+        del configuration
+        downstream = make_agent(
+            checkpoint=checkpoint_path,
+            device=device,
+            seat=seat,
+            config=AgentConfig(
+                strict=True,
+                suppress_expansion_from_prior_debt=True,
+                aggressive_sell_all=True,
+                optional_spare_watering=True,
+            ),
+        )
+        agent = make_opening_agent(
+            opening="standard_mixed",
+            downstream=downstream,
+            seat=seat,
+        )
+
+        def adapted_agent(observation: Mapping[str, Any]) -> Mapping[str, Any]:
+            return agent(_executor_observation(
+                observation, from_fast=backend_name == "fast"
+            ))
+
+        return adapted_agent
+
+    return factory
+
+
 def _plain(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _plain(item) for key, item in value.items()}
@@ -547,6 +588,7 @@ __all__ = [
     "ClosedLoopResult",
     "StatefulAgent",
     "make_checkpoint_executor_factory",
+    "make_current_control_factory",
     "make_deterministic_executor_factory",
     "run_closed_loop",
 ]

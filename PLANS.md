@@ -1,6 +1,20 @@
 # Kaggriculture Plans
 
-Last updated: 2026-08-28
+Last updated: 2026-08-30
+
+## Issue #33 Status
+
+- Bounded fast-vs-official audit completed on isolated branch
+  `codex/issue-33-fast-official-parity-audit`. The current rebuilt native
+  extension has zero first divergence across reset checks, 8 seat-swapped
+  current-control/PASS traces, one active current-control/current-control
+  trace, and the existing 8-seed legal-ish corpus.
+- Keep exact official 1.32.7 as promotion authority. Fast is provisionally
+  training-safe only for the tested paths; do not treat close scores or this
+  bounded corpus as universal parity. No engine fix, executor change, RL,
+  opponent work, or optimization was started by this audit.
+- Continue Stage 2 work independently. Reopen parity only if future engine,
+  observation, executor, or training changes produce direct evidence.
 ## Issue #28 Status
 - Immediate same-worker watering is implemented on
   `codex/issue-28-immediate-plant-water` and enabled by default. Keep the

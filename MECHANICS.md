@@ -1,6 +1,26 @@
 # Kaggriculture Mechanics Ledger
 
-Last updated: 2026-08-28
+Last updated: 2026-08-30
+
+## Issue #33 Fast/Official Parity Audit (2026-08-30)
+
+- `CONFIRMED_EXPERIMENT`: after rebuilding the native extension from the audit
+  worktree, reset underlying canonical state and policy-visible canonical
+  observations matched official 1.32.7 for seeds `7,17,42,123`.
+- `CONFIRMED_EXPERIMENT`: eight seat-swapped current BC-E + `standard_mixed`
+  opening + repaired executor + PASS traces, and one current-control vs
+  current-control trace, had zero first divergence across all 719 accepted
+  post-reset transitions. Exact saved official joint actions were replayed
+  through both backends; policy feedback was not used during same-action replay.
+- `CONFIRMED_EXPERIMENT`: the existing legal-ish corpus rerun covered 8 seeds,
+  5,752 action pairs, 33 action families, and 29 day boundaries per episode
+  with zero first divergence. Covered families include lifecycle, animal,
+  market, hiring, overflow, malformed/no-op, town, RNG/day refresh, and
+  terminal paths already defined by the corpus.
+- No new mechanic divergence was found, so no fast-engine semantic correction
+  or regression was added. This remains bounded evidence for exercised states,
+  not universal parity. Native SHA-256 and artifact details are in
+  `research/FAST_OFFICIAL_PARITY_AUDIT_ISSUE33.md`.
 
 ## Issue #25 Executor Evidence (2026-08-29)
 

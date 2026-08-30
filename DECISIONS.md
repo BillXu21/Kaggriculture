@@ -2,6 +2,28 @@
 
 This file records decisions that remain authoritative across chats and work sessions. A decision should include the reason, evidence, and conditions for revisiting it.
 
+## D-048 - Bounded Fast/Official Parity Audit Is Clean on Tested Paths
+
+- Date: 2026-08-30
+- Status: active audit result
+- Decision: The rebuilt fast engine may be used for training/simulation on the
+  exercised default-contract paths with the classification **provisionally
+  training-safe for tested paths**. Official 1.32.7 remains the promotion
+  authority; this result is not a universal semantic proof.
+- Evidence: reset semantic state and policy-visible observations matched for
+  seeds `7,17,42,123`; 8 seat-swapped current BC-E/PASS traces plus one active
+  current BC-E/current BC-E trace passed 719 accepted post-reset transitions
+  each; the existing legal-ish corpus passed 5,752 action pairs across 8 seeds
+  and 33 families with zero first divergence. Official focused suite passed
+  `102`, with one known skip.
+- Identity: native extension SHA-256
+  `c71fc02cd7acbce2c2cc8a950f894311bcc7b2b3385880fe26e7f49f99a64ffa` from
+  Rust source commit `63c8113585575fd6c3edf1417795eb553b44ddae`; official
+  package is exactly `1.32.7` under the existing provenance guard.
+- Revisit when: the fast Rust core, wire observation/canonicalization, current
+  executor, configuration contract, or official package changes, or a new
+  direct differential trace finds a mismatch.
+
 ## D-046 - Aggressive Sell Must Preserve Feed-Reserve WHEAT
 
 - Date: 2026-08-30
