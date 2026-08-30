@@ -1,5 +1,20 @@
 # Kaggriculture Historical Record
 
+## 2026-08-30 - Minimal PPO Promotion Ratchet
+
+On `codex/promotion-ratchet-minimal` from base `88dd39365f20f7935a0449980689f5e86ed0b66b`:
+
+- Added opt-in `--promotion-every` and `--max-promotions` training controls;
+  promotion uses fixed seeds `3000..3031` with both seat orientations and the
+  existing evaluation summary/gates.
+- A PASS saves `promotions/promotion_NNN.npz` plus
+  `promotions/promotion_NNN_eval.json`, then installs a detached deterministic
+  PPO policy as the next rollout opponent. HOLD and fatal anomalies leave the
+  current opponent unchanged; live PPO state and original BC-E are retained.
+- Added snapshot load support for normal deterministic runner use. Mid-ratchet
+  training resume is not added. No Kaggle experiment was run.
+- Focused validation: 25 tests passed; Ruff, compile, and diff checks passed.
+
 ## 2026-08-30 - Issue #33 Fast/Official Parity Audit
 
 On isolated branch `codex/issue-33-fast-official-parity-audit` from the Stage-2

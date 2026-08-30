@@ -2,6 +2,24 @@
 
 This file records decisions that remain authoritative across chats and work sessions. A decision should include the reason, evidence, and conditions for revisiting it.
 
+## D-049 - Ratchet Only the Frozen Rollout Opponent
+
+- Date: 2026-08-30
+- Status: active
+- Decision: Promotion-aware PPO checks use fixed seeds `3000..3031` in both
+  orientations and the existing `summarize_evaluation` / `evaluate_promotion`
+  gates. A PASS persists a detached deterministic PPO snapshot and replaces
+  only the rollout opponent; the same live PPO params, optimizer, step, and
+  RNG continue training. Original BC-E remains retained as a separate identity.
+- Rationale: stationary BC-E opposition caused the learner to train against an
+  unchanged opponent forever. The smallest correction is a current/snapshot
+  opponent ratchet without changing PPO or KL-to-original-BC-E semantics.
+- Evidence: focused ratchet/CLI tests cover HOLD/PASS, next-opponent wiring,
+  repeated replacement, fatal-anomaly blocking, snapshot detachment, PPO-state
+  continuity, BC-E retention, and snapshot roundtrip. No Kaggle run was made.
+- Revisit when: self-play results justify a broader population or league
+  mechanism; those are outside this bounded patch.
+
 ## D-048 - Bounded Fast/Official Parity Audit Is Clean on Tested Paths
 
 - Date: 2026-08-30

@@ -21,6 +21,7 @@ from rl_manager.cli import (
     DEBUG_TRACE_COMPOSITIONS,
     DEV_SEEDS,
     HOLDOUT_SEEDS,
+    PROMOTION_SEEDS,
     SMOKE_SEEDS,
     build_parser,
     execute_debug_trace,
@@ -153,6 +154,23 @@ def test_plan_exposes_ppo_stability_controls(tmp_path):
     plan = plan_training(args)
     assert plan["ppo"]["target_kl"] == 0.03
     assert plan["ppo"]["reject_update_kl"] == 2.0
+
+
+def test_plan_exposes_promotion_ratchet_options(tmp_path):
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    args = build_parser().parse_args([
+        "train", "--e-checkpoint", str(checkpoint),
+        "--executor-factory", "executor_v0@stage-a-v1", "--master-seed", "17",
+        "--updates", "30", "--promotion-every", "3", "--max-promotions", "3",
+        "--output-dir", "out", "--checkpoint", "out/ppo.npz",
+    ])
+    plan = plan_training(args)
+    assert plan["promotion"] == {
+        "every": 3, "max_promotions": 3, "seed_set": "promotion",
+        "seeds": list(range(3000, 3032)),
+    }
+    assert PROMOTION_SEEDS == tuple(range(3000, 3032))
 
 
 def test_parser_requires_explicit_executor_and_subcommand():

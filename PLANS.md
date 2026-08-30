@@ -2,6 +2,14 @@
 
 Last updated: 2026-08-30
 
+## Promotion Ratchet Status
+- The minimal opt-in PPO ratchet is implemented on
+  `codex/promotion-ratchet-minimal`: every configured cadence evaluates a
+  deterministic live candidate against the current frozen opponent with the
+  existing promotion gates. PASS persists and installs a detached snapshot;
+  HOLD leaves the opponent unchanged. The intended Kaggle run was not run
+  locally.
+
 ## Issue #33 Status
 
 - Bounded fast-vs-official audit completed on isolated branch

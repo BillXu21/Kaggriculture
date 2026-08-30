@@ -42,6 +42,7 @@ from rl_manager.ppo_policy import (
 )
 
 RL_PPO_CHECKPOINT_FORMAT = "rl_manager_ppo_checkpoint_v1"
+PPO_SNAPSHOT_FORMAT = "rl_manager_ppo_snapshot_v1"
 
 
 def _leaf_path(tokens) -> str:
@@ -216,5 +217,106 @@ def load_ppo_checkpoint(
     return state, meta
 
 
-__all__ = ["RL_PPO_CHECKPOINT_FORMAT", "load_ppo_checkpoint",
-           "save_ppo_checkpoint"]
+def save_ppo_snapshot(
+    path: str | Path,
+    state,
+    config: ManagerConfig,
+    ppo_config: PPOConfig,
+    *,
+    snapshot_identity: Mapping[str, Any],
+    provenance: Mapping[str, Any] | None = None,
+) -> Path:
+    """Persist only the detached policy/frozen-E trees for a ratchet snapshot."""
+    variant = resolve_model_variant("E")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flat: dict[str, np.ndarray] = {}
+    for tokens, leaf in jax.tree_util.tree_flatten_with_path(state.params)[0]:
+        flat["param:" + _leaf_path(tokens)] = np.asarray(leaf, dtype=np.float32)
+    for tokens, leaf in jax.tree_util.tree_flatten_with_path(
+            state.frozen_params)[0]:
+        flat["frozenparam:" + _leaf_path(tokens)] = np.asarray(
+            leaf, dtype=np.float32)
+    meta = {
+        "format": PPO_SNAPSHOT_FORMAT,
+        "model_config": dataclasses.asdict(config),
+        "ppo_config": dataclasses.asdict(ppo_config),
+        "model_variant": variant,
+        "step": int(state.step),
+        "snapshot_identity": dict(snapshot_identity),
+        "provenance": dict(provenance) if provenance else {},
+    }
+    flat["__meta__"] = np.frombuffer(
+        json.dumps(meta, sort_keys=True).encode("utf-8"), dtype=np.uint8)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as handle:
+        np.savez(handle, **flat)
+    path.unlink(missing_ok=True)
+    tmp.rename(path)
+    return path
+
+
+def load_ppo_snapshot(
+    path: str | Path,
+    *,
+    config: ManagerConfig | None = None,
+    ppo_config: PPOConfig | None = None,
+):
+    """Load a saved snapshot as a deterministic normal runner policy."""
+    from rl_manager.ppo import PPOTrainState  # local import: avoid cycle
+    from rl_manager.ppo_adapter import ppo_snapshot_from_state
+
+    path = Path(path)
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            items = {key: archive[key] for key in archive.files}
+    except Exception as error:  # noqa: BLE001 - loud re-wrap below
+        raise ValueError(
+            f"{path}: corrupt or unreadable PPO snapshot: {error}") from error
+    if "__meta__" not in items:
+        raise ValueError(f"{path}: PPO snapshot missing __meta__ record")
+    meta = json.loads(items["__meta__"].tobytes().decode("utf-8"))
+    if meta.get("format") != PPO_SNAPSHOT_FORMAT:
+        raise ValueError(
+            f"{path}: unrecognized PPO snapshot format {meta.get('format')!r}")
+    if meta.get("model_variant") != "E":
+        raise ValueError(f"{path}: PPO snapshots require model variant E")
+    stored_config = ManagerConfig(**meta["model_config"])
+    _require_matching_config(meta["model_config"], config, "model_config")
+    stored_ppo = PPOConfig(**meta["ppo_config"])
+    _require_matching_config(meta["ppo_config"], ppo_config, "ppo_config")
+
+    def rebuild(prefix: str, template: Mapping) -> dict:
+        leaves = []
+        for tokens, expected in jax.tree_util.tree_flatten_with_path(template)[0]:
+            key = prefix + _leaf_path(tokens)
+            if key not in items:
+                raise ValueError(f"{path}: snapshot missing array {key!r}")
+            array = items[key]
+            if array.shape != expected.shape or array.dtype != np.float32:
+                raise ValueError(
+                    f"{path}: array {key!r} has shape/dtype "
+                    f"({array.shape}, {array.dtype}); expected "
+                    f"({expected.shape}, float32)")
+            leaves.append(jnp.asarray(array))
+        return jax.tree_util.tree_unflatten(
+            jax.tree_util.tree_structure(template), leaves)
+
+    params = rebuild("param:", combined_params_template(stored_config, "E"))
+    frozen = rebuild("frozenparam:", empty_params(stored_config, "E"))
+    state = PPOTrainState(
+        params=params, opt_state=None, frozen_params=frozen,
+        rng=jnp.zeros((2,), dtype=jnp.uint32), step=int(meta["step"]))
+    identity = meta.get("snapshot_identity", {})
+    policy = ppo_snapshot_from_state(
+        state, stored_config, ppo_config=stored_ppo,
+        name=str(identity.get("name", "ppo_snapshot")),
+        version=str(identity.get("version", "ratchet-v1")))
+    if identity.get("fingerprint") != policy.identity.fingerprint:
+        raise ValueError(f"{path}: snapshot fingerprint does not match arrays")
+    return policy, meta
+
+
+__all__ = ["PPO_SNAPSHOT_FORMAT", "RL_PPO_CHECKPOINT_FORMAT",
+           "load_ppo_checkpoint", "load_ppo_snapshot", "save_ppo_checkpoint",
+           "save_ppo_snapshot"]

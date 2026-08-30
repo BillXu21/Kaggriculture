@@ -29,6 +29,7 @@ import hashlib
 from typing import Mapping, Sequence
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from rl_manager.ppo import PPOBatch, PPOTrainState
@@ -167,6 +168,31 @@ def ppo_batched_policy_from_state(
         policy, name=name, version=version, deterministic=deterministic)
 
 
+def ppo_snapshot_from_state(
+    state: PPOTrainState,
+    config,
+    *,
+    ppo_config: PPOConfig | None = None,
+    name: str = "ppo_snapshot",
+    version: str = "ratchet-v1",
+) -> PPOBatchedPolicy:
+    """Build a detached deterministic policy from one exact train state.
+
+    The copied trees ensure later live-learner updates cannot change the
+    opponent that was evaluated and promoted.
+    """
+    frozen_params = jax.tree_util.tree_map(
+        lambda leaf: jnp.array(leaf), state.frozen_params)
+    params = jax.tree_util.tree_map(lambda leaf: jnp.array(leaf), state.params)
+    policy = PPOPolicy(
+        frozen_params, config, seed=0, ppo_config=ppo_config or PPOConfig())
+    policy.params = params
+    policy.frozen_params = frozen_params
+    policy.rng = jnp.array(state.rng)
+    return PPOBatchedPolicy(
+        policy, name=name, version=version, deterministic=True)
+
+
 def select_ppo_subset(batch: PPOBatch, size: int) -> PPOBatch:
     """Deterministic evenly-spaced subset of an already-normalized batch.
 
@@ -206,6 +232,7 @@ def select_ppo_subset(batch: PPOBatch, size: int) -> PPOBatch:
 __all__ = [
     "PPOBatchedPolicy",
     "ppo_batched_policy_from_state",
+    "ppo_snapshot_from_state",
     "prng_key_from_id",
     "select_ppo_subset",
 ]

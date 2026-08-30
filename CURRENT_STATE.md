@@ -2,6 +2,19 @@
 
 Last updated: 2026-08-30
 
+## Promotion Ratchet
+- The bounded `codex/promotion-ratchet-minimal` patch adds opt-in PPO
+  promotion checks (`--promotion-every`) on fixed seeds `3000..3031`, both seat
+  orientations. A passing deterministic candidate is saved under
+  `promotions/promotion_NNN.npz` with its evaluation JSON and becomes the next
+  immutable rollout opponent; the live PPO train state and original BC-E
+  identity are preserved. `--max-promotions` supports a stop condition.
+- Saved snapshots can be loaded as normal deterministic runner policies with
+  `load_ppo_snapshot`. Mid-ratchet training resume is not implemented; resume
+  from a complete PPO checkpoint remains the existing stationary path.
+- Local focused validation: 25 promotion/CLI tests, Ruff, and compilation.
+  The Kaggle experiment was not run.
+
 ## Issue #33 Fast/Official Parity Audit
 - On isolated branch `codex/issue-33-fast-official-parity-audit`, anchored at
   `57db920689ef80fb373128d4b8129054816d133f`, the rebuilt current Rust

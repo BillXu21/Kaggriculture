@@ -41,6 +41,9 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "PPOConfig": ("rl_manager.ppo_policy", "PPOConfig"),
     "PPOPolicy": ("rl_manager.ppo_policy", "PPOPolicy"),
     "PPOTrainState": ("rl_manager.ppo", "PPOTrainState"),
+    "PPO_SNAPSHOT_FORMAT": (
+        "rl_manager.ppo_checkpoint", "PPO_SNAPSHOT_FORMAT"),
+    "PromotionRatchet": ("rl_manager.ratchet", "PromotionRatchet"),
     "BestCheckpointRetention": (
         "rl_manager.ppo_retention", "BestCheckpointRetention"),
     "PassPlanPolicy": ("rl_manager.policy", "PassPlanPolicy"),
@@ -90,10 +93,16 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "rl_manager.decode", "plans_from_action_tensors"),
     "ppo_batched_policy_from_state": (
         "rl_manager.ppo_adapter", "ppo_batched_policy_from_state"),
+    "ppo_snapshot_from_state": (
+        "rl_manager.ppo_adapter", "ppo_snapshot_from_state"),
     "ppo_update": ("rl_manager.ppo", "ppo_update"),
     "prng_key_from_id": ("rl_manager.ppo_adapter", "prng_key_from_id"),
     "save_ppo_checkpoint": (
         "rl_manager.ppo_checkpoint", "save_ppo_checkpoint"),
+    "save_ppo_snapshot": (
+        "rl_manager.ppo_checkpoint", "save_ppo_snapshot"),
+    "load_ppo_snapshot": (
+        "rl_manager.ppo_checkpoint", "load_ppo_snapshot"),
     "save_trace": ("rl_manager.debug_trace", "save_trace"),
     "seat_policies": ("rl_manager.types", "seat_policies"),
     "select_ppo_subset": ("rl_manager.ppo_adapter", "select_ppo_subset"),

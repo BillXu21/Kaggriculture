@@ -23,6 +23,7 @@ Design rules enforced here:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from importlib import import_module
 import sys
@@ -32,6 +33,7 @@ from typing import Any, Mapping, Sequence
 from rl_manager.evaluation import evaluate_promotion
 from rl_manager.evaluation import format_promotion_result
 from rl_manager.evaluation import summarize_evaluation
+from rl_manager.ratchet import PromotionRatchet
 from rl_manager.runner import GAME_TURNS
 from rl_manager.runner import INFERENCE_BATCH_SCOPES
 from rl_manager.types import E_VS_E, E_VS_PASS
@@ -40,6 +42,7 @@ from rl_manager.types import E_VS_E, E_VS_PASS
 SMOKE_SEEDS: tuple[int, ...] = (17, 42, 2026)
 DEV_SEEDS: tuple[int, ...] = tuple(range(200, 264))
 HOLDOUT_SEEDS: tuple[int, ...] = tuple(range(5000, 5032))
+PROMOTION_SEEDS: tuple[int, ...] = tuple(range(3000, 3032))
 SEED_SETS: dict[str, tuple[int, ...]] = {
     "smoke": SMOKE_SEEDS,
     "dev": DEV_SEEDS,
@@ -103,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_inference_batch_options(train)
     train.add_argument("--episodes-per-update", type=int, default=8)
     train.add_argument("--updates", type=int, default=1)
+    train.add_argument(
+        "--promotion-every", type=int, default=0,
+        help="Check a deterministic candidate every N updates (0 disables).")
+    train.add_argument(
+        "--max-promotions", type=int, default=None,
+        help="Stop after this many accepted promotions.")
     train.add_argument("--epochs", type=int, default=4)
     train.add_argument("--minibatch-size", type=int, default=8,
                        help="Must divide the expected complete-game row "
@@ -255,6 +264,14 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
                         ("minibatch_size", args.minibatch_size)):
         if value < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be >= 1")
+    promotion_every = int(getattr(args, "promotion_every", 0))
+    max_promotions = getattr(args, "max_promotions", None)
+    if promotion_every < 0:
+        raise ValueError("--promotion-every must be >= 0")
+    if max_promotions is not None and int(max_promotions) < 1:
+        raise ValueError("--max-promotions must be >= 1")
+    if max_promotions is not None and promotion_every == 0:
+        raise ValueError("--max-promotions requires --promotion-every")
     # Plan-time divisibility check: complete d4..29 games yield exactly
     # episodes_per_update * 26 candidate manager rows. The runtime
     # `ppo_update` strict check remains authoritative for truncations and
@@ -273,6 +290,13 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
         "master_seed": int(args.master_seed),
         "episodes_per_update": int(args.episodes_per_update),
         "updates": int(args.updates),
+        "promotion": {
+            "every": promotion_every,
+            "max_promotions": (None if max_promotions is None
+                                else int(max_promotions)),
+            "seed_set": "promotion",
+            "seeds": list(PROMOTION_SEEDS),
+        },
         "ppo": {"epochs": int(args.epochs),
                 "minibatch_size": int(args.minibatch_size),
                 "lr": float(args.lr),
@@ -407,6 +431,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
     from bc_manager_jax.model import ManagerConfig
 
     from rl_manager.ppo import build_ppo_batch, init_train_state, ppo_update
+    from rl_manager.ppo_adapter import ppo_snapshot_from_state
+    from rl_manager.ppo_checkpoint import save_ppo_snapshot
     from rl_manager.ppo_policy import PPOConfig
     from rl_manager.policy import JaxEPlanPolicy
     from rl_manager.runner import RunnerConfig, SelfPlayRunner, \
@@ -421,12 +447,16 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
     state = init_train_state(frozen_params, config,
                              seed=plan["master_seed"], ppo_config=ppo_config)
     candidate = _rollout_candidate_from_state(state, config, ppo_config)
-    frozen_policy = JaxEPlanPolicy(frozen_params, config, name="frozen_e")
+    original_bc_e = JaxEPlanPolicy(frozen_params, config, name="frozen_e")
+    ratchet = PromotionRatchet(original_bc_e)
     output_dir = Path(plan["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    promotion_dir = output_dir / "promotions"
 
     seed_stream = SeedStream(plan["master_seed"])
     history = []
+    promotion_checks: list[dict[str, Any]] = []
+    stop_after_promotion = False
     for update_index in range(plan["updates"]):
         buffer = TrajectoryBuffer(
             capacity=plan["episodes_per_update"] * 2 * 26,
@@ -458,7 +488,7 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                 update_index * plan["episodes_per_update"] + episode,
                 seed_stream.episode_seed(
                     update_index * plan["episodes_per_update"] + episode),
-                composition, candidate, frozen_policy))
+                composition, candidate, ratchet.current_opponent))
         runner.run(specs)
         batch = build_ppo_batch(buffer.finalize(), gamma=ppo_config.gamma,
                                 gae_lambda=ppo_config.gae_lambda)
@@ -466,15 +496,110 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         if metrics["accepted"]:
             candidate = _rollout_candidate_from_state(
                 state, config, ppo_config, previous=candidate)
+        update_number = update_index + 1
+        print(f"UPDATE {update_number}")
+        print(f"learner={candidate.identity.fingerprint} "
+              f"opponent={ratchet.current_opponent.identity.fingerprint} "
+              f"ppo_step={state.step}")
+
+        promotion = plan["promotion"]
+        if promotion["every"] and update_number % promotion["every"] == 0:
+            eval_candidate = _rollout_candidate_from_state(
+                state, config, ppo_config, previous=candidate,
+                deterministic=True)
+            eval_runner = (ParallelSelfPlayRunner(
+                runner_config, num_workers=plan["knobs"]["num_workers"],
+                executor_factory=executor_factory)
+                           if plan["knobs"]["num_workers"] > 1 else
+                           SelfPlayRunner(runner_config,
+                                          executor_factory=executor_factory))
+            eval_specs = []
+            for seed in promotion["seeds"]:
+                for orientation in ("candidate_vs_frozen",
+                                    "frozen_vs_candidate"):
+                    eval_specs.append(build_episode_spec(
+                        len(eval_specs), seed, orientation, eval_candidate,
+                        ratchet.current_opponent))
+            eval_results = eval_runner.run(eval_specs)
+            summary = summarize_evaluation(
+                eval_results, expected_seeds=promotion["seeds"],
+                provenance={
+                    "seed_set": promotion["seed_set"],
+                    "candidate_identity": eval_candidate.identity.to_json_dict(),
+                    "opponent_identity": (
+                        ratchet.current_opponent.identity.to_json_dict()),
+                    "original_bc_e_identity": (
+                        original_bc_e.identity.to_json_dict()),
+                    "update": update_number,
+                    "ppo_step": int(state.step),
+                })
+            decision = evaluate_promotion(summary)
+            summary["promotion"] = decision.to_dict()
+            snapshot = ppo_snapshot_from_state(
+                state, config, ppo_config=ppo_config,
+                name=f"promotion_{ratchet.promotions + 1:03d}",
+                version="ratchet-v1")
+            gate = "PASS" if decision.passed else "HOLD"
+            print(
+                f"RATCHET update={update_number} "
+                f"candidate={eval_candidate.identity.fingerprint} "
+                f"snapshot={snapshot.identity.fingerprint} "
+                f"W-L-T={summary['wlt']['W']}-{summary['wlt']['L']}-"
+                f"{summary['wlt']['T']} "
+                f"mean_margin={summary['mean_margin']} "
+                f"median_margin={summary['median_margin']} "
+                f"gate={gate} reasons={list(decision.failed_reasons)!r}")
+            promotion_checks.append({"update": update_number,
+                                     "summary": summary})
+            if decision.passed:
+                old_snapshot = ratchet.current_opponent
+                promotion_number = ratchet.promotions + 1
+                snapshot_path = save_ppo_snapshot(
+                    promotion_dir / f"promotion_{promotion_number:03d}.npz",
+                    state, config, ppo_config,
+                    snapshot_identity=snapshot.identity.to_json_dict(),
+                    provenance={
+                        "update": update_number,
+                        "ppo_step": int(state.step),
+                        "original_bc_e": original_bc_e.identity.to_json_dict(),
+                        "evaluation_seed_set": promotion["seed_set"],
+                    })
+                eval_path = promotion_dir / (
+                    f"promotion_{promotion_number:03d}_eval.json")
+                eval_path.parent.mkdir(parents=True, exist_ok=True)
+                eval_path.write_text(
+                    json.dumps({
+                        "evaluation": summary,
+                        "promotion": decision.to_dict(),
+                        "snapshot": snapshot.identity.to_json_dict(),
+                        "snapshot_path": str(snapshot_path),
+                    }, sort_keys=True, allow_nan=False, indent=2) + "\n",
+                    encoding="utf-8")
+                ratchet.apply(True, snapshot)
+                print(f"PROMOTION #{ratchet.promotions} "
+                      f"old_snapshot={old_snapshot.identity.fingerprint} "
+                      f"new_snapshot={snapshot.identity.fingerprint} "
+                      f"checkpoint={snapshot_path}")
+                if (promotion["max_promotions"] is not None
+                        and ratchet.promotions >= promotion["max_promotions"]):
+                    stop_after_promotion = True
         from rl_manager.ppo_checkpoint import save_ppo_checkpoint
 
         path = save_ppo_checkpoint(
             output_dir / f"ppo_update_{update_index:06d}.npz", state, config,
             ppo_config, provenance={"plan": dict(plan)})
         history.append({"update": update_index, "metrics": metrics,
-                        "checkpoint": str(path)})
-    return {"history": history, "final_checkpoint": history[-1]["checkpoint"]
-            if history else None}
+                        "checkpoint": str(path),
+                        "learner": candidate.identity.to_json_dict(),
+                        "opponent": ratchet.current_opponent.identity.to_json_dict(),
+                        "promotions": ratchet.promotions})
+        if stop_after_promotion:
+            break
+    return {"history": history, "promotion_checks": promotion_checks,
+            "promotions": ratchet.promotions,
+            "original_bc_e": original_bc_e.identity.to_json_dict(),
+            "final_opponent": ratchet.current_opponent.identity.to_json_dict(),
+            "final_checkpoint": history[-1]["checkpoint"] if history else None}
 
 
 def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no cover
