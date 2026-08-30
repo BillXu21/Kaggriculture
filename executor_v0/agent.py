@@ -454,11 +454,20 @@ class ExecutorAgent:
     ) -> list[dict]:
         shed = (obs.get("private") or {}).get("shed") or {}
         if self.config.aggressive_sell_all:
+            if feed is None:
+                feed = _animal_feed_state(obs, seat)
             candidates = []
             bin_log = self._day_records[int(obs["day"])]
             bin_log = bin_log["sells"][str(self._bin_anchor)]
             for product in PRODUCTS:
                 available = int(shed.get(product, 0))
+                if product == "WHEAT" and available > 0:
+                    protected = min(available, int(feed["shed_reserve"]))
+                    if protected:
+                        survival = self._day_records[int(obs["day"])]["survival"]
+                        survival["feed_reserve_protected_units"] = max(
+                            int(survival["feed_reserve_protected_units"]), protected)
+                    available -= protected
                 if available <= 0:
                     continue
                 executed, _ = clip_sell(product, available, available)

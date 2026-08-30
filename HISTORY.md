@@ -1,5 +1,15 @@
 # Kaggriculture Historical Record
 
+## 2026-08-30 - Issue #28 Follow-up: Aggressive Sell WHEAT Reserve Fix
+
+On `codex/issue-28-immediate-plant-water` after `6eb8e1fd8b03a6c37295a91035a453b53424f0f3`:
+- Official 1.32.7 8-game ON vs OFF: OFF mean `70,017.75`, ON `65,042.75` (`-4,975`), ON 6 escapes vs OFF 0, ON still improved weeds/work debt.
+- Root cause: `_sell_candidates` aggressive branch sold all shed WHEAT without subtracting `feed["shed_reserve"]`, unlike the normal path.
+- Fix: aggressive WHEAT now computes `protected = min(shed[WHEAT], shed_reserve)`, records it in `feed_reserve_protected_units`, and sells `available-protected`; non-WHEAT remains fully aggressive.
+- Regressions added: no-unfed sells all, exact reserve, at/below reserve sells none, non-WHEAT still full, carried vs shed accounting, non-aggressive unchanged, starving repro.
+- Validation: focused `100 passed, 2 skipped`; broader `148 passed, 2 skipped`; evaluator `--turn-trace` works with aggressive+plant-water+spare-water.
+- Fast sanity (seeds 7,17 both seats, aggressive+plant-water+spare-water): banks `80,316/69,325/80,761/81,326`, mean `77,932`, 0 escapes, 0 fallbacks, movement ~2.9k, PASS ~140, weeds 8-12. No promotion claim; official retest required.
+
 ## 2026-08-29 - Issue #28 Immediate Plant Watering
 
 Implemented on `codex/issue-28-immediate-plant-water` from

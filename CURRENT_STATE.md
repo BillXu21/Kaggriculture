@@ -4,16 +4,10 @@ Last updated: 2026-08-29
 
 ## Issue #28 Run Setup
 - Branch `codex/issue-28-immediate-plant-water`, base `feaf6ccfb4ac37380d9644f73d2cd7f2fb35474a`.
-- Testing the executor-only confirmed same-worker PLANT -> WATER continuation. The bounded A/B uses the frozen BC-E checkpoint from the Stage 1 sibling artifact, seeds `7,17,42,123`, both seats, PASS opponent, aggressive sell reference, and fast engine because official `kaggle_environments==1.32.7` is unavailable in this worktree.
-- Expected outputs: two evaluator JSON artifacts under the approved OpenCode temp directory; stop after the 8-game OFF/ON pair completes or the fast engine reports a status/fallback error.
-- Implementation and validation are complete. The focused suite passed `138
-  passed, 2 skipped`; broader touched-module tests passed `193 passed, 6
-  skipped`. The full suite passed `808 passed, 104 skipped` with two unrelated
-  host-sensitive failures recorded in `HISTORY.md`.
-- Fast-engine A/B completed all 8 paired games per arm with zero fallback or
-  status errors. ON versus OFF mean/median bank was `72,762.75/74,746.5` vs
-  `55,885.0/55,901.0`; mean paired delta `+16,877.75`, median `+13,249`.
-  Mean final weeds/work debt were `9.25/358.5` ON vs `13.5/417.0` OFF.
+- Executor-only confirmed same-worker PLANT -> WATER continuation. Initial focused/broader suites passed `141/193` tests; full suite `808 passed, 104 skipped` with two host-sensitive failures.
+- Initial fast-engine A/B (8 games, aggressive sell) was misleadingly positive (`72,762.75` vs `55,885.0`, `+16,877.75`).
+- Official 1.32.7 A/B exposed 6 animal escapes in ON (OFF 0) with mean delta `-4,975` (`70,017.75` vs `65,042.75`); weeds/work debt still improved.
+- Root cause: aggressive sell-all bypassed `feed["shed_reserve"]` protection for WHEAT, enabling `SELL WHEAT -> BUY WHEAT` churn while starving. Fix protects `min(shed[WHEAT], shed_reserve)` in aggressive mode. Small fast sanity (seeds 7,17 both seats, aggressive+plant-water+spare-water, `--turn-trace`) now passes 4/4 with 0 escapes, 0 fallbacks. Promotion remains blocked pending official retest.
 
 ## Issue #25
 - On isolated branch `codex/issues-25-preventive-watering` from

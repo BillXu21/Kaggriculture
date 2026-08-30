@@ -7,6 +7,7 @@ Last updated: 2026-08-28
   explicit OFF evaluator arm for attribution only; do not promote the fast
   engine A/B as an official-engine result because `kaggle_environments==1.32.7`
   was unavailable locally.
+- Follow-up 2026-08-30: fast 8-game was misleadingly positive; official 1.32.7 showed `-4,975` mean and 6 escapes. Aggressive sell-all WHEAT reserve bypass was fixed. Small fast sanity (7,17 both seats, aggressive+plant-water+spare-water, `--turn-trace`) shows 0 escapes. Promotion remains blocked pending the new official 1.32.7 8-game `--turn-trace` panel; if escapes persist, inspect `feed` starving/shortage, FEED tasks, assignments, and WHEAT orders around the escape.
 ## Issue #25 Current Gate
 
 The bounded executor correction is under review on

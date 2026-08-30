@@ -70,6 +70,12 @@ Confidence labels:
 - Official engine A/B was unavailable on the host. Fast-engine paired results
   are recorded in `HISTORY.md` and are not official-engine evidence.
 
+## Aggressive Sell WHEAT Reserve - Issue #28 Follow-up (2026-08-30)
+
+- `CONFIRMED_EXPERIMENT`: aggressive sell-all previously sold all shed WHEAT, bypassing the normal `feed["shed_reserve"]` guard; official 1.32.7 showed 6 escapes vs 0.
+- `CONFIRMED_EXPERIMENT`: aggressive WHEAT now sells `shed[WHEAT] - min(shed[WHEAT], shed_reserve)` with `shed_reserve = max(0, unfed - carried_wheat)`; non-WHEAT products remain fully sold. The protected amount is counted in `feed_reserve_protected_units` and visible in turn traces.
+- Fast sanity (7,17 both seats, aggressive+plant-water+spare-water) has 0 escapes and no WHEAT churn while starving; official retest is still required.
+
 ## Engine Identity
 
 - Latest confirmed upstream package version: `1.32.7`
