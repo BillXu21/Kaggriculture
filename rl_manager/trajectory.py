@@ -66,9 +66,11 @@ class TransitionMetadata:
     plan_json: dict[str, Any]
     executor_day_diagnostics: dict[str, Any] = field(default_factory=dict)
     trace_digest_hex: str | None = None
+    composition: str | None = None
+    reward_mode: str | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "index": self.index,
             "episode_index": self.episode_index,
             "seed": self.seed,
@@ -83,6 +85,11 @@ class TransitionMetadata:
             "executor_day_diagnostics": self.executor_day_diagnostics,
             "trace_digest_hex": self.trace_digest_hex,
         }
+        if self.composition is not None:
+            result["composition"] = self.composition
+        if self.reward_mode is not None:
+            result["reward_mode"] = self.reward_mode
+        return result
 
 
 _SCALAR_FIELDS: dict[str, tuple[type, tuple]] = {

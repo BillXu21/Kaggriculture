@@ -17,10 +17,14 @@ fabricated number.
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 DIAGNOSTICS_SCHEMA_VERSION = 1
+ECONOMIC_DIAGNOSTICS_SCHEMA_VERSION = 1
 
 #: runner timing bucket -> diagnostics key (issue #9 required split).
 _TIMING_MAP = {
@@ -207,8 +211,132 @@ def write_diagnostics(path: str | Path, payload: Mapping[str, Any]) -> Path:
     return path
 
 
+def _distribution(values: Sequence[float]) -> dict[str, float | int | None]:
+    if not values:
+        return {"count": 0, "mean": None, "median": None, "p10": None,
+                "min": None, "max": None}
+    ordered = sorted(float(value) for value in values)
+    return {
+        "count": len(ordered),
+        "mean": float(sum(ordered) / len(ordered)),
+        "median": float(statistics.median(ordered)),
+        "p10": float(np.percentile(ordered, 10)),
+        "min": ordered[0],
+        "max": ordered[-1],
+    }
+
+
+def aggregate_economic_diagnostics(results: Sequence[Any]) -> dict[str, Any]:
+    """Aggregate observed economic outcomes for trainable seats only."""
+    seats: list[tuple[Any, int, dict[str, Any]]] = []
+    for result in results:
+        trainable = {int(record["seat"]) for record in result.policy_identities
+                     if record.get("trainable")}
+        finals = {int(snapshot["seat"]): snapshot for snapshot in
+                  result.utilization_snapshots
+                  if snapshot.get("boundary") == "terminal"}
+        for seat in sorted(trainable):
+            if seat not in finals:
+                raise ValueError(
+                    f"missing terminal utilization snapshot for seat {seat}")
+            seats.append((result, seat, finals[seat]))
+    banks = [float(result.final_banks[seat]) for result, seat, _ in seats]
+    bank_distribution = _distribution(banks)
+    quadrants = [int(snapshot["land_quadrants_owned"])
+                 for _, _, snapshot in seats]
+    purchases = {quadrant: [event for result, seat, _ in seats
+                            for event in result.land_purchase_events
+                            if int(event["seat"]) == seat
+                            and event["quadrant"] == quadrant]
+                 for quadrant in ("NE", "SW", "SE")}
+    purchase_stats: dict[str, Any] = {}
+    denominator = len(seats)
+    for quadrant, events in purchases.items():
+        days = [float(event["causal_day"]) for event in events]
+        purchase_stats[quadrant] = {
+            "successful_purchase_rate": (len(events) / denominator
+                                          if denominator else None),
+            "mean_purchase_day": (float(sum(days) / len(days)) if days else None),
+            "median_purchase_day": (float(statistics.median(days))
+                                     if days else None),
+        }
+    daily_occupancy = [float(snapshot["productive_occupancy"])
+                       for result, seat, _ in seats
+                       for snapshot in result.utilization_snapshots
+                       if int(snapshot["seat"]) == seat
+                       and snapshot.get("boundary") == "daily"
+                       and int(snapshot["day"]) > 4]
+    final_snapshots = [snapshot for _, _, snapshot in seats]
+    return {
+        "trainable_seat_count": len(seats),
+        "economic": {
+            "final_bank": bank_distribution,
+            "mean_final_bank": bank_distribution["mean"],
+            "median_final_bank": bank_distribution["median"],
+            "p10_final_bank": bank_distribution["p10"],
+            "min_final_bank": bank_distribution["min"],
+            "max_final_bank": bank_distribution["max"],
+            "fraction_bank_below_10k": (sum(bank < 10000 for bank in banks) /
+                                         len(banks) if banks else None),
+            "fraction_bank_above_30k": (sum(bank > 30000 for bank in banks) /
+                                        len(banks) if banks else None),
+        },
+        "land": {
+            "mean_final_quadrants_owned": (
+                float(sum(quadrants) / len(quadrants)) if quadrants else None),
+            "final_quadrants_count": {
+                str(value): quadrants.count(value) for value in (1, 2, 3, 4)},
+            "purchases": purchase_stats,
+            "mean_final_crop_squares": _mean(final_snapshots, "crop_squares"),
+            "mean_final_animal_squares": _mean(final_snapshots, "animal_squares"),
+            "mean_final_productive_squares": _mean(
+                final_snapshots, "productive_squares"),
+            "mean_final_productive_occupancy": _mean(
+                final_snapshots, "productive_occupancy"),
+            "median_final_productive_occupancy": (
+                float(statistics.median(
+                    snapshot["productive_occupancy"] for snapshot in final_snapshots))
+                if final_snapshots else None),
+            "mean_post_d4_productive_occupancy": (
+                float(sum(daily_occupancy) / len(daily_occupancy))
+                if daily_occupancy else None),
+        },
+    }
+
+
+def _mean(snapshots: Sequence[Mapping[str, Any]], key: str) -> float | None:
+    values = [float(snapshot[key]) for snapshot in snapshots]
+    return float(sum(values) / len(values)) if values else None
+
+
+def build_economic_diagnostics(results: Sequence[Any]) -> dict[str, Any]:
+    """Return recomputable per-episode sidecars plus aggregate metrics."""
+    episodes = []
+    for result in sorted(results, key=lambda item: int(item.episode_index)):
+        trainable_seats = [int(record["seat"]) for record in result.policy_identities
+                           if record.get("trainable")]
+        episodes.append({
+            "episode": int(result.episode_index),
+            "seed": int(result.seed),
+            "composition": str(result.composition),
+            "trainable_seats": trainable_seats,
+            "final_banks": [float(value) for value in result.final_banks],
+            "rewards": [float(value) for value in result.rewards],
+            "land_purchase_events": list(result.land_purchase_events),
+            "utilization_snapshots": list(result.utilization_snapshots),
+        })
+    return {
+        "economic_diagnostics_schema_version": ECONOMIC_DIAGNOSTICS_SCHEMA_VERSION,
+        "episodes": episodes,
+        "aggregate": aggregate_economic_diagnostics(results),
+    }
+
+
 __all__ = [
     "DIAGNOSTICS_SCHEMA_VERSION",
+    "ECONOMIC_DIAGNOSTICS_SCHEMA_VERSION",
+    "aggregate_economic_diagnostics",
+    "build_economic_diagnostics",
     "build_integration_diagnostics",
     "write_diagnostics",
 ]

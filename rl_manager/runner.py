@@ -18,8 +18,9 @@ Per episode/seat the runner owns:
 - prior-day realized labor (`workers_hired` observed via `hires_today`,
   never from HIRE intents).
 
-Rewards are terminal-only: +1 win / 0 tie / -1 loss at the final manager
-transition; raw bank margins stay diagnostics.
+Rewards are terminal-only. The default is +1 win / 0 tie / -1 loss at the
+final manager transition; economic self-play can select bounded own-bank
+rewards from the final observed state.
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ from replay_daily.constants import total_hire_cost
 from rl_manager.decode import plans_from_action_tensors
 from rl_manager.debug_trace import TraceRecorder
 from rl_manager.executor_factory import make_default_executor_factory
+from rl_manager.land import farm_utilization_snapshot, observed_land_purchase_events
 from rl_manager.provenance import (
     backend_provenance,
     canonical_json,
@@ -58,10 +60,12 @@ from rl_manager.provenance import (
     sha256_hex,
 )
 from rl_manager.provider import QueuedPlanProvider
+from rl_manager.reward import RewardConfig, TERMINAL_OWN_BANK, terminal_rewards
 from rl_manager.trajectory import TrajectoryBuffer, Transition, \
     TransitionMetadata
 from rl_manager.types import (
     CANDIDATE_VS_FROZEN,
+    CURRENT_VS_CURRENT_ECONOMIC,
     E_VS_E,
     E_VS_PASS,
     FROZEN_VS_CANDIDATE,
@@ -78,7 +82,7 @@ InferenceBatchScope = Literal["policy_day", "policy"]
 # Artifact provenance sidecar schema (issue #9 A1 correction): the
 # `run_metadata` block written by `build_artifact_metadata` carries its own
 # version so consumers can pin against exactly these mandatory fields.
-ARTIFACT_METADATA_SCHEMA_VERSION = 2
+ARTIFACT_METADATA_SCHEMA_VERSION = 3
 
 
 class _ReadOnlyDict(dict):
@@ -136,11 +140,14 @@ class RunnerConfig:
     record_debug_trace: bool = False  # capture canonical viewer trace opt-in
     debug_trace_seat: int | None = None  # requested private-seat/view selector
     debug_trace_view: str = "joint"
+    reward_config: RewardConfig = field(default_factory=RewardConfig)
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "e_history_version",
             normalize_e_history_version(self.e_history_version))
+        if not isinstance(self.reward_config, RewardConfig):
+            raise TypeError("reward_config must be a RewardConfig")
         if self.inference_batch_scope not in INFERENCE_BATCH_SCOPES:
             raise ValueError(
                 "inference_batch_scope must be one of "
@@ -190,6 +197,7 @@ def build_episode_spec(
         E_VS_PASS: (),
         CANDIDATE_VS_FROZEN: (0,),
         FROZEN_VS_CANDIDATE: (1,),
+        CURRENT_VS_CURRENT_ECONOMIC: (0, 1),
     }[composition]
     return EpisodeSpec(
         episode_index=episode_index, seed=seed, composition=composition,
@@ -240,6 +248,8 @@ class EpisodeResult:
     debug_trace: dict[str, Any] | None = None
     # Keep runtime failures separate from informational opening handoff data.
     executor_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    land_purchase_events: list[dict[str, Any]] = field(default_factory=list)
+    utilization_snapshots: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _executor_factory_provenance(factory: Any) -> dict[str, Any]:
@@ -329,6 +339,8 @@ def build_artifact_metadata(
             "timing_seconds": {
                 key: float(result.timing_seconds[key])
                 for key in sorted(result.timing_seconds)},
+            "land_purchase_events": copy.deepcopy(result.land_purchase_events),
+            "utilization_snapshots": copy.deepcopy(result.utilization_snapshots),
         },
         "opening": copy.deepcopy(dict(provenance["opening"])),
         "backend": copy.deepcopy(dict(provenance["backend"])),
@@ -339,6 +351,7 @@ def build_artifact_metadata(
         "master_seed": provenance["master_seed"],
         "manager_start_day": int(provenance["manager_start_day"]),
         "e_history_version": str(provenance["e_history_version"]),
+        "reward_config": copy.deepcopy(dict(provenance["reward_config"])),
     }
 
 
@@ -375,6 +388,8 @@ class _EpisodeState:
                  backend: EngineBackend | None = None) -> None:
         self.spec = spec
         self.config = config
+        self._rollout_policy_identities = tuple(
+            policy.identity for policy in spec.policies)
         for policy in spec.policies:
             policy_history = getattr(policy.identity, "e_history_version", None)
             if policy_history is not None and policy_history != \
@@ -420,6 +435,10 @@ class _EpisodeState:
         self.hires_current_day = [0, 0]
         self.planned_days: list[set[int]] = [set(), set()]
         self.transition_index: dict[tuple[int, int], int] = {}
+        self.land_purchase_events: list[dict[str, Any]] = []
+        self.utilization_snapshots: list[dict[str, Any]] = []
+        self._snapshot_days: set[int] = set()
+        self._unlocked_quadrants_seen: list[set[str]] = [set(), set()]
         self.day_hashers: dict[int, Any] = {}
         self.day_digests: dict[int, bytes] = {}
         self.obs: list[dict[str, Any]] = []
@@ -435,6 +454,8 @@ class _EpisodeState:
         self.obs = self._adapt_observations(self.backend.reset())
         for seat in range(2):
             self._note_day_start(seat)
+            self._unlocked_quadrants_seen[seat] = set(
+                self.obs[seat]["farms"][seat]["unlocked_quadrants"])
 
     def _adapt_observations(
         self,
@@ -546,6 +567,48 @@ class _EpisodeState:
                 self.hires_current_day[seat], hires)
             self._note_day_start(seat)
 
+    def record_observed_land_transition(
+            self, previous_obs: Sequence[Mapping[str, Any]], *,
+            day: int, hour: int) -> None:
+        for seat in range(2):
+            events = observed_land_purchase_events(
+                previous_obs[seat]["farms"][seat],
+                self.obs[seat]["farms"][seat],
+                episode=self.spec.episode_index, seat=seat, day=day, hour=hour)
+            for event in events:
+                quadrant = str(event["quadrant"])
+                if quadrant not in self._unlocked_quadrants_seen[seat]:
+                    self.land_purchase_events.append(event)
+            self._unlocked_quadrants_seen[seat].update(
+                self.obs[seat]["farms"][seat]["unlocked_quadrants"])
+
+    def ensure_policy_identity(self) -> None:
+        if self.spec.composition != CURRENT_VS_CURRENT_ECONOMIC:
+            return
+        current = tuple(policy.identity for policy in self.spec.policies)
+        if current != self._rollout_policy_identities:
+            raise RuntimeError(
+                "current_vs_current_economic policy identity changed during "
+                "rollout; refusing mixed-version on-policy data")
+
+    def record_daily_utilization(self, day: int) -> None:
+        if day < self.config.manager_start_day or day >= TOTAL_DAYS:
+            return
+        if day in self._snapshot_days:
+            return
+        for seat in range(2):
+            self.utilization_snapshots.append(farm_utilization_snapshot(
+                self.obs[seat]["farms"][seat], day=day,
+                episode=self.spec.episode_index, seat=seat, boundary="daily"))
+        self._snapshot_days.add(day)
+
+    def record_terminal_utilization(self) -> None:
+        day = int(self.obs[0]["day"])
+        for seat in range(2):
+            self.utilization_snapshots.append(farm_utilization_snapshot(
+                self.obs[seat]["farms"][seat], day=day,
+                episode=self.spec.episode_index, seat=seat, boundary="terminal"))
+
     def encode_seat(self, seat: int) -> dict[str, np.ndarray]:
         obs = self.obs[seat]
         return encode_live_inputs(
@@ -655,6 +718,7 @@ class SelfPlayRunner:
             "master_seed": master_seed,
             "manager_start_day": config.manager_start_day,
             "e_history_version": config.e_history_version,
+            "reward_config": config.reward_config.to_json_dict(),
         }
         if config.batch_backend and config.backend_name != "fast":
             raise ValueError("batch_backend currently supports backend_name='fast' only")
@@ -663,6 +727,20 @@ class SelfPlayRunner:
     def run(self, specs: Sequence[EpisodeSpec]) -> list[EpisodeResult]:
         if not specs:
             return []
+        for spec in specs:
+            if spec.composition == CURRENT_VS_CURRENT_ECONOMIC:
+                if self.config.reward_config.mode != TERMINAL_OWN_BANK:
+                    raise ValueError(
+                        "current_vs_current_economic requires terminal_own_bank; "
+                        "symmetric double-sided terminal_wlt training is rejected")
+                if spec.trainable_seats != (0, 1):
+                    raise ValueError(
+                        "current_vs_current_economic requires trainable seats (0, 1)")
+                if (spec.policies[0] is not spec.policies[1]
+                        or spec.policies[0].identity != spec.policies[1].identity):
+                    raise ValueError(
+                        "current_vs_current_economic requires the exact same immutable "
+                        "live policy at both seats")
         num_envs = max(1, int(self.config.num_envs))
         results: list[EpisodeResult] = []
         for start in range(0, len(specs), num_envs):
@@ -708,8 +786,13 @@ class SelfPlayRunner:
             t2 = time.perf_counter()
 
             for state, actions in zip(active, per_state_actions):
+                previous_obs = state.obs
+                causal_day = int(state.obs[0]["day"])
+                causal_hour = int(state.obs[0]["hour"])
                 obs, _rewards, _statuses = state.backend.step(actions)
                 state.obs = state._adapt_observations(obs)
+                state.record_observed_land_transition(
+                    previous_obs, day=causal_day, hour=causal_hour)
             t3 = time.perf_counter()
 
             newly_done: list[_EpisodeState] = []
@@ -757,6 +840,8 @@ class SelfPlayRunner:
             state.obs = state._adapt_observations(observation)
             for seat in range(2):
                 state._note_day_start(seat)
+                state._unlocked_quadrants_seen[seat] = set(
+                    state.obs[seat]["farms"][seat]["unlocked_quadrants"])
 
         results: list[EpisodeResult] = []
         pass_pair = [
@@ -796,10 +881,15 @@ class SelfPlayRunner:
 
             observations, _rewards, _statuses = batch.step(batch_actions)
             for index, state in enumerate(states):
+                previous_obs = state.obs
+                causal_day = int(state.obs[0]["day"])
+                causal_hour = int(state.obs[0]["hour"])
                 state.backend.update(observations[index], batch.rewards(index),
                                      batch.statuses(index))
                 if not state.done:
                     state.obs = state._adapt_observations(observations[index])
+                    state.record_observed_land_transition(
+                        previous_obs, day=causal_day, hour=causal_hour)
             t3 = time.perf_counter()
 
             newly_done: list[_EpisodeState] = []
@@ -831,10 +921,12 @@ class SelfPlayRunner:
         start_day = self.config.manager_start_day
         requests: list[tuple[_EpisodeState, int, int]] = []
         for state in active:
+            state.ensure_policy_identity()
             day = int(state.obs[0]["day"])
             hour = int(state.obs[0]["hour"])
             if hour != 0 or day < start_day:
                 continue
+            state.record_daily_utilization(day)
             for seat in range(2):
                 if day not in state.planned_days[seat]:
                     requests.append((state, seat, day))
@@ -868,7 +960,17 @@ class SelfPlayRunner:
                     for state, seat, request_day in group])
             prng_id = f"episode={group[0][0].spec.episode_index}/day={day}/" \
                       f"policy={identity_id}"
-            outputs = policy.plan_batch(batch, prng_id)
+            row_aware = getattr(policy, "plan_batch_with_row_ids", None)
+            if (callable(row_aware)
+                    and any(state.spec.composition == CURRENT_VS_CURRENT_ECONOMIC
+                            for state, _, _ in group)):
+                row_ids = [
+                    f"episode={state.spec.episode_index}/seat={seat}/day={request_day}"
+                    f"/policy={policy.identity.identity_id()}"
+                    for state, seat, request_day in group]
+                outputs = row_aware(batch, row_ids, prng_id)
+            else:
+                outputs = policy.plan_batch(batch, prng_id)
             expected = len(group)
             if outputs.batch_size != expected:
                 raise ValueError(
@@ -928,6 +1030,8 @@ class SelfPlayRunner:
             opponent_id=opponent.identity.identity_id(),
             trainable=trainable,
             plan_json=plan.to_json_dict(),
+            composition=state.spec.composition,
+            reward_mode=state.config.reward_config.mode,
         )
         # Queue the decoded plan for the unmodified executor to consume at
         # its first turn of this day (exact once-per-day manager decision).
@@ -952,7 +1056,9 @@ class SelfPlayRunner:
 
     # ------------------------------------------------------------ finalize
     def _finalize(self, state: _EpisodeState) -> EpisodeResult:
+        state.ensure_policy_identity()
         state.finalized = True
+        state.record_terminal_utilization()
         debug_trace = state.record_terminal_trace()
         # Seal the final day's primitive-action digest and patch rows.
         current_day = int(state.obs[0]["day"])
@@ -967,10 +1073,7 @@ class SelfPlayRunner:
                  for seat in range(2)]
         margin = banks[0] - banks[1]
         winner_seat = 0 if margin > 0 else (1 if margin < 0 else -1)
-        rewards = [0.0, 0.0]
-        if winner_seat >= 0:
-            rewards[winner_seat] = 1.0
-            rewards[1 - winner_seat] = -1.0
+        rewards = terminal_rewards(banks, self.config.reward_config)
         terminated = not state.truncated
 
         if self.buffer is not None:
@@ -1044,6 +1147,8 @@ class SelfPlayRunner:
                 for seat in range(2)),
             debug_trace=debug_trace,
             executor_diagnostics=executor_diagnostics,
+            land_purchase_events=copy.deepcopy(state.land_purchase_events),
+            utilization_snapshots=copy.deepcopy(state.utilization_snapshots),
         )
 
     # ------------------------------------------------------------- artifact

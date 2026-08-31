@@ -21,6 +21,12 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "rl_manager.debug_trace", "DEBUG_TRACE_SCHEMA_VERSION"),
     "DIAGNOSTICS_SCHEMA_VERSION": (
         "rl_manager.diagnostics", "DIAGNOSTICS_SCHEMA_VERSION"),
+    "aggregate_economic_diagnostics": (
+        "rl_manager.diagnostics", "aggregate_economic_diagnostics"),
+    "build_economic_diagnostics": (
+        "rl_manager.diagnostics", "build_economic_diagnostics"),
+    "CURRENT_VS_CURRENT_ECONOMIC": (
+        "rl_manager.types", "CURRENT_VS_CURRENT_ECONOMIC"),
     "DebugTraceError": ("rl_manager.debug_trace", "DebugTraceError"),
     "E_VS_E": ("rl_manager.types", "E_VS_E"),
     "E_VS_PASS": ("rl_manager.types", "E_VS_PASS"),
@@ -32,6 +38,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "PromotionDecision": ("rl_manager.evaluation", "PromotionDecision"),
     "FROZEN_VS_CANDIDATE": (
         "rl_manager.types", "FROZEN_VS_CANDIDATE"),
+    "farm_utilization_snapshot": (
+        "rl_manager.land", "farm_utilization_snapshot"),
+    "observed_land_purchase_events": (
+        "rl_manager.land", "observed_land_purchase_events"),
     "GAME_TURNS": ("rl_manager.runner", "GAME_TURNS"),
     "JaxEPlanPolicy": ("rl_manager.policy", "JaxEPlanPolicy"),
     "LOGPROB_GROUPS": ("rl_manager.decode", "LOGPROB_GROUPS"),
@@ -57,6 +67,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "RL_PPO_CHECKPOINT_FORMAT": (
         "rl_manager.ppo_checkpoint", "RL_PPO_CHECKPOINT_FORMAT"),
     "RunnerConfig": ("rl_manager.runner", "RunnerConfig"),
+    "RewardConfig": ("rl_manager.reward", "RewardConfig"),
+    "REWARD_MODES": ("rl_manager.reward", "REWARD_MODES"),
+    "TERMINAL_OWN_BANK": ("rl_manager.reward", "TERMINAL_OWN_BANK"),
+    "TERMINAL_WLT": ("rl_manager.reward", "TERMINAL_WLT"),
     "SeedStream": ("rl_manager.seeds", "SeedStream"),
     "SelfPlayRunner": ("rl_manager.runner", "SelfPlayRunner"),
     "TOTAL_MANAGER_DAYS": ("rl_manager.runner", "TOTAL_MANAGER_DAYS"),

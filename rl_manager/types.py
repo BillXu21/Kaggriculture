@@ -18,8 +18,9 @@ E_VS_E = "e_vs_e"
 E_VS_PASS = "e_vs_pass"
 CANDIDATE_VS_FROZEN = "candidate_vs_frozen"
 FROZEN_VS_CANDIDATE = "frozen_vs_candidate"
+CURRENT_VS_CURRENT_ECONOMIC = "current_vs_current_economic"
 COMPOSITIONS = (E_VS_E, E_VS_PASS, CANDIDATE_VS_FROZEN,
-                FROZEN_VS_CANDIDATE)
+                 FROZEN_VS_CANDIDATE, CURRENT_VS_CURRENT_ECONOMIC)
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,8 @@ def seat_policies(
         return candidate, frozen
     if composition == FROZEN_VS_CANDIDATE:
         return frozen, candidate
+    if composition == CURRENT_VS_CURRENT_ECONOMIC:
+        return candidate, candidate
     raise ValueError(
         f"unknown composition {composition!r}; expected one of "
         f"{list(COMPOSITIONS)}")

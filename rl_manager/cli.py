@@ -42,6 +42,10 @@ from rl_manager.ratchet import PromotionRatchet
 from rl_manager.runner import GAME_TURNS
 from rl_manager.runner import INFERENCE_BATCH_SCOPES
 from rl_manager.types import E_VS_E, E_VS_PASS
+from rl_manager.types import (CANDIDATE_VS_FROZEN,
+                               CURRENT_VS_CURRENT_ECONOMIC)
+from rl_manager.reward import (REWARD_MODES, RewardConfig,
+                               TERMINAL_OWN_BANK)
 
 #: Fixed evaluation seed sets (issue #9 Evaluation section).
 SMOKE_SEEDS: tuple[int, ...] = (17, 42, 2026)
@@ -57,6 +61,7 @@ SEED_SETS: dict[str, tuple[int, ...]] = {
 #: Backends accepted by the rollout harness (`oracle.backend`).
 KNOWN_BACKENDS = ("fast", "official")
 DEBUG_TRACE_COMPOSITIONS = (E_VS_E, E_VS_PASS)
+TRAINING_COMPOSITIONS = (CANDIDATE_VS_FROZEN, CURRENT_VS_CURRENT_ECONOMIC)
 
 #: Explicit executor factory registry (issue #7 swaps/adds entries here).
 EXECUTOR_FACTORIES: Mapping[str, str] = {
@@ -99,6 +104,12 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--init-mode", choices=("bc", "scratch"),
                        default="bc",
                        help="Mutable manager initialization (default: bc).")
+    train.add_argument("--training-composition", choices=TRAINING_COMPOSITIONS,
+                       default=CANDIDATE_VS_FROZEN)
+    train.add_argument("--reward-mode", choices=REWARD_MODES,
+                       default="terminal_wlt")
+    train.add_argument("--bank-reward-baseline", type=float, default=3000.0)
+    train.add_argument("--bank-reward-scale", type=float, default=50000.0)
     train.add_argument("--num-workers", type=int, default=1,
                        help="Rollout worker processes (default 1).")
     train.add_argument("--num-envs", type=int, default=1,
@@ -277,6 +288,20 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
     init_mode = str(getattr(args, "init_mode", "bc"))
     if init_mode not in ("bc", "scratch"):
         raise ValueError("--init-mode must be one of ('bc', 'scratch')")
+    composition = str(getattr(args, "training_composition",
+                              CANDIDATE_VS_FROZEN))
+    if composition not in TRAINING_COMPOSITIONS:
+        raise ValueError(
+            f"--training-composition must be one of {TRAINING_COMPOSITIONS}")
+    reward_config = RewardConfig(
+        mode=str(getattr(args, "reward_mode", "terminal_wlt")),
+        bank_baseline=float(getattr(args, "bank_reward_baseline", 3000.0)),
+        bank_scale=float(getattr(args, "bank_reward_scale", 50000.0)))
+    if (composition == CURRENT_VS_CURRENT_ECONOMIC
+            and reward_config.mode != TERMINAL_OWN_BANK):
+        raise ValueError(
+            "current_vs_current_economic requires --reward-mode "
+            "terminal_own_bank; symmetric W/L training is rejected")
     for name, value in (("episodes_per_update", args.episodes_per_update),
                         ("updates", args.updates),
                         ("epochs", args.epochs),
@@ -296,18 +321,25 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
     # `ppo_update` strict check remains authoritative for truncations and
     # actual row counts; this only catches incompatible plans BEFORE any
     # env/checkpoint-heavy work.
-    expected_rows = int(args.episodes_per_update) * 26
+    rows_per_game = (52 if composition == CURRENT_VS_CURRENT_ECONOMIC else 26)
+    expected_rows = int(args.episodes_per_update) * rows_per_game
     if expected_rows % int(args.minibatch_size) != 0:
         raise ValueError(
             f"--minibatch-size {args.minibatch_size} must divide the "
             f"expected complete-game row count {expected_rows} "
-            f"(episodes_per_update {args.episodes_per_update} * 26); "
+            f"(episodes_per_update {args.episodes_per_update} * "
+            f"{rows_per_game}); "
             f"runtime ppo_update would fail loud after rollout")
     plan.update({
         "mode": "train",
         "e_checkpoint": str(Path(args.e_checkpoint)),
         "master_seed": int(args.master_seed),
         "init_mode": init_mode,
+        "training_composition": composition,
+        "reward": reward_config.to_json_dict(),
+        "expected_trainable_rows": expected_rows,
+        "expected_trajectory_rows": int(args.episodes_per_update) * 2 * 26,
+        "rows_per_complete_game": rows_per_game,
         "episodes_per_update": int(args.episodes_per_update),
         "updates": int(args.updates),
         "promotion": {
@@ -498,7 +530,7 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
     stop_after_promotion = False
     for update_index in range(plan["updates"]):
         buffer = TrajectoryBuffer(
-            capacity=plan["episodes_per_update"] * 2 * 26,
+            capacity=plan["expected_trajectory_rows"],
             input_spec=e_input_spec(),
             e_history_version=plan["e_history_version"])
         runner_config = RunnerConfig(
@@ -507,6 +539,7 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                                    "numThreads": plan["knobs"]["num_threads"]},
             num_envs=plan["knobs"]["num_envs"],
             e_history_version=plan["e_history_version"],
+            reward_config=RewardConfig(**plan["reward"]),
             **plan["runner_options"])
         executor_factory = _resolve_executor_factory(
             plan["executor_factory"],
@@ -519,20 +552,25 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                 runner_config, trajectory_buffer=buffer,
                 executor_factory=executor_factory,
                 master_seed=plan["master_seed"]))
-        # Seat randomization: alternate orientation by episode parity while
-        # evaluation below always pairs both seats explicitly.
+        # Candidate-v-frozen keeps its historical alternating seat orientation;
+        # economic self-play intentionally uses the same live policy twice.
         specs = []
         for episode in range(plan["episodes_per_update"]):
-            composition = ("candidate_vs_frozen" if episode % 2 == 0
-                           else "frozen_vs_candidate")
+            composition = (plan["training_composition"]
+                           if plan["training_composition"] ==
+                           CURRENT_VS_CURRENT_ECONOMIC else
+                           ("candidate_vs_frozen" if episode % 2 == 0
+                            else "frozen_vs_candidate"))
             specs.append(build_episode_spec(
                 update_index * plan["episodes_per_update"] + episode,
                 seed_stream.episode_seed(
                     update_index * plan["episodes_per_update"] + episode),
                 composition, candidate, ratchet.current_opponent))
-        runner.run(specs)
-        batch = build_ppo_batch(buffer.finalize(), gamma=ppo_config.gamma,
-                                gae_lambda=ppo_config.gae_lambda)
+        results = runner.run(specs)
+        batch = build_ppo_batch(
+            buffer.finalize(), gamma=ppo_config.gamma,
+            gae_lambda=ppo_config.gae_lambda,
+            sidecar_records=buffer.sidecar_records)
         state, metrics = ppo_update(state, batch, config, ppo_config)
         if metrics["accepted"]:
             candidate = _rollout_candidate_from_state(
@@ -540,9 +578,19 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                 e_history_version=plan["e_history_version"])
         update_number = update_index + 1
         print(f"UPDATE {update_number}")
+        rollout_opponent = (ratchet.current_opponent.identity.fingerprint
+                            if plan["training_composition"] !=
+                            CURRENT_VS_CURRENT_ECONOMIC else "not_used")
         print(f"learner={candidate.identity.fingerprint} "
-              f"opponent={ratchet.current_opponent.identity.fingerprint} "
-              f"ppo_step={state.step}")
+              f"rollout_opponent={rollout_opponent} ppo_step={state.step}")
+        from rl_manager.diagnostics import (build_economic_diagnostics,
+                                            write_diagnostics)
+        economic = build_economic_diagnostics(results)
+        economic["update"] = update_number
+        economic["reward_config"] = dict(plan["reward"])
+        write_diagnostics(
+            output_dir / f"economic_update_{update_number:06d}.json", economic)
+        print(f"economic={json.dumps(economic['aggregate'], sort_keys=True)}")
 
         promotion = plan["promotion"]
         if promotion["every"] and update_number % promotion["every"] == 0:
@@ -636,22 +684,36 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
             output_dir / f"ppo_update_{update_index:06d}.npz", state, config,
             ppo_config, e_history_version=plan["e_history_version"],
             provenance={"plan": dict(plan),
+                        "training_composition": plan["training_composition"],
+                        "reward_config": dict(plan["reward"]),
                         "init_mode": plan["init_mode"],
                         "initialization_seed": initialization_seed})
         history.append({"update": update_index, "metrics": metrics,
                         "checkpoint": str(path),
                         "init_mode": plan["init_mode"],
                         "learner": candidate.identity.to_json_dict(),
-                        "opponent": ratchet.current_opponent.identity.to_json_dict(),
+                        "opponent": (None if plan["training_composition"] ==
+                                      CURRENT_VS_CURRENT_ECONOMIC else
+                                      ratchet.current_opponent.identity.to_json_dict()),
+                        "frozen_reference": (
+                            ratchet.current_opponent.identity.to_json_dict()),
                         "promotions": ratchet.promotions})
         if stop_after_promotion:
             break
+    final_path = save_ppo_checkpoint(
+        plan["checkpoint"], state, config, ppo_config,
+        e_history_version=plan["e_history_version"],
+        provenance={"plan": dict(plan),
+                    "training_composition": plan["training_composition"],
+                    "reward_config": dict(plan["reward"]),
+                    "init_mode": plan["init_mode"],
+                    "initialization_seed": initialization_seed})
     return {"history": history, "promotion_checks": promotion_checks,
             "init_mode": plan["init_mode"],
             "promotions": ratchet.promotions,
             "original_bc_e": original_bc_e.identity.to_json_dict(),
             "final_opponent": ratchet.current_opponent.identity.to_json_dict(),
-            "final_checkpoint": history[-1]["checkpoint"] if history else None}
+            "final_checkpoint": str(final_path)}
 
 
 def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no cover

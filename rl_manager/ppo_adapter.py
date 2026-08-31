@@ -238,6 +238,10 @@ def select_ppo_subset(batch: PPOBatch, size: int) -> PPOBatch:
         advantages=take(batch.advantages),
         returns=take(batch.returns),
         values=take(batch.values),
+        learner_fingerprint=batch.learner_fingerprint,
+        learner_fingerprints=(None if batch.learner_fingerprints is None else
+                               tuple(batch.learner_fingerprints[index]
+                                     for index in indices)),
     )
 
 

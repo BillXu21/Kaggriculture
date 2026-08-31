@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -61,6 +61,8 @@ class PPOBatch:
     advantages: np.ndarray
     returns: np.ndarray
     values: np.ndarray
+    learner_fingerprint: str | None = None
+    learner_fingerprints: tuple[str, ...] | None = None
 
     @property
     def size(self) -> int:
@@ -75,6 +77,8 @@ def build_ppo_batch(
     bootstrap_values: np.ndarray | None = None,
     normalize_advantages: bool = True,
     epsilon: float = 1e-8,
+    sidecar_records: Sequence[Any] | None = None,
+    learner_fingerprints: Sequence[str] | None = None,
 ) -> PPOBatch:
     """Convert finalized/loaded trajectory arrays into a PPO batch.
 
@@ -85,6 +89,25 @@ def build_ppo_batch(
     rows = valid_trainable_rows(arrays)
     if rows.size == 0:
         raise ValueError("no candidate/trainable valid trajectory rows")
+    fingerprints: list[str] = []
+    if sidecar_records is not None:
+        if len(sidecar_records) < int(rows.max()) + 1:
+            raise ValueError("trajectory sidecar is shorter than PPO arrays")
+        fingerprints = [str(record["policy_fingerprint"])
+                        if isinstance(record, Mapping) else
+                        str(record.policy_fingerprint)
+                        for row in rows
+                        for record in (sidecar_records[int(row)],)]
+    elif learner_fingerprints is not None:
+        values = list(learner_fingerprints)
+        if len(values) != len(arrays["valid"]):
+            raise ValueError("learner_fingerprints must align with trajectory rows")
+        fingerprints = [str(values[int(row)]) for row in rows]
+    unique_fingerprints = set(fingerprints)
+    if len(unique_fingerprints) > 1:
+        raise ValueError(
+            "one PPO batch contains trainable rows sampled from multiple "
+            f"learner fingerprints: {sorted(unique_fingerprints)}")
     inputs = {key[len("input_"):]: np.ascontiguousarray(arrays[key][rows])
               for key in arrays if key.startswith("input_")}
     action_tensors = {
@@ -111,7 +134,10 @@ def build_ppo_batch(
         advantages=gae["advantages"],
         returns=gae["returns"],
         values=np.ascontiguousarray(
-            np.asarray(arrays["value"])[rows], dtype=np.float32))
+            np.asarray(arrays["value"])[rows], dtype=np.float32),
+        learner_fingerprint=(next(iter(unique_fingerprints))
+                             if unique_fingerprints else None),
+        learner_fingerprints=(tuple(fingerprints) if fingerprints else None))
 
 
 # ----------------------------------------------------------- train state
@@ -274,6 +300,12 @@ def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
     """
     n = batch.size
     mb = ppo_config.minibatch_size
+    if batch.learner_fingerprints is not None:
+        fingerprints = set(batch.learner_fingerprints)
+        if len(batch.learner_fingerprints) != n or len(fingerprints) > 1:
+            raise ValueError(
+                "one PPO batch contains trainable rows sampled from multiple "
+                f"learner fingerprints: {sorted(fingerprints)}")
     if n % mb != 0:
         raise ValueError(
             f"batch size {n} must be divisible by minibatch_size {mb} "
