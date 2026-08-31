@@ -1,163 +1,103 @@
 # AGENTS.md
 
-Instructions for any chat, coding agent, or contributor working in this repository.
+Repository-wide instructions for coding agents and contributors.
 
-## Read Order
+## Primary Task Context
 
-Before substantial work, read:
+The explicit user request or GitHub issue is the primary task packet. Read it fully and treat its scope, base commit/branch, acceptance criteria, and non-goals as authoritative unless current source evidence contradicts it.
 
-1. `CURRENT_STATE.md`
-2. `DECISIONS.md`
-3. `PLANS.md`
-4. `MECHANICS.md`
-5. the newest relevant section of `HISTORY.md`
+Do **not** read every project-history document before starting work.
 
-Do not rely on chat memory when these files provide a durable answer.
+## Context Tiers
 
-## Current Project Mode
+### Hot context — read routinely
 
-The project is in a **post-V0.7 forensic + RL-readiness phase**.
+1. the current issue / user task;
+2. this `AGENTS.md`;
+3. the source and tests directly relevant to the task.
 
-The final 24-game real-BC-E / V0.7 PASS panel found acceptable middle-of-distribution performance but three catastrophic `<1k` tails. Do **not** declare V0.7 generalization-validated, launch another broad heuristic search, or start a large PPO/self-play run yet.
+If the issue links a specific research note or runbook, read that targeted document or section.
 
-Immediate authorized work is bounded to:
+### Cold context — retrieve only when needed
 
-- generate and inspect a small set of visual replays spanning catastrophic, same-seed control, median, and strong outcomes;
-- use passive logs/traces to identify the **first bad day** and classify each failure as manager strategy, executor mechanics, or policy-executor interaction;
-- patch only obvious, reproducible mechanical defects that prevent execution of a feasible strategy;
-- profile rollout throughput and CPU scaling before serious RL, including where time is spent in engine, executor, encoding, orchestration/IPC, and policy inference;
-- prepare small RL initialization/reward experiments only after the executor is accepted/frozen.
+- `CURRENT_STATE.md` — current cross-project facts and accepted baselines;
+- `PLANS.md` — broader priorities and deferred work;
+- `DECISIONS.md` and `.agents/notes/**` — durable rationale and rejected alternatives;
+- `MECHANICS.md` — verified engine/mechanics evidence;
+- `HISTORY.md` — prior implementation/results/failures;
+- `research/**` and `docs/**` — detailed reports and runbooks.
 
-Current learning hypothesis is not a durable architecture change: BC-E may imitate elite strategies that operate too close to the execution frontier for the current deterministic executor. A policy trained closed-loop may need to learn around that executor. Candidate future experiments include full BC-E initialization, BC-E trunk with reset action heads, and scratch manager training after a longer deterministic opening.
+Search/grep for relevant headings, symbols, issue numbers, or terms first, then read only the useful section. Do not sequentially or wholesale ingest these files merely "for context." The issue packet should normally contain enough task-local context to begin source inspection.
 
-Do not silently convert those candidate experiments into production architecture. Record evidence first.
+## Source of Truth
 
-## Core Technical Direction
+For current behavior/mechanics, prefer:
 
-Prefer:
+1. current source at the task's actual base/ref;
+2. controlled behavioral tests or reproduced traces;
+3. pinned official specification/engine source;
+4. durable project notes and prior reports.
 
-- exact engine tracking;
-- deterministic evaluation;
-- learned strategy with deterministic mechanical execution;
-- structured route execution;
-- closed-loop repair;
-- passive causal diagnostics;
-- measured throughput optimization before large training runs.
-
-Do not assume primitive-action deep RL is the correct starting point.
+Historical docs explain why something exists; they do not override current code or fresh evidence.
 
 ## Scope Discipline
 
 - Work in one bounded packet at a time.
-- Avoid speculative abstractions before the first concrete use case.
-- Do not quietly expand a research task into implementation.
-- Do not modify vendored third-party engine or baseline files in place.
-- Preserve original artifacts and record local patches separately.
-- Prefer simple executable smoke scripts over enormous test suites when a direct behavioral test is clearer and faster.
+- Follow the issue's explicit base/branch/worktree constraints and avoid disturbing unrelated concurrent work.
+- Prefer the simplest change that satisfies the stated contract.
+- Do not quietly expand research into implementation or a bug fix into architecture redesign.
+- Do not modify vendored third-party engine/baseline artifacts in place.
+- Preserve original artifacts; record derived/local patches separately.
 
-## Source of Truth
+## Validation
 
-Mechanics priority:
+Use the smallest realistic validation that proves the changed contract.
 
-1. exact current engine source;
-2. controlled behavioral test;
-3. official current specification;
-4. discussion or notebook claims.
+- Prefer focused behavioral tests and real execution paths over giant test matrices.
+- Reuse still-valid evidence; do not rerun broad suites only for completeness.
+- If a change affects lifecycle, persistence/resume, multiprocessing, packaging, or engine semantics, include a small real-path check when practical.
+- Competitive evaluations should use fixed recorded seeds, both seat assignments when relevant, immutable identities, exact engine provenance, and machine-readable results.
+- PASS/random agents are plumbing smokes, not competitive evidence.
+- When the issue names official `kaggle_environments==1.32.7` as promotion authority, fast-engine score magnitude is diagnostic only.
 
-Use the confidence labels defined in `MECHANICS.md`. Never promote a discussion claim to a confirmed mechanic without evidence.
+## Expensive Runs and Kaggle
 
-## Engine and Artifact Provenance
+Before a genuinely expensive run, ensure the exact command/config, branch+commit, engine/artifact identities, seed/seat policy, outputs, and stop/recovery conditions are recorded somewhere appropriate for that task. Do not launch from remembered configuration when repository/run artifacts disagree.
 
-Every locked engine or third-party agent must record:
+For Kaggle work:
 
-- original source;
-- retrieval date;
-- version or commit;
-- SHA-256 hashes;
-- local modifications;
-- assumed server compatibility;
-- relevant known behavioral differences.
+- preserve attached datasets and accelerator/notebook metadata unless explicitly changing them;
+- use Kaggle secrets for Git authentication;
+- prefer a fresh clone over risky in-notebook repository surgery;
+- keep long runs foregrounded unless background execution is explicitly requested;
+- log enough phase/timing/output information to diagnose a failed run.
 
-Never overwrite the original artifact when adapting it.
+## Durable Documentation
 
-## Evaluation Rules
+Update durable docs **only when the task materially changes durable knowledge**. Do not treat every file below as a mandatory completion checklist.
 
-Every serious competitive evaluation must:
+- `CURRENT_STATE.md`: concise current truths/baselines; replace stale facts rather than accumulating history.
+- `DECISIONS.md` / `.agents/notes/**`: decisions whose rationale or rejected alternatives will matter later.
+- `MECHANICS.md`: verified mechanics/evidence/regressions.
+- `HISTORY.md`: notable completed work, measurements, failures, and artifact identities worth preserving.
+- `PLANS.md`: only when project priorities or sequencing actually change.
+- `research/**`: detailed experiment reports/runbooks when the issue needs them.
 
-- use a fixed recorded seed list;
-- play both seat assignments;
-- use immutable agent identities;
-- record exact engine identity;
-- compare against a frozen versioned opponent pool;
-- save machine-readable results;
-- separate plumbing baselines from competitive baselines.
+Avoid duplicating the same fact across several documents. Prefer pointers to one authoritative detailed record.
 
-Pass, random, and other trivial agents are smoke tests only.
+## Coding Expectations
 
-## Compute Safety
-
-Before an expensive run, update `CURRENT_STATE.md` with:
-
-- objective and hypothesis;
-- exact command or configuration;
-- branch and commit;
-- engine version and hashes;
-- agents and opponent-pool versions;
-- seeds and seat policy;
-- expected output paths;
-- stop conditions;
-- recovery or resume plan.
-
-After the run, record results and failures before starting the next experiment.
-
-Do not launch a run from a remembered configuration when the durable files disagree or are incomplete.
-
-## Kaggle Workflow
-
-- Prefer one clear setup cell.
-- Use Kaggle secrets for Git authentication.
-- Avoid `git fetch` in Kaggle notebooks when a fresh clone is safer.
-- Keep runs foregrounded unless the user explicitly requests background execution.
-- Use CPU for plumbing and evaluation unless accelerators provide a measured benefit.
-- Track `/kaggle/working` storage use and avoid unnecessary duplication.
-- Do not overwrite notebook dataset attachments or accelerator metadata when exporting or editing notebooks.
-- Log phase, elapsed time, throughput, worker counts, skips, and output paths for long jobs.
-
-## Documentation Update Contract
-
-At the end of substantial work:
-
-- `CURRENT_STATE.md`: replace stale active facts; keep concise.
-- `HISTORY.md`: append what happened, including failures and exact artifacts.
-- `PLANS.md`: revise priorities and future work.
-- `DECISIONS.md`: add or supersede durable choices.
-- `MECHANICS.md`: update evidence, confidence, engine identity, and regressions.
-
-A task is not complete if its durable state has not been recorded.
-
-## Coding Expectations Once Implementation Begins
-
-- Python 3.12 unless the live Kaggle environment requires otherwise.
+- Python 3.12 unless the live environment requires otherwise.
 - Deterministic behavior by default.
 - Type hints for public interfaces.
-- Clear error messages and explicit validation.
-- JSON/JSONL outputs with schemas or version fields.
-- Small targeted behavioral tests for engine contracts.
-- Fast smoke commands that can run before larger suites.
-- Avoid hidden global state and unrecorded random seeds.
+- Clear failures and explicit validation at contract boundaries.
+- Version/schema fields for persisted JSON/JSONL/checkpoints when semantics matter.
+- Avoid hidden global state and unrecorded randomness.
 
 ## Submission Safety
 
-Before packaging a Kaggle submission:
-
-- validate `agent(obs)` with representative observations;
-- confirm no network dependency;
-- confirm paths and imports work in a clean environment;
-- verify runtime and memory limits;
-- include deterministic fallback behavior;
-- record the exact archive hash and source commit;
-- do not change notebook datasets or accelerator settings unintentionally.
+Before packaging a Kaggle submission, validate representative `agent(obs)` calls, clean-environment imports/paths, no unintended network dependency, runtime/memory limits, deterministic fallback behavior, and exact archive/source provenance.
 
 ## Communication
 
-Be direct about uncertainty, failed checks, or missing access. Partial verified progress is better than a confident guess. Do not promise background work or future delivery.
+Be direct about uncertainty, failed checks, unavailable artifacts, and evidence limits. Partial verified progress is better than a confident guess.
