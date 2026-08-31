@@ -25,7 +25,7 @@ The variant is persisted OUTSIDE `model_config` in the native NPZ metadata
 and is checked strictly against any requested variant — never inferred from
 weight shapes.
 
-Native format `bc_manager_jax_checkpoint_v1`: one .npz archive with
+Native format `bc_manager_jax_checkpoint_v2`: one .npz archive with
 flattened parameter arrays plus a JSON metadata record. No pickle.
 """
 
@@ -40,7 +40,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from bc_manager.economics import normalize_model_variant
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    E_HISTORY_LEGACY,
+    normalize_e_history_version,
+    normalize_model_variant,
+)
 from bc_manager_jax.model import (
     ECONOMIC_DIM,
     ManagerConfig,
@@ -49,7 +54,8 @@ from bc_manager_jax.model import (
 )
 
 TORCH_CHECKPOINT_FORMAT = "bc_manager_checkpoint_v1"
-NATIVE_CHECKPOINT_FORMAT = "bc_manager_jax_checkpoint_v1"
+NATIVE_CHECKPOINT_FORMAT = "bc_manager_jax_checkpoint_v2"
+_LEGACY_NATIVE_CHECKPOINT_FORMAT = "bc_manager_jax_checkpoint_v1"
 
 
 # ------------------------------------------------- expected torch state
@@ -275,11 +281,24 @@ def _payload_model_variant(payload: Mapping[str, Any]) -> str:
             f"{raw!r}: {error}") from error
 
 
+def _payload_e_history_version(payload: Mapping[str, Any],
+                               variant: str) -> str | None:
+    """Resolve E semantics; unversioned historical E payloads are legacy."""
+    raw = payload.get("e_history_version")
+    if variant not in ("E", "JE"):
+        if raw is not None:
+            raise ValueError("non-E checkpoint carries e_history_version")
+        return None
+    return (E_HISTORY_LEGACY if raw is None
+            else normalize_e_history_version(raw))
+
+
 def load_torch_checkpoint(
     source: str | Path | Mapping[str, Any],
     config: ManagerConfig | None = None,
     *,
     model_variant: str | None = None,
+    expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
 ) -> tuple[dict, dict[str, Any]]:
     """Load a `bc_manager_checkpoint_v1` payload from a path or dict and
     convert its state dict strictly. Returns (params, metadata).
@@ -311,18 +330,26 @@ def load_torch_checkpoint(
 
     resolved = _require_matching_config(payload["model_config"], config)
     stored_variant = _payload_model_variant(payload)
+    stored_history = _payload_e_history_version(payload, stored_variant)
     if model_variant is not None and \
             resolve_model_variant(model_variant) != stored_variant:
         raise ValueError(
             f"checkpoint stores model_variant {stored_variant!r} but the "
             f"requested variant is "
             f"{resolve_model_variant(model_variant)!r}; refusing to guess")
+    if stored_history is not None and expected_e_history_version is not None \
+            and stored_history != normalize_e_history_version(
+                expected_e_history_version):
+        raise ValueError(
+            f"checkpoint e_history_version {stored_history!r} does not match "
+            f"requested {normalize_e_history_version(expected_e_history_version)!r}")
     params = convert_torch_state_dict(payload["model_state_dict"], resolved,
                                       stored_variant)
     metadata = {
         "format": payload["format"],
         "model_config": dict(payload["model_config"]),
         "model_variant": stored_variant,
+        "e_history_version": stored_history,
         "epoch": payload.get("epoch"),
         "kind": payload.get("kind"),
         "training_config": payload.get("training_config"),
@@ -336,7 +363,8 @@ def load_torch_checkpoint(
 
 def save_native(path: str | Path, params: Mapping, config: ManagerConfig,
                 metadata: Mapping[str, Any] | None = None,
-                model_variant: str = "V0") -> None:
+                model_variant: str = "V0",
+                e_history_version: str | None = None) -> None:
     """Save params/config/metadata as a small pickle-free .npz archive.
 
     The resolved variant is stored as a top-level `model_variant` record in
@@ -344,6 +372,13 @@ def save_native(path: str | Path, params: Mapping, config: ManagerConfig,
     checkpoint layout.
     """
     variant = resolve_model_variant(model_variant)
+    if variant in ("E", "JE"):
+        history_version = normalize_e_history_version(
+            e_history_version or E_HISTORY_CORRECTED_V1)
+    elif e_history_version is not None:
+        raise ValueError("non-E checkpoint cannot carry e_history_version")
+    else:
+        history_version = None
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     flat: dict[str, np.ndarray] = {}
@@ -357,6 +392,7 @@ def save_native(path: str | Path, params: Mapping, config: ManagerConfig,
         "format": NATIVE_CHECKPOINT_FORMAT,
         "model_config": dataclasses.asdict(config),
         "model_variant": variant,
+        "e_history_version": history_version,
         "metadata": dict(metadata) if metadata else {},
     }
     flat["__meta__"] = np.frombuffer(
@@ -371,8 +407,9 @@ def save_native(path: str | Path, params: Mapping, config: ManagerConfig,
 
 def load_native(path: str | Path,
                 config: ManagerConfig | None = None,
-                *,
-                model_variant: str | None = None) -> tuple[dict, dict]:
+                *, model_variant: str | None = None,
+                expected_e_history_version: str | None =
+                E_HISTORY_CORRECTED_V1) -> tuple[dict, dict]:
     """Load a native .npz checkpoint; fail loudly on corruption or any
     config/structure incompatibility.
 
@@ -390,19 +427,30 @@ def load_native(path: str | Path,
     if "__meta__" not in items:
         raise ValueError(f"{path}: native checkpoint missing __meta__ record")
     meta = json.loads(items["__meta__"].tobytes().decode("utf-8"))
-    if meta.get("format") != NATIVE_CHECKPOINT_FORMAT:
+    if meta.get("format") not in (NATIVE_CHECKPOINT_FORMAT,
+                                   _LEGACY_NATIVE_CHECKPOINT_FORMAT):
         raise ValueError(
             f"{path}: unrecognized native checkpoint format "
-            f"{meta.get('format')!r}; expected {NATIVE_CHECKPOINT_FORMAT!r}")
+            f"{meta.get('format')!r}; expected one of "
+            f"{NATIVE_CHECKPOINT_FORMAT!r}/{_LEGACY_NATIVE_CHECKPOINT_FORMAT!r}")
     resolved = _require_matching_config(meta["model_config"], config)
     stored_variant = _payload_model_variant(meta)
+    stored_history = _payload_e_history_version(meta, stored_variant)
     if model_variant is not None and \
             resolve_model_variant(model_variant) != stored_variant:
         raise ValueError(
             f"{path}: native checkpoint stores model_variant "
             f"{stored_variant!r} but the requested variant is "
             f"{resolve_model_variant(model_variant)!r}")
+    if stored_history is not None and expected_e_history_version is not None \
+            and stored_history != normalize_e_history_version(
+                expected_e_history_version):
+        raise ValueError(
+            f"{path}: native checkpoint e_history_version {stored_history!r} "
+            f"does not match requested "
+            f"{normalize_e_history_version(expected_e_history_version)!r}")
     meta["model_variant"] = stored_variant
+    meta["e_history_version"] = stored_history
 
     spec = empty_params(resolved, stored_variant)
     treedef = jax.tree_util.tree_structure(spec)

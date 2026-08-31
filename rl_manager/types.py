@@ -11,6 +11,8 @@ from typing import Mapping, Protocol, runtime_checkable
 
 import numpy as np
 
+from bc_manager.economics import normalize_e_history_version
+
 # Compositions (issue #9 A3). Seat 0's policy is listed first.
 E_VS_E = "e_vs_e"
 E_VS_PASS = "e_vs_pass"
@@ -25,24 +27,36 @@ class PolicyIdentity:
     """Immutable opponent/policy snapshot identity.
 
     `fingerprint` is a parameter digest (or checkpoint digest) — never a
-    committed artifact. Two identities are equal only when all three fields
-    match, so frozen-vs-candidate bookkeeping cannot silently alias.
+    committed artifact. The optional E history version is part of the
+    identity, so corrected and legacy policies cannot silently alias.
     """
 
     name: str
     version: str
     fingerprint: str
+    e_history_version: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.e_history_version is not None:
+            object.__setattr__(
+                self, "e_history_version",
+                normalize_e_history_version(self.e_history_version))
 
     def identity_id(self) -> str:
-        return f"{self.name}@{self.version}:{self.fingerprint[:12]}"
+        base = f"{self.name}@{self.version}:{self.fingerprint[:12]}"
+        return (base if self.e_history_version is None else
+                f"{base}:e-history={self.e_history_version}")
 
     def to_json_dict(self) -> dict[str, str]:
-        return {
+        result = {
             "name": self.name,
             "version": self.version,
             "fingerprint": self.fingerprint,
             "identity_id": self.identity_id(),
         }
+        if self.e_history_version is not None:
+            result["e_history_version"] = self.e_history_version
+        return result
 
 
 @dataclass(frozen=True)

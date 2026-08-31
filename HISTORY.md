@@ -1,5 +1,23 @@
 # Kaggriculture Historical Record
 
+## 2026-08-31 - Issue #30 Corrected E Economic History
+
+- Versioned E history semantics as `E_CORRECTED_V1` and explicit
+  `E_LEGACY`. Corrected channels use observed adjacent daily-start bank
+  snapshots only; the first manager day, gaps, backwards days, and episode
+  resets are deterministic invalid `0/0` states.
+- Threaded the semantic identity through BC regeneration/training, JAX/native
+  checkpoints, PPO checkpoints/snapshots, policy identities, trajectory
+  artifacts, scalar/parallel/spawned runners, evaluation, and submission
+  manifests. Corrected defaults reject legacy E artifacts rather than
+  silently mixing them.
+- Added runner rollover and legacy trajectory regressions. The combined
+  focused suite passed `144`, with `3` expected skips. Changed-file lint and
+  compilation passed. Native fast-engine tests could not run because Rust and
+  Cargo are not installed in this environment.
+- Added the exact raw regeneration, corrected GPU BC-E, PPO readiness, and
+  not-yet-run PPO command to `research/ISSUE30_E_HISTORY_RUNBOOK.md`.
+
 ## 2026-08-30 - Issue #35 Asymmetric Executor / External-Agent Harness
 
 - Added a separate `evaluation/` primitive-controller loop. It accepts two

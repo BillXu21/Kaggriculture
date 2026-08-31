@@ -1,5 +1,10 @@
 # BC V1 Ablation — Durable State and Exact Kaggle Runbook (issue #6)
 
+> Issue #30 correction: for any new E/JE run, use
+> `--e-history-version E_CORRECTED_V1`. The raw-data regeneration, corrected
+> BC command, explicit legacy behavior, and PPO readiness command are recorded
+> in [`ISSUE30_E_HISTORY_RUNBOOK.md`](ISSUE30_E_HISTORY_RUNBOOK.md).
+
 Status: **implementation complete locally; real corpus/checkpoints absent on
 this machine; no real training results, no closed-loop panel results, and no
 winner exist yet.** The exact Kaggle execution below is the next gate. This

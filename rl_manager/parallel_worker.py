@@ -194,7 +194,8 @@ def worker_main(task_queue: Any, request_queue: Any, response_queue: Any,
         if task.trajectory_capacity is not None:
             from rl_manager.trajectory import TrajectoryBuffer, e_input_spec
             trajectory = TrajectoryBuffer(
-                capacity=int(task.trajectory_capacity), input_spec=e_input_spec())
+                capacity=int(task.trajectory_capacity), input_spec=e_input_spec(),
+                e_history_version=task.runner_config.e_history_version)
         runner = SelfPlayRunner(
             task.runner_config, trajectory_buffer=trajectory,
             executor_factory=_factory_from_wire(

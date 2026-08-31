@@ -1,6 +1,22 @@
 # Kaggriculture Mechanics Ledger
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
+
+## Issue #30 E Economic History (2026-08-31)
+
+- `CONFIRMED_EXPERIMENT`: corrected E channels 12/13 are built from the
+  observed previous adjacent daily-start bank, not submitted orders or
+  inferred fills. The first manager decision at day 4 is invalid (`0/0`);
+  day 5 uses the realized day-4 start when adjacent.
+- `CONFIRMED_EXPERIMENT`: day gaps, backwards days, and episode/seat state
+  boundaries produce deterministic invalid history. Runner, BC batch adapter,
+  live encoder, internal evaluation, scalar runner, and spawned worker paths
+  use the same versioned identity.
+- `CONFIRMED_EXPERIMENT`: unversioned historical E checkpoints resolve to
+  `E_LEGACY`; corrected defaults reject them, while explicit legacy loaders and
+  the runner-compatible submission path preserve their old behavior.
+- Evidence is local focused testing only. Corrected BC regeneration, model
+  training, PPO training, and TPU behavior remain unmeasured.
 
 ## Animal Crop-Sacrifice Placement Correction (2026-08-30)
 

@@ -10,7 +10,12 @@ encoder and tracker.
 
 import numpy as np
 
-from bc_manager.economics import EconomicHistory
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    E_HISTORY_LEGACY,
+    EconomicHistory,
+    previous_net_cash,
+)
 from bc_manager.live import encode_live_inputs
 
 
@@ -151,3 +156,19 @@ def test_runner_style_daily_start_tracking_is_adjacent_only():
     assert [day for day, _ in contexts] == [29, 30]
     assert [float(row[13]) for _, row in contexts] == [1.0, 0.0]
     assert float(contexts[1][1][12]) == 0.0  # invalid delta channel stays 0
+
+
+def test_history_versions_are_explicit_and_legacy_is_zero_invalid():
+    assert previous_net_cash(
+        E_HISTORY_CORRECTED_V1, 5, 125.0, (4, 100.0)) == (25.0, True)
+    assert previous_net_cash(
+        E_HISTORY_CORRECTED_V1, 4, 125.0, (3, 100.0)) == (25.0, True)
+    assert previous_net_cash(
+        E_HISTORY_LEGACY, 5, 125.0, (4, 100.0)) == (0.0, False)
+
+    obs = _obs(5, 125.0, 225.0)
+    legacy = _context(encode_live_inputs(
+        obs, 0, {"workers_hired": 0, "hire_cost": 0}, step=120,
+        economic_prev_start=(4, 100.0),
+        e_history_version=E_HISTORY_LEGACY))
+    assert legacy[12] == 0.0 and legacy[13] == 0.0

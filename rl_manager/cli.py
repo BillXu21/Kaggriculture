@@ -33,6 +33,11 @@ from typing import Any, Mapping, Sequence
 from rl_manager.evaluation import evaluate_promotion
 from rl_manager.evaluation import format_promotion_result
 from rl_manager.evaluation import summarize_evaluation
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    E_HISTORY_VERSIONS,
+    normalize_e_history_version,
+)
 from rl_manager.ratchet import PromotionRatchet
 from rl_manager.runner import GAME_TURNS
 from rl_manager.runner import INFERENCE_BATCH_SCOPES
@@ -127,6 +132,9 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--output-dir", required=True)
     train.add_argument("--checkpoint", required=True,
                        help="Output RL PPO checkpoint path (.npz).")
+    train.add_argument("--e-history-version", choices=E_HISTORY_VERSIONS,
+                       default=E_HISTORY_CORRECTED_V1,
+                       help="Explicit E input semantics; legacy is compatibility-only.")
 
     ev = sub.add_parser("eval",
                         help="Fixed-seed paired evaluation vs frozen E.")
@@ -146,6 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_inference_batch_options(ev)
     ev.add_argument("--seed-set", required=True, choices=sorted(SEED_SETS))
     ev.add_argument("--output-json", required=True)
+    ev.add_argument("--e-history-version", choices=E_HISTORY_VERSIONS,
+                    default=E_HISTORY_CORRECTED_V1)
     ev.add_argument(CONFIRM_FLAG, action="store_true",
                     help="Required for the expensive dev/holdout panels.")
 
@@ -194,6 +204,8 @@ def _validate_common(args: argparse.Namespace) -> dict[str, Any]:
             f"(issue #7 selection must be explicit)")
     if args.backend not in KNOWN_BACKENDS:
         raise ValueError(f"--backend must be one of {KNOWN_BACKENDS}")
+    history_version = normalize_e_history_version(
+        getattr(args, "e_history_version", E_HISTORY_CORRECTED_V1))
     knobs: dict[str, int] = {}
     for arg_name, label in (("num_workers", "workers"),
                             ("num_envs", "envs"),
@@ -220,6 +232,7 @@ def _validate_common(args: argparse.Namespace) -> dict[str, Any]:
     if not math.isfinite(wait_ms) or wait_ms < 0:
         raise ValueError("--inference-batch-wait-ms must be finite and >= 0")
     return {"knobs": knobs,
+            "e_history_version": history_version,
             "runner_options": {
                 "low_telemetry": bool(getattr(args, "low_telemetry", False)),
                 "read_only_agent_observations": bool(
@@ -407,6 +420,7 @@ def _rollout_candidate_from_state(
     ppo_config: Any,
     previous: Any | None = None,
     deterministic: bool | None = None,
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
 ) -> Any:
     """Build a rollout adapter bound to the exact returned train state."""
     from rl_manager.ppo_adapter import ppo_batched_policy_from_state
@@ -423,6 +437,10 @@ def _rollout_candidate_from_state(
         version=(previous.identity.version if previous is not None
                  else "ppo-v0"),
         deterministic=deterministic,
+        e_history_version=(previous.identity.e_history_version
+                           if previous is not None
+                           and previous.identity.e_history_version is not None
+                           else e_history_version),
     )
 
 
@@ -441,13 +459,19 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
     from rl_manager.trajectory import TrajectoryBuffer, e_input_spec
     from rl_manager.parallel import ParallelSelfPlayRunner
 
-    frozen_params, metadata = load_torch_checkpoint(plan["e_checkpoint"])
+    frozen_params, metadata = load_torch_checkpoint(
+        plan["e_checkpoint"],
+        expected_e_history_version=plan["e_history_version"])
     config = ManagerConfig(**metadata["model_config"])
     ppo_config = PPOConfig(**plan["ppo"])
     state = init_train_state(frozen_params, config,
                              seed=plan["master_seed"], ppo_config=ppo_config)
-    candidate = _rollout_candidate_from_state(state, config, ppo_config)
-    original_bc_e = JaxEPlanPolicy(frozen_params, config, name="frozen_e")
+    candidate = _rollout_candidate_from_state(
+        state, config, ppo_config,
+        e_history_version=plan["e_history_version"])
+    original_bc_e = JaxEPlanPolicy(
+        frozen_params, config, name="frozen_e",
+        e_history_version=plan["e_history_version"])
     ratchet = PromotionRatchet(original_bc_e)
     output_dir = Path(plan["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -460,12 +484,14 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
     for update_index in range(plan["updates"]):
         buffer = TrajectoryBuffer(
             capacity=plan["episodes_per_update"] * 2 * 26,
-            input_spec=e_input_spec())
+            input_spec=e_input_spec(),
+            e_history_version=plan["e_history_version"])
         runner_config = RunnerConfig(
             backend_name=plan["backend"],
             backend_configuration={"seed": 0,
                                    "numThreads": plan["knobs"]["num_threads"]},
             num_envs=plan["knobs"]["num_envs"],
+            e_history_version=plan["e_history_version"],
             **plan["runner_options"])
         executor_factory = _resolve_executor_factory(
             plan["executor_factory"],
@@ -495,7 +521,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         state, metrics = ppo_update(state, batch, config, ppo_config)
         if metrics["accepted"]:
             candidate = _rollout_candidate_from_state(
-                state, config, ppo_config, previous=candidate)
+                state, config, ppo_config, previous=candidate,
+                e_history_version=plan["e_history_version"])
         update_number = update_index + 1
         print(f"UPDATE {update_number}")
         print(f"learner={candidate.identity.fingerprint} "
@@ -506,7 +533,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         if promotion["every"] and update_number % promotion["every"] == 0:
             eval_candidate = _rollout_candidate_from_state(
                 state, config, ppo_config, previous=candidate,
-                deterministic=True)
+                deterministic=True,
+                e_history_version=plan["e_history_version"])
             eval_runner = (ParallelSelfPlayRunner(
                 runner_config, num_workers=plan["knobs"]["num_workers"],
                 executor_factory=executor_factory)
@@ -538,7 +566,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
             snapshot = ppo_snapshot_from_state(
                 state, config, ppo_config=ppo_config,
                 name=f"promotion_{ratchet.promotions + 1:03d}",
-                version="ratchet-v1")
+                version="ratchet-v1",
+                e_history_version=plan["e_history_version"])
             gate = "PASS" if decision.passed else "HOLD"
             print(
                 f"RATCHET update={update_number} "
@@ -563,7 +592,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                         "ppo_step": int(state.step),
                         "original_bc_e": original_bc_e.identity.to_json_dict(),
                         "evaluation_seed_set": promotion["seed_set"],
-                    })
+                    },
+                    e_history_version=plan["e_history_version"])
                 eval_path = promotion_dir / (
                     f"promotion_{promotion_number:03d}_eval.json")
                 eval_path.parent.mkdir(parents=True, exist_ok=True)
@@ -587,7 +617,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
 
         path = save_ppo_checkpoint(
             output_dir / f"ppo_update_{update_index:06d}.npz", state, config,
-            ppo_config, provenance={"plan": dict(plan)})
+            ppo_config, e_history_version=plan["e_history_version"],
+            provenance={"plan": dict(plan)})
         history.append({"update": update_index, "metrics": metrics,
                         "checkpoint": str(path),
                         "learner": candidate.identity.to_json_dict(),
@@ -613,17 +644,25 @@ def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no
         build_episode_spec
     from rl_manager.parallel import ParallelSelfPlayRunner
 
-    frozen_params, metadata = load_torch_checkpoint(plan["e_checkpoint"])
+    frozen_params, metadata = load_torch_checkpoint(
+        plan["e_checkpoint"],
+        expected_e_history_version=plan["e_history_version"])
     config = ManagerConfig(**metadata["model_config"])
-    state, _meta = load_ppo_checkpoint(plan["checkpoint"], config=config)
+    state, _meta = load_ppo_checkpoint(
+        plan["checkpoint"], config=config,
+        expected_e_history_version=plan["e_history_version"])
     candidate = ppo_batched_policy_from_state(
-        state, config, name="ppo_candidate", deterministic=True)
-    frozen_policy = JaxEPlanPolicy(frozen_params, config, name="frozen_e")
+        state, config, name="ppo_candidate", deterministic=True,
+        e_history_version=plan["e_history_version"])
+    frozen_policy = JaxEPlanPolicy(
+        frozen_params, config, name="frozen_e",
+        e_history_version=plan["e_history_version"])
     runner_config = RunnerConfig(
         backend_name=plan["backend"],
         backend_configuration={"seed": 0,
                                "numThreads": plan["knobs"]["num_threads"]},
         num_envs=plan["knobs"]["num_envs"],
+        e_history_version=plan["e_history_version"],
         **plan["runner_options"])
     executor_factory = _resolve_executor_factory(
         plan["executor_factory"],
@@ -664,14 +703,17 @@ def _make_debug_trace_policy(plan: Mapping[str, Any]) -> Any:
     from rl_manager.policy import JaxEPlanPolicy
 
     checkpoint = plan["e_checkpoint"]
-    params, metadata = load_torch_checkpoint(checkpoint)
+    params, metadata = load_torch_checkpoint(
+        checkpoint, expected_e_history_version=E_HISTORY_CORRECTED_V1)
     try:
         config = ManagerConfig(**metadata["model_config"])
     except (KeyError, TypeError) as exc:
         raise ValueError(
             f"BC-E checkpoint {checkpoint} lacks metadata.model_config; "
             "supply a compatible committed BC-E checkpoint") from exc
-    return JaxEPlanPolicy(params, config, name="trace_e")
+    return JaxEPlanPolicy(
+        params, config, name="trace_e",
+        e_history_version=metadata["e_history_version"])
 
 
 def execute_debug_trace(plan: Mapping[str, Any]) -> list[dict[str, Any]]:

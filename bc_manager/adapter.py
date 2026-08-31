@@ -94,7 +94,11 @@ from .constants import (
     board_field_present,
     sell_bin_index,
 )
-from .economics import ECONOMIC_CONTEXT_KEY, derive_economic_context
+from .economics import (
+    E_HISTORY_CORRECTED_V1,
+    ECONOMIC_CONTEXT_KEY,
+    derive_economic_context,
+)
 
 # Dotted-path projection: PyArrow names each selected nested leaf column by
 # its last path component ("events.sells" -> "sells").
@@ -416,6 +420,8 @@ def _input_arrays_from_starts(
 def table_to_arrays(
     table: pa.Table, *, include_opponent: bool = False,
     with_economic_context: bool = False,
+    manager_start_day: int | None = None,
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], list[dict[str, Any]]]:
     """Convert a filtered canonical table into compact NumPy arrays.
 
@@ -441,6 +447,8 @@ def table_to_arrays(
             day_col,
             inputs["scalars"][:, 0],
             inputs["unlocked"].sum(axis=1),
+            e_history_version=e_history_version,
+            manager_start_day=manager_start_day,
         )
     targets = build_targets(target_rows, sells_rows)
     meta = [_eval_metadata(m, d) for m, d in zip(meta_rows, day_col)]
@@ -571,13 +579,17 @@ def load_dataset(
     min_score: float = MIN_SCORE_DEFAULT,
     include_opponent: bool = False,
     with_economic_context: bool = False,
+    manager_start_day: int | None = None,
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
 ) -> dict[str, Any]:
     """Load one date-filtered dataset split as compact arrays."""
     table, report = load_selected_table(paths, dates=dates,
                                         min_score=min_score)
     inputs, targets, meta = table_to_arrays(
         table, include_opponent=include_opponent,
-        with_economic_context=with_economic_context)
+        with_economic_context=with_economic_context,
+        manager_start_day=manager_start_day,
+        e_history_version=e_history_version)
     return {"inputs": inputs, "targets": targets, "meta": meta,
             "report": report}
 
@@ -590,6 +602,8 @@ def load_train_val(
     min_score: float = MIN_SCORE_DEFAULT,
     include_opponent: bool = False,
     with_economic_context: bool = False,
+    manager_start_day: int | None = None,
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
 ) -> dict[str, Any]:
     """Date-held-out train/validation split with equal min_score filtering.
 
@@ -616,7 +630,9 @@ def load_train_val(
         split_table = table.filter(mask)
         inputs, targets, meta = table_to_arrays(
             split_table, include_opponent=include_opponent,
-            with_economic_context=with_economic_context)
+            with_economic_context=with_economic_context,
+            manager_start_day=manager_start_day,
+            e_history_version=e_history_version)
         return {"inputs": inputs, "targets": targets, "meta": meta,
                 "report": {"rows_read": read_report["rows_read"],
                            "rows_selected": len(meta),

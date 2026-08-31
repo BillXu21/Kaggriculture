@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from bc_manager.economics import E_HISTORY_CORRECTED_V1
 from rl_manager.ppo_checkpoint import save_ppo_checkpoint
 
 
@@ -52,6 +53,7 @@ class BestCheckpointRetention:
         evaluation: Mapping[str, Any],
         provenance: Mapping[str, Any] | None = None,
         model_variant: str = "E",
+        e_history_version: str = E_HISTORY_CORRECTED_V1,
     ) -> bool:
         """Save ``state`` only when ``score`` strictly improves that named best."""
         score = float(score)
@@ -64,6 +66,7 @@ class BestCheckpointRetention:
                 return False
         save_ppo_checkpoint(
             path, state, config, ppo_config, model_variant=model_variant,
+            e_history_version=e_history_version,
             provenance={
                 "best_retention": {
                     "name": name,

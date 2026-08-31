@@ -90,6 +90,11 @@ _agent = None
 class RunnerParityProvider(CheckpointPlanProvider):
     """Reproduce the E economic-context semantics used by the legacy runner."""
 
+    def __init__(self, checkpoint_path, device="cpu"):
+        super().__init__(
+            checkpoint_path, device=device,
+            expected_e_history_version="E_LEGACY")
+
     def daily_plan(self, obs, seat, previous_execution=None):
         economic_prev_start = None
         if self.uses_economic_context:
@@ -182,6 +187,7 @@ def build_submission(
             )
             manifest["submission_variant"] = label
             manifest["submission_fix"] = "legacy_runner_economic_context_parity"
+            manifest["e_history_version"] = "E_LEGACY"
             manifest["legacy_runner_sha"] = LEGACY_RUNNER_SHA
             manifest["aggressive_sell_all"] = aggressive_sell_all
             manifest["optional_spare_watering"] = True

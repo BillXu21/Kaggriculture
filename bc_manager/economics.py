@@ -28,9 +28,14 @@ __all__ = [
     "ECONOMIC_DIM",
     "ECONOMIC_CONTEXT_KEY",
     "MODEL_VARIANTS",
+    "E_HISTORY_LEGACY",
+    "E_HISTORY_CORRECTED_V1",
+    "E_HISTORY_VERSIONS",
     "SEED_COSTS",
     "ANIMAL_COSTS",
     "normalize_model_variant",
+    "normalize_e_history_version",
+    "previous_net_cash",
     "signed_log_cash",
     "cash_linear",
     "affordability",
@@ -50,6 +55,13 @@ __all__ = [
 #   [13] prev_net_cash_valid 1 iff an exact day-1 row was joined
 ECONOMIC_DIM = 14
 ECONOMIC_CONTEXT_KEY = "economic_context"
+
+# Serialized semantic identities. E_LEGACY reproduces the historical runner
+# bug (current start supplied as previous, hence 0/invalid). E_CORRECTED_V1
+# rolls observed manager-day starts and never infers fills from policy output.
+E_HISTORY_LEGACY = "E_LEGACY"
+E_HISTORY_CORRECTED_V1 = "E_CORRECTED_V1"
+E_HISTORY_VERSIONS = (E_HISTORY_LEGACY, E_HISTORY_CORRECTED_V1)
 
 MODEL_VARIANTS = ("V0", "J", "E", "JE")
 
@@ -73,6 +85,44 @@ def normalize_model_variant(value: str) -> str:
             f"unknown model_variant {value!r}; expected one of "
             f"{list(MODEL_VARIANTS)}")
     return variant
+
+
+def normalize_e_history_version(value: str) -> str:
+    """Normalize and validate a serialized variant-E history identity."""
+    if not isinstance(value, str):
+        raise ValueError(
+            f"e_history_version must be a string, got {type(value).__name__}")
+    version = value.strip().upper()
+    if version not in E_HISTORY_VERSIONS:
+        raise ValueError(
+            f"unknown e_history_version {value!r}; expected one of "
+            f"{list(E_HISTORY_VERSIONS)}")
+    return version
+
+
+def previous_net_cash(
+    version: str,
+    day: int,
+    money: float,
+    previous_start: tuple[int, float] | None,
+) -> tuple[float, bool]:
+    """Resolve channels 12/13 from observed manager-day starts only.
+
+    Corrected V1 is invalid on the first manager decision and after any day
+    gap. Legacy is deterministically zero/invalid on every decision.
+    """
+    version = normalize_e_history_version(version)
+    day = int(day)
+    money = float(money)
+    if day < 0 or not np.isfinite(money):
+        raise ValueError(f"invalid observed daily start day={day}, money={money!r}")
+    if version == E_HISTORY_LEGACY or previous_start is None:
+        return 0.0, False
+    prev_day, prev_money = int(previous_start[0]), float(previous_start[1])
+    if not np.isfinite(prev_money):
+        raise ValueError(f"previous daily-start money must be finite, got {prev_money!r}")
+    valid = prev_day == day - 1
+    return (money - prev_money if valid else 0.0), valid
 
 
 def signed_log_cash(money: float) -> float:
@@ -144,6 +194,9 @@ def derive_economic_context(
     days: Sequence[int],
     money: Sequence[float],
     unlocked_counts: Sequence[int],
+    *,
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
+    manager_start_day: int | None = None,
 ) -> np.ndarray:
     """Batch economic context [N, 14] from per-row canonical columns.
 
@@ -154,6 +207,7 @@ def derive_economic_context(
     unknown episode ids never join across groups: channels 12/13 encode
     0/invalid. Only *earlier* rows are read; future/end data is untouched.
     """
+    version = normalize_e_history_version(e_history_version)
     n = len(days)
     if not (len(episode_ids) == len(seats) == len(money)
             == len(unlocked_counts) == n):
@@ -178,12 +232,17 @@ def derive_economic_context(
     for group in groups.values():
         for day, idx in group.items():
             prev_idx = group.get(day - 1)  # exact key join; earlier day only
-            delta = (
-                float(money[idx]) - float(money[prev_idx])
-                if prev_idx is not None else None
-            )
+            previous = None if prev_idx is None else (
+                day - 1, float(money[prev_idx]))
+            # Deployment starts its manager tracker at manager_start_day, so
+            # that first policy decision must not consume opening-day history.
+            if manager_start_day is not None and day <= int(manager_start_day):
+                previous = None
+            delta, valid = previous_net_cash(
+                version, day, float(money[idx]), previous)
             out[idx] = economic_context(
-                float(money[idx]), int(unlocked_counts[idx]), delta)
+                float(money[idx]), int(unlocked_counts[idx]),
+                delta if valid else None)
     return out
 
 

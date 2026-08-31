@@ -214,6 +214,7 @@ class ParallelSelfPlayRunner:
                 self.executor_factory, "version", "unknown"),
             "master_seed": master_seed,
             "manager_start_day": config.manager_start_day,
+            "e_history_version": config.e_history_version,
             "inference_batch_scope": self.batch_scope,
             "fixed_inference_batch_size": self.fixed_batch,
             "inference_batch_wait_seconds": self.batch_wait,

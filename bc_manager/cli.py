@@ -15,6 +15,7 @@ from typing import Sequence
 
 from .adapter import SchemaVersionError
 from .constants import MIN_SCORE_DEFAULT, TRAIN_DATES_DEFAULT, VAL_DATES_DEFAULT
+from .economics import E_HISTORY_CORRECTED_V1, E_HISTORY_VERSIONS
 from .model import ManagerConfig, tiny_manager_config
 from .training import TrainingConfig, run_training
 
@@ -49,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="model variant: V0 (current inputs), J (joint "
                              "plan decoder), E (economic context), or JE "
                              "(both; issue #6)")
+    parser.add_argument("--e-history-version", choices=E_HISTORY_VERSIONS,
+                        default=E_HISTORY_CORRECTED_V1,
+                        help="E history semantics; legacy is compatibility-only")
     parser.add_argument("--tiny", action="store_true",
                         help="16/1/1/32/dropout=0 CPU validation config")
     # training configuration
@@ -105,7 +109,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.parquet, model_config=model_config,
             training_config=training_config, train_dates=args.train_dates,
             val_dates=args.val_dates, min_score=args.min_score,
-            device_spec=args.device, model_variant=args.variant)
+            device_spec=args.device, model_variant=args.variant,
+            e_history_version=args.e_history_version)
     except SchemaVersionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

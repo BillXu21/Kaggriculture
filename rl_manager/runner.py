@@ -36,6 +36,10 @@ from typing import Any, Literal
 import numpy as np
 
 from bc_manager.constants import TOTAL_DAYS
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    normalize_e_history_version,
+)
 from bc_manager.live import encode_live_inputs
 from executor_v0.plan import DailyPlan
 from opening_book.agent import make_opening_agent
@@ -74,7 +78,7 @@ InferenceBatchScope = Literal["policy_day", "policy"]
 # Artifact provenance sidecar schema (issue #9 A1 correction): the
 # `run_metadata` block written by `build_artifact_metadata` carries its own
 # version so consumers can pin against exactly these mandatory fields.
-ARTIFACT_METADATA_SCHEMA_VERSION = 1
+ARTIFACT_METADATA_SCHEMA_VERSION = 2
 
 
 class _ReadOnlyDict(dict):
@@ -119,6 +123,7 @@ class RunnerConfig:
         default_factory=lambda: {"seed": 0, "numThreads": 1})
     opening: str = "standard_mixed"
     manager_start_day: int = MANAGER_START_DAY
+    e_history_version: str = E_HISTORY_CORRECTED_V1
     max_turns: int = GAME_TURNS
     num_envs: int = 1  # lockstep envs per chunk (single-process mode)
     low_telemetry: bool = False  # skip executor turn snapshots for training
@@ -133,6 +138,9 @@ class RunnerConfig:
     debug_trace_view: str = "joint"
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "e_history_version",
+            normalize_e_history_version(self.e_history_version))
         if self.inference_batch_scope not in INFERENCE_BATCH_SCOPES:
             raise ValueError(
                 "inference_batch_scope must be one of "
@@ -273,6 +281,7 @@ def _debug_trace_metadata(
             "backend_configuration": copy.deepcopy(dict(configuration)),
             "executor_factory": _executor_factory_provenance(
                 provenance["executor_factory"]),
+            "e_history_version": str(provenance["e_history_version"]),
             "action_state_alignment": {
                 "initial": "step 0 reset snapshot carries its primitive decision",
                 "decision": "canonical_state is observed before joint_actions",
@@ -329,6 +338,7 @@ def build_artifact_metadata(
                      for record in result.policy_identities],
         "master_seed": provenance["master_seed"],
         "manager_start_day": int(provenance["manager_start_day"]),
+        "e_history_version": str(provenance["e_history_version"]),
     }
 
 
@@ -365,6 +375,14 @@ class _EpisodeState:
                  backend: EngineBackend | None = None) -> None:
         self.spec = spec
         self.config = config
+        for policy in spec.policies:
+            policy_history = getattr(policy.identity, "e_history_version", None)
+            if policy_history is not None and policy_history != \
+                    config.e_history_version:
+                raise ValueError(
+                    f"policy {policy.identity.identity_id()} requires "
+                    f"e_history_version {policy_history!r}, but runner uses "
+                    f"{config.e_history_version!r}")
         configuration = dict(config.backend_configuration)
         configuration["seed"] = int(spec.seed)
         self.configuration = configuration
@@ -395,7 +413,8 @@ class _EpisodeState:
                                    seat=seat))
         # Runner-owned per-seat tracking (exact E history semantics).
         self.last_seen_day = [-1, -1]
-        self.daily_start: list[tuple[int, float] | None] = [None, None]
+        self.current_daily_start: list[tuple[int, float] | None] = [None, None]
+        self.previous_daily_start: list[tuple[int, float] | None] = [None, None]
         self.previous_execution: list[dict[str, int]] = [
             {"workers_hired": 0, "hire_cost": 0} for _ in range(2)]
         self.hires_current_day = [0, 0]
@@ -511,10 +530,13 @@ class _EpisodeState:
             # seal its joint-action digest (idempotent; the other seat's
             # rollover finds the hasher already popped).
             self.seal_day_digest(self.last_seen_day[seat])
+            self.previous_daily_start[seat] = (
+                None if day <= self.config.manager_start_day
+                else self.current_daily_start[seat])
         self.last_seen_day[seat] = day
         self.hires_current_day[seat] = int(
             obs["farms"][seat].get("hires_today", 0) or 0)
-        self.daily_start[seat] = (
+        self.current_daily_start[seat] = (
             day, float(obs["farms"][seat]["money"]))
 
     def track_post_step(self) -> None:
@@ -529,7 +551,8 @@ class _EpisodeState:
         return encode_live_inputs(
             obs, seat, dict(self.previous_execution[seat]),
             step=int(obs["step"]),
-            economic_prev_start=self.daily_start[seat])
+            economic_prev_start=self.previous_daily_start[seat],
+            e_history_version=self.config.e_history_version)
 
     def hash_joint_action(self, day: int, hour: int,
                           actions: list[Mapping[str, Any]]) -> None:
@@ -631,6 +654,7 @@ class SelfPlayRunner:
                 self.executor_factory, "version", "unknown"),
             "master_seed": master_seed,
             "manager_start_day": config.manager_start_day,
+            "e_history_version": config.e_history_version,
         }
         if config.batch_backend and config.backend_name != "fast":
             raise ValueError("batch_backend currently supports backend_name='fast' only")

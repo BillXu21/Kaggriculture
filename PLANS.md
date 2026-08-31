@@ -1,6 +1,16 @@
 # Kaggriculture Plans
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
+
+## Issue #30 Corrected E History
+- Regenerate schema-v3 canonical Parquet from raw replays, train a fresh
+  corrected BC-E checkpoint, and validate it through the fixed closed-loop
+  panel before any promotion decision. Use the exact commands in
+  `research/ISSUE30_E_HISTORY_RUNBOOK.md`.
+- Run the PPO readiness checks and inspect corrected checkpoint metadata first;
+  do not start PPO or TPU training from this implementation worktree. Any
+  legacy artifact must use an explicit `E_LEGACY` path and must not be mixed
+  with corrected artifacts.
 
 ## Issue #35 Status
 - The bounded heterogeneous primitive-controller evaluation harness is

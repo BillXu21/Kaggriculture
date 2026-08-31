@@ -176,6 +176,17 @@ def test_full_game_deterministic_52_transitions_and_schema(tiny_e):
             == list(range(4, 30))
     assert int(arrays["day"].min()) == MANAGER_START_DAY
 
+    # The manager handoff starts at d4: opening-day history is deliberately
+    # not consumed by the first manager decision. d5 uses the realized d4
+    # daily-start bank, independently for each seat.
+    for seat in (0, 1):
+        rows = [i for i, (s, d) in enumerate(zip(seats, days))
+                if s == seat]
+        d4 = next(i for i in rows if days[i] == 4)
+        d5 = next(i for i in rows if days[i] == 5)
+        assert arrays["input_economic_context"][d4, 13] == 0.0
+        assert arrays["input_economic_context"][d5, 13] == 1.0
+
     # Terminal-only rewards: only final-day rows may carry +/-1 (both zero
     # on a tie), matching the final bank margin sign.
     reward_rows = [(i, float(r)) for i, r in enumerate(arrays["reward"])
@@ -469,6 +480,30 @@ def test_truncated_results_carry_distinct_explicit_seeds():
     assert len(set(seeds)) == len(seeds)  # explicit distinct seed stream
     stream = SeedStream(MASTER_SEED)
     assert seeds == [stream.episode_seed(i + 100) for i in (0, 1)]
+
+
+def test_runner_handoff_uses_manager_day_boundary_for_e_history(monkeypatch):
+    monkeypatch.setattr(
+        "rl_manager.runner.make_backend",
+        lambda name, configuration: _TraceBackend(configuration),
+    )
+    policy = _ConstantPlanPolicy("history-boundary")
+    buffer = TrajectoryBuffer(capacity=4, input_spec=e_input_spec())
+    runner = SelfPlayRunner(
+        _runner_config(max_turns=121), trajectory_buffer=buffer,
+        executor_factory=_TraceExecutorFactory(), master_seed=MASTER_SEED)
+    spec = build_episode_spec(0, MASTER_SEED, E_VS_E, policy, policy)
+
+    runner.run([spec])
+    arrays = buffer.finalize()
+    for seat in (0, 1):
+        rows = [i for i, (row_seat, day) in enumerate(
+            zip(arrays["seat"], arrays["day"]))
+                if row_seat == seat]
+        d4 = next(i for i in rows if arrays["day"][i] == 4)
+        d5 = next(i for i in rows if arrays["day"][i] == 5)
+        assert arrays["input_economic_context"][d4, 13] == 0.0
+        assert arrays["input_economic_context"][d5, 13] == 1.0
 
 
 class _TraceBackend:

@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from bc_manager.economics import E_HISTORY_LEGACY
 from rl_manager.decode import ACTION_TENSOR_SHAPES, LOGPROB_GROUPS
 from rl_manager.trajectory import (
     TRAJECTORY_SCHEMA_VERSION,
@@ -177,3 +178,25 @@ def test_load_rejects_schema_version_and_count_mismatch(tmp_path: Path):
     np.savez_compressed(str(base) + ".npz", **arrays)
     with pytest.raises(ValueError, match="schema version"):
         TrajectoryBuffer.load(base)
+
+
+def test_legacy_trajectory_requires_explicit_history_version(tmp_path: Path):
+    buffer = TrajectoryBuffer(capacity=2, input_spec=e_input_spec())
+    buffer.append(*_make_transition())
+    base = tmp_path / "legacy-traj"
+    buffer.save(base)
+    with np.load(str(base) + ".npz") as data:
+        arrays = {key: data[key] for key in data.files
+                  if key != "e_history_version"}
+    arrays["schema_version"] = np.asarray(1, dtype=np.int32)
+    np.savez_compressed(str(base) + ".npz", **arrays)
+    sidecar = json.loads((tmp_path / "legacy-traj.json").read_text())
+    sidecar["schema_version"] = 1
+    sidecar["npz_schema_version"] = 1
+    (tmp_path / "legacy-traj.json").write_text(json.dumps(sidecar))
+
+    with pytest.raises(ValueError, match="does not match requested"):
+        load_trajectory(base)
+    loaded, _ = load_trajectory(
+        base, expected_e_history_version=E_HISTORY_LEGACY)
+    assert loaded.e_history_version == E_HISTORY_LEGACY

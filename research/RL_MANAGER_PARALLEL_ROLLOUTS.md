@@ -31,6 +31,10 @@ main process before the rollout coordinator starts children:
 python -m rl_manager.cli eval --checkpoint /kaggle/input/ppo/ppo.npz --e-checkpoint /kaggle/input/bc-e/best.pt --executor-factory executor_v0@stage-a-v1 --backend fast --num-workers 4 --num-envs 1 --num-threads 1 --low-telemetry --read-only-agent-observations --batch-backend --seed-set smoke --output-json /kaggle/working/issue17-smoke.json
 ```
 
+For corrected Issue #30 artifacts, add
+`--e-history-version E_CORRECTED_V1` to both `train` and `eval`. Do not pass a
+legacy checkpoint to this command; use the explicit legacy compatibility path.
+
 For scaling, repeat the same fixed seed set and immutable checkpoints with
 `--num-workers 1,2,4,8`; keep `--num-envs 1` first, then test `2` and `4`.
 Record startup/compile time separately from the steady-state wall interval.

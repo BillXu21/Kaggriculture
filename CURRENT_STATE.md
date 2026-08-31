@@ -1,6 +1,23 @@
 # Kaggriculture Current State
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
+
+## Issue #30 Corrected E History
+- On branch `codex/issue-30-corrected-e-history`, E economic history is
+  versioned as `E_CORRECTED_V1` or explicit `E_LEGACY`. Corrected history is
+  derived only from observed adjacent daily-start bank snapshots; the first
+  manager day is invalid and gaps/backwards days are invalid. Runner state is
+  per episode and seat across scalar, batched, and spawned paths.
+- Corrected metadata is threaded through BC checkpoints, JAX conversion and
+  native checkpoints, PPO checkpoints/snapshots, policy identities,
+  trajectories, evaluation, and submission manifests. Corrected loaders reject
+  legacy E artifacts unless `E_LEGACY` is explicitly requested.
+- Focused validation passes `144 passed, 3 skipped`; the fake-backend runner
+  handoff regression passes. Full native fast-engine tests could not run in
+  this worktree because `fast_env._kaggriculture_env` is not built locally.
+- No corrected BC regeneration, BC training, PPO training, or TPU run was
+  started. Exact commands are in
+  `research/ISSUE30_E_HISTORY_RUNBOOK.md`.
 
 ## Issue #35 Asymmetric Evaluation Harness
 - On branch `codex/issue-35-external-agent-match-harness`, the separate

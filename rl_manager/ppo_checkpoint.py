@@ -1,7 +1,7 @@
-"""RL PPO checkpoint format `rl_manager_ppo_checkpoint_v1` (issue #9 req. 5).
+"""RL PPO checkpoint format `rl_manager_ppo_checkpoint_v2` (issue #9 req. 5).
 
 A NEW rl_manager-native format — the issue-#8 BC native format
-(`bc_manager_jax_checkpoint_v1`) is never altered or overloaded. One
+(`bc_manager_jax_checkpoint_v2`) is never altered or overloaded. One
 pickle-free .npz archive (allow_pickle=False) with flattened parameter /
 optimizer-state arrays plus a strict JSON metadata record:
 
@@ -10,7 +10,8 @@ optimizer-state arrays plus a strict JSON metadata record:
 - `opt:<i>`            optimizer state leaves in template-flatten order;
 - `rng`                explicit PRNG stream state, uint32 [2];
 - `__meta__`           JSON: format, ManagerConfig, PPOConfig, variant=E,
-                       step, rollout seed, provenance, leaf counts.
+                       E history version, step, rollout seed, provenance,
+                       leaf counts.
 
 Load reconstructs EVERYTHING from the strict expected template tree and
 verifies each stored array's path/shape/dtype loudly; a resumed state runs
@@ -28,6 +29,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    E_HISTORY_LEGACY,
+    normalize_e_history_version,
+)
 from bc_manager_jax.model import (
     ManagerConfig,
     empty_params,
@@ -41,8 +47,10 @@ from rl_manager.ppo_policy import (
     make_ppo_optimizer,
 )
 
-RL_PPO_CHECKPOINT_FORMAT = "rl_manager_ppo_checkpoint_v1"
-PPO_SNAPSHOT_FORMAT = "rl_manager_ppo_snapshot_v1"
+RL_PPO_CHECKPOINT_FORMAT = "rl_manager_ppo_checkpoint_v2"
+PPO_SNAPSHOT_FORMAT = "rl_manager_ppo_snapshot_v2"
+_LEGACY_RL_PPO_CHECKPOINT_FORMAT = "rl_manager_ppo_checkpoint_v1"
+_LEGACY_PPO_SNAPSHOT_FORMAT = "rl_manager_ppo_snapshot_v1"
 
 
 def _leaf_path(tokens) -> str:
@@ -59,6 +67,7 @@ def save_ppo_checkpoint(
     ppo_config: PPOConfig,
     *,
     model_variant: str = "E",
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
     provenance: Mapping[str, Any] | None = None,
 ) -> Path:
     """Save train state + configs + provenance atomically, pickle-free."""
@@ -66,6 +75,7 @@ def save_ppo_checkpoint(
     if variant != "E":
         raise ValueError(
             f"RL PPO checkpoints store variant E only, got {variant!r}")
+    history_version = normalize_e_history_version(e_history_version)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -91,6 +101,7 @@ def save_ppo_checkpoint(
         "model_config": dataclasses.asdict(config),
         "ppo_config": dataclasses.asdict(ppo_config),
         "model_variant": variant,
+        "e_history_version": history_version,
         "step": int(state.step),
         "rollout_seed": (None if state.rollout_seed is None
                          else int(state.rollout_seed)),
@@ -129,6 +140,7 @@ def load_ppo_checkpoint(
     config: ManagerConfig | None = None,
     ppo_config: PPOConfig | None = None,
     model_variant: str = "E",
+    expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
 ):
     """Strictly reconstruct `(PPOTrainState, metadata)` from a checkpoint."""
     from rl_manager.ppo import PPOTrainState  # local import: avoid cycle
@@ -145,15 +157,25 @@ def load_ppo_checkpoint(
     if "__meta__" not in items:
         raise ValueError(f"{path}: RL PPO checkpoint missing __meta__ record")
     meta = json.loads(items["__meta__"].tobytes().decode("utf-8"))
-    if meta.get("format") != RL_PPO_CHECKPOINT_FORMAT:
+    if meta.get("format") not in (RL_PPO_CHECKPOINT_FORMAT,
+                                   _LEGACY_RL_PPO_CHECKPOINT_FORMAT):
         raise ValueError(
             f"{path}: unrecognized RL PPO checkpoint format "
-            f"{meta.get('format')!r}; expected {RL_PPO_CHECKPOINT_FORMAT!r}")
+            f"{meta.get('format')!r}; expected one of "
+            f"{RL_PPO_CHECKPOINT_FORMAT!r}/{_LEGACY_RL_PPO_CHECKPOINT_FORMAT!r}")
     stored_variant = meta.get("model_variant")
     if stored_variant != variant:
         raise ValueError(
             f"{path}: checkpoint stores model_variant {stored_variant!r} but "
             f"the requested variant is {variant!r}")
+    stored_history = normalize_e_history_version(
+        meta.get("e_history_version", E_HISTORY_LEGACY))
+    if expected_e_history_version is not None and stored_history != \
+            normalize_e_history_version(expected_e_history_version):
+        raise ValueError(
+            f"{path}: checkpoint e_history_version {stored_history!r} does not "
+            f"match requested "
+            f"{normalize_e_history_version(expected_e_history_version)!r}")
 
     stored_model_config = ManagerConfig(**meta["model_config"])
     _require_matching_config(meta["model_config"], config, "model_config")
@@ -224,10 +246,15 @@ def save_ppo_snapshot(
     ppo_config: PPOConfig,
     *,
     snapshot_identity: Mapping[str, Any],
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
     provenance: Mapping[str, Any] | None = None,
 ) -> Path:
     """Persist only the detached policy/frozen-E trees for a ratchet snapshot."""
     variant = resolve_model_variant("E")
+    history_version = normalize_e_history_version(e_history_version)
+    identity_history = snapshot_identity.get("e_history_version")
+    if identity_history not in (None, history_version):
+        raise ValueError("snapshot identity e_history_version does not match payload")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     flat: dict[str, np.ndarray] = {}
@@ -242,6 +269,7 @@ def save_ppo_snapshot(
         "model_config": dataclasses.asdict(config),
         "ppo_config": dataclasses.asdict(ppo_config),
         "model_variant": variant,
+        "e_history_version": history_version,
         "step": int(state.step),
         "snapshot_identity": dict(snapshot_identity),
         "provenance": dict(provenance) if provenance else {},
@@ -261,6 +289,7 @@ def load_ppo_snapshot(
     *,
     config: ManagerConfig | None = None,
     ppo_config: PPOConfig | None = None,
+    expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
 ):
     """Load a saved snapshot as a deterministic normal runner policy."""
     from rl_manager.ppo import PPOTrainState  # local import: avoid cycle
@@ -276,11 +305,20 @@ def load_ppo_snapshot(
     if "__meta__" not in items:
         raise ValueError(f"{path}: PPO snapshot missing __meta__ record")
     meta = json.loads(items["__meta__"].tobytes().decode("utf-8"))
-    if meta.get("format") != PPO_SNAPSHOT_FORMAT:
+    if meta.get("format") not in (PPO_SNAPSHOT_FORMAT,
+                                   _LEGACY_PPO_SNAPSHOT_FORMAT):
         raise ValueError(
             f"{path}: unrecognized PPO snapshot format {meta.get('format')!r}")
     if meta.get("model_variant") != "E":
         raise ValueError(f"{path}: PPO snapshots require model variant E")
+    stored_history = normalize_e_history_version(
+        meta.get("e_history_version", E_HISTORY_LEGACY))
+    if expected_e_history_version is not None and stored_history != \
+            normalize_e_history_version(expected_e_history_version):
+        raise ValueError(
+            f"{path}: snapshot e_history_version {stored_history!r} does not "
+            f"match requested "
+            f"{normalize_e_history_version(expected_e_history_version)!r}")
     stored_config = ManagerConfig(**meta["model_config"])
     _require_matching_config(meta["model_config"], config, "model_config")
     stored_ppo = PPOConfig(**meta["ppo_config"])
@@ -311,7 +349,10 @@ def load_ppo_snapshot(
     policy = ppo_snapshot_from_state(
         state, stored_config, ppo_config=stored_ppo,
         name=str(identity.get("name", "ppo_snapshot")),
-        version=str(identity.get("version", "ratchet-v1")))
+        version=str(identity.get("version", "ratchet-v1")),
+        e_history_version=stored_history)
+    if identity.get("e_history_version") not in (None, stored_history):
+        raise ValueError(f"{path}: snapshot identity history version mismatch")
     if identity.get("fingerprint") != policy.identity.fingerprint:
         raise ValueError(f"{path}: snapshot fingerprint does not match arrays")
     return policy, meta

@@ -29,12 +29,19 @@ from bc_manager.coherence import (
     plan_coherence_record,
 )
 from bc_manager.constants import ANIMAL_ORDER, CROP_ORDER, PRODUCT_ORDER
-from bc_manager.economics import EconomicHistory
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    E_HISTORY_LEGACY,
+    EconomicHistory,
+)
 from bc_manager.live import encode_live_inputs
 from bc_manager.model import ManagerConfig, predict_counts, predict_land, \
     predict_sells
-from bc_manager.training import checkpoint_model_variant, \
-    load_model_from_checkpoint
+from bc_manager.training import (
+    checkpoint_e_history_version,
+    checkpoint_model_variant,
+    load_model_from_checkpoint,
+)
 
 from .plan import SELL_BIN_ANCHORS, DailyPlan
 
@@ -136,14 +143,18 @@ class CheckpointPlanProvider:
     """
 
     def __init__(self, checkpoint_path: str | Path, device: str = "cpu",
-                 include_opponent_board: bool | None = None) -> None:
+                 include_opponent_board: bool | None = None,
+                 expected_e_history_version: str = E_HISTORY_CORRECTED_V1) -> None:
         path = Path(checkpoint_path)
         if not path.is_file():
             raise FileNotFoundError(
                 f"BC manager checkpoint not found: {path}; supply the real "
                 f"D-019 best.pt path instead of fabricating one")
-        self.model, payload = load_model_from_checkpoint(path, device=device)
+        self.model, payload = load_model_from_checkpoint(
+            path, device=device,
+            expected_e_history_version=expected_e_history_version)
         self.model_variant = checkpoint_model_variant(payload)
+        self.e_history_version = checkpoint_e_history_version(payload)
         self.model_config = ManagerConfig(**payload["model_config"])
         if include_opponent_board is None:
             include_opponent_board = self.model_config.include_opponent_board
@@ -155,7 +166,8 @@ class CheckpointPlanProvider:
         # One fresh tracker per provider (= per game); day0/gap/backwards
         # semantics live in EconomicHistory itself. V0/J never touch it.
         self._economic_history: EconomicHistory | None = (
-            EconomicHistory() if self.uses_economic_context else None)
+            EconomicHistory() if self.e_history_version == E_HISTORY_CORRECTED_V1
+            else None)
         self._coherence_records: list[dict] = []
 
     @property
@@ -163,10 +175,17 @@ class CheckpointPlanProvider:
         return self.model_variant in ("E", "JE")
 
     def daily_plan(self, obs, seat, previous_execution=None) -> DailyPlan:
+        if self.e_history_version == E_HISTORY_CORRECTED_V1:
+            history_args = {"economic_history": self._economic_history}
+        elif self.e_history_version == E_HISTORY_LEGACY:
+            history_args = {"economic_prev_start": (
+                int(obs["day"]), float(obs["farms"][seat]["money"]))}
+        else:
+            history_args = {}
         inputs = encode_live_inputs(
             obs, seat, previous_execution,
             include_opponent=self.include_opponent_board,
-            economic_history=self._economic_history)
+            **history_args)
         batch = {
             key: torch.from_numpy(np.ascontiguousarray(value))
             for key, value in inputs.items()
@@ -197,6 +216,7 @@ class CheckpointPlanProvider:
         """JSON-safe closed-loop coherence diagnostics accumulated so far."""
         return {
             "model_variant": self.model_variant,
+            "e_history_version": self.e_history_version,
             "records": list(self._coherence_records),
             "aggregate": aggregate_plan_coherence(self._coherence_records),
         }

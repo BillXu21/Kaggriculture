@@ -73,7 +73,8 @@ def _factory(
         return PassControllerFactory(display_name=name or "PASS")
     if "@" not in spec:
         raise ValueError(
-            f"controller spec {spec!r} must be pass, bc@PATH, ppo@PATH, "
+            f"controller spec {spec!r} must be pass, bc@PATH, bc-legacy@PATH, "
+            "ppo@PATH, ppo-legacy@PATH, "
             "or external@PATH"
         )
     kind, path = spec.split("@", 1)
@@ -86,7 +87,8 @@ def _factory(
             timeout_seconds=timeout,
             display_name=name or Path(path).stem,
         )
-    if kind not in {"bc", "ppo", "snapshot", "ppo-snapshot"}:
+    if kind not in {"bc", "bc-legacy", "ppo", "ppo-legacy",
+                    "snapshot", "snapshot-legacy", "ppo-snapshot"}:
         raise ValueError(f"unknown controller kind {kind!r}")
     return load_internal_factory(
         kind,

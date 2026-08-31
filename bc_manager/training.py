@@ -34,7 +34,12 @@ from .coherence import (
     current_animal_counts,
     current_crop_counts,
 )
-from .economics import normalize_model_variant
+from .economics import (
+    E_HISTORY_CORRECTED_V1,
+    E_HISTORY_LEGACY,
+    normalize_e_history_version,
+    normalize_model_variant,
+)
 from .metrics import group_metrics, nonzero_recall, sell_presence_accuracy
 from .model import (
     DailyManagerTransformer,
@@ -314,7 +319,8 @@ def save_checkpoint(path: str | Path, *, kind: str, epoch: int,
                     model_config: ManagerConfig,
                     training_config: TrainingConfig,
                     validation_metrics: Mapping[str, Any],
-                    model_variant: str = "V0") -> None:
+                     model_variant: str = "V0",
+                     e_history_version: str | None = None) -> None:
     """Atomic best/last checkpoint write inside the caller's directory.
 
     The variant is stored as a top-level payload field, never inside
@@ -323,11 +329,20 @@ def save_checkpoint(path: str | Path, *, kind: str, epoch: int,
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    variant = normalize_model_variant(model_variant)
+    if variant in ("E", "JE"):
+        history_version = normalize_e_history_version(
+            e_history_version or E_HISTORY_CORRECTED_V1)
+    elif e_history_version is not None:
+        raise ValueError("non-E checkpoints cannot carry e_history_version")
+    else:
+        history_version = None
     payload = {
         "format": CHECKPOINT_FORMAT,
         "kind": kind,
         "epoch": int(epoch),
-        "model_variant": normalize_model_variant(model_variant),
+        "model_variant": variant,
+        "e_history_version": history_version,
         "model_state_dict": model.state_dict(),
         "model_config": asdict(model_config),
         "training_config": asdict(training_config),
@@ -356,9 +371,23 @@ def checkpoint_model_variant(payload: Mapping[str, Any]) -> str:
             f"checkpoint carries an invalid model_variant: {exc}") from exc
 
 
+def checkpoint_e_history_version(payload: Mapping[str, Any]) -> str | None:
+    """Stored E semantics; historical E payloads without the field are legacy."""
+    variant = checkpoint_model_variant(payload)
+    raw = payload.get("e_history_version")
+    if variant not in ("E", "JE"):
+        if raw is not None:
+            raise ValueError("non-E checkpoint carries e_history_version")
+        return None
+    if raw is None:
+        return E_HISTORY_LEGACY
+    return normalize_e_history_version(raw)
+
+
 def load_model_from_checkpoint(
     path: str | Path, device: str | torch.device = "cpu",
     *, expected_variant: str | None = None,
+    expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
 ) -> tuple[DailyManagerTransformer, dict[str, Any]]:
     """Reconstruct the model from the serialized config and state.
 
@@ -368,11 +397,17 @@ def load_model_from_checkpoint(
     """
     payload = load_checkpoint(path)
     variant = checkpoint_model_variant(payload)
+    history_version = checkpoint_e_history_version(payload)
     if expected_variant is not None \
             and variant != normalize_model_variant(expected_variant):
         raise ValueError(
             f"{path}: checkpoint variant {variant!r} does not match the "
             f"requested variant {normalize_model_variant(expected_variant)!r}")
+    if history_version is not None and expected_e_history_version is not None and history_version != \
+            normalize_e_history_version(expected_e_history_version):
+        raise ValueError(
+            f"{path}: checkpoint e_history_version {history_version!r} does not "
+            f"match requested {normalize_e_history_version(expected_e_history_version)!r}")
     model_config = ManagerConfig(**payload["model_config"])
     model = DailyManagerTransformer(model_config, model_variant=variant)
     model.load_state_dict(payload["model_state_dict"])
@@ -415,6 +450,7 @@ def run_training(
     min_score: float = MIN_SCORE_DEFAULT,
     device_spec: str = "auto",
     model_variant: str = "V0",
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
     log: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """Full in-RAM BC run: load -> tensors -> baseline -> epochs -> ckpts."""
@@ -423,11 +459,17 @@ def run_training(
         else TrainingConfig()
     variant = normalize_model_variant(model_variant)
     uses_economic_context = variant in ("E", "JE")
+    history_version = normalize_e_history_version(e_history_version)
+    if not uses_economic_context and history_version != E_HISTORY_CORRECTED_V1:
+        raise ValueError(
+            "e_history_version is only applicable to E/JE training")
 
     data = load_train_val(paths, train_dates=train_dates,
                           val_dates=val_dates, min_score=min_score,
                           include_opponent=model_config.include_opponent_board,
-                          with_economic_context=uses_economic_context)
+                          with_economic_context=uses_economic_context,
+                          manager_start_day=(4 if uses_economic_context else None),
+                          e_history_version=history_version)
     if len(data["train"]["meta"]) == 0:
         raise ValueError(
             f"empty train split: no rows selected for dates "
@@ -519,13 +561,19 @@ def run_training(
                                 model=model, model_config=model_config,
                                 training_config=training_config,
                                 validation_metrics=val_report,
-                                model_variant=variant)
+                                model_variant=variant,
+                                e_history_version=(history_version
+                                                   if uses_economic_context
+                                                   else None))
         if last_path is not None:
             save_checkpoint(last_path, kind="last", epoch=epoch, model=model,
                             model_config=model_config,
                             training_config=training_config,
                             validation_metrics=val_report,
-                            model_variant=variant)
+                            model_variant=variant,
+                            e_history_version=(history_version
+                                               if uses_economic_context
+                                               else None))
         history.append(record)
         groups = " ".join(f"{name}={val_report[f'group.{name}']:.4f}"
                           for name in GROUP_NAMES)
@@ -555,6 +603,8 @@ def run_training(
         "stopped_early": stopped_early,
         "baseline_validation": baseline_report,
         "model_variant": variant,
+        "e_history_version": (
+            history_version if uses_economic_context else None),
         "trainable_parameters": param_count,
         "device": str(device),
         "amp_enabled": bool(amp_enabled),

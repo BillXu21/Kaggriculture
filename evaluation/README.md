@@ -10,8 +10,12 @@ orientations by default and writes a strict JSON result envelope from
 
 - `bc@PATH`: BC-E Torch checkpoint, loaded through
   `bc_manager_jax.checkpoint.load_torch_checkpoint(..., model_variant="E")`.
+- `bc-legacy@PATH`: explicitly load an unversioned/legacy E checkpoint with
+  `E_LEGACY` semantics; corrected `bc@PATH` rejects that mismatch.
 - `ppo@PATH`: detached PPO snapshot, loaded through existing
   `load_ppo_snapshot`.
+- `ppo-legacy@PATH` or `snapshot-legacy@PATH`: explicitly load a legacy PPO
+  snapshot; corrected snapshot kinds reject the mismatch.
 - `external@PATH`: local file or extracted bundle, loaded in a child process.
 - `pass`: plumbing baseline.
 

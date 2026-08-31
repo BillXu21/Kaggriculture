@@ -50,8 +50,8 @@ remain untouched — it adds only a compatible Optax bound.
 | `manager_loss(outputs, targets, weights=None)` | validating loss; `loss_from_validated` is the jit-safe core; `validate_target_shapes` validates without outputs |
 | `TrainConfig`, `make_optimizer`, `init_opt_state`, `train_step(...)` | AdamW(lr 3e-4, wd 1e-2, betas .9/.999, eps 1e-8) after global-norm clip 1.0 — existing `bc_manager.training` semantics |
 | `create_data_mesh`, `shard_batch`, `replicate_tree` | NamedSharding replicated data-parallel helpers |
-| `convert_torch_state_dict`, `load_torch_checkpoint(path_or_payload, config=None, model_variant=None)`, `expected_torch_state_shapes` | strict conversion from `bc_manager_checkpoint_v1`; the payload's top-level `model_variant` (absent -> V0) selects the contract, an explicit request must match exactly, J/JE rejected |
-| `save_native` / `load_native` | pickle-free `.npz` native format `bc_manager_jax_checkpoint_v1`; stores `model_variant` top-level in the metadata (outside `model_config`) |
+| `convert_torch_state_dict`, `load_torch_checkpoint(path_or_payload, config=None, model_variant=None, expected_e_history_version=...)`, `expected_torch_state_shapes` | strict conversion from `bc_manager_checkpoint_v1`; the payload's top-level `model_variant` (absent -> V0) and E history version select the contract, explicit requests must match exactly, J/JE rejected |
+| `save_native` / `load_native` | pickle-free `.npz` native format `bc_manager_jax_checkpoint_v2`; stores `model_variant` and `e_history_version` top-level in metadata (outside `model_config`), while v1 remains explicit legacy-compatible |
 
 ## Checkpoint conversion
 

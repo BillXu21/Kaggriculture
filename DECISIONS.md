@@ -2,6 +2,26 @@
 
 This file records decisions that remain authoritative across chats and work sessions. A decision should include the reason, evidence, and conditions for revisiting it.
 
+## D-052 - Version Corrected E Economic History
+
+- Date: 2026-08-31
+- Status: active compatibility boundary
+- Decision: `E_CORRECTED_V1` is the default E contract. Its history channels
+  use only observed adjacent daily-start bank snapshots, with deterministic
+  invalid `0/0` values on the first manager day, gaps, backwards days, and
+  episode resets. `E_LEGACY` reproduces the old current-start-as-previous
+  behavior and is available only through explicit loader, CLI, evaluation,
+  or legacy-submission selection.
+- Rationale: the old runner produced a zero/invalid history while silently
+  presenting it as a meaningful feature. Versioned identities prevent a
+  legacy checkpoint, policy, runner, or artifact from crossing the corrected
+  model boundary by inference.
+- Evidence: authoritative batch/live encoder tests, corrected first-manager
+  handoff regression, checkpoint/snapshot metadata checks, and policy identity
+  separation pass locally. No retraining or PPO run was started.
+- Revisit when: a new E feature contract changes the meaning of these channels
+  and receives a separately versioned derivation and regeneration path.
+
 ## D-051 - Keep Heterogeneous Match Evaluation Outside RL Manager
 
 - Date: 2026-08-30

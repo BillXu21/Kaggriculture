@@ -17,10 +17,16 @@ from typing import Any, Mapping
 import numpy as np
 
 from bc_manager.live import encode_live_inputs
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    E_HISTORY_LEGACY,
+    normalize_e_history_version,
+)
 
 from rl_manager.decode import ACTION_TENSOR_SHAPES, LOGPROB_GROUPS
 
-TRAJECTORY_SCHEMA_VERSION = 1
+TRAJECTORY_SCHEMA_VERSION = 2
+_LEGACY_TRAJECTORY_SCHEMA_VERSION = 1
 
 _TRACE_DIGEST_LEN = 32  # sha256 raw bytes
 
@@ -107,11 +113,14 @@ class TrajectoryBuffer:
         self,
         capacity: int,
         input_spec: Mapping[str, tuple[int, ...] | tuple[tuple[int, ...], type]],
+        *,
+        e_history_version: str = E_HISTORY_CORRECTED_V1,
     ) -> None:
         if isinstance(capacity, bool) or not isinstance(capacity, int) \
                 or capacity < 1:
             raise ValueError(f"capacity must be a positive int, got {capacity!r}")
         self.capacity = int(capacity)
+        self.e_history_version = normalize_e_history_version(e_history_version)
         self._count = 0
         self._arrays: dict[str, np.ndarray] = {}
 
@@ -271,7 +280,9 @@ class TrajectoryBuffer:
         arrays = {"schema_version": np.asarray(TRAJECTORY_SCHEMA_VERSION,
                                                dtype=np.int32),
                   "count": np.asarray(self._count, dtype=np.int32),
-                  "capacity": np.asarray(self.capacity, dtype=np.int32)}
+                  "capacity": np.asarray(self.capacity, dtype=np.int32),
+                  "e_history_version": np.frombuffer(
+                      self.e_history_version.encode("utf-8"), dtype=np.uint8)}
         # Only the filled rows are serialized so the NPZ stays compact;
         # capacity-sized zero tail is reconstructed on load.
         arrays.update({name: array[:self._count]
@@ -282,6 +293,7 @@ class TrajectoryBuffer:
             "npz_schema_version": TRAJECTORY_SCHEMA_VERSION,
             "count": self._count,
             "capacity": self.capacity,
+            "e_history_version": self.e_history_version,
             "run_metadata": dict(run_metadata or {}),
             "transitions": [record.to_json_dict()
                             for record in self.sidecar_records],
@@ -295,17 +307,44 @@ class TrajectoryBuffer:
         return base
 
     @classmethod
-    def load(cls, path: str | Path) -> tuple["TrajectoryBuffer", dict[str, Any]]:
-        """Round-trip load; validates schema version and count bounds."""
+    def load(
+        cls,
+        path: str | Path,
+        *,
+        expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
+    ) -> tuple["TrajectoryBuffer", dict[str, Any]]:
+        """Round-trip load; validates schema, history version, and count bounds.
+
+        Schema v1 is accepted only when the caller explicitly requests
+        ``E_LEGACY``; corrected loading remains the default.
+        """
         base = Path(path)
         with np.load(str(base) + ".npz", allow_pickle=False) as data:
             schema = int(data["schema_version"])
-            if schema != TRAJECTORY_SCHEMA_VERSION:
+            if schema not in (TRAJECTORY_SCHEMA_VERSION,
+                              _LEGACY_TRAJECTORY_SCHEMA_VERSION):
                 raise ValueError(
                     f"trajectory schema version {schema} != supported "
-                    f"{TRAJECTORY_SCHEMA_VERSION}")
+                    f"{TRAJECTORY_SCHEMA_VERSION} or legacy "
+                    f"{_LEGACY_TRAJECTORY_SCHEMA_VERSION}")
             count = int(data["count"])
             capacity = int(data["capacity"])
+            if schema == _LEGACY_TRAJECTORY_SCHEMA_VERSION:
+                e_history_version = E_HISTORY_LEGACY
+            else:
+                try:
+                    e_history_version = normalize_e_history_version(
+                        data["e_history_version"].tobytes().decode("utf-8"))
+                except (KeyError, UnicodeDecodeError, ValueError) as exc:
+                    raise ValueError(
+                        "trajectory is missing a valid e_history_version") from exc
+            if (expected_e_history_version is not None
+                    and e_history_version != normalize_e_history_version(
+                        expected_e_history_version)):
+                raise ValueError(
+                    f"trajectory e_history_version {e_history_version!r} does "
+                    f"not match requested "
+                    f"{normalize_e_history_version(expected_e_history_version)!r}")
             input_spec: dict[str, tuple[tuple[int, ...], type]] = {}
             for key in data.files:
                 if not key.startswith("input_"):
@@ -318,9 +357,11 @@ class TrajectoryBuffer:
             missing = expected_core - set(data.files)
             if missing:
                 raise ValueError(f"npz missing schema arrays {sorted(missing)}")
-            buffer = cls(capacity=capacity, input_spec=input_spec)
+            buffer = cls(capacity=capacity, input_spec=input_spec,
+                         e_history_version=e_history_version)
             for key in data.files:
-                if key in ("schema_version", "count", "capacity"):
+                if key in ("schema_version", "count", "capacity",
+                           "e_history_version"):
                     continue
                 if key not in buffer._arrays:
                     raise ValueError(f"unexpected npz array {key!r}")
@@ -377,6 +418,11 @@ def e_input_spec() -> dict[str, tuple[tuple[int, ...], type]]:
             for key, value in inputs.items()}
 
 
-def load_trajectory(path: str | Path) -> tuple[TrajectoryBuffer, dict[str, Any]]:
+def load_trajectory(
+    path: str | Path,
+    *,
+    expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
+) -> tuple[TrajectoryBuffer, dict[str, Any]]:
     """Module-level alias matching `TrajectoryBuffer.load`."""
-    return TrajectoryBuffer.load(path)
+    return TrajectoryBuffer.load(
+        path, expected_e_history_version=expected_e_history_version)

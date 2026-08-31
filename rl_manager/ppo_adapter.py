@@ -32,6 +32,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    normalize_e_history_version,
+)
 from rl_manager.ppo import PPOBatch, PPOTrainState
 from rl_manager.ppo_policy import PPOConfig, PPOPolicy
 from rl_manager.policy import params_fingerprint
@@ -62,13 +66,16 @@ class PPOBatchedPolicy:
         name: str = "ppo_candidate",
         version: str = "ppo-v0",
         deterministic: bool = False,
+        e_history_version: str = E_HISTORY_CORRECTED_V1,
     ) -> None:
         self._policy = policy
         self._deterministic = bool(deterministic)
+        self.e_history_version = normalize_e_history_version(e_history_version)
         self.identity = PolicyIdentity(
             name=name,
             version=version,
             fingerprint=params_fingerprint(policy.params),
+            e_history_version=self.e_history_version,
         )
         # Batching proof instrumentation (tests assert on these).
         self.call_count = 0
@@ -84,6 +91,7 @@ class PPOBatchedPolicy:
             name=self.identity.name,
             version=self.identity.version,
             fingerprint=params_fingerprint(self._policy.params),
+            e_history_version=self.e_history_version,
         )
 
     def plan_batch(
@@ -150,6 +158,7 @@ def ppo_batched_policy_from_state(
     name: str = "ppo_candidate",
     version: str = "ppo-v0",
     deterministic: bool = False,
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
 ) -> PPOBatchedPolicy:
     """Reconstruct an eval/train-capable adapter from a loaded train state.
 
@@ -165,7 +174,8 @@ def ppo_batched_policy_from_state(
     policy.frozen_params = state.frozen_params
     policy.rng = state.rng
     return PPOBatchedPolicy(
-        policy, name=name, version=version, deterministic=deterministic)
+        policy, name=name, version=version, deterministic=deterministic,
+        e_history_version=e_history_version)
 
 
 def ppo_snapshot_from_state(
@@ -175,6 +185,7 @@ def ppo_snapshot_from_state(
     ppo_config: PPOConfig | None = None,
     name: str = "ppo_snapshot",
     version: str = "ratchet-v1",
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
 ) -> PPOBatchedPolicy:
     """Build a detached deterministic policy from one exact train state.
 
@@ -190,7 +201,8 @@ def ppo_snapshot_from_state(
     policy.frozen_params = frozen_params
     policy.rng = jnp.array(state.rng)
     return PPOBatchedPolicy(
-        policy, name=name, version=version, deterministic=True)
+        policy, name=name, version=version, deterministic=True,
+        e_history_version=e_history_version)
 
 
 def select_ppo_subset(batch: PPOBatch, size: int) -> PPOBatch:

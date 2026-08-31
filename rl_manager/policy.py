@@ -17,6 +17,11 @@ from typing import Mapping
 import jax
 import numpy as np
 
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    normalize_e_history_version,
+)
+
 from bc_manager_jax.model import (
     ECONOMIC_CONTEXT_KEY,
     ManagerConfig,
@@ -64,18 +69,21 @@ class JaxEPlanPolicy:
         name: str = "jax_e",
         version: str = "stage-a-v1",
         model_variant: str = "E",
+        e_history_version: str = E_HISTORY_CORRECTED_V1,
     ) -> None:
         self._variant = resolve_model_variant(model_variant)
         if self._variant != "E":
             raise ValueError(
                 "JaxEPlanPolicy is the own-only E contract; got variant "
                 f"{self._variant!r}")
+        self.e_history_version = normalize_e_history_version(e_history_version)
         self._params = params
         self._config = config
         self.identity = PolicyIdentity(
             name=name,
             version=version,
             fingerprint=params_fingerprint(params),
+            e_history_version=self.e_history_version,
         )
         # Batching proof instrumentation (tests assert on these).
         self.call_count = 0

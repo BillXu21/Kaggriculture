@@ -9,6 +9,10 @@ import subprocess
 from typing import Any, Mapping
 
 from bc_manager.live import encode_live_inputs
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    E_HISTORY_LEGACY,
+)
 from executor_v0.agent import AgentConfig
 from executor_v0.foreman import ForemanConfig
 from opening_book.agent import make_opening_agent
@@ -87,6 +91,7 @@ class InternalController:
         opening_name: str,
         executor_factory: Any,
         configuration: Mapping[str, Any],
+        e_history_version: str | None = None,
     ) -> None:
         self.seat = seat
         self.policy = policy
@@ -106,6 +111,8 @@ class InternalController:
         self._previous_execution = {"workers_hired": 0, "hire_cost": 0}
         self._hires_today = 0
         self._planned_days: set[int] = set()
+        self.e_history_version = e_history_version or getattr(
+            getattr(policy, "identity", None), "e_history_version", None)
 
     def _observe_day(self, observation: Mapping[str, Any]) -> None:
         day = int(observation["day"])
@@ -117,7 +124,8 @@ class InternalController:
                 "workers_hired": self._hires_today,
                 "hire_cost": total_hire_cost(self._hires_today),
             }
-            self._previous_start = self._current_start
+            self._previous_start = (
+                None if day <= 4 else self._current_start)
         self._last_day = day
         self._hires_today = int(farm.get("hires_today", 0) or 0)
         self._current_start = (day, float(farm["money"]))
@@ -126,12 +134,17 @@ class InternalController:
         day = int(observation["day"])
         if day < 4 or int(observation["hour"]) != 0 or day in self._planned_days:
             return
+        previous_start = self._previous_start
+        if self.e_history_version == E_HISTORY_LEGACY:
+            previous_start = (
+                day, float(observation["farms"][self.seat]["money"]))
         inputs = encode_live_inputs(
             observation,
             self.seat,
             self._previous_execution,
             step=int(observation["step"]),
-            economic_prev_start=self._previous_start,
+            economic_prev_start=previous_start,
+            e_history_version=self.e_history_version,
         )
         outputs = self.policy.plan_batch(
             inputs, f"evaluation/seat={self.seat}/day={day}"
@@ -174,11 +187,16 @@ class InternalControllerFactory:
     checkpoint_path: str | None = None
     policy_source: Mapping[str, Any] | None = None
     executor_factory: Any | None = None
+    e_history_version: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.executor_config, AgentConfig):
             raise TypeError("executor_config must be an AgentConfig")
         self._executor_factory = self.executor_factory
+        if self.e_history_version is None:
+            self.e_history_version = getattr(
+                getattr(self.policy, "identity", None),
+                "e_history_version", None)
 
     @property
     def provenance(self) -> Mapping[str, Any]:
@@ -208,6 +226,7 @@ class InternalControllerFactory:
             },
             "repository_commit": _repository_commit(),
             "execution_mode": "in_process",
+            "e_history_version": self.e_history_version,
         }
 
     def _factory(self) -> Any:
@@ -229,6 +248,7 @@ class InternalControllerFactory:
             opening_name=self.opening_name,
             executor_factory=self._factory(),
             configuration=configuration,
+            e_history_version=self.e_history_version,
         )
 
 
@@ -283,12 +303,16 @@ def load_internal_factory(
 ) -> InternalControllerFactory:
     """Load BC-E or a detached PPO snapshot through existing loaders."""
     path = Path(checkpoint_path)
-    if kind == "bc":
+    if kind in {"bc", "bc-legacy"}:
         from bc_manager_jax.checkpoint import load_torch_checkpoint
         from bc_manager_jax.model import ManagerConfig
         from rl_manager.policy import JaxEPlanPolicy
 
-        params, metadata = load_torch_checkpoint(path, model_variant="E")
+        expected_history = (E_HISTORY_LEGACY if kind == "bc-legacy"
+                            else E_HISTORY_CORRECTED_V1)
+        params, metadata = load_torch_checkpoint(
+            path, model_variant="E",
+            expected_e_history_version=expected_history)
         config = ManagerConfig(**metadata["model_config"])
         policy = JaxEPlanPolicy(
             params,
@@ -296,16 +320,23 @@ def load_internal_factory(
             name=display_name or "bc_e",
             version="bc-e-v1",
             model_variant="E",
+            e_history_version=metadata["e_history_version"],
         )
-    elif kind in {"ppo", "ppo-snapshot", "snapshot"}:
+    elif kind in {"ppo", "ppo-snapshot", "snapshot",
+                  "ppo-legacy", "snapshot-legacy"}:
         from rl_manager.ppo_checkpoint import load_ppo_snapshot
 
-        policy, metadata = load_ppo_snapshot(path)
+        expected_history = (E_HISTORY_LEGACY
+                            if kind.endswith("-legacy") else
+                            E_HISTORY_CORRECTED_V1)
+        policy, metadata = load_ppo_snapshot(
+            path, expected_e_history_version=expected_history)
         if display_name:
             policy.identity = type(policy.identity)(
                 name=display_name,
                 version=policy.identity.version,
                 fingerprint=policy.identity.fingerprint,
+                e_history_version=policy.identity.e_history_version,
             )
     else:
         raise ValueError(f"unsupported internal controller kind {kind!r}")
@@ -319,6 +350,7 @@ def load_internal_factory(
             "kind": kind,
             "metadata": metadata,
         },
+        e_history_version=getattr(policy.identity, "e_history_version", None),
     )
 
 

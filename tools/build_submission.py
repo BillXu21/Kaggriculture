@@ -11,6 +11,8 @@ import sys
 import tarfile
 from typing import Iterable
 
+from bc_manager.economics import E_HISTORY_CORRECTED_V1
+
 REQUIRED_PACKAGES = (
     "executor_v0",
     "bc_manager",
@@ -23,6 +25,27 @@ CHECKPOINT_SHA256 = (
     "F4B029D3E463ABA1DB0544377D0D616E3DE94AA6CC469D3446F018DDDD8F6BF2"
 ).lower()
 MANIFEST_FORMAT = "bc_e_v07_submission_v1"
+
+
+def _known_checkpoint_history(checkpoint: Path) -> tuple[str, str | None] | None:
+    """Read semantic metadata when this is a repository BC checkpoint.
+
+    Test/dummy or externally opaque files remain buildable; valid E payloads
+    are never allowed to cross the corrected submission boundary silently.
+    """
+    try:
+        import torch
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    except Exception:  # noqa: BLE001 - opaque external artifact is handled below
+        return None
+    if not isinstance(payload, dict) or payload.get("format") != "bc_manager_checkpoint_v1":
+        return None
+    from bc_manager.training import (
+        checkpoint_e_history_version,
+        checkpoint_model_variant,
+    )
+    variant = checkpoint_model_variant(payload)
+    return variant, checkpoint_e_history_version(payload)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -134,6 +157,13 @@ def build_submission(
             f"checkpoint SHA-256 {checkpoint_digest} does not match pinned BC-E "
             f"identity {expected_checkpoint_sha256.lower()}"
         )
+    checkpoint_metadata = _known_checkpoint_history(checkpoint)
+    if checkpoint_metadata is not None:
+        variant, history_version = checkpoint_metadata
+        if variant in ("E", "JE") and history_version != E_HISTORY_CORRECTED_V1:
+            raise ValueError(
+                f"legacy {variant} checkpoint requires {history_version!r}; "
+                "use build_runner_compatible_submission.py explicitly")
 
     template = root / "tools" / "submission_main.py"
     if not template.is_file():
@@ -156,6 +186,7 @@ def build_submission(
         "runtime_packages": list(REQUIRED_PACKAGES),
         "checkpoint_sha256": checkpoint_digest,
         "checkpoint_member": "best.pt",
+        "e_history_version": E_HISTORY_CORRECTED_V1,
         "entrypoint_member": "main.py",
         "native_extensions": [],
         "files": file_manifest,
