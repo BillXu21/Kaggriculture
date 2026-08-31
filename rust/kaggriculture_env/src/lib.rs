@@ -2313,6 +2313,54 @@ struct RustBatchEnv {
     pool: Option<ThreadPool>,
 }
 
+/// V0 executor seam.  The semantic oracle remains the production Python
+/// ExecutorAgent; this native object owns the callable and forwards one
+/// observation at a time without changing its state or action vocabulary.
+/// A later experiment may replace the callable with a native core only after
+/// differential parity proves the replacement safe.
+#[pyclass]
+struct RustExecutorV0 {
+    oracle: Py<PyAny>,
+    calls: u64,
+}
+
+#[pymethods]
+impl RustExecutorV0 {
+    #[new]
+    fn new(oracle: Py<PyAny>) -> Self {
+        Self { oracle, calls: 0 }
+    }
+
+    fn __call__<'py>(
+        &mut self,
+        py: Python<'py>,
+        observation: &Bound<'py, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        self.calls += 1;
+        self.oracle.bind(py).call1((observation,)).map(Bound::unbind)
+    }
+
+    fn diagnostics_json<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        self.oracle
+            .bind(py)
+            .call_method0("diagnostics_json")
+            .map(Bound::unbind)
+    }
+
+    #[getter]
+    fn debug_trace_turn<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        self.oracle
+            .bind(py)
+            .getattr("debug_trace_turn")
+            .map(Bound::unbind)
+    }
+
+    #[getter]
+    fn calls(&self) -> u64 {
+        self.calls
+    }
+}
+
 impl RustBatchEnv {
     fn game_config(&self) -> GameConfig {
         self.config.clone()
@@ -3212,6 +3260,7 @@ impl RustBatchEnv {
 #[pymodule]
 fn _kaggriculture_env(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustBatchEnv>()?;
+    m.add_class::<RustExecutorV0>()?;
     m.add("OBS_SIZE", OBSERVATION_SIZE)?;
     m.add("MASK_SIZE", MASK_SIZE)?;
     m.add("MAX_HANDS", MAX_HANDS)?;

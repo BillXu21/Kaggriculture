@@ -2,6 +2,13 @@
 
 Last updated: 2026-08-30
 
+## Issue #36 Status
+- The bounded Rust executor V0 experiment is complete on
+  `codex/issue-36-rust-executor-v0`. The PyO3 adapter is exact by delegation
+  but slower end-to-end than Python, so keep it opt-in and do not port the
+  executor task system or change the training default. No Stage 3 work follows
+  this experiment.
+
 ## Issue #35 Status
 - The bounded heterogeneous primitive-controller evaluation harness is
   implemented separately from `rl_manager` training/self-play. Use fixed seed

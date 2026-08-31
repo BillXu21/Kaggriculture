@@ -27,6 +27,7 @@ def run_case(
     low_telemetry: bool,
     read_only_observations: bool,
     record_rollout: bool,
+    executor_backend: str,
     warmups: int,
     repeats: int,
 ) -> dict[str, Any]:
@@ -41,11 +42,15 @@ def run_case(
             SelfPlayRunner,
             build_episode_spec,
         )
+        from rl_manager.executor_factory import make_rust_executor_factory
         from rl_manager.types import E_VS_E
 
         params, metadata = load_torch_checkpoint(checkpoint)
         policy = JaxEPlanPolicy(
             params, ManagerConfig(**metadata["model_config"]), name="benchmark")
+        executor_factory = None
+        if executor_backend == "rust":
+            executor_factory = make_rust_executor_factory()
         samples = []
         fingerprints = []
         for iteration in range(warmups + repeats):
@@ -61,7 +66,7 @@ def run_case(
             if record_rollout:
                 runner_config["record_rollout"] = True
             runner = SelfPlayRunner(RunnerConfig(
-                **runner_config))
+                **runner_config), executor_factory=executor_factory)
             specs = [
                 build_episode_spec(index, seed, E_VS_E, policy, policy)
                 for index, seed in enumerate(SEEDS[:num_envs])
@@ -75,8 +80,14 @@ def run_case(
                     "games_per_second": len(results) / elapsed,
                     "primitive_turns": sum(719 for _ in results),
                     "primitive_turns_per_second": (719 * len(results)) / elapsed,
+                    "manager_inference_seconds": runner.timing_totals[
+                        "manager_inference"],
                     "agent_actions_seconds": runner.timing_totals["agent_actions"],
                     "agent_actions_share": runner.timing_totals["agent_actions"] / elapsed,
+                    "env_step_seconds": runner.timing_totals["env_step"],
+                    "orchestration_seconds": runner.timing_totals[
+                        "orchestration"],
+                    "runner_timing_seconds": dict(runner.timing_totals),
                 })
                 fingerprints.append({
                     "final_banks": [result.final_banks for result in results],
@@ -96,6 +107,7 @@ def run_case(
             "num_envs": num_envs,
             "low_telemetry": low_telemetry,
             "read_only_observations": read_only_observations,
+            "executor_backend": executor_backend,
             "warmups": warmups,
             "repeats": repeats,
             "samples": samples,
@@ -127,6 +139,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--low-telemetry", action="store_true")
     parser.add_argument("--read-only-observations", action="store_true")
     parser.add_argument("--record-rollout", action="store_true")
+    parser.add_argument("--executor-backend", choices=("python", "rust"),
+                        default="python")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     if any(value < 1 for value in args.num_envs):
@@ -143,6 +157,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             low_telemetry=args.low_telemetry, warmups=args.warmups,
             repeats=args.repeats,
             read_only_observations=args.read_only_observations,
+            executor_backend=args.executor_backend,
             record_rollout=args.record_rollout)
             for num_envs in args.num_envs],
     }

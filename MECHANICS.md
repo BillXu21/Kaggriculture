@@ -2,6 +2,22 @@
 
 Last updated: 2026-08-30
 
+## Issue #36 Rust Executor V0 (2026-08-31)
+
+- `CONFIRMED_EXPERIMENT`: `RustExecutorV0` forwards each observation to the
+  same stateful Python `ExecutorAgent` instance held by a fresh per-seat,
+  per-game factory. This preserves all current task, dependency, routing,
+  safety, watering, placement, debt, market, optional-work, diagnostics, and
+  reset semantics exactly at the public action boundary.
+- `CONFIRMED_EXPERIMENT`: BC-E fast closed-loop parity had zero first action
+  divergence over 3 seeds x 2 seats x 719 primitive turns, with equal banks and
+  terminal statuses.
+- `CONFIRMED_EXPERIMENT`: the native callback boundary did not improve local
+  scalar rollout throughput; see the issue report for timing and limits.
+- Native Rust semantic coverage is intentionally none in V0. Any future
+  semantic port requires a compact input boundary and the same first-divergence
+  gate before benchmarking.
+
 ## Animal Crop-Sacrifice Placement Correction (2026-08-30)
 
 - `CONFIRMED_EXPERIMENT`: an animal `crop_sacrifice` slot must clear its

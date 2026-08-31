@@ -2,6 +2,22 @@
 
 This file records decisions that remain authoritative across chats and work sessions. A decision should include the reason, evidence, and conditions for revisiting it.
 
+## D-052 - Keep Rust Executor V0 Experimental and Python-Oracle Bound
+
+- Date: 2026-08-31
+- Status: closed experiment; Python remains default
+- Decision: Keep `executor_v0@rust-v0` as an explicit opt-in PyO3 parity
+  boundary only. It owns a Python `ExecutorAgent` oracle and does not replace
+  the semantic implementation or training factory.
+- Rationale: the native callback passed exact BC-E action traces but was
+  `1.6%..1.9%` slower end-to-end at N=1/2/8. A large independent semantic port
+  is not justified by this measured workload.
+- Evidence: `research/ISSUE36_RUST_EXECUTOR_V0.md` and raw local benchmark/
+  parity artifacts. Profiling found a theoretical perfect-executor ceiling of
+  only about `1.68x..1.72x` after the existing low-telemetry optimizations.
+- Revisit when: target-host profiling shows materially higher executor share or
+  a compact native array boundary removes Python mapping/conversion overhead.
+
 ## D-051 - Keep Heterogeneous Match Evaluation Outside RL Manager
 
 - Date: 2026-08-30

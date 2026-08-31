@@ -57,6 +57,8 @@ DEBUG_TRACE_COMPOSITIONS = (E_VS_E, E_VS_PASS)
 EXECUTOR_FACTORIES: Mapping[str, str] = {
     "executor_v0@stage-a-v1": "rl_manager.executor_factory:"
                               "make_default_executor_factory",
+    "executor_v0@rust-v0": "rl_manager.executor_factory:"
+                            "make_rust_executor_factory",
 }
 
 CONFIRM_FLAG = "--confirm-expensive"

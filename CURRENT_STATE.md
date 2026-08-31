@@ -2,6 +2,27 @@
 
 Last updated: 2026-08-30
 
+## Issue #36 Rust Executor V0 Throughput Experiment
+- On `codex/issue-36-rust-executor-v0`, based exactly on
+  `f91ea26a782bc39bfe7ff8ea88c395d10e438afd`, the opt-in
+  `executor_v0@rust-v0` factory exposes a PyO3 `RustExecutorV0` boundary while
+  retaining the unchanged Python executor as semantic oracle. Python remains
+  the default; no manager, PPO, reward, checkpoint identity, or submission
+  behavior changed.
+- Profiling with BC-E, fast scalar `numThreads=1`, low telemetry/read-only
+  observations measured agent/executor shares of `40.6%/41.4%/41.7%` at
+  N=1/2/8. Perfect zero-cost executor ceilings are approximately `1.68x`,
+  `1.71x`, and `1.72x` total throughput.
+- Exact BC-E closed-loop parity passed seeds `17,42,2026`, both seats, 2,157
+  joint primitive action pairs, identical final banks and `DONE/DONE` status.
+  No PPO snapshot was available; official 1.32.7 was unavailable locally.
+- End-to-end local medians (one warmup/two repeats) were Python vs Rust:
+  N=1 `4.674s/4.755s`, N=2 `8.220s/8.382s`, N=8 `34.357s/34.916s`.
+  Rust was `1.6%..1.9%` slower. Recommendation: abandon as an optimization
+  and retain Python; do not make Rust the training default.
+- Full report and raw ignored artifacts: `research/ISSUE36_RUST_EXECUTOR_V0.md`,
+  `artifacts/local/issue36-*.json`.
+
 ## Issue #35 Asymmetric Evaluation Harness
 - On branch `codex/issue-35-external-agent-match-harness`, the separate
   `evaluation/` harness runs independent primitive controllers on each seat

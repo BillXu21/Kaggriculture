@@ -1,5 +1,28 @@
 # Kaggriculture Historical Record
 
+## 2026-08-31 - Issue #36 Rust Executor V0 Throughput Experiment
+
+- Started branch `codex/issue-36-rust-executor-v0` exactly at
+  `f91ea26a782bc39bfe7ff8ea88c395d10e438afd`.
+- Added a PyO3 `RustExecutorV0` callable and explicit
+  `executor_v0@rust-v0` factory. The object forwards to the unchanged Python
+  executor oracle; Python remains the default and all manager/PPO/strategy
+  behavior is unchanged.
+- Extended the self-play benchmark with explicit manager inference,
+  executor/agent, environment, orchestration, total wall-time, games/s, and
+  primitive-turns/s fields. Added a strict first-divergence comparator and
+  fixed-seed closed-loop script.
+- Release Rust build and native unit tests passed. The BC-E fast panel over
+  seeds `17,42,2026`, both seats, and 2,157 joint primitive action pairs had
+  zero first divergence, equal banks, and `DONE/DONE` statuses. No PPO
+  snapshot or official 1.32.7 package was locally available.
+- Low-telemetry/read-only scalar medians Python vs Rust were N=1
+  `4.674s/4.755s`, N=2 `8.220s/8.382s`, and N=8 `34.357s/34.916s`.
+  Rust was `1.6%..1.9%` slower, so the semantic port was stopped early and the
+  adapter is not recommended for tomorrow's training.
+- Raw artifacts are ignored under `artifacts/local/issue36-*.json`; report:
+  `research/ISSUE36_RUST_EXECUTOR_V0.md`.
+
 ## 2026-08-30 - Issue #35 Asymmetric Executor / External-Agent Harness
 
 - Added a separate `evaluation/` primitive-controller loop. It accepts two

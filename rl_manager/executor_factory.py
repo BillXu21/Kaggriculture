@@ -14,6 +14,9 @@ from typing import Any, Mapping, Protocol
 from rl_manager.provider import QueuedPlanProvider
 
 EXECUTOR_FACTORY_VERSION = "executor_v0.make_agent(strict=True)@stage-a-v1"
+RUST_EXECUTOR_FACTORY_VERSION = (
+    "executor_v0.rust-v0-parity-adapter@stage-a-v0"
+)
 
 
 class RlExecutorFactory(Protocol):
@@ -63,3 +66,13 @@ def make_default_executor_factory(
                               config=resolved_config)
 
     return _DefaultExecutorFactory()
+
+
+def make_rust_executor_factory(
+    agent_config: Any | None = None,
+) -> Any:
+    """Build the explicit opt-in Rust V0 parity-prototype factory."""
+
+    from executor_v0.rust_backend import make_rust_executor_factory as builder
+
+    return builder(agent_config)

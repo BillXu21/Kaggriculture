@@ -47,6 +47,20 @@ rotation signal is available at this executor layer.
 
 ## Usage
 
+### Rust V0 parity seam
+
+The Rust executor experiment is explicit and does not change the default:
+
+```bash
+python -m rl_manager.cli eval ... --executor-factory executor_v0@rust-v0
+```
+
+`executor_v0@rust-v0` is a PyO3 boundary around the unchanged Python
+`ExecutorAgent` oracle. It is parity-safe but intentionally not a native
+semantic port; use `research/ISSUE36_RUST_EXECUTOR_V0.md` for the measured
+throughput result. The normal `executor_v0@stage-a-v1` factory remains the
+training default.
+
 Fake-manager plumbing smoke (no model, no engine needed to build the agent):
 
 ```bash
