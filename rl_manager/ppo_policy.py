@@ -444,7 +444,8 @@ class PPOPolicy:
 
     def __init__(self, frozen_params: Mapping, config: ManagerConfig, *,
                  seed: int, model_variant: str = "E",
-                 ppo_config: PPOConfig | None = None) -> None:
+                 ppo_config: PPOConfig | None = None,
+                 initial_base_params: Mapping | None = None) -> None:
         variant = resolve_model_variant(model_variant)
         if variant != "E":
             raise ValueError(
@@ -457,9 +458,23 @@ class PPOPolicy:
         self.frozen_params = jax.tree_util.tree_map(
             lambda leaf: jnp.array(leaf), frozen_params)
         value_key, rng = jax.random.split(jax.random.PRNGKey(seed))
-        # Mutable copy of the E base params + independent small value head.
+        # Mutable base + independent small value head. The default remains an
+        # exact BC copy; callers may provide a separately initialized tree.
+        if initial_base_params is not None:
+            frozen_leaves = jax.tree_util.tree_leaves(frozen_params)
+            initial_leaves = jax.tree_util.tree_leaves(initial_base_params)
+            if (jax.tree_util.tree_structure(initial_base_params)
+                    != jax.tree_util.tree_structure(frozen_params)):
+                raise ValueError("initial_base_params pytree structure does not "
+                                 "match frozen_params")
+            for initial, frozen in zip(initial_leaves, frozen_leaves):
+                if initial.shape != frozen.shape or initial.dtype != frozen.dtype:
+                    raise ValueError(
+                        "initial_base_params leaves must match frozen_params "
+                        "shapes and dtypes")
         mutable_base = jax.tree_util.tree_map(
-            lambda leaf: jnp.array(leaf), frozen_params)
+            lambda leaf: jnp.array(leaf),
+            frozen_params if initial_base_params is None else initial_base_params)
         self.params = {
             "base": mutable_base,
             "value": init_value_head(config, value_key,

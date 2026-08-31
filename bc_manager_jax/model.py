@@ -239,6 +239,22 @@ def init_params(config: ManagerConfig, seed: int,
     return jax.tree_util.tree_unflatten(treedef, values)
 
 
+def init_train_params(config: ManagerConfig, seed: int,
+                      model_variant: str = "V0") -> dict:
+    """Random training initialization with functional LayerNorm scales."""
+    params = init_params(config, seed, model_variant)
+    for layer in params["encoder"]["layers"]:
+        layer["norm1_weight"] = jnp.ones_like(layer["norm1_weight"])
+        layer["norm1_bias"] = jnp.zeros_like(layer["norm1_bias"])
+        layer["norm2_weight"] = jnp.ones_like(layer["norm2_weight"])
+        layer["norm2_bias"] = jnp.zeros_like(layer["norm2_bias"])
+    params["encoder_norm"]["weight"] = jnp.ones_like(
+        params["encoder_norm"]["weight"])
+    params["encoder_norm"]["bias"] = jnp.zeros_like(
+        params["encoder_norm"]["bias"])
+    return params
+
+
 # ------------------------------------------------------------- primitives
 
 

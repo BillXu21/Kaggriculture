@@ -99,6 +99,7 @@ def test_parser_defaults_are_safe_single_process():
         "out/ppo.npz"])
     assert (args.num_workers, args.num_envs, args.num_threads) == (1, 1, 1)
     assert args.backend == "fast"
+    assert args.init_mode == "bc"
     assert not args.low_telemetry
     assert not args.read_only_agent_observations
     assert not args.batch_backend
@@ -154,6 +155,18 @@ def test_plan_exposes_ppo_stability_controls(tmp_path):
     plan = plan_training(args)
     assert plan["ppo"]["target_kl"] == 0.03
     assert plan["ppo"]["reject_update_kl"] == 2.0
+
+
+def test_scratch_init_mode_is_recorded_in_training_plan(tmp_path):
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    args = build_parser().parse_args([
+        "train", "--e-checkpoint", str(checkpoint),
+        "--executor-factory", "executor_v0@stage-a-v1", "--master-seed", "17",
+        "--init-mode", "scratch", "--output-dir", "out",
+        "--checkpoint", "out/ppo.npz",
+    ])
+    assert plan_training(args)["init_mode"] == "scratch"
 
 
 def test_plan_exposes_promotion_ratchet_options(tmp_path):

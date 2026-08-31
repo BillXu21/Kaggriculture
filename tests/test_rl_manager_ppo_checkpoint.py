@@ -64,7 +64,7 @@ def test_roundtrip_full_state_and_provenance(env, tmp_path):
     config, ppo_config, _batch, state = env
     state.rollout_seed = 2026
     provenance = {"bc_checkpoint": "artifacts/local/bc-v1-E/best.pt",
-                  "created_by": "test"}
+                  "created_by": "test", "init_mode": "scratch"}
     path = save_ppo_checkpoint(tmp_path / "ck.npz", state, config,
                                ppo_config,
                                provenance=provenance)

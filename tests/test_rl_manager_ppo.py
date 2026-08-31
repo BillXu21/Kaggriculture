@@ -4,7 +4,12 @@ import jax
 import numpy as np
 import pytest
 
-from bc_manager_jax.model import init_params, tiny_manager_config
+from bc_manager_jax.model import (
+    forward as jax_forward,
+    init_params,
+    init_train_params,
+    tiny_manager_config,
+)
 from rl_manager.gae import compute_gae
 from rl_manager.ppo import (
     PPOBatch,
@@ -68,6 +73,79 @@ def test_explained_variance_perfect_and_finite_on_constant_returns():
     value = jax.numpy.asarray([5.0, 5.0, 5.0])
     # Var(returns)=0 -> epsilon-stable denominator keeps the metric finite.
     assert np.isfinite(float(explained_variance(value, constant_returns)))
+
+
+def test_bc_and_scratch_initialization_contracts(tiny_e):
+    frozen, config = tiny_e
+    ppo_config = PPOConfig(minibatch_size=2)
+    bc_default = init_train_state(
+        frozen, config, seed=42, ppo_config=ppo_config)
+    bc_explicit = init_train_state(
+        frozen, config, seed=42, ppo_config=ppo_config,
+        initial_base_params=frozen)
+    for got, want in zip(jax.tree_util.tree_leaves(bc_default.params),
+                         jax.tree_util.tree_leaves(bc_explicit.params)):
+        assert np.array_equal(got, want)
+    assert np.array_equal(np.asarray(bc_default.rng),
+                          np.asarray(bc_explicit.rng))
+
+    scratch_base = init_train_params(config, seed=123, model_variant="E")
+    scratch_again = init_train_params(config, seed=123, model_variant="E")
+    scratch_other = init_train_params(config, seed=124, model_variant="E")
+    assert all(np.all(layer["norm1_weight"] == 1.0)
+               and np.all(layer["norm2_weight"] == 1.0)
+               for layer in scratch_base["encoder"]["layers"])
+    assert np.all(scratch_base["encoder_norm"]["weight"] == 1.0)
+    frozen_before = [np.asarray(leaf).copy()
+                     for leaf in jax.tree_util.tree_leaves(frozen)]
+    scratch = init_train_state(
+        frozen, config, seed=42, ppo_config=ppo_config,
+        initial_base_params=scratch_base)
+    scratch_again_state = init_train_state(
+        frozen, config, seed=42, ppo_config=ppo_config,
+        initial_base_params=scratch_again)
+
+    for got, want in zip(jax.tree_util.tree_leaves(frozen), frozen_before):
+        assert np.array_equal(got, want)
+    for got, want in zip(jax.tree_util.tree_leaves(scratch.params["base"]),
+                         jax.tree_util.tree_leaves(frozen)):
+        assert got.shape == want.shape
+        assert got.dtype == want.dtype
+    assert (jax.tree_util.tree_structure(scratch.params)
+            == jax.tree_util.tree_structure(bc_default.params))
+    for got, want in zip(jax.tree_util.tree_leaves(scratch.params),
+                         jax.tree_util.tree_leaves(bc_default.params)):
+        assert got.shape == want.shape
+        assert got.dtype == want.dtype
+    for got, want in zip(jax.tree_util.tree_leaves(scratch.params["base"]),
+                         jax.tree_util.tree_leaves(scratch_again_state.params["base"])):
+        assert np.array_equal(got, want)
+    assert any(not np.array_equal(got, want) for got, want in zip(
+        jax.tree_util.tree_leaves(scratch.params["base"]),
+        jax.tree_util.tree_leaves(scratch.frozen_params)))
+    assert any(not np.array_equal(got, want) for got, want in zip(
+        jax.tree_util.tree_leaves(scratch_base),
+        jax.tree_util.tree_leaves(scratch_other)))
+    for got, want in zip(jax.tree_util.tree_leaves(scratch.frozen_params),
+                         frozen_before):
+        assert np.array_equal(got, want)
+
+
+def test_scratch_sell_quantities_still_use_frozen_reference(tiny_e):
+    frozen, config = tiny_e
+    scratch = init_train_params(config, seed=123, model_variant="E")
+    policy = PPOPolicy(frozen, config, seed=12,
+                       initial_base_params=scratch)
+    batch = _two_row_inputs()
+    frozen_outputs = jax_forward(frozen, batch, config, model_variant="E")
+    quantity = np.floor(
+        np.expm1(np.clip(np.asarray(frozen_outputs["sell_quantity_log1p"]),
+                         0.0, None)) + 0.5)
+    result = policy.act(batch, rng=jax.random.PRNGKey(0))
+    presence = result["action_tensors"]["sell_presence"].astype(bool)
+    assert np.array_equal(
+        result["action_tensors"]["sell_quantity"],
+        np.where(presence, quantity, 0).astype(np.int16))
 
 
 def _make_batch(policy, batch_inputs, *, rewards=(1.0, -1.0)):

@@ -39,6 +39,13 @@ def test_policy_and_environment_streams_are_separate_namespaces():
     assert stream.environment_seed(0) != stream.episode_seed(0)
 
 
+def test_initialization_seed_is_deterministic_and_master_scoped():
+    assert SeedStream(5).initialization_seed() == \
+        SeedStream(5).initialization_seed()
+    assert SeedStream(5).initialization_seed() != \
+        SeedStream(6).initialization_seed()
+
+
 def test_invalid_master_seed_and_index_fail_loud():
     with pytest.raises(ValueError):
         SeedStream(-1)

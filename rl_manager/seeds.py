@@ -14,6 +14,7 @@ import numpy as np
 _EPISODE_TAG = 1
 _POLICY_TAG = 2
 _ENVIRONMENT_TAG = 3
+_INITIALIZATION_TAG = 4
 
 
 class SeedStream:
@@ -45,3 +46,7 @@ class SeedStream:
     def environment_seed(self, env_index: int) -> int:
         """Reserved future knob for per-worker environment streams."""
         return self._derive(_ENVIRONMENT_TAG, env_index)
+
+    def initialization_seed(self, index: int = 0) -> int:
+        """Derive a deterministic seed for model initialization."""
+        return self._derive(_INITIALIZATION_TAG, index)

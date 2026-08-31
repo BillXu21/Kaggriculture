@@ -96,6 +96,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Explicit executor factory selection.")
     train.add_argument("--backend", default="fast", choices=KNOWN_BACKENDS)
     train.add_argument("--master-seed", type=int, required=True)
+    train.add_argument("--init-mode", choices=("bc", "scratch"),
+                       default="bc",
+                       help="Mutable manager initialization (default: bc).")
     train.add_argument("--num-workers", type=int, default=1,
                        help="Rollout worker processes (default 1).")
     train.add_argument("--num-envs", type=int, default=1,
@@ -271,6 +274,9 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
     plan = _validate_common(args)
     if args.master_seed < 0:
         raise ValueError("--master-seed must be nonnegative")
+    init_mode = str(getattr(args, "init_mode", "bc"))
+    if init_mode not in ("bc", "scratch"):
+        raise ValueError("--init-mode must be one of ('bc', 'scratch')")
     for name, value in (("episodes_per_update", args.episodes_per_update),
                         ("updates", args.updates),
                         ("epochs", args.epochs),
@@ -301,6 +307,7 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
         "mode": "train",
         "e_checkpoint": str(Path(args.e_checkpoint)),
         "master_seed": int(args.master_seed),
+        "init_mode": init_mode,
         "episodes_per_update": int(args.episodes_per_update),
         "updates": int(args.updates),
         "promotion": {
@@ -446,7 +453,7 @@ def _rollout_candidate_from_state(
 
 def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no cover
     from bc_manager_jax.checkpoint import load_torch_checkpoint
-    from bc_manager_jax.model import ManagerConfig
+    from bc_manager_jax.model import ManagerConfig, init_train_params
 
     from rl_manager.ppo import build_ppo_batch, init_train_state, ppo_update
     from rl_manager.ppo_adapter import ppo_snapshot_from_state
@@ -464,8 +471,16 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         expected_e_history_version=plan["e_history_version"])
     config = ManagerConfig(**metadata["model_config"])
     ppo_config = PPOConfig(**plan["ppo"])
+    initial_base_params = None
+    initialization_seed = None
+    if plan["init_mode"] == "scratch":
+        initialization_seed = SeedStream(
+            plan["master_seed"]).initialization_seed()
+        initial_base_params = init_train_params(
+            config, seed=initialization_seed, model_variant="E")
     state = init_train_state(frozen_params, config,
-                             seed=plan["master_seed"], ppo_config=ppo_config)
+                             seed=plan["master_seed"], ppo_config=ppo_config,
+                             initial_base_params=initial_base_params)
     candidate = _rollout_candidate_from_state(
         state, config, ppo_config,
         e_history_version=plan["e_history_version"])
@@ -560,6 +575,7 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                         original_bc_e.identity.to_json_dict()),
                     "update": update_number,
                     "ppo_step": int(state.step),
+                    "init_mode": plan["init_mode"],
                 })
             decision = evaluate_promotion(summary)
             summary["promotion"] = decision.to_dict()
@@ -592,6 +608,7 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                         "ppo_step": int(state.step),
                         "original_bc_e": original_bc_e.identity.to_json_dict(),
                         "evaluation_seed_set": promotion["seed_set"],
+                        "init_mode": plan["init_mode"],
                     },
                     e_history_version=plan["e_history_version"])
                 eval_path = promotion_dir / (
@@ -618,15 +635,19 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         path = save_ppo_checkpoint(
             output_dir / f"ppo_update_{update_index:06d}.npz", state, config,
             ppo_config, e_history_version=plan["e_history_version"],
-            provenance={"plan": dict(plan)})
+            provenance={"plan": dict(plan),
+                        "init_mode": plan["init_mode"],
+                        "initialization_seed": initialization_seed})
         history.append({"update": update_index, "metrics": metrics,
                         "checkpoint": str(path),
+                        "init_mode": plan["init_mode"],
                         "learner": candidate.identity.to_json_dict(),
                         "opponent": ratchet.current_opponent.identity.to_json_dict(),
                         "promotions": ratchet.promotions})
         if stop_after_promotion:
             break
     return {"history": history, "promotion_checks": promotion_checks,
+            "init_mode": plan["init_mode"],
             "promotions": ratchet.promotions,
             "original_bc_e": original_bc_e.identity.to_json_dict(),
             "final_opponent": ratchet.current_opponent.identity.to_json_dict(),
@@ -648,7 +669,7 @@ def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no
         plan["e_checkpoint"],
         expected_e_history_version=plan["e_history_version"])
     config = ManagerConfig(**metadata["model_config"])
-    state, _meta = load_ppo_checkpoint(
+    state, checkpoint_meta = load_ppo_checkpoint(
         plan["checkpoint"], config=config,
         expected_e_history_version=plan["e_history_version"])
     candidate = ppo_batched_policy_from_state(
@@ -685,6 +706,8 @@ def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no
             "seed_set": plan["seed_set"],
             "candidate_identity": candidate.identity.to_json_dict(),
             "opponent_identity": frozen_policy.identity.to_json_dict(),
+            "init_mode": checkpoint_meta.get("provenance", {}).get(
+                "init_mode"),
         },
     )
     decision = evaluate_promotion(summary)

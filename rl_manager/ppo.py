@@ -131,12 +131,14 @@ class PPOTrainState:
 
 def init_train_state(frozen_params: Mapping, config: ManagerConfig, *,
                      seed: int, ppo_config: PPOConfig,
-                     model_variant: str = "E") -> PPOTrainState:
+                     model_variant: str = "E",
+                     initial_base_params: Mapping | None = None) -> PPOTrainState:
     """Mutable base copy + small value head + fresh optimizer state."""
     from rl_manager.ppo_policy import PPOPolicy  # local: avoids cycle cost
 
     policy = PPOPolicy(frozen_params, config, seed=seed,
-                       model_variant=model_variant, ppo_config=ppo_config)
+                       model_variant=model_variant, ppo_config=ppo_config,
+                       initial_base_params=initial_base_params)
     mask = frozen_leaf_mask(policy.params)
     opt_state = make_ppo_optimizer(ppo_config, mask).init(policy.params)
     return PPOTrainState(params=policy.params, opt_state=opt_state,
