@@ -2,6 +2,23 @@
 
 Last updated: 2026-08-30
 
+## Issue #35 Asymmetric Evaluation Harness
+- On branch `codex/issue-35-external-agent-match-harness`, the separate
+  `evaluation/` harness runs independent primitive controllers on each seat
+  over scalar `fast` or pinned `official` backends. Internal BC-E and PPO
+  snapshots use the existing `standard_mixed` -> daily policy -> executor
+  stack with complete seat-specific `AgentConfig` provenance; external local
+  files/extracted bundles run in persistent per-game child processes.
+- Results are strict JSON with fixed seeds, both orientations, A-perspective
+  margin/WLT, banks/statuses/runtime/trace digest, errors, and provenance.
+  Pinned source evidence supports `agent(observation)` and
+  `agent(observation, configuration)` dispatch via `co_argcount`; child
+  subprocesses are isolation from parent imports/state, not security sandboxes.
+- Local checkpoint-backed fast diagnostic completed: BC-E normal versus BC-E
+  aggressive on seed 7, both orientations, with aggressive B winning both
+  games. No P3 snapshot was available locally, so no
+  P3-vs-BC panel was run.
+
 ## Animal Crop-Sacrifice Placement Correction
 - On `codex/fix-animal-crop-sacrifice-placement`, based on
   `codex/promotion-ratchet-minimal` at `ce4f0e4`, animal

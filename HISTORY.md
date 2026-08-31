@@ -1,5 +1,27 @@
 # Kaggriculture Historical Record
 
+## 2026-08-30 - Issue #35 Asymmetric Executor / External-Agent Harness
+
+- Added a separate `evaluation/` primitive-controller loop. It accepts two
+  unrelated stateful controllers, forwards each only its own observation, runs
+  explicit `fast` or `official` scalar backends, supports both orientations,
+  validates official-shaped action containers, and emits deterministic trace
+  digests plus strict JSON panel summaries.
+- Added internal BC-E/PPO snapshot adapters over the existing `standard_mixed`
+  opening, daily policy, queued plan, and executor stack. Each seat receives a
+  separate executor config; normal BC and BC+`aggressive_sell_all` have distinct
+  identities and serialized provenance.
+- Added external local-file/extracted-bundle subprocess execution. The child
+  preserves state across turns, mirrors pinned 1.32.7 `co_argcount` dispatch
+  for `agent(obs)` / `agent(obs, configuration)`, returns traceback details,
+  and is restarted per game. ZIP packaging and security sandboxing are out of
+  scope and documented.
+- Focused harness tests passed `9`; fast PASS-vs-PASS completed deterministically
+  on seed 7 in both orientations. A real local BC-E versus PASS smoke completed
+  both orientations; a local BC-E normal versus aggressive diagnostic completed
+  2 games. P3 snapshot artifacts were not present, so the requested P3-vs-BC
+  panel was not run and no result is claimed.
+
 ## 2026-08-30 - Animal Crop-Sacrifice Placement Correction
 
 On `codex/fix-animal-crop-sacrifice-placement`, based on

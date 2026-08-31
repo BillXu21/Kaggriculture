@@ -2,6 +2,14 @@
 
 Last updated: 2026-08-30
 
+## Issue #35 Status
+- The bounded heterogeneous primitive-controller evaluation harness is
+  implemented separately from `rl_manager` training/self-play. Use fixed seed
+  lists and both seats for serious panels, and treat fast results as diagnostic
+  until the pinned official backend is available. The next operator action is
+  to supply the P3 snapshot and downloaded extracted agent paths, then run the
+  documented commands; do not tune the executor or start League V0 here.
+
 ## Animal Crop-Sacrifice Placement Correction
 - The bounded executor correction is implemented on
   `codex/fix-animal-crop-sacrifice-placement` from

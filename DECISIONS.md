@@ -2,6 +2,29 @@
 
 This file records decisions that remain authoritative across chats and work sessions. A decision should include the reason, evidence, and conditions for revisiting it.
 
+## D-051 - Keep Heterogeneous Match Evaluation Outside RL Manager
+
+- Date: 2026-08-30
+- Status: active evaluation architecture
+- Decision: Asymmetric evaluation uses a separate primitive-controller harness:
+  each seat owns an independent stateful controller and returns one official
+  JSON-shaped primitive action; the scalar fast or official backend remains the
+  transition authority. Internal controllers may use distinct BC/PPO policies,
+  openings, executor factories, and complete `AgentConfig` values. External
+  controllers execute in one persistent subprocess per seat/game over a JSONL
+  protocol.
+- Rationale: `rl_manager.runner` is intentionally optimized for one internal
+  manager-policy/executor stack and one JAX owner. Forcing external competitor
+  code or seat-specific executor construction into training would broaden the
+  ownership and determinism contract unnecessarily.
+- Evidence: Issue #35 harness tests cover deterministic fast PASS panels, seat
+  privacy/orientation, subprocess action/error handling, stable digests, and
+  pinned 1.32.7 callable dispatch evidence. Subprocess isolation prevents
+  parent import/state pollution but is not host security isolation.
+- Revisit when: external-agent throughput or real archive compatibility needs a
+  different process boundary, or a later tournament system has a concrete
+  scheduling requirement.
+
 ## D-050 - Clear Living Crops Before Animal Crop-Sacrifice Builds
 
 - Date: 2026-08-30
