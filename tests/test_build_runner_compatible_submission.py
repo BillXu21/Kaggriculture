@@ -6,7 +6,13 @@ import json
 from pathlib import Path
 import tarfile
 
-from tools.build_runner_compatible_submission import build_submission
+import pytest
+
+from tools.build_runner_compatible_submission import (
+    POLICY_CONTRACT_PPO_FROZEN_SELL,
+    POLICY_CONTRACT_SINGLE,
+    build_submission,
+)
 
 
 def _write_base_archive(path: Path) -> None:
@@ -50,22 +56,26 @@ def _extract(archive_path: Path, output: Path) -> None:
         archive.extractall(output)
 
 
-def test_builder_hardcodes_runner_compat_and_strict_runtime(tmp_path: Path) -> None:
+def test_builder_emits_dual_ppo_contract_and_d4_handoff(tmp_path: Path) -> None:
     base = tmp_path / "base.tar.gz"
-    checkpoint = tmp_path / "ppo.pt"
+    mutable = tmp_path / "ppo.pt"
+    frozen = tmp_path / "frozen.pt"
     output = tmp_path / "fixed.tar.gz"
     extracted = tmp_path / "extracted"
     extracted.mkdir()
 
     _write_base_archive(base)
-    checkpoint.write_bytes(b"new-ppo-checkpoint")
+    mutable.write_bytes(b"mutable-ppo-checkpoint")
+    frozen.write_bytes(b"frozen-bc-checkpoint")
 
     result = build_submission(
         base_archive=base,
-        checkpoint=checkpoint,
+        checkpoint=mutable,
+        frozen_checkpoint=frozen,
         output=output,
         aggressive_sell_all=False,
-        label="rl-u50",
+        label="rl-u10",
+        policy_contract=POLICY_CONTRACT_PPO_FROZEN_SELL,
     )
     _extract(output, extracted)
 
@@ -73,13 +83,29 @@ def test_builder_hardcodes_runner_compat_and_strict_runtime(tmp_path: Path) -> N
     executor_agent = (extracted / "executor_v0" / "agent.py").read_text()
     manifest = json.loads((extracted / "submission_manifest.json").read_text())
 
+    # Generated entrypoint must be syntactically valid.
+    compile(main, "main.py", "exec")
+
     assert "class RunnerParityProvider" in main
     assert "economic_prev_start = (" in main
     assert "strict=True" in main
     assert "aggressive_sell_all=False" in main
     assert "optional_spare_watering=True" in main
     assert "KAGGRICULTURE_SUBMISSION_STRICT" not in main
-    assert (extracted / "best.pt").read_bytes() == checkpoint.read_bytes()
+
+    # Critical Issue20 PPO deployment contract: use the full frozen network.
+    assert '_FROZEN_CHECKPOINT = _ROOT / "frozen_e.pt"' in main
+    assert "frozen_outputs = self._frozen.model(batch)" in main
+    assert 'outputs["sell_quantity_log1p"] = ' in main
+    assert 'frozen_outputs["sell_quantity_log1p"]' in main
+
+    # Critical opening -> manager handoff parity.
+    assert '"workers_hired": 5' in main
+    assert '"hire_cost": 12' in main
+    assert "previous_execution = dict(_OPENING_PREVIOUS_EXECUTION)" in main
+
+    assert (extracted / "best.pt").read_bytes() == mutable.read_bytes()
+    assert (extracted / "frozen_e.pt").read_bytes() == frozen.read_bytes()
 
     vendored = extracted / "executor_v0" / "_submission_market.py"
     assert vendored.is_file()
@@ -90,27 +116,55 @@ def test_builder_hardcodes_runner_compat_and_strict_runtime(tmp_path: Path) -> N
         in executor_agent
     )
 
-    assert manifest["submission_variant"] == "rl-u50"
-    assert manifest["submission_fix"] == "legacy_runner_economic_context_parity"
+    assert manifest["submission_variant"] == "rl-u10"
+    assert manifest["submission_fix"] == "issue20_runner_deployment_parity_v2"
+    assert manifest["policy_contract"] == POLICY_CONTRACT_PPO_FROZEN_SELL
     assert manifest["aggressive_sell_all"] is False
     assert manifest["optional_spare_watering"] is True
-    assert manifest["vendored_runtime_dependencies"] == [
-        "executor_v0/_submission_market.py",
-    ]
-    assert manifest["patched_runtime_imports"] == {
-        "from fast_env.market import market_price":
-            "from executor_v0._submission_market import market_price",
+    assert manifest["opening_handoff_previous_execution"] == {
+        "workers_hired": 5,
+        "hire_cost": 12,
     }
-    assert result["optional_spare_watering"] is True
+    assert manifest["ppo_deployment_contract"] == {
+        "mutable_network": "best.pt",
+        "mutable_outputs": [
+            "crop_logits",
+            "animal_logits",
+            "land_logits",
+            "fertilizer_logits",
+            "care_logits",
+            "sell_presence_logits",
+        ],
+        "frozen_network": "frozen_e.pt",
+        "frozen_outputs": ["sell_quantity_log1p"],
+    }
+    assert "ppo_full_frozen_network_sell_quantity" in manifest["submission_fixes"]
+    assert manifest["frozen_e_checkpoint_sha256"] == hashlib.sha256(
+        frozen.read_bytes()
+    ).hexdigest()
+
+    file_paths = {record["path"] for record in manifest["files"]}
+    assert "best.pt" in file_paths
+    assert "frozen_e.pt" in file_paths
+    assert "executor_v0/_submission_market.py" in file_paths
+
+    assert result["policy_contract"] == POLICY_CONTRACT_PPO_FROZEN_SELL
+    assert result["opening_handoff_previous_execution"] == {
+        "workers_hired": 5,
+        "hire_cost": 12,
+    }
     assert result["checkpoint_sha256"] == hashlib.sha256(
-        checkpoint.read_bytes()
+        mutable.read_bytes()
+    ).hexdigest()
+    assert result["frozen_e_checkpoint_sha256"] == hashlib.sha256(
+        frozen.read_bytes()
     ).hexdigest()
 
 
-def test_builder_can_emit_instant_sell_control(tmp_path: Path) -> None:
+def test_builder_single_network_contract_stays_explicit(tmp_path: Path) -> None:
     base = tmp_path / "base.tar.gz"
     checkpoint = tmp_path / "bc.pt"
-    output = tmp_path / "insta.tar.gz"
+    output = tmp_path / "single.tar.gz"
     extracted = tmp_path / "extracted"
     extracted.mkdir()
 
@@ -120,19 +174,67 @@ def test_builder_can_emit_instant_sell_control(tmp_path: Path) -> None:
     build_submission(
         base_archive=base,
         checkpoint=checkpoint,
+        frozen_checkpoint=None,
         output=output,
         aggressive_sell_all=True,
         label="bc-e-instant-sell",
+        policy_contract=POLICY_CONTRACT_SINGLE,
     )
     _extract(output, extracted)
 
     main = (extracted / "main.py").read_text()
-    executor_agent = (extracted / "executor_v0" / "agent.py").read_text()
     manifest = json.loads((extracted / "submission_manifest.json").read_text())
 
+    compile(main, "main.py", "exec")
+    assert "frozen_checkpoint_path=None" in main
     assert "aggressive_sell_all=True" in main
-    assert "optional_spare_watering=True" in main
-    assert (extracted / "executor_v0" / "_submission_market.py").is_file()
-    assert "from fast_env.market import market_price" not in executor_agent
-    assert manifest["aggressive_sell_all"] is True
-    assert manifest["optional_spare_watering"] is True
+    assert not (extracted / "frozen_e.pt").exists()
+    assert manifest["policy_contract"] == POLICY_CONTRACT_SINGLE
+    assert manifest["ppo_deployment_contract"] is None
+    assert "frozen_e_checkpoint_sha256" not in manifest
+
+
+def test_builder_refuses_ppo_contract_without_frozen_checkpoint(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base.tar.gz"
+    checkpoint = tmp_path / "ppo.pt"
+    output = tmp_path / "bad.tar.gz"
+
+    _write_base_archive(base)
+    checkpoint.write_bytes(b"ppo")
+
+    with pytest.raises(ValueError, match="requires --frozen-checkpoint"):
+        build_submission(
+            base_archive=base,
+            checkpoint=checkpoint,
+            frozen_checkpoint=None,
+            output=output,
+            aggressive_sell_all=False,
+            label="rl-u10",
+            policy_contract=POLICY_CONTRACT_PPO_FROZEN_SELL,
+        )
+
+
+def test_builder_refuses_frozen_checkpoint_under_single_contract(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base.tar.gz"
+    checkpoint = tmp_path / "bc.pt"
+    frozen = tmp_path / "frozen.pt"
+    output = tmp_path / "bad.tar.gz"
+
+    _write_base_archive(base)
+    checkpoint.write_bytes(b"bc")
+    frozen.write_bytes(b"frozen")
+
+    with pytest.raises(ValueError, match="does not accept --frozen-checkpoint"):
+        build_submission(
+            base_archive=base,
+            checkpoint=checkpoint,
+            frozen_checkpoint=frozen,
+            output=output,
+            aggressive_sell_all=False,
+            label="bc",
+            policy_contract=POLICY_CONTRACT_SINGLE,
+        )
