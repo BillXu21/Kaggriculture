@@ -29,6 +29,7 @@ The audit uses a deterministic synthetic E_LEGACY manager batch and checks:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -299,7 +300,7 @@ def main() -> int:
 
     if mutable.model_config != frozen.model_config:
         raise RuntimeError("mutable/frozen Torch ManagerConfig mismatch")
-    if mutable.model_config != config:
+    if dataclasses.asdict(mutable.model_config) != dataclasses.asdict(config):
         raise RuntimeError("Torch/JAX ManagerConfig mismatch")
     if mutable.model_variant != frozen.model_variant:
         raise RuntimeError("mutable/frozen Torch model_variant mismatch")
