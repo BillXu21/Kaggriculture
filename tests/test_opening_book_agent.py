@@ -113,6 +113,26 @@ def test_full_96_turn_playback_then_exact_d4h0_handoff(trace):
     assert diag["handoff"]["clean_d4h0_handoff"] is True
 
 
+@pytest.mark.parametrize(
+    ("identity", "seat"),
+    [("fourth_quadrant_s0", 0), ("fourth_quadrant_s1", 1)],
+)
+def test_fourth_quadrant_traces_play_96_turns_then_handoff(identity, seat):
+    trace = load_built_in_trace(identity)
+    downstream = RecordingDownstream()
+    agent = make_opening_agent(identity, downstream=downstream, seat=seat)
+    for day, hour in HORIZON:
+        assert agent(make_obs(trace, day, hour, seat=seat)) \
+            == trace["turns"][day * 24 + hour]["action"]
+    handoff = make_obs(trace, 4, 0, seat=seat)
+    assert agent(handoff) is downstream.result
+    diagnostics = agent.diagnostics_json()
+    assert diagnostics["opening"] == identity
+    assert diagnostics["turns_replayed"] == 96
+    assert diagnostics["divergence"]["occurred"] is False
+    assert diagnostics["handoff"]["clean_d4h0_handoff"] is True
+
+
 def test_d3h23_boundary_and_all_later_calls_delegated(trace):
     downstream = RecordingDownstream()
     agent = make_opening_agent(downstream=downstream, seat=0)

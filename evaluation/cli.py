@@ -68,6 +68,7 @@ def _factory(
     config_path: str | None,
     aggressive: bool,
     opening: str,
+    opening_names: tuple[str, str] | None = None,
 ) -> Any:
     if spec == "pass":
         return PassControllerFactory(display_name=name or "PASS")
@@ -96,6 +97,7 @@ def _factory(
         executor_config=_config(config_path, aggressive),
         display_name=name,
         opening_name=opening,
+        opening_names=opening_names,
     )
 
 
@@ -113,6 +115,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--b-aggressive-sell", action="store_true")
     parser.add_argument("--a-opening", default="standard_mixed")
     parser.add_argument("--b-opening", default="standard_mixed")
+    parser.add_argument("--a-opening-s0")
+    parser.add_argument("--a-opening-s1")
+    parser.add_argument("--b-opening-s0")
+    parser.add_argument("--b-opening-s1")
     parser.add_argument("--external-timeout", type=float, default=None)
     parser.add_argument("--backend", choices=("fast", "official"), default="fast")
     parser.add_argument("--seeds", nargs="+", default=["0"], metavar="SEED|START..END")
@@ -128,6 +134,11 @@ def main(argv: list[str] | None = None) -> int:
     seeds = _seed_values(args.seeds)
     if args.num_threads < 1:
         raise ValueError("--num-threads must be positive")
+    def opening_names(seat0: str | None, seat1: str | None) -> tuple[str, str] | None:
+        if (seat0 is None) != (seat1 is None):
+            raise ValueError("per-seat opening requires both seat-0 and seat-1 names")
+        return (seat0, seat1) if seat0 is not None and seat1 is not None else None
+
     factory_a = _factory(
         args.a,
         name=args.a_name,
@@ -136,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         config_path=args.a_config,
         aggressive=args.a_aggressive_sell,
         opening=args.a_opening,
+        opening_names=opening_names(args.a_opening_s0, args.a_opening_s1),
     )
     factory_b = _factory(
         args.b,
@@ -145,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         config_path=args.b_config,
         aggressive=args.b_aggressive_sell,
         opening=args.b_opening,
+        opening_names=opening_names(args.b_opening_s0, args.b_opening_s1),
     )
     backend_configuration = {"seed": 0, "numThreads": args.num_threads}
     print(

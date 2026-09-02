@@ -10,8 +10,10 @@ import sys
 import pytest
 
 from evaluation.agent_match import normalize_action, run_match, run_panel
+from evaluation.cli import build_parser
 from evaluation.external import ExternalControllerFactory, bundle_digest
 from evaluation.internal import (
+    InternalControllerFactory,
     PassControllerFactory,
     load_internal_factory,
     make_agent_config,
@@ -160,6 +162,44 @@ def test_agent_config_serialization_distinguishes_aggressive_seat():
     assert normal.aggressive_sell_all is False
     assert aggressive.aggressive_sell_all is True
     assert json.dumps(normal.__dict__, default=str)
+
+
+def test_internal_factory_selects_explicit_opening_per_seat():
+    class Executor:
+        def __call__(self, observation):
+            return {"farmer": ["PASS"], "hands": [], "market": []}
+
+    class Factory:
+        name = "test-executor"
+        version = "test-v1"
+
+        def create(self, **kwargs):
+            del kwargs
+            return Executor()
+
+    factory = InternalControllerFactory(
+        policy=object(),
+        executor_config=make_agent_config(),
+        opening_names=("fourth_quadrant_s0", "fourth_quadrant_s1"),
+        executor_factory=Factory(),
+    )
+    assert factory.create(seat=0, configuration={}).opening._identity \
+        == "fourth_quadrant_s0"
+    assert factory.create(seat=1, configuration={}).opening._identity \
+        == "fourth_quadrant_s1"
+    provenance = factory.provenance["opening"]
+    assert [item["name"] for item in provenance["by_seat"]] == [
+        "fourth_quadrant_s0", "fourth_quadrant_s1"]
+
+
+def test_evaluation_cli_exposes_optional_per_seat_opening_flags():
+    args = build_parser().parse_args([
+        "--a-opening-s0", "fourth_quadrant_s0",
+        "--a-opening-s1", "fourth_quadrant_s1",
+        "--output", "panel.json",
+    ])
+    assert (args.a_opening_s0, args.a_opening_s1) == (
+        "fourth_quadrant_s0", "fourth_quadrant_s1")
 
 
 def test_internal_bc_identity_and_executor_provenance_are_stable():

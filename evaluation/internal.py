@@ -20,6 +20,7 @@ from replay_daily.constants import total_hire_cost
 from rl_manager.decode import plans_from_action_tensors
 from rl_manager.executor_factory import EXECUTOR_FACTORY_VERSION
 from rl_manager.provider import QueuedPlanProvider
+from rl_manager.provenance import opening_provenance
 
 
 def _repository_commit() -> str | None:
@@ -188,10 +189,18 @@ class InternalControllerFactory:
     policy_source: Mapping[str, Any] | None = None
     executor_factory: Any | None = None
     e_history_version: str | None = None
+    opening_names: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.executor_config, AgentConfig):
             raise TypeError("executor_config must be an AgentConfig")
+        if (self.opening_names is not None
+                and (not isinstance(self.opening_names, tuple)
+                     or len(self.opening_names) != 2
+                     or any(not isinstance(name, str) or not name
+                            for name in self.opening_names))):
+            raise ValueError(
+                "opening_names must be a (seat-0, seat-1) string tuple")
         self._executor_factory = self.executor_factory
         if self.e_history_version is None:
             self.e_history_version = getattr(
@@ -205,6 +214,20 @@ class InternalControllerFactory:
         checkpoint_digest = None
         if self.checkpoint_path:
             checkpoint_digest = sha256_file(self.checkpoint_path)
+        opening = (
+            {
+                "mode": "per_seat",
+                "by_seat": [
+                    {"seat": seat, **_opening_provenance(name)}
+                    for seat, name in enumerate(self.opening_names)
+                ],
+            }
+            if self.opening_names is not None else
+            {
+                "name": self.opening_name,
+                "identity": _opening_identity(self.opening_name),
+            }
+        )
         return {
             "display_name": self.display_name,
             "kind": "internal",
@@ -213,10 +236,7 @@ class InternalControllerFactory:
             "policy_source": dict(self.policy_source or {}),
             "checkpoint_path": self.checkpoint_path,
             "checkpoint_sha256": checkpoint_digest,
-            "opening": {
-                "name": self.opening_name,
-                "identity": _opening_identity(self.opening_name),
-            },
+            "opening": opening,
             "executor_factory": {
                 "name": getattr(self._factory(), "name", "executor_v0"),
                 "version": getattr(
@@ -245,7 +265,9 @@ class InternalControllerFactory:
         return InternalController(
             seat=seat,
             policy=self.policy,
-            opening_name=self.opening_name,
+            opening_name=(self.opening_names[seat]
+                          if self.opening_names is not None
+                          else self.opening_name),
             executor_factory=self._factory(),
             configuration=configuration,
             e_history_version=self.e_history_version,
@@ -264,6 +286,16 @@ def _opening_identity(name: str) -> str:
     from rl_manager.provenance import opening_provenance
 
     return str(opening_provenance(name)["digest"])
+
+
+def _opening_provenance(name: str) -> dict[str, Any]:
+    """Return the full built-in opening identity used by runner provenance."""
+    provenance = dict(opening_provenance(name))
+    return {
+        "name": provenance["name"],
+        "identity": provenance["digest"],
+        "source_provenance": provenance["source_provenance"],
+    }
 
 
 def make_agent_config(
@@ -300,6 +332,7 @@ def load_internal_factory(
     executor_config: AgentConfig,
     display_name: str | None = None,
     opening_name: str = "standard_mixed",
+    opening_names: tuple[str, str] | None = None,
 ) -> InternalControllerFactory:
     """Load BC-E or a detached PPO snapshot through existing loaders."""
     path = Path(checkpoint_path)
@@ -344,6 +377,7 @@ def load_internal_factory(
         policy=policy,
         executor_config=executor_config,
         opening_name=opening_name,
+        opening_names=opening_names,
         display_name=display_name or getattr(policy.identity, "name", kind),
         checkpoint_path=str(path),
         policy_source={

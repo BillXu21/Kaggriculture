@@ -278,6 +278,88 @@ def test_full_game_opening_handoff_and_episode_digest(tiny_e):
     assert result.trace_digest == game["results"][1].trace_digest
 
 
+def test_runner_accepts_explicit_seat_openings_and_records_both_provenances():
+    config = _runner_config(
+        openings=("fourth_quadrant_s0", "fourth_quadrant_s1"))
+    assert config.opening_for_seat(0) == "fourth_quadrant_s0"
+    assert config.opening_for_seat(1) == "fourth_quadrant_s1"
+    runner = SelfPlayRunner(config, executor_factory=_TraceExecutorFactory())
+    opening = runner.provenance["opening"]
+    assert opening["mode"] == "per_seat"
+    assert [record["seat"] for record in opening["by_seat"]] == [0, 1]
+    assert [record["name"] for record in opening["by_seat"]] == [
+        "fourth_quadrant_s0", "fourth_quadrant_s1"]
+    assert [record["source_provenance"]["source_seat"]
+            for record in opening["by_seat"]] == [0, 1]
+    assert opening["by_seat"][0]["digest"] != opening["by_seat"][1]["digest"]
+
+
+def test_runner_single_opening_keeps_legacy_resolution_and_provenance():
+    config = _runner_config(opening="pasture_heavy")
+    assert config.opening_for_seat(0) == config.opening_for_seat(1) \
+        == "pasture_heavy"
+    runner = SelfPlayRunner(config, executor_factory=_TraceExecutorFactory())
+    assert runner.provenance["opening"]["name"] == "pasture_heavy"
+
+
+def test_runner_d4_previous_execution_uses_realized_d3_hires(monkeypatch):
+    """The FQ trace reaches d4 with observed labor, not HIRE intent counts."""
+    from oracle.backend import make_backend as make_real_backend
+
+    class CapturingPolicy(_ConstantPlanPolicy):
+        def __init__(self):
+            super().__init__("capture-d3-hires")
+            self.d4_scalars = None
+
+        def plan_batch(self, inputs, prng_id):
+            if int(inputs["day"][0]) == 4:
+                self.d4_scalars = inputs["scalars"].copy()
+            return super().plan_batch(inputs, prng_id)
+
+    class RecordingBackend:
+        name = "fast"
+
+        def __init__(self, configuration):
+            self._backend = make_real_backend("fast", configuration)
+
+        def reset(self):
+            return self._backend.reset()
+
+        def canonical_state(self):
+            return self._backend.canonical_state()
+
+        def step(self, actions):
+            return self._backend.step(actions)
+
+        @property
+        def rewards(self):
+            return self._backend.rewards
+
+        @property
+        def statuses(self):
+            return self._backend.statuses
+
+    monkeypatch.setattr(
+        "rl_manager.runner.make_backend",
+        lambda name, configuration: RecordingBackend(configuration),
+    )
+    policy = CapturingPolicy()
+    runner = SelfPlayRunner(
+        _runner_config(
+            openings=("fourth_quadrant_s0", "standard_mixed"),
+            max_turns=97,
+        ),
+        master_seed=17,
+    )
+    result = runner.run([build_episode_spec(0, 17, E_VS_E, policy, policy)])[0]
+    assert all(d["divergence"]["occurred"] is False
+               for d in result.opening_diagnostics)
+    assert policy.d4_scalars is not None
+    # Fast-engine d3 observations realize 6 and 5 hires for this fixed pair;
+    # the corresponding costs are 20 and 12, respectively.
+    assert policy.d4_scalars[:, 2:4].tolist() == [[6.0, 20.0], [5.0, 12.0]]
+
+
 def test_artifact_save_load_records_mandatory_provenance_automatically(
         tmp_path: Path, tiny_e):
     """Issue #9 A1 correction: `save_trajectory_artifact` merges episode

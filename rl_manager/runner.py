@@ -141,8 +141,15 @@ class RunnerConfig:
     debug_trace_seat: int | None = None  # requested private-seat/view selector
     debug_trace_view: str = "joint"
     reward_config: RewardConfig = field(default_factory=RewardConfig)
+    openings: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
+        if self.openings is not None:
+            if (not isinstance(self.openings, tuple)
+                    or len(self.openings) != 2
+                    or any(not isinstance(name, str) or not name
+                           for name in self.openings)):
+                raise ValueError("openings must be a (seat-0, seat-1) string tuple")
         object.__setattr__(
             self, "e_history_version",
             normalize_e_history_version(self.e_history_version))
@@ -161,6 +168,12 @@ class RunnerConfig:
                 or self.inference_batch_wait_seconds < 0):
             raise ValueError(
                 "inference_batch_wait_seconds must be finite and >= 0")
+
+    def opening_for_seat(self, seat: int) -> str:
+        """Resolve the configured opening without changing single-name behavior."""
+        if seat not in (0, 1):
+            raise ValueError(f"seat must be 0 or 1, got {seat!r}")
+        return self.openings[seat] if self.openings is not None else self.opening
 
 
 @dataclass(frozen=True)
@@ -262,6 +275,19 @@ def _executor_factory_provenance(factory: Any) -> dict[str, Any]:
         "version": version,
         "identifier": identifier,
         "version_sha256": sha256_hex(identifier),
+    }
+
+
+def _runner_opening_provenance(config: RunnerConfig) -> dict[str, Any]:
+    """Keep legacy provenance for one opening; enumerate explicit seat choices."""
+    if config.openings is None:
+        return opening_provenance(config.opening)
+    return {
+        "mode": "per_seat",
+        "by_seat": [
+            {"seat": seat, **opening_provenance(config.opening_for_seat(seat))}
+            for seat in (0, 1)
+        ],
     }
 
 
@@ -424,7 +450,7 @@ class _EpisodeState:
                 configuration=configuration, provider=self.providers[seat])
             self.executors.append(executor)
             self.openings.append(
-                make_opening_agent(config.opening, downstream=executor,
+                make_opening_agent(config.opening_for_seat(seat), downstream=executor,
                                    seat=seat))
         # Runner-owned per-seat tracking (exact E history semantics).
         self.last_seen_day = [-1, -1]
@@ -709,7 +735,7 @@ class SelfPlayRunner:
             "manager_inference": 0.0, "agent_actions": 0.0,
             "env_step": 0.0, "orchestration": 0.0}
         self.provenance: dict[str, Any] = {
-            "opening": opening_provenance(config.opening),
+            "opening": _runner_opening_provenance(config),
             "backend": backend_provenance(
                 config.backend_name, config.backend_configuration),
             "executor_factory": self.executor_factory,

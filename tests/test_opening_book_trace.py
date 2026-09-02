@@ -69,7 +69,8 @@ def synthetic_replay_path(tmp_path):
 
 def test_built_in_identities_and_default():
     assert built_in_identities() == (
-        "standard_mixed", "pasture_heavy", "carrot_start"
+        "standard_mixed", "pasture_heavy", "carrot_start",
+        "fourth_quadrant_s0", "fourth_quadrant_s1"
     )
     assert DEFAULT_IDENTITY == "standard_mixed"
     for identity in built_in_identities():
@@ -136,6 +137,37 @@ def test_builtin_provenance_records_source_seat_and_digest():
         assert doc["content_digest"] == compute_content_digest(doc["turns"])
     # The opening book supports source traces from either seat.
     assert seen_seats <= {0, 1}
+
+
+def test_fourth_quadrant_trace_provenance_is_stable():
+    expected = {
+        "fourth_quadrant_s0": {
+            "source_episode": 104670896,
+            "source_seat": 0,
+            "source_seed": 144368101,
+            "source_player": "Fourth Quadrant",
+            "source_replay_sha256":
+                "71eff635ee2ce8c95bf80e95665169bea4839b23d8cc2a6b6aaf7c73c9286f20",
+        },
+        "fourth_quadrant_s1": {
+            "source_episode": 104671727,
+            "source_seat": 1,
+            "source_seed": 752669175,
+            "source_player": "Fourth Quadrant",
+            "source_replay_sha256":
+                "6071dad82af38ccbd82fd7dffea10182c634ab7e3bc91b7156bb128f76632ffa",
+        },
+    }
+    expected_digests = {
+        "fourth_quadrant_s0":
+            "55ab1e931d83b9bc07bf52ab517f9f0fd3d2cc1f26156a07174f9a04e0973f9a",
+        "fourth_quadrant_s1":
+            "3304cc35a91c3986be4f224d45f0efe9f19e7ab567199b2e5f584f86204945ed",
+    }
+    for identity, provenance in expected.items():
+        doc = load_built_in_trace(identity)
+        assert doc["provenance"] == provenance
+        assert doc["content_digest"] == expected_digests[identity]
 
 
 # ---------------------------------------------------------------------------
