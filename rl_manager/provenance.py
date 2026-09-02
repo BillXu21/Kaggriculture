@@ -1,8 +1,8 @@
 """Provenance helpers: opening/backend/engine/policy identity capture.
 
-Every episode records exact engine provenance, opening name + digest, and
-policy/opponent snapshot identities so any stored trajectory can be tied to
-the exact stack that produced it.
+Every episode records exact engine provenance, opening identity (and a trace
+digest when an opening trace exists), and policy/opponent snapshot identities
+so any stored trajectory can be tied to the exact stack that produced it.
 """
 
 from __future__ import annotations
@@ -23,7 +23,9 @@ def sha256_hex(text: str) -> str:
 
 
 def opening_provenance(opening_name: str) -> dict[str, Any]:
-    """Built-in opening identity: name plus sha256 of its canonical trace."""
+    """Return an opening identity, hashing only trace-backed openings."""
+    if opening_name == "none":
+        return {"name": "none"}
     from opening_book.trace import load_built_in_trace
 
     trace = load_built_in_trace(opening_name)

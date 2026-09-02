@@ -38,6 +38,7 @@ from rl_manager.runner import (
     MANAGER_START_DAY,
     RunnerConfig,
     SelfPlayRunner,
+    build_artifact_metadata,
     build_episode_spec,
 )
 from rl_manager.seeds import SeedStream
@@ -300,6 +301,56 @@ def test_runner_single_opening_keeps_legacy_resolution_and_provenance():
         == "pasture_heavy"
     runner = SelfPlayRunner(config, executor_factory=_TraceExecutorFactory())
     assert runner.provenance["opening"]["name"] == "pasture_heavy"
+
+
+def test_no_opening_calls_manager_and_executor_at_d0(monkeypatch):
+    class ImmediateExecutor(_TraceExecutor):
+        def __init__(self, seat):
+            super().__init__(seat)
+            self.calls = []
+
+        def __call__(self, obs):
+            self.calls.append((int(obs["day"]), int(obs["hour"])))
+            return {"farmer": ["EXECUTOR"], "hands": [], "market": []}
+
+    class ImmediateExecutorFactory(_TraceExecutorFactory):
+        def __init__(self):
+            self.created = []
+
+        def create(self, *, backend_name, seat, configuration, provider):
+            del backend_name, configuration, provider
+            executor = ImmediateExecutor(seat)
+            self.created.append(executor)
+            return executor
+
+    def fail_opening(*args, **kwargs):
+        raise AssertionError("no-opening mode must not construct an opener")
+
+    monkeypatch.setattr("rl_manager.runner.make_opening_agent", fail_opening)
+    monkeypatch.setattr(
+        "rl_manager.runner.make_backend",
+        lambda name, configuration: _TraceBackend(configuration),
+    )
+    policy = _ConstantPlanPolicy("no-opening")
+    factory = ImmediateExecutorFactory()
+    buffer = TrajectoryBuffer(capacity=2, input_spec=e_input_spec())
+    runner = SelfPlayRunner(
+        _runner_config(opening="none", manager_start_day=0, max_turns=1),
+        trajectory_buffer=buffer, executor_factory=factory,
+        master_seed=MASTER_SEED)
+    result = runner.run([
+        build_episode_spec(0, MASTER_SEED, E_VS_E, policy, policy)])[0]
+
+    assert policy.calls == [(policy.identity.identity_id(), 0, 2)]
+    assert [executor.calls for executor in factory.created] == [
+        [(0, 0)], [(0, 0)]]
+    assert result.transitions == 2
+    assert all(record["opening"] == "none"
+               and record["turns_replayed"] == 0
+               for record in result.opening_diagnostics)
+    metadata = build_artifact_metadata(runner.provenance, result)
+    assert metadata["opening"] == {"name": "none"}
+    assert metadata["manager_start_day"] == 0
 
 
 def test_runner_d4_previous_execution_uses_realized_d3_hires(monkeypatch):

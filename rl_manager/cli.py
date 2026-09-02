@@ -38,6 +38,7 @@ from bc_manager.economics import (
     E_HISTORY_VERSIONS,
     normalize_e_history_version,
 )
+from bc_manager.constants import TOTAL_DAYS
 from rl_manager.ratchet import PromotionRatchet
 from rl_manager.runner import GAME_TURNS
 from rl_manager.runner import INFERENCE_BATCH_SCOPES
@@ -100,6 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
                        choices=sorted(EXECUTOR_FACTORIES),
                        help="Explicit executor factory selection.")
     train.add_argument("--backend", default="fast", choices=KNOWN_BACKENDS)
+    train.add_argument("--opening", default="standard_mixed")
+    train.add_argument("--manager-start-day", type=int, default=4)
     train.add_argument("--master-seed", type=int, required=True)
     train.add_argument("--init-mode", choices=("bc", "scratch"),
                        default="bc",
@@ -133,9 +136,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop after this many accepted promotions.")
     train.add_argument("--epochs", type=int, default=4)
     train.add_argument("--minibatch-size", type=int, default=8,
-                       help="Must divide the expected complete-game row "
-                            "count (episodes_per_update * 26); checked at "
-                            "plan time before any rollout.")
+                        help="Must divide the expected complete-game row "
+                             "count; checked at "
+                             "plan time before any rollout.")
     train.add_argument("--lr", type=float, default=3e-4)
     train.add_argument("--kl-to-frozen-coef", type=float, default=0.0)
     train.add_argument("--target-kl", type=float, default=None,
@@ -285,6 +288,13 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
     plan = _validate_common(args)
     if args.master_seed < 0:
         raise ValueError("--master-seed must be nonnegative")
+    opening = str(getattr(args, "opening", "standard_mixed"))
+    if not opening:
+        raise ValueError("--opening must be non-empty")
+    manager_start_day = int(getattr(args, "manager_start_day", 4))
+    if not 0 <= manager_start_day < TOTAL_DAYS:
+        raise ValueError(
+            f"--manager-start-day must be in [0, {TOTAL_DAYS - 1}]")
     init_mode = str(getattr(args, "init_mode", "bc"))
     if init_mode not in ("bc", "scratch"):
         raise ValueError("--init-mode must be one of ('bc', 'scratch')")
@@ -316,12 +326,13 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--max-promotions must be >= 1")
     if max_promotions is not None and promotion_every == 0:
         raise ValueError("--max-promotions requires --promotion-every")
-    # Plan-time divisibility check: complete d4..29 games yield exactly
-    # episodes_per_update * 26 candidate manager rows. The runtime
+    # Plan-time divisibility check for complete manager horizons. The runtime
     # `ppo_update` strict check remains authoritative for truncations and
     # actual row counts; this only catches incompatible plans BEFORE any
     # env/checkpoint-heavy work.
-    rows_per_game = (52 if composition == CURRENT_VS_CURRENT_ECONOMIC else 26)
+    decisions_per_seat = TOTAL_DAYS - manager_start_day
+    rows_per_game = decisions_per_seat * (
+        2 if composition == CURRENT_VS_CURRENT_ECONOMIC else 1)
     expected_rows = int(args.episodes_per_update) * rows_per_game
     if expected_rows % int(args.minibatch_size) != 0:
         raise ValueError(
@@ -334,11 +345,15 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
         "mode": "train",
         "e_checkpoint": str(Path(args.e_checkpoint)),
         "master_seed": int(args.master_seed),
+        "opening": opening,
+        "manager_start_day": manager_start_day,
+        "manager_decisions_per_seat": decisions_per_seat,
         "init_mode": init_mode,
         "training_composition": composition,
         "reward": reward_config.to_json_dict(),
         "expected_trainable_rows": expected_rows,
-        "expected_trajectory_rows": int(args.episodes_per_update) * 2 * 26,
+        "expected_trajectory_rows": (
+            int(args.episodes_per_update) * 2 * decisions_per_seat),
         "rows_per_complete_game": rows_per_game,
         "episodes_per_update": int(args.episodes_per_update),
         "updates": int(args.updates),
@@ -538,6 +553,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
             backend_configuration={"seed": 0,
                                    "numThreads": plan["knobs"]["num_threads"]},
             num_envs=plan["knobs"]["num_envs"],
+            opening=plan["opening"],
+            manager_start_day=plan["manager_start_day"],
             e_history_version=plan["e_history_version"],
             reward_config=RewardConfig(**plan["reward"]),
             **plan["runner_options"])

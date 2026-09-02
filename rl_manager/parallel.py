@@ -35,13 +35,13 @@ from rl_manager.parallel_protocol import (
     WorkerTask,
 )
 from rl_manager.parallel_worker import worker_main
+from bc_manager.constants import TOTAL_DAYS
 from rl_manager.provenance import backend_provenance, opening_provenance
 from rl_manager.runner import (
     EpisodeResult,
     EpisodeSpec,
     RunnerConfig,
     SelfPlayRunner,
-    TOTAL_MANAGER_DAYS,
     build_artifact_metadata,
 )
 from rl_manager.trajectory import TrajectoryBuffer, Transition
@@ -272,7 +272,8 @@ class ParallelSelfPlayRunner:
         shard_capacity = None
         if self.buffer is not None:
             shard_capacity = max(1, max(
-                len(groups[worker]) * 2 * TOTAL_MANAGER_DAYS
+                len(groups[worker]) * 2
+                * (TOTAL_DAYS - self.config.manager_start_day)
                 for worker in range(self.num_workers)))
         owner_pid = mp.current_process().pid
         for worker_id in range(self.num_workers):

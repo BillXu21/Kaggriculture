@@ -37,7 +37,7 @@ from rl_manager.policy import params_fingerprint
 from rl_manager.ppo import init_train_state
 from rl_manager.ppo_policy import PPOConfig
 from rl_manager.runner import build_episode_spec
-from rl_manager.types import E_VS_E, E_VS_PASS
+from rl_manager.types import CURRENT_VS_CURRENT_ECONOMIC, E_VS_E, E_VS_PASS
 from tests.test_rl_manager_runner import (
     _ConstantPlanPolicy,
     _TraceBackend,
@@ -99,6 +99,8 @@ def test_parser_defaults_are_safe_single_process():
         "out/ppo.npz"])
     assert (args.num_workers, args.num_envs, args.num_threads) == (1, 1, 1)
     assert args.backend == "fast"
+    assert args.opening == "standard_mixed"
+    assert args.manager_start_day == 4
     assert args.init_mode == "bc"
     assert not args.low_telemetry
     assert not args.read_only_agent_observations
@@ -368,6 +370,39 @@ def test_train_plan_rejects_minibatch_incompatible_with_expected_rows(
     # A divisor of 208 is accepted.
     plan = plan_training(_train_args(**base, minibatch_size=104))
     assert plan["ppo"]["minibatch_size"] == 104
+
+
+def test_train_plan_no_opening_uses_30_decisions_per_seat(tmp_path):
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    args = build_parser().parse_args([
+        "train", "--e-checkpoint", str(checkpoint),
+        "--executor-factory", "executor_v0@stage-a-v1", "--master-seed", "17",
+        "--opening", "none", "--manager-start-day", "0",
+        "--episodes-per-update", "1", "--minibatch-size", "30",
+        "--output-dir", "out", "--checkpoint", "out/ppo.npz",
+    ])
+    plan = plan_training(args)
+    assert plan["opening"] == "none"
+    assert plan["manager_start_day"] == 0
+    assert plan["manager_decisions_per_seat"] == 30
+    assert plan["rows_per_complete_game"] == 30
+    assert plan["expected_trainable_rows"] == 30
+    assert plan["expected_trajectory_rows"] == 60
+
+    economic = plan_training(args.__class__(**{
+        **vars(args),
+        "training_composition": CURRENT_VS_CURRENT_ECONOMIC,
+        "reward_mode": "terminal_own_bank",
+        "minibatch_size": 60,
+    }))
+    assert economic["rows_per_complete_game"] == 60
+    assert economic["expected_trainable_rows"] == 60
+    assert economic["expected_trajectory_rows"] == 60
+
+    with pytest.raises(ValueError, match="must divide"):
+        plan_training(args.__class__(**{
+            **vars(args), "minibatch_size": 16}))
 
 
 def test_train_plan_full_fields(tmp_path):

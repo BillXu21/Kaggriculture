@@ -74,7 +74,7 @@ from rl_manager.types import (
 )
 
 MANAGER_START_DAY = 4
-TOTAL_MANAGER_DAYS = TOTAL_DAYS - MANAGER_START_DAY  # 26 decisions/seat
+TOTAL_MANAGER_DAYS = TOTAL_DAYS - MANAGER_START_DAY  # default d4..d29 horizon
 GAME_TURNS = 719  # post-reset primitive turns in one 720-step game
 INFERENCE_BATCH_SCOPES = ("policy_day", "policy")
 InferenceBatchScope = Literal["policy_day", "policy"]
@@ -144,6 +144,11 @@ class RunnerConfig:
     openings: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
+        if (isinstance(self.manager_start_day, bool)
+                or not isinstance(self.manager_start_day, int)
+                or not 0 <= self.manager_start_day < TOTAL_DAYS):
+            raise ValueError(
+                f"manager_start_day must be an int in [0, {TOTAL_DAYS - 1}]")
         if self.openings is not None:
             if (not isinstance(self.openings, tuple)
                     or len(self.openings) != 2
@@ -337,7 +342,8 @@ def build_artifact_metadata(
 ) -> dict[str, Any]:
     """Typed automatic artifact metadata for one episode's trajectory save.
 
-    Merges the runner provenance snapshot (opening identity/digest, backend/
+    Merges the runner provenance snapshot (opening identity/digest when
+    applicable, backend/
     engine provenance, executor factory version/hash/identifier, master seed,
     manager start day) with the exact per-episode outcome (final banks,
     margin, winner, rewards, terminal statuses, episode trace digest, trace
@@ -438,20 +444,28 @@ class _EpisodeState:
         factory = provenance["executor_factory"]
         self.executors = []
         self.openings = []
+        self.action_agents = []
         for seat in range(2):
             if (spec.composition == E_VS_PASS
                     and seat != spec.controlled_seat):
                 pass_agent = _PassAgent(seat)
                 self.executors.append(pass_agent)
                 self.openings.append(pass_agent)
+                self.action_agents.append(pass_agent)
                 continue
             executor = factory.create(
                 backend_name=config.backend_name, seat=seat,
                 configuration=configuration, provider=self.providers[seat])
             self.executors.append(executor)
-            self.openings.append(
-                make_opening_agent(config.opening_for_seat(seat), downstream=executor,
-                                   seat=seat))
+            opening = config.opening_for_seat(seat)
+            if opening == "none":
+                self.openings.append(None)
+                self.action_agents.append(executor)
+            else:
+                opening_agent = make_opening_agent(
+                    opening, downstream=executor, seat=seat)
+                self.openings.append(opening_agent)
+                self.action_agents.append(opening_agent)
         # Runner-owned per-seat tracking (exact E history semantics).
         self.last_seen_day = [-1, -1]
         self.current_daily_start: list[tuple[int, float] | None] = [None, None]
@@ -797,7 +811,7 @@ class SelfPlayRunner:
                 observations = (
                     state.agent_obs if state.config.read_only_agent_observations
                     else [copy.deepcopy(view) for view in state.obs])
-                actions = [state.openings[seat](observations[seat])
+                actions = [state.action_agents[seat](observations[seat])
                            for seat in range(2)]
                 day = int(state.obs[0]["day"])
                 hour = int(state.obs[0]["hour"])
@@ -891,7 +905,7 @@ class SelfPlayRunner:
                     state.agent_obs
                     if state.config.read_only_agent_observations
                     else [copy.deepcopy(view) for view in state.obs])
-                actions = [state.openings[seat](observations[seat])
+                actions = [state.action_agents[seat](observations[seat])
                            for seat in range(2)]
                 day = int(state.obs[0]["day"])
                 hour = int(state.obs[0]["hour"])
@@ -1114,8 +1128,16 @@ class SelfPlayRunner:
                         self.buffer.patch_truncated(last_index)
             self._patch_executor_diagnostics(state)
 
-        opening_diagnostics = [agent.diagnostics_json()
-                               for agent in state.openings]
+        opening_diagnostics = [
+            (agent.diagnostics_json() if agent is not None else {
+                "schema_version": 1,
+                "opening": "none",
+                "seat": seat,
+                "turns_replayed": 0,
+                "divergence": {"occurred": False},
+                "fallback_active": False,
+            })
+            for seat, agent in enumerate(state.openings)]
         executor_diagnostics: list[dict[str, Any]] = []
         for seat, executor in enumerate(state.executors):
             try:
