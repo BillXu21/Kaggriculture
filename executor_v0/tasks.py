@@ -39,7 +39,7 @@ from executor_v0.layout import (
     tile_role,
 )
 from executor_v0.plan import DailyPlan
-from replay_daily.constants import ANIMALS, CROPS, LAND_ORDER, PRODUCTS
+from replay_daily.constants import CROPS, LAND_ORDER, PRODUCTS
 from replay_daily.lifecycle import canonical_board
 
 __all__ = [
@@ -522,24 +522,28 @@ def generate_tasks(
         unresolved.append(f"crop_deficit_unresolved:{crop}:{count}")
 
     # ---- MANAGER: animal deficits --------------------------------------
-    # Prerequisite gating (issue #7): a BUILD is only emitted when its PLACE
-    # can plausibly execute today -- the animal is already owned (shed or
-    # carried) or affordable at current cash. Otherwise the structure would
-    # sit empty; the deficit resurfaces automatically once cash/animals
-    # change because tasks regenerate every turn.
-    place_keys_by_animal: dict[str, list[str]] = {}
+    # Each emitted PLACE reserves one specific animal observed in the shed or
+    # carried inventory. Affordable-but-unowned animals must be bought before
+    # regeneration can authorize either PLACE or construction of new housing.
+    remaining_owned_animals = {
+        animal: _available(state, animal) for animal in ANIMAL_ORDER}
+    planned_animal_demand = {animal: 0 for animal in ANIMAL_ORDER}
     for slot in animal_layout_result.placements:
+        planned_animal_demand[slot.animal] += 1
         if slot.source == "empty_structure":
+            if remaining_owned_animals[slot.animal] <= 0:
+                unresolved.append(
+                    f"place_deferred_no_animal:{slot.animal}:"
+                    f"{slot.coord[0]},{slot.coord[1]}")
+                continue
+            remaining_owned_animals[slot.animal] -= 1
             place_key = f"PLACE:{slot.animal}:{slot.coord[0]},{slot.coord[1]}"
             tasks.append(Task(key=place_key, kind="PLACE",
                               priority=Priority.MANAGER, tile=slot.coord,
                               animal=slot.animal, required_item=slot.animal,
                               quantity=1, source="manager_target"))
-            place_keys_by_animal.setdefault(slot.animal, []).append(place_key)
             continue
-        animal_owned = _available(state, slot.animal) > 0
-        animal_affordable = float(state["money"])             >= float(ANIMALS[slot.animal]["cost"])
-        if not (animal_owned or animal_affordable):
+        if remaining_owned_animals[slot.animal] <= 0:
             unresolved.append(
                 f"build_deferred_no_animal:{slot.animal}:"
                 f"{slot.coord[0]},{slot.coord[1]}")
@@ -570,6 +574,7 @@ def generate_tasks(
                                   source="crop_sacrifice"))
                 dig_keys_by_coord[slot.coord] = dig_key
             build_deps.append(dig_key)
+        remaining_owned_animals[slot.animal] -= 1
         build_kind = ("BUILD_COOP" if slot.structure == "COOP"
                       else "BUILD_PASTURE")
         build_key = f"{build_kind}:{slot.coord[0]},{slot.coord[1]}"
@@ -584,10 +589,9 @@ def generate_tasks(
         place_key = f"PLACE:{slot.animal}:{slot.coord[0]},{slot.coord[1]}"
         tasks.append(Task(key=place_key, kind="PLACE",
                           priority=Priority.MANAGER, tile=slot.coord,
-                          animal=slot.animal, required_item=slot.animal,
-                          quantity=1, depends_on=(build_key,),
-                          source="manager_target"))
-        place_keys_by_animal.setdefault(slot.animal, []).append(place_key)
+                           animal=slot.animal, required_item=slot.animal,
+                           quantity=1, depends_on=(build_key,),
+                           source="manager_target"))
     for animal, count in animal_layout_result.unresolved:
         unresolved.append(f"animal_deficit_unresolved:{animal}:{count}")
 
@@ -635,10 +639,9 @@ def generate_tasks(
                 quantity=remaining, deadline_hour=bin_anchor + 3,
                 source=f"sell_bin_{bin_anchor}"))
 
-    # ---- LOGISTICS: purchases implied by active tasks only --------------
+    # ---- LOGISTICS: purchases implied by active/planned tasks -------------
     seed_demand: dict[str, int] = {}
     item_demand: dict[str, int] = {}
-    animal_demand: dict[str, int] = {}
     for task in tasks:
         if task.kind == "PLANT":
             seed_demand[task.crop] = seed_demand.get(task.crop, 0) + 1
@@ -647,8 +650,6 @@ def generate_tasks(
                 item_demand.get(_FERTILIZER_ITEM, 0) + 1
         elif task.kind == "FEED":
             item_demand[_FEED_ITEM] = item_demand.get(_FEED_ITEM, 0) + 1
-        elif task.kind == "PLACE":
-            animal_demand[task.animal] = animal_demand.get(task.animal, 0) + 1
     for crop, demand in sorted(seed_demand.items()):
         shortage = demand - int(state["seeds"].get(crop, 0))
         if shortage > 0:
@@ -663,7 +664,9 @@ def generate_tasks(
                               priority=Priority.LOGISTICS, tile=None,
                               product=item, quantity=shortage,
                               required_item=item, source="task_shortage"))
-    for animal, demand in sorted(animal_demand.items()):
+    # Deferred housing still contributes demand so buying an animal can make
+    # that placement executable after the next observation regeneration.
+    for animal, demand in sorted(planned_animal_demand.items()):
         shortage = demand - _available(state, animal)
         if shortage > 0:
             tasks.append(Task(key=f"BUY_ANIMAL:{animal}", kind="BUY_ANIMAL",

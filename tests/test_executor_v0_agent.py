@@ -739,8 +739,9 @@ def test_over_cap_candidates_not_counted_or_decremented():
         entry = diag["sells"]["0"][product]
         assert entry == {"requested": 1, "submitted": 1, "remaining": 0}
     # ...and the dropped hires are requested but NOT submitted.
-    assert diag["hires"] == {"requested": 7, "submitted": 1,
-                             "observed_max": 0}
+    # One fabricated animal BUILD is no longer part of the workload.
+    assert diag["hires"] == {"requested": 6, "submitted": 1,
+                              "observed_max": 0}
 
 
 def test_market_order_cap_enforced():

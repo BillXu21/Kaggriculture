@@ -344,6 +344,118 @@ def test_animal_shortage_generates_buy_animal_only_for_deficit():
     assert [(t.animal, t.quantity) for t in buys] == [("COW", 2)]
 
 
+def test_goose_target_without_owned_geese_never_builds_even_with_cash():
+    result = generate_tasks(
+        make_obs(shed={}, money=3000.0), 0,
+        feasible_plan=make_plan(animal_targets={"GOOSE": 5}),
+        remaining_sells={})
+
+    assert by_kind(result, "BUILD_COOP") == []
+    assert by_kind(result, "PLACE") == []
+    assert [(t.animal, t.quantity) for t in by_kind(result, "BUY_ANIMAL")] == [
+        ("GOOSE", 5)]
+    assert any(u.startswith("build_deferred_no_animal:GOOSE")
+               for u in result.unresolved)
+
+
+def test_one_owned_goose_reserves_only_one_new_coop():
+    result = generate_tasks(
+        make_obs(shed={"GOOSE": 1}, money=3000.0), 0,
+        feasible_plan=make_plan(animal_targets={"GOOSE": 3}),
+        remaining_sells={})
+
+    assert len(by_kind(result, "BUILD_COOP")) == 1
+    assert len(by_kind(result, "PLACE")) == 1
+    assert [(t.animal, t.quantity) for t in by_kind(result, "BUY_ANIMAL")] == [
+        ("GOOSE", 2)]
+
+
+@pytest.mark.parametrize("money", [0.0, 100.0])
+def test_zero_owned_geese_never_commit_empty_housing_at_any_cash(money):
+    result = generate_tasks(
+        make_obs(shed={}, money=money), 0,
+        feasible_plan=make_plan(animal_targets={"GOOSE": 2}),
+        remaining_sells={})
+
+    assert by_kind(result, "BUILD_COOP") == []
+    assert by_kind(result, "PLACE") == []
+    assert [(t.animal, t.quantity) for t in by_kind(result, "BUY_ANIMAL")] == [
+        ("GOOSE", 2)]
+
+
+def test_existing_empty_coop_uses_one_owned_goose_without_building():
+    tiles = [[None] * 10 for _ in range(10)]
+    tiles[0][1] = {"kind": "COOP"}
+    result = generate_tasks(
+        make_obs(tiles=tiles, shed={"GOOSE": 1}), 0,
+        feasible_plan=make_plan(animal_targets={"GOOSE": 2}),
+        remaining_sells={})
+
+    places = by_kind(result, "PLACE")
+    assert len(places) == 1 and places[0].tile == (0, 1)
+    assert by_kind(result, "BUILD_COOP") == []
+    assert [(t.animal, t.quantity) for t in by_kind(result, "BUY_ANIMAL")] == [
+        ("GOOSE", 1)]
+
+
+@pytest.mark.parametrize("animal,build_kind", [
+    ("COW", "BUILD_PASTURE"),
+    ("SHEEP", "BUILD_PASTURE"),
+])
+def test_pasture_animals_require_one_owned_reservation(
+        animal, build_kind):
+    result = generate_tasks(
+        make_obs(shed={animal: 1}, money=3000.0), 0,
+        feasible_plan=make_plan(animal_targets={animal: 3}),
+        remaining_sells={})
+
+    assert len(by_kind(result, build_kind)) == 1
+    assert len([t for t in by_kind(result, "PLACE") if t.animal == animal]) == 1
+    buys = [t for t in by_kind(result, "BUY_ANIMAL") if t.animal == animal]
+    assert [(t.animal, t.quantity) for t in buys] == [(animal, 2)]
+
+
+def test_animal_reservations_are_species_correct_for_mixed_deficits():
+    result = generate_tasks(
+        make_obs(shed={"GOOSE": 1, "COW": 1}, money=3000.0), 0,
+        feasible_plan=make_plan(animal_targets={
+            "GOOSE": 2, "COW": 2, "SHEEP": 2}),
+        remaining_sells={})
+
+    assert len(by_kind(result, "BUILD_COOP")) == 1
+    assert len(by_kind(result, "BUILD_PASTURE")) == 1
+    assert sorted(t.animal for t in by_kind(result, "PLACE")) == [
+        "COW", "GOOSE"]
+    assert [(t.animal, t.quantity) for t in by_kind(result, "BUY_ANIMAL")] == [
+        ("COW", 1), ("GOOSE", 1), ("SHEEP", 2)]
+
+
+def test_repeated_generation_never_gets_new_housing_ahead_of_occupants():
+    plan = make_plan(animal_targets={"GOOSE": 3})
+    initial = make_obs(shed={})
+    first = generate_tasks(initial, 0, feasible_plan=plan,
+                           remaining_sells={})
+    again = generate_tasks(copy.deepcopy(initial), 0, feasible_plan=plan,
+                           remaining_sells={})
+    assert by_kind(first, "BUILD_COOP") == []
+    assert by_kind(again, "BUILD_COOP") == []
+
+    one_owned = make_obs(shed={"GOOSE": 1})
+    staged = generate_tasks(one_owned, 0, feasible_plan=plan,
+                            remaining_sells={})
+    build = by_kind(staged, "BUILD_COOP")
+    assert len(build) == 1
+    next_tiles = [[None] * 10 for _ in range(10)]
+    y, x = build[0].tile
+    next_tiles[y][x] = animal_tile("GOOSE")
+    after_placement = make_obs(tiles=next_tiles, shed={})
+    regenerated = generate_tasks(after_placement, 0, feasible_plan=plan,
+                                 remaining_sells={})
+    assert by_kind(regenerated, "BUILD_COOP") == []
+    assert [(t.animal, t.quantity)
+            for t in by_kind(regenerated, "BUY_ANIMAL")] == [("GOOSE", 2)]
+
+
 # --------------------------------------------------------- care / fertilize
 
 
@@ -831,16 +943,15 @@ def test_build_deferred_when_animal_neither_owned_nor_affordable():
                for u in result.unresolved)
 
 
-def test_build_emitted_when_animal_affordable_even_if_not_owned():
+def test_build_not_emitted_when_animal_affordable_but_not_owned():
     tiles = [[None] * 10 for _ in range(10)]
     obs = make_obs(tiles=tiles, shed={}, money=3000.0)
     plan = make_plan(animal_targets={"COW": 1})
     result = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
-    builds = by_kind(result, "BUILD_PASTURE")
-    assert len(builds) == 1
-    assert builds[0].depends_on == ()
-    places = by_kind(result, "PLACE")
-    assert places and places[0].depends_on == (builds[0].key,)
+    assert by_kind(result, "BUILD_PASTURE") == []
+    assert by_kind(result, "PLACE") == []
+    assert [(t.animal, t.quantity) for t in by_kind(result, "BUY_ANIMAL")] == [
+        ("COW", 1)]
 
 
 def test_crop_and_animal_planners_never_claim_same_tile():

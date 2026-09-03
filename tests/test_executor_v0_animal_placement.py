@@ -153,26 +153,33 @@ def test_purchased_cow_crop_sacrifice_completes_across_regenerated_tasks():
     plan = make_plan(animals={"COW": 1}, crops={"WHEAT": 25})
 
     first = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
-    assert any(task.source == "crop_sacrifice" for task in first.tasks)
+    assert not any(task.source == "crop_sacrifice" for task in first.tasks)
+    assert not any(task.kind in ("DIG", "BUILD_PASTURE", "PLACE")
+                   for task in first.tasks)
     assert [(task.key, task.quantity) for task in first.tasks
             if task.kind == "BUY_ANIMAL"] == [("BUY_ANIMAL:COW", 1)]
-    assert run_foreman(obs, 0, first.sorted_tasks()).farmer_action == ("DIG",)
-    target = next(task.tile for task in first.tasks if task.kind == "DIG")
+
+    purchased = copy.deepcopy(obs)
+    purchased["private"]["shed"]["COW"] = 1
+    second = generate_tasks(purchased, 0, feasible_plan=plan, remaining_sells={})
+    assert any(task.source == "crop_sacrifice" for task in second.tasks)
+    assert run_foreman(purchased, 0, second.sorted_tasks()).farmer_action == (
+        "DIG",)
+    target = next(task.tile for task in second.tasks if task.kind == "DIG")
     assert target == (4, 4)
 
-    dug = copy.deepcopy(obs)
+    dug = copy.deepcopy(purchased)
     dug["farms"][0]["tiles"][4][4] = None
-    dug["private"]["shed"]["COW"] = 1
-    second = generate_tasks(dug, 0, feasible_plan=plan, remaining_sells={})
-    assert run_foreman(dug, 0, second.sorted_tasks()).farmer_action == (
+    third = generate_tasks(dug, 0, feasible_plan=plan, remaining_sells={})
+    assert run_foreman(dug, 0, third.sorted_tasks()).farmer_action == (
         "BUILD_PASTURE",)
 
     built = copy.deepcopy(dug)
     built["farms"][0]["tiles"][4][4] = {"kind": "PASTURE"}
     built["private"]["shed"]["COW"] = 0
     built["private"]["inventories"][0]["COW"] = 1
-    third = generate_tasks(built, 0, feasible_plan=plan, remaining_sells={})
-    assert run_foreman(built, 0, third.sorted_tasks()).farmer_action == (
+    fourth = generate_tasks(built, 0, feasible_plan=plan, remaining_sells={})
+    assert run_foreman(built, 0, fourth.sorted_tasks()).farmer_action == (
         "PLACE", "COW", 1)
 
     placed = copy.deepcopy(built)
