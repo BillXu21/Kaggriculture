@@ -148,6 +148,26 @@ def test_parser_and_plan_expose_integrated_runner_options(tmp_path):
     }
 
 
+def test_low_telemetry_only_disables_turn_snapshots():
+    from rl_manager.cli import _resolve_executor_factory
+
+    normal = _resolve_executor_factory("executor_v0@stage-a-v1").agent_config
+    low = _resolve_executor_factory(
+        "executor_v0@stage-a-v1", low_telemetry=True).agent_config
+    normal_fields = dataclasses.asdict(normal)
+    low_fields = dataclasses.asdict(low)
+    assert normal_fields["record_turn_snapshot"] is True
+    assert low_fields["record_turn_snapshot"] is False
+    assert {k: v for k, v in normal_fields.items()
+            if k != "record_turn_snapshot"} == \
+        {k: v for k, v in low_fields.items() if k != "record_turn_snapshot"}
+    assert low.strict is True
+    assert low.optional_spare_watering is True
+    assert low.suppress_expansion_from_prior_debt is True
+    assert low.aggressive_sell_all is False
+    assert low.immediate_plant_water is True
+
+
 def test_plan_exposes_ppo_stability_controls(tmp_path):
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"placeholder")

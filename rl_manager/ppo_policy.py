@@ -14,7 +14,9 @@ Architecture decisions implemented here (packet root decisions 3/4/6/7/9):
 - Action distribution given the manager representation: 17 conditionally
   independent categoricals (5 crop 0..100, 3 animal 0..100, 1 land stored
   0..3 / decoded 1..4, 5 fertilizer 0..100, 3 care 0..100) plus 54
-  sell-presence Bernoullis. No masks, no autoregression. Joint logprob is
+  sell-presence Bernoullis. No autoregression. Optional static strategic
+  curriculum support restrictions may narrow the land and animal-target
+  categoricals. Joint logprob is
   the raw SUM of all component logprobs; entropy uses the raw sum with six
   group means reported.
 - Sampling vmaps over explicit per-row decision seeds (fold_in of one root

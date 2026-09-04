@@ -23,6 +23,7 @@ Design rules enforced here:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 from importlib import import_module
@@ -304,9 +305,9 @@ def _resolve_executor_factory(
             f"cannot resolve executor factory {identifier!r} from registry") \
             from exc
     if low_telemetry and identifier == "executor_v0@stage-a-v1":
-        from executor_v0.agent import AgentConfig
-
-        return builder(AgentConfig(strict=True, record_turn_snapshot=False))
+        default = builder()
+        return builder(dataclasses.replace(
+            default.agent_config, record_turn_snapshot=False))
     return builder()
 
 
