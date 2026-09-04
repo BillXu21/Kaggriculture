@@ -61,6 +61,41 @@ def _batch_key_sort_key(key: BatchKey) -> tuple[str, int]:
     return (key[0].identity_id(), int(key[1]))
 
 
+def pad_batch_to_physical(
+        batch: Mapping[str, np.ndarray], physical_size: int
+        ) -> tuple[dict[str, np.ndarray], int]:
+    """Pad stacked `[N, ...]` arrays to one fixed physical batch.
+
+    Single shared definition of rollout fixed-batch padding: short batches
+    are extended to exactly `physical_size` rows by repeating row 0, the full
+    physical batch is evaluated, and padded outputs are discarded by the
+    caller. Returns the padded batch plus the padding-row count.
+    """
+    if (isinstance(physical_size, bool) or not isinstance(physical_size, int)
+            or physical_size < 1):
+        raise ValueError(
+            "physical batch size must be a positive int, "
+            f"got {physical_size!r}")
+    arrays = {name: np.asarray(array) for name, array in batch.items()}
+    if not arrays:
+        raise ValueError("cannot pad an empty batch")
+    real_count = int(next(iter(arrays.values())).shape[0])
+    if real_count < 1:
+        raise ValueError("cannot pad an empty batch")
+    if real_count > physical_size:
+        raise ValueError(
+            f"real batch {real_count} exceeds physical batch size "
+            f"{physical_size}")
+    padding_count = physical_size - real_count
+    if not padding_count:
+        return dict(arrays), 0
+    padded = {}
+    for name, array in arrays.items():
+        padding = np.repeat(array[0:1], padding_count, axis=0)
+        padded[name] = np.concatenate((array, padding), axis=0)
+    return padded, padding_count
+
+
 def _factory_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
     """Use a child-local default factory with its complete config."""
     if (getattr(factory, "name", None) == "executor_v0"
@@ -434,13 +469,9 @@ class ParallelSelfPlayRunner:
         batch = {name: np.concatenate(
             [np.asarray(request.inputs[name]) for request in requests], axis=0)
                  for name in keys}
+        batch, padding_count = pad_batch_to_physical(batch, physical_count)
         row_ids = [request.request_id for request in requests]
-        padding_count = physical_count - real_count
         if padding_count:
-            for name in keys:
-                source = np.asarray(batch[name])[0:1]
-                padding = np.repeat(source, padding_count, axis=0)
-                batch[name] = np.concatenate((batch[name], padding), axis=0)
             padding_prefix = "|".join(row_ids)
             row_ids.extend(
                 f"padding/policy={identity.identity_id()}/"

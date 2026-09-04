@@ -645,33 +645,9 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                     update_index * plan["episodes_per_update"] + episode),
                 composition, candidate, ratchet.current_opponent))
         results = runner.run(specs)
-        batch = build_ppo_batch(
-            buffer.finalize(), gamma=ppo_config.gamma,
-            gae_lambda=ppo_config.gae_lambda,
-            sidecar_records=buffer.sidecar_records)
-        recomputed = candidate._policy.evaluate_actions(
-            batch.inputs, batch.action_tensors)
-        if not np.allclose(recomputed["logprob_total"], batch.old_logprob,
-                           rtol=0.0, atol=1e-5):
-            max_error = float(np.max(np.abs(
-                recomputed["logprob_total"] - batch.old_logprob)))
-            raise ValueError(
-                "rollout stored logprobs do not match active PPO policy "
-                f"recomputation (max_abs_error={max_error})")
-        state, metrics = ppo_update(
-            state, batch, config, ppo_config, curriculum=curriculum)
-        if metrics["accepted"]:
-            candidate = _rollout_candidate_from_state(
-                state, config, ppo_config, previous=candidate,
-                e_history_version=plan["e_history_version"],
-                curriculum=curriculum)
         update_number = update_index + 1
-        print(f"UPDATE {update_number}")
-        rollout_opponent = (ratchet.current_opponent.identity.fingerprint
-                            if plan["training_composition"] !=
-                            CURRENT_VS_CURRENT_ECONOMIC else "not_used")
-        print(f"learner={candidate.identity.fingerprint} "
-              f"rollout_opponent={rollout_opponent} ppo_step={state.step}")
+        # Persist rollout economics before the logprob audit / PPO update so
+        # a later failure cannot lose the completed rollout evidence.
         from rl_manager.diagnostics import (build_economic_diagnostics,
                                             write_diagnostics)
         economic = build_economic_diagnostics(results)
@@ -679,6 +655,39 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         economic["reward_config"] = dict(plan["reward"])
         write_diagnostics(
             output_dir / f"economic_update_{update_number:06d}.json", economic)
+        batch = build_ppo_batch(
+            buffer.finalize(), gamma=ppo_config.gamma,
+            gae_lambda=ppo_config.gae_lambda,
+            sidecar_records=buffer.sidecar_records)
+        from rl_manager.ppo_adapter import recompute_stored_action_logprobs
+        physical_batch_size = plan["runner_options"][
+            "fixed_inference_batch_size"]
+        recomputed_logprob = recompute_stored_action_logprobs(
+            candidate._policy, batch.inputs, batch.action_tensors,
+            physical_batch_size=physical_batch_size)
+        max_abs_error = float(np.max(np.abs(
+            recomputed_logprob.astype(np.float64)
+            - np.asarray(batch.old_logprob, dtype=np.float64))))
+        print(f"logprob_audit physical_batch_size={physical_batch_size} "
+              f"rows={batch.size} max_abs_error={max_abs_error}")
+        if not np.allclose(recomputed_logprob, batch.old_logprob,
+                           rtol=0.0, atol=1e-5):
+            raise ValueError(
+                "rollout stored logprobs do not match active PPO policy "
+                f"recomputation (max_abs_error={max_abs_error})")
+        state, metrics = ppo_update(
+            state, batch, config, ppo_config, curriculum=curriculum)
+        if metrics["accepted"]:
+            candidate = _rollout_candidate_from_state(
+                state, config, ppo_config, previous=candidate,
+                e_history_version=plan["e_history_version"],
+                curriculum=curriculum)
+        print(f"UPDATE {update_number}")
+        rollout_opponent = (ratchet.current_opponent.identity.fingerprint
+                            if plan["training_composition"] !=
+                            CURRENT_VS_CURRENT_ECONOMIC else "not_used")
+        print(f"learner={candidate.identity.fingerprint} "
+              f"rollout_opponent={rollout_opponent} ppo_step={state.step}")
         print(f"economic={json.dumps(economic['aggregate'], sort_keys=True)}")
 
         promotion = plan["promotion"]

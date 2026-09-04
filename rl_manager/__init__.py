@@ -117,6 +117,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "rl_manager.ppo_adapter", "ppo_snapshot_from_state"),
     "ppo_update": ("rl_manager.ppo", "ppo_update"),
     "prng_key_from_id": ("rl_manager.ppo_adapter", "prng_key_from_id"),
+    "recompute_stored_action_logprobs": (
+        "rl_manager.ppo_adapter", "recompute_stored_action_logprobs"),
     "save_ppo_checkpoint": (
         "rl_manager.ppo_checkpoint", "save_ppo_checkpoint"),
     "save_ppo_snapshot": (

@@ -217,6 +217,40 @@ def test_plan_records_exact_curriculum_caps(tmp_path):
         max_land=1, max_goose=0, max_cow=2, max_sheep=3).to_json_dict()
 
 
+def test_economic_diagnostics_written_before_batch_failure(
+        tmp_path, monkeypatch):
+    from bc_manager_jax.model import init_params, tiny_manager_config
+    from rl_manager.cli import execute_training
+
+    tiny_config = tiny_manager_config()
+
+    def _fake_load_checkpoint(path, expected_e_history_version=None):
+        return (init_params(tiny_config, seed=3, model_variant="E"),
+                {"model_config": dataclasses.asdict(tiny_config)})
+
+    class _EmptyRunner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, specs):
+            return []
+
+    monkeypatch.setattr("bc_manager_jax.checkpoint.load_torch_checkpoint",
+                        _fake_load_checkpoint)
+    monkeypatch.setattr("rl_manager.runner.SelfPlayRunner", _EmptyRunner)
+
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    output_dir = tmp_path / "out"
+    plan = plan_training(_train_args(
+        e_checkpoint=str(checkpoint), output_dir=str(output_dir),
+        checkpoint=str(output_dir / "ppo.npz"), episodes_per_update=1,
+        minibatch_size=26))
+    with pytest.raises(ValueError, match="no candidate/trainable"):
+        execute_training(plan)
+    assert (output_dir / "economic_update_000001.json").is_file()
+
+
 def test_scratch_init_mode_is_recorded_in_training_plan(tmp_path):
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"placeholder")

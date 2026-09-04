@@ -263,10 +263,68 @@ def select_ppo_subset(batch: PPOBatch, size: int) -> PPOBatch:
     )
 
 
+def recompute_stored_action_logprobs(
+        policy: PPOPolicy,
+        inputs: Mapping[str, np.ndarray],
+        action_tensors: Mapping[str, np.ndarray],
+        *,
+        physical_batch_size: int | None = None,
+        ) -> np.ndarray:
+    """Recompute stored-action `logprob_total` in original row order.
+
+    Slices the logical batch into contiguous physical chunks evaluated with
+    `PPOPolicy.evaluate_actions()` — actions are never resampled. When
+    `physical_batch_size` is set (fixed-B rollout inference), each chunk is
+    evaluated at exactly that physical shape; a short final chunk is padded
+    with the shared rollout helper (repeat chunk row 0) and padded outputs
+    are discarded. Without a fixed size the whole logical batch is evaluated
+    once, preserving existing behavior. Out-of-support stored actions still
+    fail loudly inside `evaluate_actions()`.
+    """
+    from rl_manager.parallel import pad_batch_to_physical
+
+    real_inputs = {name: np.asarray(array) for name, array in inputs.items()}
+    real_actions = {name: np.asarray(array)
+                    for name, array in action_tensors.items()}
+    if not real_inputs or not real_actions:
+        raise ValueError("logprob audit requires inputs and stored actions")
+    rows = int(next(iter(real_inputs.values())).shape[0])
+    if rows < 1:
+        raise ValueError("logprob audit requires at least one stored row")
+    for name, array in real_actions.items():
+        if int(array.shape[0]) != rows:
+            raise ValueError(
+                f"stored action {name!r} has {int(array.shape[0])} rows, "
+                f"expected {rows}")
+    if physical_batch_size is None:
+        return np.asarray(
+            policy.evaluate_actions(inputs, action_tensors)["logprob_total"])
+    size = int(physical_batch_size) if not isinstance(
+        physical_batch_size, bool) else -1
+    if size < 1:
+        raise ValueError(
+            "physical batch size must be a positive int, "
+            f"got {physical_batch_size!r}")
+    chunks = []
+    for start in range(0, rows, size):
+        chunk_inputs = {name: array[start:start + size]
+                        for name, array in real_inputs.items()}
+        chunk_actions = {name: array[start:start + size]
+                         for name, array in real_actions.items()}
+        real_count = int(next(iter(chunk_inputs.values())).shape[0])
+        padded_inputs, _ = pad_batch_to_physical(chunk_inputs, size)
+        padded_actions, _ = pad_batch_to_physical(chunk_actions, size)
+        recomputed = np.asarray(policy.evaluate_actions(
+            padded_inputs, padded_actions)["logprob_total"])
+        chunks.append(recomputed[:real_count])
+    return np.concatenate(chunks, axis=0)
+
+
 __all__ = [
     "PPOBatchedPolicy",
     "ppo_batched_policy_from_state",
     "ppo_snapshot_from_state",
     "prng_key_from_id",
+    "recompute_stored_action_logprobs",
     "select_ppo_subset",
 ]
