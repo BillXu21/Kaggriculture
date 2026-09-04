@@ -168,6 +168,27 @@ def test_low_telemetry_only_disables_turn_snapshots():
     assert low.immediate_plant_water is True
 
 
+def test_cli_import_is_accelerator_safe_in_fresh_subprocess():
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys; import rl_manager.cli; "
+        "from rl_manager.parallel_worker import "
+        "FORBIDDEN_ACCELERATOR_MODULES; "
+        "bad = [m for m in sys.modules if any("
+        "m == name or m.startswith(name + '.') "
+        "for name in FORBIDDEN_ACCELERATOR_MODULES)]; "
+        "print('BAD:' + ','.join(sorted(bad))); "
+        "raise SystemExit(1 if bad else 0)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True,
+        cwd=Path(__file__).resolve().parents[1], timeout=300)
+    assert completed.returncode == 0, \
+        completed.stdout + completed.stderr
+
+
 def test_plan_exposes_ppo_stability_controls(tmp_path):
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"placeholder")

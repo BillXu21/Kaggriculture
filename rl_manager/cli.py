@@ -29,7 +29,7 @@ import math
 from importlib import import_module
 import sys
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
 
@@ -50,7 +50,8 @@ from rl_manager.types import (CANDIDATE_VS_FROZEN,
                                CURRENT_VS_CURRENT_ECONOMIC)
 from rl_manager.reward import (REWARD_MODES, RewardConfig,
                                TERMINAL_OWN_BANK)
-from rl_manager.ppo_policy import CurriculumMaskConfig
+if TYPE_CHECKING:  # pragma: no cover - import-time accelerator safety
+    from rl_manager.ppo_policy import CurriculumMaskConfig
 
 #: Fixed evaluation seed sets (issue #9 Evaluation section).
 SMOKE_SEEDS: tuple[int, ...] = (17, 42, 2026)
@@ -285,6 +286,8 @@ def _validate_common(args: argparse.Namespace) -> dict[str, Any]:
 
 def _curriculum_from_args(args: argparse.Namespace) -> CurriculumMaskConfig:
     """Build the explicit static strategic support for one run boundary."""
+    from rl_manager.ppo_policy import CurriculumMaskConfig  # parent-side only
+
     return CurriculumMaskConfig(
         max_land=getattr(args, "curriculum_max_land", None),
         max_goose=getattr(args, "curriculum_max_goose", None),
@@ -553,6 +556,7 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
     from rl_manager.ppo_checkpoint import load_ppo_checkpoint
     from rl_manager.ppo_checkpoint import save_ppo_snapshot
     from rl_manager.ppo_policy import PPOConfig
+    from rl_manager.ppo_policy import CurriculumMaskConfig  # parent-side only
     from rl_manager.policy import JaxEPlanPolicy
     from rl_manager.runner import RunnerConfig, SelfPlayRunner, \
         build_episode_spec
@@ -822,6 +826,7 @@ def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no
 
     from rl_manager.ppo_adapter import ppo_batched_policy_from_state
     from rl_manager.ppo_checkpoint import load_ppo_checkpoint
+    from rl_manager.ppo_policy import CurriculumMaskConfig  # parent-side only
     from rl_manager.policy import JaxEPlanPolicy
     from rl_manager.runner import RunnerConfig, SelfPlayRunner, \
         build_episode_spec
