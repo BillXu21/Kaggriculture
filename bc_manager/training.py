@@ -9,6 +9,7 @@ checkpoints. No scheduler, DDP, sweep, or download infrastructure.
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import time
@@ -28,13 +29,20 @@ from .constants import (
     TRAIN_DATES_DEFAULT,
     VAL_DATES_DEFAULT,
 )
-from .loss import GROUP_NAMES, ManagerLossConfig, manager_loss
+from .loss import (
+    GROUP_NAMES,
+    ManagerLossConfig,
+    manager_loss,
+    mixed_manager_loss,
+    teacher_student_loss,
+)
 from .coherence import (
     coherence_metrics,
     current_animal_counts,
     current_crop_counts,
 )
 from .economics import (
+    ECONOMIC_CONTEXT_KEY,
     E_HISTORY_CORRECTED_V1,
     E_HISTORY_LEGACY,
     normalize_e_history_version,
@@ -268,11 +276,30 @@ def evaluate(model: DailyManagerTransformer, loader: DataLoader,
 def train_one_epoch(model: DailyManagerTransformer,
                     loader: DataLoader, optimizer: torch.optim.Optimizer,
                     device: torch.device, training_config: TrainingConfig,
-                    scaler: torch.amp.GradScaler | None) -> dict[str, float]:
+                    scaler: torch.amp.GradScaler | None,
+                    *,
+                    teacher: DailyManagerTransformer | None = None,
+                    distill_weight: float = 0.0,
+                    distill_temperature: float = 1.0) -> dict[str, float]:
     """One shuffled training epoch with clipping (+ optional AMP)."""
+    if teacher is None and distill_weight > 0.0:
+        raise ValueError("distill_weight > 0 requires a teacher")
+    if not 0.0 <= distill_weight <= 1.0:
+        raise ValueError(
+            f"distill_weight must be within [0, 1], got {distill_weight}")
+    if (not math.isfinite(float(distill_temperature))
+            or distill_temperature <= 0.0):
+        raise ValueError(
+            f"distill_temperature must be positive, got {distill_temperature}")
+    distillation_active = teacher is not None and distill_weight > 0.0
+    if teacher is not None:
+        teacher.eval()
     model.train()
     totals = {name: 0.0 for name in GROUP_NAMES}
-    total_loss = 0.0
+    distill_totals = {name: 0.0 for name in GROUP_NAMES}
+    hard_total = 0.0
+    distill_total = 0.0
+    combined_total = 0.0
     rows = 0
     started = time.perf_counter()
     for inputs, targets in loader:
@@ -282,8 +309,22 @@ def train_one_epoch(model: DailyManagerTransformer,
         with torch.autocast(device_type=device.type,
                             enabled=scaler is not None):
             outputs = model(inputs)
-            loss, groups = manager_loss(outputs, targets,
-                                        training_config.loss_weights)
+            hard_loss, groups = manager_loss(
+                outputs, targets, training_config.loss_weights)
+            if distillation_active:
+                with torch.no_grad():
+                    teacher_outputs = teacher(inputs)
+                soft_loss, soft_groups = teacher_student_loss(
+                    outputs, teacher_outputs,
+                    temperature=distill_temperature,
+                    config=training_config.loss_weights)
+                loss = mixed_manager_loss(hard_loss, soft_loss,
+                                          distill_weight)
+            else:
+                soft_loss = hard_loss.detach() * 0.0
+                soft_groups = {name: groups[name].detach() * 0.0
+                               for name in GROUP_NAMES}
+                loss = hard_loss
         batch = inputs["day"].shape[0]
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -298,13 +339,21 @@ def train_one_epoch(model: DailyManagerTransformer,
                                            training_config.gradient_clip)
             optimizer.step()
         rows += batch
-        total_loss += float(loss.detach()) * batch
+        hard_total += float(hard_loss.detach()) * batch
+        distill_total += float(soft_loss.detach()) * batch
+        combined_total += float(loss.detach()) * batch
         for name in GROUP_NAMES:
             totals[name] += float(groups[name].detach()) * batch
+            distill_totals[name] += float(soft_groups[name].detach()) * batch
     elapsed = time.perf_counter() - started
     return {
-        "total": total_loss / max(rows, 1),
+        "total": combined_total / max(rows, 1),
+        "hard_total": hard_total / max(rows, 1),
+        "distill_total": distill_total / max(rows, 1),
+        "combined_total": combined_total / max(rows, 1),
         **{f"group.{name}": totals[name] / max(rows, 1)
+           for name in GROUP_NAMES},
+        **{f"distill_group.{name}": distill_totals[name] / max(rows, 1)
            for name in GROUP_NAMES},
         "elapsed_seconds": elapsed,
         "examples_per_second": rows / max(elapsed, 1e-9),
@@ -319,8 +368,10 @@ def save_checkpoint(path: str | Path, *, kind: str, epoch: int,
                     model_config: ManagerConfig,
                     training_config: TrainingConfig,
                     validation_metrics: Mapping[str, Any],
-                     model_variant: str = "V0",
-                     e_history_version: str | None = None) -> None:
+                    model_variant: str = "V0",
+                    e_history_version: str | None = None,
+                    distillation_metadata: Mapping[str, Any] | None = None
+                    ) -> None:
     """Atomic best/last checkpoint write inside the caller's directory.
 
     The variant is stored as a top-level payload field, never inside
@@ -348,6 +399,8 @@ def save_checkpoint(path: str | Path, *, kind: str, epoch: int,
         "training_config": asdict(training_config),
         "validation_metrics": _jsonable(validation_metrics),
     }
+    if distillation_metadata is not None:
+        payload["distillation"] = _jsonable(distillation_metadata)
     tmp = path.with_name(path.name + ".tmp")
     torch.save(payload, tmp)
     os.replace(tmp, path)
@@ -440,6 +493,63 @@ def resolve_device(spec: str = "auto") -> torch.device:
     return torch.device(spec)
 
 
+def _validate_distillation_settings(distill_weight: float,
+                                    distill_temperature: float,
+                                    teacher_checkpoint: str | Path | None) -> None:
+    if not 0.0 <= distill_weight <= 1.0:
+        raise ValueError(
+            f"distill_weight must be within [0, 1], got {distill_weight}")
+    if (not math.isfinite(float(distill_temperature))
+            or distill_temperature <= 0.0):
+        raise ValueError(
+            f"distill_temperature must be positive, got "
+            f"{distill_temperature}")
+    if distill_weight > 0.0 and teacher_checkpoint is None:
+        raise ValueError("distill_weight > 0 requires --teacher-checkpoint")
+
+
+def _validate_teacher_student_contract(
+        teacher: DailyManagerTransformer,
+        teacher_payload: Mapping[str, Any],
+        student_config: ManagerConfig,
+        student_variant: str,
+        student_history_version: str | None,
+        teacher_source: str | Path) -> dict[str, Any]:
+    if student_variant != "JE":
+        raise ValueError(
+            "teacher distillation requires a JE student, got "
+            f"{student_variant!r}")
+    if teacher.model_variant != "E":
+        raise ValueError(
+            "teacher distillation requires an E teacher, got "
+            f"{teacher.model_variant!r}")
+    if teacher.config.count_max != student_config.count_max:
+        raise ValueError(
+            "teacher/student count_max mismatch: "
+            f"{teacher.config.count_max} != {student_config.count_max}")
+    if (teacher.config.include_opponent_board
+            != student_config.include_opponent_board):
+        raise ValueError(
+            "teacher/student opponent-board contract mismatch: "
+            f"{teacher.config.include_opponent_board} != "
+            f"{student_config.include_opponent_board}")
+    if teacher.config.include_opponent_board or student_config.include_opponent_board:
+        raise ValueError(
+            "teacher distillation requires include_opponent_board=False")
+    teacher_history = checkpoint_e_history_version(teacher_payload)
+    if teacher_history != student_history_version:
+        raise ValueError(
+            "teacher/student e_history_version mismatch: "
+            f"{teacher_history!r} != {student_history_version!r}")
+    return {
+        "enabled": True,
+        "teacher_checkpoint": Path(str(teacher_source)).name,
+        "teacher_variant": teacher.model_variant,
+        "teacher_model_config": asdict(teacher.config),
+        "teacher_e_history_version": teacher_history,
+    }
+
+
 def run_training(
     paths: str | Path | Sequence[str | Path],
     *,
@@ -451,6 +561,9 @@ def run_training(
     device_spec: str = "auto",
     model_variant: str = "V0",
     e_history_version: str = E_HISTORY_CORRECTED_V1,
+    teacher_checkpoint: str | Path | None = None,
+    distill_weight: float = 0.0,
+    distill_temperature: float = 1.0,
     log: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """Full in-RAM BC run: load -> tensors -> baseline -> epochs -> ckpts."""
@@ -460,9 +573,34 @@ def run_training(
     variant = normalize_model_variant(model_variant)
     uses_economic_context = variant in ("E", "JE")
     history_version = normalize_e_history_version(e_history_version)
+    _validate_distillation_settings(distill_weight, distill_temperature,
+                                    teacher_checkpoint)
+    if teacher_checkpoint is not None and variant != "JE":
+        raise ValueError(
+            "teacher distillation requires a JE student, got "
+            f"{variant!r}")
     if not uses_economic_context and history_version != E_HISTORY_CORRECTED_V1:
         raise ValueError(
             "e_history_version is only applicable to E/JE training")
+
+    device = resolve_device(device_spec)
+    teacher = None
+    distillation_metadata: dict[str, Any] = {
+        "enabled": False,
+        "distill_weight": float(distill_weight),
+        "distill_temperature": float(distill_temperature),
+    }
+    if teacher_checkpoint is not None:
+        teacher, teacher_payload = load_model_from_checkpoint(
+            teacher_checkpoint, device=device, expected_variant="E",
+            expected_e_history_version=history_version)
+        distillation_metadata.update(_validate_teacher_student_contract(
+            teacher, teacher_payload, model_config, variant, history_version,
+            teacher_checkpoint))
+        distillation_metadata["distill_weight"] = float(distill_weight)
+        distillation_metadata["distill_temperature"] = float(
+            distill_temperature)
+        distillation_metadata["enabled"] = distill_weight > 0.0
 
     data = load_train_val(paths, train_dates=train_dates,
                           val_dates=val_dates, min_score=min_score,
@@ -486,7 +624,6 @@ def run_training(
     np.random.seed(seed % (2**32))
     torch.manual_seed(seed)
 
-    device = resolve_device(device_spec)
     amp_enabled = training_config.use_amp
     if amp_enabled is None:
         amp_enabled = device.type == "cuda"
@@ -496,6 +633,18 @@ def run_training(
     train_inputs, train_targets = arrays_to_tensors(
         data["train"]["inputs"], data["train"]["targets"],
         include_opponent_board=model_config.include_opponent_board)
+    if teacher is not None:
+        teacher_required = set({
+            "board_kind", "board_crop", "board_animal", "board_numeric",
+            "board_bool", "board_mask", "scalars", "shed_counts",
+            "seed_counts", "carried_counts", "unlocked",
+            "market_inventory", "market_prices", "shop_counts", "day",
+            "days_remaining", ECONOMIC_CONTEXT_KEY,
+        })
+        missing = sorted(teacher_required - set(train_inputs))
+        if missing:
+            raise ValueError(
+                f"student dataset lacks inputs required by teacher: {missing}")
     val_inputs, val_targets = arrays_to_tensors(
         data["val"]["inputs"], data["val"]["targets"],
         include_opponent_board=model_config.include_opponent_board)
@@ -525,6 +674,12 @@ def run_training(
         f"train_rows={len(train_dataset)} val_rows={len(val_dataset)}")
     log(f"model_config={asdict(model_config)}")
     log(f"training_config={_jsonable(asdict(training_config))}")
+    if not distillation_metadata["enabled"]:
+        log("distillation=off")
+    else:
+        log("distillation=on "
+            f"weight={distill_weight:g} temperature={distill_temperature:g} "
+            f"teacher={distillation_metadata['teacher_checkpoint']}")
 
     history: list[dict[str, Any]] = []
     best_epoch = -1
@@ -540,7 +695,10 @@ def run_training(
     stopped_early = False
     for epoch in range(1, training_config.epochs + 1):
         train_report = train_one_epoch(model, train_loader, optimizer,
-                                       device, training_config, scaler)
+                                       device, training_config, scaler,
+                                       teacher=teacher,
+                                       distill_weight=distill_weight,
+                                       distill_temperature=distill_temperature)
         val_report = evaluate(model, val_loader, device,
                               training_config.loss_weights)
         record = {
@@ -563,8 +721,11 @@ def run_training(
                                 validation_metrics=val_report,
                                 model_variant=variant,
                                 e_history_version=(history_version
-                                                   if uses_economic_context
-                                                   else None))
+                                                    if uses_economic_context
+                                                    else None),
+                                distillation_metadata=(
+                                    distillation_metadata
+                                    if teacher is not None else None))
         if last_path is not None:
             save_checkpoint(last_path, kind="last", epoch=epoch, model=model,
                             model_config=model_config,
@@ -572,8 +733,11 @@ def run_training(
                             validation_metrics=val_report,
                             model_variant=variant,
                             e_history_version=(history_version
-                                               if uses_economic_context
-                                               else None))
+                                                if uses_economic_context
+                                                else None),
+                            distillation_metadata=(
+                                distillation_metadata
+                                if teacher is not None else None))
         history.append(record)
         groups = " ".join(f"{name}={val_report[f'group.{name}']:.4f}"
                           for name in GROUP_NAMES)
@@ -612,6 +776,7 @@ def run_training(
         "val_rows": len(val_dataset),
         "model_config": asdict(model_config),
         "training_config": _jsonable(asdict(training_config)),
+        "distillation": distillation_metadata,
         "best_checkpoint": str(best_path) if best_path else None,
         "last_checkpoint": str(last_path) if last_path else None,
     }

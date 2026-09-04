@@ -75,6 +75,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-dir", required=True,
                         help="directory for best.pt / last.pt "
                              "(use an ignored path such as data/temp)")
+    parser.add_argument("--teacher-checkpoint", default=None,
+                        help="existing E checkpoint for JE distillation")
+    parser.add_argument("--distill-weight", type=float, default=0.0,
+                        help="teacher-loss mixture weight in [0, 1]; "
+                             "0 keeps hard-label-only training")
+    parser.add_argument("--distill-temperature", type=float, default=1.0,
+                        help="temperature for categorical teacher targets")
     return parser
 
 
@@ -110,7 +117,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             training_config=training_config, train_dates=args.train_dates,
             val_dates=args.val_dates, min_score=args.min_score,
             device_spec=args.device, model_variant=args.variant,
-            e_history_version=args.e_history_version)
+            e_history_version=args.e_history_version,
+            teacher_checkpoint=args.teacher_checkpoint,
+            distill_weight=args.distill_weight,
+            distill_temperature=args.distill_temperature)
     except SchemaVersionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

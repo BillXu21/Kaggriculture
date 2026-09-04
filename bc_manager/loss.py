@@ -13,6 +13,7 @@ log1p(100) per cell (repeated same-bin events); it is consumed as-is.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -165,3 +166,84 @@ def manager_loss(
 
     total = sum(config.weight(name) * groups[name] for name in GROUP_NAMES)
     return total, groups
+
+
+_CATEGORICAL_OUTPUTS = {
+    "crop": "crop_logits",
+    "animal": "animal_logits",
+    "land": "land_logits",
+    "fertilizer": "fertilizer_logits",
+    "care": "care_logits",
+}
+
+
+def teacher_student_loss(
+    student_outputs: Mapping[str, Tensor],
+    teacher_outputs: Mapping[str, Tensor],
+    *,
+    temperature: float = 1.0,
+    config: ManagerLossConfig | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Group-balanced soft-target loss from an E teacher to a JE student.
+
+    Categorical groups use Hinton-style KL with the ``temperature**2``
+    correction. Sell presence uses the teacher sigmoid probability as a soft
+    BCE target. Sell quantity uses teacher-presence-weighted SmoothL1 over
+    the log1p grid, retaining the hard loss's positive-cell semantics.
+    """
+    if not math.isfinite(float(temperature)) or temperature <= 0.0:
+        raise ValueError(
+            f"distill_temperature must be positive, got {temperature}")
+    config = config if config is not None else ManagerLossConfig()
+    t = float(temperature)
+    groups: dict[str, Tensor] = {}
+    for group, key in _CATEGORICAL_OUTPUTS.items():
+        student = student_outputs[key]
+        teacher = teacher_outputs[key].detach()
+        if student.shape != teacher.shape:
+            raise ValueError(
+                f"teacher/student {key} shapes differ: "
+                f"{tuple(teacher.shape)} != {tuple(student.shape)}")
+        per_cell = F.kl_div(
+            F.log_softmax(student / t, dim=-1),
+            F.softmax(teacher / t, dim=-1),
+            reduction="none",
+        ).sum(dim=-1)
+        groups[group] = per_cell.mean() * (t * t)
+
+    student_presence = student_outputs["sell_presence_logits"]
+    teacher_presence = teacher_outputs["sell_presence_logits"].detach()
+    if student_presence.shape != teacher_presence.shape:
+        raise ValueError(
+            "teacher/student sell_presence_logits shapes differ: "
+            f"{tuple(teacher_presence.shape)} != "
+            f"{tuple(student_presence.shape)}")
+    groups["sell_presence"] = F.binary_cross_entropy_with_logits(
+        student_presence, torch.sigmoid(teacher_presence))
+
+    student_quantity = student_outputs["sell_quantity_log1p"]
+    teacher_quantity = teacher_outputs["sell_quantity_log1p"].detach()
+    if student_quantity.shape != teacher_quantity.shape:
+        raise ValueError(
+            "teacher/student sell_quantity_log1p shapes differ: "
+            f"{tuple(teacher_quantity.shape)} != "
+            f"{tuple(student_quantity.shape)}")
+    quantity_pair = F.smooth_l1_loss(
+        student_quantity, teacher_quantity, reduction="none", beta=1.0)
+    teacher_presence_probability = torch.sigmoid(teacher_presence).detach()
+    groups["sell_quantity"] = (
+        quantity_pair * teacher_presence_probability).sum() / \
+        teacher_presence_probability.sum().clamp(min=1.0)
+
+    total = sum(config.weight(name) * groups[name] for name in GROUP_NAMES)
+    return total, groups
+
+
+def mixed_manager_loss(hard_loss: Tensor, distill_loss: Tensor,
+                       distill_weight: float) -> Tensor:
+    """Return the configured hard-label/teacher objective mixture."""
+    if not 0.0 <= distill_weight <= 1.0:
+        raise ValueError(
+            f"distill_weight must be within [0, 1], got {distill_weight}")
+    return (1.0 - distill_weight) * hard_loss + \
+        distill_weight * distill_loss

@@ -81,6 +81,27 @@ Selling is less complete: held-out sell-presence recall is ~64.8% despite
 93.9% presence accuracy, so sparse accuracy alone should not be treated as
 success.
 
+## BC-E to JE distillation
+
+Initialize a larger JE model from an own-only E checkpoint by retaining the
+original expert hard labels and mixing them with teacher soft targets:
+
+```bash
+python -m bc_manager.cli <all-five-parquets> \
+    --variant JE --e-history-version E_LEGACY \
+    --d-model 256 --layers 6 --heads 8 --ffn 768 --dropout 0.1 \
+    --teacher-checkpoint /kaggle/input/datasets/billll/v0-bc-e/best.pt \
+    --distill-weight 0.5 --distill-temperature 2.0 \
+    --checkpoint-dir data/temp/bc-je-distill
+```
+
+The categorical groups use temperature-scaled KL, sell presence uses soft
+sigmoid BCE targets, and sell quantity uses teacher-presence-weighted
+SmoothL1 in log1p space. `--distill-weight 0` preserves hard-label-only
+training; the default CLI behavior remains unchanged when no teacher is
+provided. Teacher metadata is stored in a top-level `distillation` checkpoint
+block without serializing the teacher model.
+
 The next gate is closed-loop evaluation with a deterministic executor. Do not
 interpret this teacher-forced result as proof of competitive game strength.
 
