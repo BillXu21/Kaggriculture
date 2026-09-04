@@ -19,7 +19,10 @@ from rl_manager.ppo import (
     init_train_state,
     ppo_update,
 )
-from rl_manager.ppo_policy import (CurriculumMaskConfig, PPOConfig, PPOPolicy)
+from rl_manager.ppo_policy import (
+    CurriculumMaskConfig, PPOConfig, PPOPolicy, TargetedExplorationConfig,
+    curriculum_behavior_fingerprint,
+)
 
 
 def _encoded(day: int = 4, money: float = 3000.0):
@@ -309,6 +312,43 @@ def test_metrics_exact_for_identity_ratio_batch(tiny_e):
     assert abs(metrics["kl_to_frozen"]) < 1e-6
     # Advantage normalization over the full batch happened once.
     assert abs(metrics["adv_mean"]) < 1e-6
+
+
+def test_active_exploration_ppo_ratio_starts_at_one(tiny_e):
+    params, config = tiny_e
+    curriculum = CurriculumMaskConfig(max_land=2)
+    exploration = TargetedExplorationConfig(epsilon=0.15, land_target=2)
+    policy = PPOPolicy(params, config, seed=17, curriculum=curriculum,
+                       exploration=exploration)
+    batch = _make_batch(policy, _two_row_inputs())
+    ppo_config = PPOConfig(minibatch_size=2, epochs=1, entropy_coef=0.0,
+                           kl_to_frozen_coef=0.0)
+    state = init_train_state(params, config, seed=7, ppo_config=ppo_config,
+                             curriculum=curriculum, exploration=exploration)
+    _, metrics = ppo_update(state, batch, config, ppo_config,
+                            curriculum=curriculum, exploration=exploration)
+    assert abs(metrics["approx_kl"]) < 1e-5
+    assert metrics["clip_fraction"] < 1e-6
+
+
+def test_active_exploration_fingerprint_mismatch_is_rejected(tiny_e):
+    params, config = tiny_e
+    curriculum = CurriculumMaskConfig(max_land=2)
+    exploration = TargetedExplorationConfig(epsilon=0.15, land_target=2)
+    policy = PPOPolicy(params, config, seed=17, curriculum=curriculum,
+                       exploration=exploration)
+    batch = _make_batch(policy, _two_row_inputs())
+    batch = PPOBatch(
+        inputs=batch.inputs, action_tensors=batch.action_tensors,
+        old_logprob=batch.old_logprob, advantages=batch.advantages,
+        returns=batch.returns, values=batch.values,
+        learner_fingerprint=curriculum_behavior_fingerprint(
+            params, curriculum, exploration))
+    ppo_config = PPOConfig(minibatch_size=2, epochs=1)
+    state = init_train_state(params, config, seed=7, ppo_config=ppo_config,
+                             curriculum=curriculum)
+    with pytest.raises(ValueError, match="fingerprint"):
+        ppo_update(state, batch, config, ppo_config, curriculum=curriculum)
 
 
 def test_minibatch_divisibility_enforced(tiny_e):

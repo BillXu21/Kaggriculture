@@ -16,7 +16,9 @@ from rl_manager.ppo_policy import (
     CurriculumMaskConfig,
     PPO_GROUPS,
     PPOPolicy,
+    TargetedExplorationConfig,
     apply_curriculum_mask,
+    apply_targeted_exploration,
     bernoulli_entropy,
     bernoulli_logprobs,
     categorical_entropy,
@@ -264,6 +266,75 @@ def test_curriculum_config_rejects_invalid_values():
         CurriculumMaskConfig(max_goose=-1)
     with pytest.raises(ValueError, match="int"):
         CurriculumMaskConfig(max_cow=True)
+    with pytest.raises(ValueError, match="epsilon"):
+        TargetedExplorationConfig(epsilon=True)
+    with pytest.raises(ValueError, match="epsilon"):
+        TargetedExplorationConfig(epsilon=float("nan"))
+    with pytest.raises(ValueError, match="goose_target"):
+        TargetedExplorationConfig(epsilon=0.1, goose_target=-1)
+
+
+def test_targeted_exploration_probability_math_and_untargeted_identity():
+    logits = {
+        "crop": jax.numpy.asarray([[[0.2, -0.4, 0.8]]]),
+        "animal": jax.numpy.asarray([[[0.1, 0.2, 0.3],
+                                      [0.4, 0.5, 0.6],
+                                      [0.7, 0.8, 0.9]]]),
+        "land": jax.numpy.asarray([[0.3, -0.2, 0.7, 0.1]]),
+        "fertilizer": jax.numpy.asarray([[[0.1, 0.2, 0.3]]]),
+        "care": jax.numpy.asarray([[[0.3, 0.2, 0.1]]]),
+        "sell_presence": jax.numpy.asarray([[0.2, -0.1]]),
+    }
+    exploration = TargetedExplorationConfig(
+        epsilon=0.15, land_target=2, cow_target=1)
+    got = apply_targeted_exploration(logits, exploration)
+    p = np.exp(np.asarray(jax.nn.log_softmax(logits["land"])))
+    expected = 0.85 * p[0] + 0.15 * np.array([0, 1, 0, 0])
+    assert np.allclose(np.exp(np.asarray(got["land"])), expected, atol=1e-6)
+    assert float(np.exp(np.asarray(got["land"]))[0, 1]) >= 0.15
+    assert got["crop"] is logits["crop"]
+    assert got["sell_presence"] is logits["sell_presence"]
+    cow = np.exp(np.asarray(got["animal"])[0, 1])
+    cow_expected = 0.85 * np.exp(np.asarray(
+        jax.nn.log_softmax(logits["animal"][0, 1])))
+    cow_expected[1] += 0.15
+    assert np.allclose(cow, cow_expected, atol=1e-6)
+    assert np.array_equal(got["animal"][0, 0], logits["animal"][0, 0])
+    assert np.array_equal(got["animal"][0, 2], logits["animal"][0, 2])
+
+
+def test_targeted_exploration_requires_curriculum_support():
+    logits = {"land": jax.numpy.zeros((1, 4)),
+              "animal": jax.numpy.zeros((1, 3, 3))}
+    with pytest.raises(ValueError, match="curriculum"):
+        apply_targeted_exploration(
+            logits, TargetedExplorationConfig(epsilon=0.2, land_target=2),
+            CurriculumMaskConfig(max_land=1))
+
+
+def test_inactive_exploration_preserves_historical_fingerprint(tiny_e):
+    params, _config = tiny_e
+    assert curriculum_behavior_fingerprint(params) == \
+        curriculum_behavior_fingerprint(params, exploration=TargetedExplorationConfig())
+
+
+def test_active_exploration_logprob_audit_and_deterministic_ignore(
+        tiny_e, batch):
+    params, config = tiny_e
+    curriculum = CurriculumMaskConfig(max_land=2)
+    exploration = TargetedExplorationConfig(epsilon=0.2, land_target=2)
+    policy = PPOPolicy(params, config, seed=7, curriculum=curriculum,
+                       exploration=exploration)
+    sampled = policy.act(batch, rng=jax.random.PRNGKey(99),
+                         decision_seeds=np.arange(4, dtype=np.uint32))
+    recomputed = policy.evaluate_actions(batch, sampled["action_tensors"])
+    assert np.array_equal(sampled["logprob_total"],
+                           recomputed["logprob_total"])
+    greedy = policy.act(batch, deterministic=True)["action_tensors"]
+    plain = PPOPolicy(params, config, seed=7, curriculum=curriculum).act(
+        batch, deterministic=True)["action_tensors"]
+    for name in ACTION_TENSOR_SHAPES:
+        assert np.array_equal(greedy[name], plain[name]), name
 
 
 def test_logprob_recomputation_exact_from_stored_actions(tiny_e, batch):

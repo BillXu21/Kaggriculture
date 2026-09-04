@@ -78,6 +78,7 @@ PPO_GROUPS: tuple[str, ...] = (
     "crop", "animal", "land", "fertilizer", "care", "sell_presence")
 
 CURRICULUM_MASK_VERSION = "static-strategic-curriculum-v1"
+TARGETED_EXPLORATION_VERSION = "targeted-unlock-exploration-v1"
 ANIMAL_TARGET_MAX = 100
 
 
@@ -139,16 +140,86 @@ class CurriculumMaskConfig:
                    max_sheep=value.get("max_sheep"))
 
 
+@dataclasses.dataclass(frozen=True)
+class TargetedExplorationConfig:
+    """Temporary stochastic behavior mixture for explicit strategic targets."""
+
+    epsilon: float = 0.0
+    land_target: int | None = None
+    goose_target: int | None = None
+    cow_target: int | None = None
+    sheep_target: int | None = None
+
+    def __post_init__(self) -> None:
+        epsilon = self.epsilon
+        if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+            raise ValueError(f"epsilon must be a finite float in [0, 1), got {epsilon!r}")
+        if not math.isfinite(float(epsilon)) or not 0.0 <= float(epsilon) < 1.0:
+            raise ValueError(f"epsilon must be a finite float in [0, 1), got {epsilon!r}")
+        for name in ("land_target", "goose_target", "cow_target",
+                     "sheep_target"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool)
+                                      or not isinstance(value, int)):
+                raise ValueError(f"{name} must be an int or None, got {value!r}")
+        if self.land_target is not None and not 1 <= self.land_target <= 4:
+            raise ValueError(
+                f"land_target must be in decoded target range [1, 4], got "
+                f"{self.land_target}")
+        for name in ("goose_target", "cow_target", "sheep_target"):
+            value = getattr(self, name)
+            if value is not None and not 0 <= value <= ANIMAL_TARGET_MAX:
+                raise ValueError(
+                    f"{name} must be in [0, {ANIMAL_TARGET_MAX}], got {value}")
+
+    @property
+    def inactive(self) -> bool:
+        return float(self.epsilon) == 0.0 and all(value is None for value in (
+            self.land_target, self.goose_target, self.cow_target,
+            self.sheep_target))
+
+    def to_json_dict(self) -> dict[str, float | int | str | None]:
+        return {
+            "version": TARGETED_EXPLORATION_VERSION,
+            "epsilon": float(self.epsilon),
+            "land_target": self.land_target,
+            "goose_target": self.goose_target,
+            "cow_target": self.cow_target,
+            "sheep_target": self.sheep_target,
+        }
+
+    @classmethod
+    def from_json_dict(cls, value: Mapping[str, object] | None
+                       ) -> "TargetedExplorationConfig":
+        if value is None:
+            return cls()
+        version = value.get("version", TARGETED_EXPLORATION_VERSION)
+        if version != TARGETED_EXPLORATION_VERSION:
+            raise ValueError(f"unknown targeted exploration version {version!r}")
+        return cls(epsilon=value.get("epsilon", 0.0),
+                   land_target=value.get("land_target"),
+                   goose_target=value.get("goose_target"),
+                   cow_target=value.get("cow_target"),
+                   sheep_target=value.get("sheep_target"))
+
+
 def curriculum_behavior_fingerprint(
         params: Mapping,
-        curriculum: CurriculumMaskConfig | None = None) -> str:
+        curriculum: CurriculumMaskConfig | None = None,
+        exploration: TargetedExplorationConfig | None = None) -> str:
     """Fingerprint PPO parameters plus their effective curriculum support."""
     active = curriculum or CurriculumMaskConfig()
+    active_exploration = exploration or TargetedExplorationConfig()
     digest = hashlib.sha256()
     digest.update(b"rl_manager.ppo.behavior.v1\0")
     digest.update(params_fingerprint(params).encode("ascii"))
     digest.update(json.dumps(active.to_json_dict(), sort_keys=True,
-                             separators=(",", ":")).encode("ascii"))
+                              separators=(",", ":")).encode("ascii"))
+    # Preserve every historical inactive curriculum fingerprint byte-for-byte.
+    if not active_exploration.inactive:
+        digest.update(b"\0targeted-exploration\0")
+        digest.update(json.dumps(active_exploration.to_json_dict(), sort_keys=True,
+                                 separators=(",", ":")).encode("ascii"))
     return digest.hexdigest()
 
 
@@ -273,6 +344,74 @@ def apply_curriculum_mask(
                 animal = animal.at[:, species_index, maximum + 1:].set(sentinel)
         masked["animal"] = animal
     return masked
+
+
+def apply_targeted_exploration(
+        logits: dict[str, jax.Array],
+        exploration: TargetedExplorationConfig | None = None,
+        curriculum: CurriculumMaskConfig | None = None,
+        ) -> dict[str, jax.Array]:
+    """Mix selected post-curriculum categoricals with target point masses.
+
+    Returned targeted components are log-probability-equivalent logits for
+    ``q = (1 - epsilon) * softmax(logits) + epsilon * delta_target``.
+    Untargeted groups are retained exactly. The resulting entropy therefore
+    describes the stochastic behavior policy for targeted components.
+    """
+    active = exploration or TargetedExplorationConfig()
+    if active.inactive:
+        return logits
+    support = curriculum or CurriculumMaskConfig()
+    epsilon = float(active.epsilon)
+    log_epsilon = jnp.log(jnp.asarray(epsilon, dtype=logits["land"].dtype))
+
+    def mixed(component: jax.Array, target_index: int) -> jax.Array:
+        if not 0 <= target_index < component.shape[-1]:
+            raise ValueError(
+                f"exploration target index {target_index} exceeds categorical "
+                f"count_max {component.shape[-1] - 1}")
+        logp = jax.nn.log_softmax(component, axis=-1)
+        result = logp + jnp.log1p(
+            -jnp.asarray(epsilon, dtype=component.dtype))
+        target = jnp.logaddexp(result[..., target_index],
+                               log_epsilon.astype(component.dtype))
+        return result.at[..., target_index].set(target)
+
+    adjusted = dict(logits)
+    if active.land_target is not None:
+        if (support.max_land is not None
+                and active.land_target > support.max_land):
+            raise ValueError(
+                f"land_target={active.land_target} is outside current "
+                f"curriculum max_land={support.max_land}")
+        adjusted["land"] = mixed(
+            logits["land"], active.land_target - LAND_INDEX_OFFSET)
+
+    animal_targets = (active.goose_target, active.cow_target,
+                      active.sheep_target)
+    curriculum_maxima = (support.max_goose, support.max_cow,
+                         support.max_sheep)
+    if any(target is not None for target in animal_targets):
+        if logits["animal"].shape[-2] != len(ANIMAL_ORDER):
+            raise ValueError("animal logits do not match named species order")
+        animal = logits["animal"]
+        for species_index, (target, maximum) in enumerate(zip(
+                animal_targets, curriculum_maxima)):
+            if target is None:
+                continue
+            species = ANIMAL_ORDER[species_index].lower()
+            if not 0 <= target < animal.shape[-1]:
+                raise ValueError(
+                    f"{species}_target={target} must be in model range "
+                    f"[0, {animal.shape[-1] - 1}]")
+            if maximum is not None and target > maximum:
+                raise ValueError(
+                    f"{species}_target={target} is outside current curriculum "
+                    f"max_{species}={maximum}")
+            animal = animal.at[:, species_index, :].set(
+                mixed(animal[:, species_index, :], target))
+        adjusted["animal"] = animal
+    return adjusted
 
 
 def _sum_components(per_row: jax.Array) -> jax.Array:
@@ -570,7 +709,8 @@ class PPOPolicy:
                  seed: int, model_variant: str = "E",
                  ppo_config: PPOConfig | None = None,
                  initial_base_params: Mapping | None = None,
-                 curriculum: CurriculumMaskConfig | None = None) -> None:
+                 curriculum: CurriculumMaskConfig | None = None,
+                 exploration: TargetedExplorationConfig | None = None) -> None:
         variant = resolve_model_variant(model_variant)
         if variant != "E":
             raise ValueError(
@@ -579,6 +719,7 @@ class PPOPolicy:
         self._variant = variant
         self._config = config
         self.curriculum = curriculum or CurriculumMaskConfig()
+        self.exploration = exploration or TargetedExplorationConfig()
         for species, maximum in zip(ANIMAL_ORDER, (
                 self.curriculum.max_goose, self.curriculum.max_cow,
                 self.curriculum.max_sheep)):
@@ -586,6 +727,29 @@ class PPOPolicy:
                 raise ValueError(
                     f"max_{species.lower()}={maximum} exceeds model "
                     f"count_max {config.count_max}")
+        for species, target in zip(ANIMAL_ORDER, (
+                self.exploration.goose_target, self.exploration.cow_target,
+                self.exploration.sheep_target)):
+            if target is not None and not 0 <= target <= config.count_max:
+                raise ValueError(
+                    f"{species.lower()}_target={target} must be in "
+                    f"[0, {config.count_max}]")
+        if (self.exploration.land_target is not None
+                and self.curriculum.max_land is not None
+                and self.exploration.land_target > self.curriculum.max_land):
+            raise ValueError(
+                f"land_target={self.exploration.land_target} is outside current "
+                f"curriculum max_land={self.curriculum.max_land}")
+        for species, target, maximum in zip(
+                ANIMAL_ORDER,
+                (self.exploration.goose_target, self.exploration.cow_target,
+                 self.exploration.sheep_target),
+                (self.curriculum.max_goose, self.curriculum.max_cow,
+                 self.curriculum.max_sheep)):
+            if target is not None and maximum is not None and target > maximum:
+                raise ValueError(
+                    f"{species.lower()}_target={target} is outside current "
+                    f"curriculum max_{species.lower()}={maximum}")
         self.ppo_config = ppo_config or PPOConfig()
         # Immutable frozen snapshot: independent copies, never written to.
         self.frozen_params = jax.tree_util.tree_map(
@@ -644,7 +808,9 @@ class PPOPolicy:
         if deterministic:
             indices = deterministic_action_indices(logits)
         else:
-            indices = sample_action_indices(logits, rng, decision_seeds)
+            behavior_logits = apply_targeted_exploration(
+                logits, self.exploration, self.curriculum)
+            indices = sample_action_indices(behavior_logits, rng, decision_seeds)
 
         batch = int(prepared["board_kind"].shape[0])
         presence_bits = np.asarray(indices["sell_presence"], dtype=np.int64) \
@@ -666,7 +832,8 @@ class PPOPolicy:
             "sell_presence": presence_bits.astype(np.uint8),
             "sell_quantity": sell_quantity,
         }
-        stats = group_logprob_and_entropy(logits, indices)
+        stats = group_logprob_and_entropy(
+            logits if deterministic else behavior_logits, indices)
         value = np.asarray(value_from_representation(
             representation, self.params["value"]), dtype=np.float32)
         return {
@@ -696,6 +863,8 @@ class PPOPolicy:
             model_variant=self._variant)
         logits = apply_curriculum_mask(
             distribution_logits(mut_outputs), self.curriculum)
+        logits = apply_targeted_exploration(
+            logits, self.exploration, self.curriculum)
         batch = int(prepared["board_kind"].shape[0])
         indices = action_index_tensors(
             action_tensors, batch, curriculum=self.curriculum)
@@ -745,8 +914,11 @@ __all__ = [
     "PPOConfig",
     "PPO_GROUPS",
     "PPOPolicy",
+    "TARGETED_EXPLORATION_VERSION",
+    "TargetedExplorationConfig",
     "action_index_tensors",
     "apply_curriculum_mask",
+    "apply_targeted_exploration",
     "bernoulli_entropy",
     "bernoulli_kl_to_frozen",
     "bernoulli_logprobs",

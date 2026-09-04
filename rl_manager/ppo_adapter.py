@@ -41,6 +41,7 @@ from rl_manager.ppo_policy import (
     CurriculumMaskConfig,
     PPOConfig,
     PPOPolicy,
+    TargetedExplorationConfig,
     curriculum_behavior_fingerprint,
 )
 from rl_manager.policy import params_fingerprint
@@ -73,6 +74,7 @@ class PPOBatchedPolicy:
         deterministic: bool = False,
         e_history_version: str = E_HISTORY_CORRECTED_V1,
         curriculum: CurriculumMaskConfig | None = None,
+        exploration: TargetedExplorationConfig | None = None,
     ) -> None:
         self._policy = policy
         self._deterministic = bool(deterministic)
@@ -80,12 +82,18 @@ class PPOBatchedPolicy:
         if self.curriculum != policy.curriculum:
             raise ValueError(
                 "adapter curriculum must match the bound PPO policy")
+        requested_exploration = exploration or policy.exploration
+        if requested_exploration != policy.exploration:
+            raise ValueError(
+                "adapter exploration must match the bound PPO policy")
+        self.exploration = (TargetedExplorationConfig()
+                            if self._deterministic else requested_exploration)
         self.e_history_version = normalize_e_history_version(e_history_version)
         self.identity = PolicyIdentity(
             name=name,
             version=version,
             fingerprint=curriculum_behavior_fingerprint(
-                policy.params, self.curriculum),
+                policy.params, self.curriculum, self.exploration),
             e_history_version=self.e_history_version,
         )
         # Batching proof instrumentation (tests assert on these).
@@ -102,7 +110,7 @@ class PPOBatchedPolicy:
             name=self.identity.name,
             version=self.identity.version,
             fingerprint=curriculum_behavior_fingerprint(
-                self._policy.params, self.curriculum),
+                self._policy.params, self.curriculum, self.exploration),
             e_history_version=self.e_history_version,
         )
 
@@ -175,6 +183,7 @@ def ppo_batched_policy_from_state(
     deterministic: bool = False,
     e_history_version: str = E_HISTORY_CORRECTED_V1,
     curriculum: CurriculumMaskConfig | None = None,
+    exploration: TargetedExplorationConfig | None = None,
 ) -> PPOBatchedPolicy:
     """Reconstruct an eval/train-capable adapter from a loaded train state.
 
@@ -185,13 +194,15 @@ def ppo_batched_policy_from_state(
     """
     policy = PPOPolicy(
         state.frozen_params, config, seed=0,
-        ppo_config=ppo_config or PPOConfig(), curriculum=curriculum)
+        ppo_config=ppo_config or PPOConfig(), curriculum=curriculum,
+        exploration=exploration)
     policy.params = state.params
     policy.frozen_params = state.frozen_params
     policy.rng = state.rng
     return PPOBatchedPolicy(
         policy, name=name, version=version, deterministic=deterministic,
-        e_history_version=e_history_version, curriculum=curriculum)
+        e_history_version=e_history_version, curriculum=curriculum,
+        exploration=exploration)
 
 
 def ppo_snapshot_from_state(

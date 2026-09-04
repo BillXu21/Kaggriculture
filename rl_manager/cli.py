@@ -51,7 +51,8 @@ from rl_manager.types import (CANDIDATE_VS_FROZEN,
 from rl_manager.reward import (REWARD_MODES, RewardConfig,
                                TERMINAL_OWN_BANK)
 if TYPE_CHECKING:  # pragma: no cover - import-time accelerator safety
-    from rl_manager.ppo_policy import CurriculumMaskConfig
+    from rl_manager.ppo_policy import (CurriculumMaskConfig,
+                                       TargetedExplorationConfig)
 
 #: Fixed evaluation seed sets (issue #9 Evaluation section).
 SMOKE_SEEDS: tuple[int, ...] = (17, 42, 2026)
@@ -98,6 +99,15 @@ def _add_curriculum_options(parser: argparse.ArgumentParser) -> None:
                         help="Maximum absolute COW target (0..count_max).")
     parser.add_argument("--curriculum-max-sheep", type=int, default=None,
                         help="Maximum absolute SHEEP target (0..count_max).")
+
+
+def _add_unlock_exploration_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--unlock-exploration-epsilon", type=float, default=0.0)
+    parser.add_argument("--unlock-exploration-updates", type=int, default=0)
+    parser.add_argument("--unlock-exploration-land-target", type=int, default=None)
+    parser.add_argument("--unlock-exploration-goose-target", type=int, default=None)
+    parser.add_argument("--unlock-exploration-cow-target", type=int, default=None)
+    parser.add_argument("--unlock-exploration-sheep-target", type=int, default=None)
 
 
 # --------------------------------------------------------------- parser
@@ -171,6 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
                        default=E_HISTORY_CORRECTED_V1,
                        help="Explicit E input semantics; legacy is compatibility-only.")
     _add_curriculum_options(train)
+    _add_unlock_exploration_options(train)
 
     ev = sub.add_parser("eval",
                         help="Fixed-seed paired evaluation vs frozen E.")
@@ -296,6 +307,19 @@ def _curriculum_from_args(args: argparse.Namespace) -> CurriculumMaskConfig:
     )
 
 
+def _exploration_from_args(args: argparse.Namespace) -> TargetedExplorationConfig:
+    """Build the explicit temporary rollout behavior config."""
+    from rl_manager.ppo_policy import TargetedExplorationConfig  # parent-side only
+
+    return TargetedExplorationConfig(
+        epsilon=getattr(args, "unlock_exploration_epsilon", 0.0),
+        land_target=getattr(args, "unlock_exploration_land_target", None),
+        goose_target=getattr(args, "unlock_exploration_goose_target", None),
+        cow_target=getattr(args, "unlock_exploration_cow_target", None),
+        sheep_target=getattr(args, "unlock_exploration_sheep_target", None),
+    )
+
+
 def _resolve_executor_factory(
         identifier: str, *, low_telemetry: bool = False) -> Any:
     """Resolve the explicit registry entry in the owner before spawning."""
@@ -319,6 +343,33 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
     effects beyond validation)."""
     plan = _validate_common(args)
     curriculum = _curriculum_from_args(args)
+    exploration = _exploration_from_args(args)
+    unlock_updates = getattr(args, "unlock_exploration_updates", 0)
+    if (isinstance(unlock_updates, bool) or not isinstance(unlock_updates, int)
+            or unlock_updates < 0):
+        raise ValueError("--unlock-exploration-updates must be an integer >= 0")
+    targets = (exploration.land_target, exploration.goose_target,
+               exploration.cow_target, exploration.sheep_target)
+    if exploration.land_target is not None and curriculum.max_land is not None \
+            and exploration.land_target > curriculum.max_land:
+        raise ValueError(
+            f"land exploration target {exploration.land_target} is outside "
+            f"current curriculum max_land={curriculum.max_land}")
+    for name, target, maximum in zip(
+            ("goose", "cow", "sheep"),
+            targets[1:],
+            (curriculum.max_goose, curriculum.max_cow, curriculum.max_sheep)):
+        if target is not None and maximum is not None and target > maximum:
+            raise ValueError(
+                f"{name} exploration target {target} is outside current "
+                f"curriculum max_{name}={maximum}")
+    has_target = any(target is not None for target in targets)
+    if (float(exploration.epsilon) > 0.0 or has_target or unlock_updates > 0) \
+            and not (float(exploration.epsilon) > 0.0 and unlock_updates > 0
+                     and has_target):
+        raise ValueError(
+            "active unlock exploration requires epsilon > 0, updates > 0, "
+            "and at least one explicit target")
     if args.master_seed < 0:
         raise ValueError("--master-seed must be nonnegative")
     opening = str(getattr(args, "opening", "standard_mixed"))
@@ -392,6 +443,8 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
         "resume_checkpoint": (None if resume_checkpoint is None else
                                str(Path(resume_checkpoint))),
         "curriculum": curriculum.to_json_dict(),
+        "unlock_exploration": exploration.to_json_dict(),
+        "unlock_exploration_updates": int(unlock_updates),
         "training_composition": composition,
         "reward": reward_config.to_json_dict(),
         "expected_trainable_rows": expected_rows,
@@ -419,6 +472,47 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint": str(Path(args.checkpoint)),
     })
     return plan
+
+
+def _exploration_for_update(plan: Mapping[str, Any], update_index: int
+                            ) -> TargetedExplorationConfig:
+    """Resolve invocation-local first-N rollout behavior without PPO-step state."""
+
+    from rl_manager.ppo_policy import TargetedExplorationConfig
+    configured = TargetedExplorationConfig.from_json_dict(
+        plan.get("unlock_exploration"))
+    updates = int(plan.get("unlock_exploration_updates", 0))
+    return configured if update_index < updates else TargetedExplorationConfig()
+
+
+def _target_action_rates(arrays: Mapping[str, np.ndarray],
+                         exploration: TargetedExplorationConfig
+                         ) -> dict[str, dict[str, float | int]]:
+    """Measure requested target action frequency on valid trainable rows."""
+    rows = ((np.asarray(arrays["valid"]) == 1)
+            & (np.asarray(arrays["trainable"]) == 1))
+    count = int(rows.sum())
+    rates: dict[str, dict[str, float | int]] = {}
+    targets = {
+        "land": (exploration.land_target, "action_land", None),
+        "goose": (exploration.goose_target, "action_animal", 0),
+        "cow": (exploration.cow_target, "action_animal", 1),
+        "sheep": (exploration.sheep_target, "action_animal", 2),
+    }
+    for name, (target, field, species_index) in targets.items():
+        if target is None:
+            continue
+        values = np.asarray(arrays[field])[rows]
+        if species_index is not None:
+            values = values[:, species_index]
+        sampled = int(np.count_nonzero(values == target))
+        rates[name] = {
+            "target": int(target),
+            "sampled_count": sampled,
+            "trainable_row_count": count,
+            "sampled_fraction": (sampled / count if count else None),
+        }
+    return rates
 
 
 def plan_evaluation(args: argparse.Namespace) -> dict[str, Any]:
@@ -521,6 +615,7 @@ def _rollout_candidate_from_state(
     deterministic: bool | None = None,
     e_history_version: str = E_HISTORY_CORRECTED_V1,
     curriculum: CurriculumMaskConfig | None = None,
+    exploration: TargetedExplorationConfig | None = None,
 ) -> Any:
     """Build a rollout adapter bound to the exact returned train state."""
     from rl_manager.ppo_adapter import ppo_batched_policy_from_state
@@ -530,6 +625,11 @@ def _rollout_candidate_from_state(
                           else False)
     if curriculum is None and previous is not None:
         curriculum = previous.curriculum
+    if exploration is None and previous is not None and not deterministic:
+        exploration = previous.exploration
+    if deterministic:
+        from rl_manager.ppo_policy import TargetedExplorationConfig
+        exploration = TargetedExplorationConfig()
     return ppo_batched_policy_from_state(
         state,
         config,
@@ -544,6 +644,7 @@ def _rollout_candidate_from_state(
                            and previous.identity.e_history_version is not None
                             else e_history_version),
         curriculum=curriculum,
+        exploration=exploration,
     )
 
 
@@ -590,7 +691,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
             curriculum=curriculum)
     candidate = _rollout_candidate_from_state(
         state, config, ppo_config,
-        e_history_version=plan["e_history_version"], curriculum=curriculum)
+        e_history_version=plan["e_history_version"], curriculum=curriculum,
+        exploration=_exploration_for_update(plan, 0))
     print(f"curriculum={json.dumps(curriculum.to_json_dict(), sort_keys=True)}")
     original_bc_e = JaxEPlanPolicy(
         frozen_params, config, name="frozen_e",
@@ -605,6 +707,22 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
     promotion_checks: list[dict[str, Any]] = []
     stop_after_promotion = False
     for update_index in range(plan["updates"]):
+        exploration = _exploration_for_update(plan, update_index)
+        candidate = _rollout_candidate_from_state(
+            state, config, ppo_config, previous=candidate,
+            e_history_version=plan["e_history_version"], curriculum=curriculum,
+            exploration=exploration)
+        updates_remaining = max(
+            0, int(plan["unlock_exploration_updates"]) - update_index - 1)
+        print(
+            "unlock_exploration "
+            f"active={str(not exploration.inactive).lower()} "
+            f"epsilon={float(exploration.epsilon):g} "
+            f"updates_remaining={updates_remaining} "
+            f"land_target={exploration.land_target} "
+            f"goose_target={exploration.goose_target} "
+            f"cow_target={exploration.cow_target} "
+            f"sheep_target={exploration.sheep_target}")
         buffer = TrajectoryBuffer(
             capacity=plan["expected_trajectory_rows"],
             input_spec=e_input_spec(),
@@ -651,12 +769,16 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         from rl_manager.diagnostics import (build_economic_diagnostics,
                                             write_diagnostics)
         economic = build_economic_diagnostics(results)
+        rollout_arrays = buffer.finalize()
+        target_rates = _target_action_rates(rollout_arrays, exploration)
+        economic["unlock_target_rates"] = target_rates
+        economic["unlock_exploration"] = exploration.to_json_dict()
         economic["update"] = update_number
         economic["reward_config"] = dict(plan["reward"])
         write_diagnostics(
             output_dir / f"economic_update_{update_number:06d}.json", economic)
         batch = build_ppo_batch(
-            buffer.finalize(), gamma=ppo_config.gamma,
+            rollout_arrays, gamma=ppo_config.gamma,
             gae_lambda=ppo_config.gae_lambda,
             sidecar_records=buffer.sidecar_records)
         from rl_manager.ppo_adapter import recompute_stored_action_logprobs
@@ -676,12 +798,13 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                 "rollout stored logprobs do not match active PPO policy "
                 f"recomputation (max_abs_error={max_abs_error})")
         state, metrics = ppo_update(
-            state, batch, config, ppo_config, curriculum=curriculum)
+            state, batch, config, ppo_config, curriculum=curriculum,
+            exploration=exploration)
         if metrics["accepted"]:
             candidate = _rollout_candidate_from_state(
                 state, config, ppo_config, previous=candidate,
                 e_history_version=plan["e_history_version"],
-                curriculum=curriculum)
+                curriculum=curriculum, exploration=exploration)
         print(f"UPDATE {update_number}")
         rollout_opponent = (ratchet.current_opponent.identity.fingerprint
                             if plan["training_composition"] !=
@@ -689,6 +812,9 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         print(f"learner={candidate.identity.fingerprint} "
               f"rollout_opponent={rollout_opponent} ppo_step={state.step}")
         print(f"economic={json.dumps(economic['aggregate'], sort_keys=True)}")
+        for name, rate in target_rates.items():
+            print(f"unlock_target_rate {name}={rate['target']} "
+                  f"sampled_fraction={rate['sampled_fraction']}")
 
         promotion = plan["promotion"]
         if promotion["every"] and update_number % promotion["every"] == 0:
@@ -721,10 +847,13 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                     "original_bc_e_identity": (
                         original_bc_e.identity.to_json_dict()),
                     "update": update_number,
-                    "ppo_step": int(state.step),
-                    "init_mode": plan["init_mode"],
-                    "curriculum": curriculum.to_json_dict(),
-                })
+                     "ppo_step": int(state.step),
+                     "init_mode": plan["init_mode"],
+                     "curriculum": curriculum.to_json_dict(),
+                     "unlock_exploration": plan["unlock_exploration"],
+                     "unlock_exploration_updates": plan[
+                         "unlock_exploration_updates"],
+                 })
             decision = evaluate_promotion(summary)
             summary["promotion"] = decision.to_dict()
             snapshot = ppo_snapshot_from_state(
@@ -759,6 +888,9 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                         "evaluation_seed_set": promotion["seed_set"],
                         "init_mode": plan["init_mode"],
                         "curriculum": curriculum.to_json_dict(),
+                        "unlock_exploration": plan["unlock_exploration"],
+                        "unlock_exploration_updates": plan[
+                            "unlock_exploration_updates"],
                     },
                     e_history_version=plan["e_history_version"],
                     curriculum=curriculum)

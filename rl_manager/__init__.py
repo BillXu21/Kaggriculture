@@ -51,8 +51,14 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "PPOConfig": ("rl_manager.ppo_policy", "PPOConfig"),
     "CurriculumMaskConfig": (
         "rl_manager.ppo_policy", "CurriculumMaskConfig"),
+    "TargetedExplorationConfig": (
+        "rl_manager.ppo_policy", "TargetedExplorationConfig"),
+    "TARGETED_EXPLORATION_VERSION": (
+        "rl_manager.ppo_policy", "TARGETED_EXPLORATION_VERSION"),
     "apply_curriculum_mask": (
         "rl_manager.ppo_policy", "apply_curriculum_mask"),
+    "apply_targeted_exploration": (
+        "rl_manager.ppo_policy", "apply_targeted_exploration"),
     "curriculum_behavior_fingerprint": (
         "rl_manager.ppo_policy", "curriculum_behavior_fingerprint"),
     "PPOPolicy": ("rl_manager.ppo_policy", "PPOPolicy"),

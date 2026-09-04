@@ -26,6 +26,7 @@ from rl_manager.cli import (
     build_parser,
     execute_debug_trace,
     _rollout_candidate_from_state,
+    _exploration_for_update,
     plan_debug_trace,
     plan_evaluation,
     plan_training,
@@ -33,7 +34,6 @@ from rl_manager.cli import (
 )
 from rl_manager.debug_trace import load_trace
 from rl_manager.policy import PassPlanPolicy
-from rl_manager.policy import params_fingerprint
 from rl_manager.ppo import init_train_state
 from rl_manager.ppo_policy import (CurriculumMaskConfig, PPOConfig,
                                     curriculum_behavior_fingerprint)
@@ -117,6 +117,12 @@ def test_parser_defaults_are_safe_single_process():
     assert (args.curriculum_max_land, args.curriculum_max_goose,
             args.curriculum_max_cow, args.curriculum_max_sheep) == \
         (None, None, None, None)
+    assert args.unlock_exploration_epsilon == 0.0
+    assert args.unlock_exploration_updates == 0
+    assert (args.unlock_exploration_land_target,
+            args.unlock_exploration_goose_target,
+            args.unlock_exploration_cow_target,
+            args.unlock_exploration_sheep_target) == (None, None, None, None)
 
     ev = build_parser().parse_args([
         "eval", "--checkpoint", "ppo.npz", "--e-checkpoint", "ck.pt",
@@ -215,6 +221,39 @@ def test_plan_records_exact_curriculum_caps(tmp_path):
         "--output-dir", "out", "--checkpoint", "out/ppo.npz"])
     assert plan_training(args)["curriculum"] == CurriculumMaskConfig(
         max_land=1, max_goose=0, max_cow=2, max_sheep=3).to_json_dict()
+
+
+def test_unlock_exploration_plan_and_first_n_schedule(tmp_path):
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    args = build_parser().parse_args([
+        "train", "--e-checkpoint", str(checkpoint),
+        "--executor-factory", "executor_v0@stage-a-v1", "--master-seed", "17",
+        "--updates", "10", "--curriculum-max-land", "2",
+        "--unlock-exploration-epsilon", "0.15",
+        "--unlock-exploration-updates", "5",
+        "--unlock-exploration-land-target", "2",
+        "--output-dir", "out", "--checkpoint", "out/ppo.npz"])
+    plan = plan_training(args)
+    assert plan["unlock_exploration"]["land_target"] == 2
+    assert not _exploration_for_update(plan, 0).inactive
+    assert not _exploration_for_update(plan, 4).inactive
+    assert _exploration_for_update(plan, 5).inactive
+
+
+def test_unlock_exploration_plan_rejects_masked_target(tmp_path):
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    args = build_parser().parse_args([
+        "train", "--e-checkpoint", str(checkpoint),
+        "--executor-factory", "executor_v0@stage-a-v1", "--master-seed", "17",
+        "--curriculum-max-land", "1",
+        "--unlock-exploration-epsilon", "0.15",
+        "--unlock-exploration-updates", "5",
+        "--unlock-exploration-land-target", "2",
+        "--output-dir", "out", "--checkpoint", "out/ppo.npz"])
+    with pytest.raises(ValueError, match="current curriculum"):
+        plan_training(args)
 
 
 def test_economic_diagnostics_written_before_batch_failure(

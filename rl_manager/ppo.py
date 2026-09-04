@@ -10,8 +10,9 @@ Loss per minibatch:
     ratio        = exp(new_logprob - old_logprob)
     pi_loss      = -mean(min(ratio*A, clip(ratio)*A))
     value_loss   = mean((value - returns)^2)
-    entropy      = mean(raw-summed entropy over all 17 cats + 54 Bernoullis)
-    kl_to_frozen = mean analytic KL(current || frozen E), coef default 0
+    entropy      = mean behavior-policy entropy over all 17 cats + 54 Bernoullis
+    kl_to_frozen = mean analytic KL(current curriculum policy || frozen E),
+                    coef default 0
     loss         = pi_loss + value_coef*value_loss - entropy_coef*entropy
                    + kl_to_frozen_coef*kl_to_frozen
 
@@ -41,8 +42,10 @@ from rl_manager.gae import advantage_stats, compute_gae, valid_trainable_rows
 from rl_manager.ppo_policy import (
     CurriculumMaskConfig,
     PPOConfig,
+    TargetedExplorationConfig,
     action_index_tensors,
     apply_curriculum_mask,
+    apply_targeted_exploration,
     combined_params_template,
     curriculum_behavior_fingerprint,
     distribution_logits,
@@ -163,15 +166,16 @@ def init_train_state(frozen_params: Mapping, config: ManagerConfig, *,
                      seed: int, ppo_config: PPOConfig,
                      model_variant: str = "E",
                      initial_base_params: Mapping | None = None,
-                     curriculum: CurriculumMaskConfig | None = None
+                     curriculum: CurriculumMaskConfig | None = None,
+                     exploration: TargetedExplorationConfig | None = None
                      ) -> PPOTrainState:
     """Mutable base copy + small value head + fresh optimizer state."""
     from rl_manager.ppo_policy import PPOPolicy  # local: avoids cycle cost
 
     policy = PPOPolicy(frozen_params, config, seed=seed,
-                       model_variant=model_variant, ppo_config=ppo_config,
-                       initial_base_params=initial_base_params,
-                       curriculum=curriculum)
+                        model_variant=model_variant, ppo_config=ppo_config,
+                        initial_base_params=initial_base_params,
+                        curriculum=curriculum, exploration=exploration)
     mask = frozen_leaf_mask(policy.params)
     opt_state = make_ppo_optimizer(ppo_config, mask).init(policy.params)
     return PPOTrainState(params=policy.params, opt_state=opt_state,
@@ -202,7 +206,9 @@ def explained_variance(values: jax.Array, returns: jax.Array) -> jax.Array:
 @functools.lru_cache(maxsize=None)
 def _compiled_update(config: ManagerConfig, ppo_config: PPOConfig,
                      model_variant: str = "E",
-                     curriculum: CurriculumMaskConfig = CurriculumMaskConfig()):
+                     curriculum: CurriculumMaskConfig = CurriculumMaskConfig(),
+                     exploration: TargetedExplorationConfig =
+                     TargetedExplorationConfig()):
     """JIT'd single-minibatch update; cached per architecture/config."""
     template = combined_params_template(config, model_variant)
     optimizer = make_ppo_optimizer(ppo_config, frozen_leaf_mask(template))
@@ -213,7 +219,9 @@ def _compiled_update(config: ManagerConfig, ppo_config: PPOConfig,
             params["base"], prepared_inputs, config, model_variant)
         logits = apply_curriculum_mask(
             distribution_logits(mut_outputs), curriculum)
-        stats = group_logprob_and_entropy(logits, indices)
+        behavior_logits = apply_targeted_exploration(
+            logits, exploration, curriculum)
+        stats = group_logprob_and_entropy(behavior_logits, indices)
         value = value_from_representation(representation, params["value"])
         terms = clipped_surrogate_terms(stats["logprob_total"] - old_logprob,
                                         advantages, ppo_config.clip_eps)
@@ -258,7 +266,9 @@ def _compiled_update(config: ManagerConfig, ppo_config: PPOConfig,
 @functools.lru_cache(maxsize=None)
 def _compiled_epoch_metrics(config: ManagerConfig, ppo_config: PPOConfig,
                             model_variant: str = "E",
-                            curriculum: CurriculumMaskConfig = CurriculumMaskConfig()):
+                            curriculum: CurriculumMaskConfig = CurriculumMaskConfig(),
+                            exploration: TargetedExplorationConfig =
+                            TargetedExplorationConfig()):
     """JIT'd full-batch diagnostics evaluated after each PPO epoch."""
     def evaluate(params, frozen_params, prepared_inputs, indices,
                  old_logprob, advantages, returns):
@@ -266,7 +276,9 @@ def _compiled_epoch_metrics(config: ManagerConfig, ppo_config: PPOConfig,
             params["base"], prepared_inputs, config, model_variant)
         logits = apply_curriculum_mask(
             distribution_logits(mut_outputs), curriculum)
-        stats = group_logprob_and_entropy(logits, indices)
+        behavior_logits = apply_targeted_exploration(
+            logits, exploration, curriculum)
+        stats = group_logprob_and_entropy(behavior_logits, indices)
         value = value_from_representation(representation, params["value"])
         terms = clipped_surrogate_terms(stats["logprob_total"] - old_logprob,
                                         advantages, ppo_config.clip_eps)
@@ -303,7 +315,8 @@ _METRIC_KEYS = ("loss", "pi_loss", "value_loss", "entropy", "approx_kl",
 def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
                ppo_config: PPOConfig, *,
                model_variant: str = "E",
-               curriculum: CurriculumMaskConfig | None = None
+               curriculum: CurriculumMaskConfig | None = None,
+               exploration: TargetedExplorationConfig | None = None
                ) -> tuple[PPOTrainState, dict]:
     """Run `epochs` x (N / minibatch_size) jitted minibatch updates.
 
@@ -316,6 +329,7 @@ def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
     itself, preserving its parameters, optimizer state, RNG, and step.
     """
     active_curriculum = curriculum or CurriculumMaskConfig()
+    active_exploration = exploration or TargetedExplorationConfig()
     n = batch.size
     mb = ppo_config.minibatch_size
     if batch.learner_fingerprints is not None:
@@ -326,10 +340,10 @@ def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
                 f"learner fingerprints: {sorted(fingerprints)}")
     if batch.learner_fingerprint is not None:
         expected_fingerprint = curriculum_behavior_fingerprint(
-            state.params, active_curriculum)
+            state.params, active_curriculum, active_exploration)
         legacy_fingerprint = params_fingerprint(state.params)
         accepted_fingerprints = {expected_fingerprint}
-        if active_curriculum.unrestricted:
+        if active_curriculum.unrestricted and active_exploration.inactive:
             accepted_fingerprints.add(legacy_fingerprint)
         if (len(str(batch.learner_fingerprint)) == 64 and
                 batch.learner_fingerprint not in accepted_fingerprints):
@@ -343,7 +357,8 @@ def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
             f"batch size {n} must be divisible by minibatch_size {mb} "
             f"(fail loud instead of silently dropping rows)")
     variant = model_variant
-    core = _compiled_update(config, ppo_config, variant, active_curriculum)
+    core = _compiled_update(config, ppo_config, variant, active_curriculum,
+                            active_exploration)
 
     perm_key, next_rng = jax.random.split(state.rng)
     perm = np.asarray(jax.random.permutation(perm_key, n))
@@ -364,7 +379,7 @@ def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
     stop_reason = "completed"
     rejection_reason: str | None = None
     epoch_core = _compiled_epoch_metrics(
-        config, ppo_config, variant, active_curriculum)
+        config, ppo_config, variant, active_curriculum, active_exploration)
 
     def finite_tree(tree) -> bool:
         return all(np.all(np.isfinite(np.asarray(leaf))) for leaf in
