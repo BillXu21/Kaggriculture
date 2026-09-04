@@ -233,3 +233,7 @@ def test_parallel_current_current_merge_has_each_row_once():
     assert sorted(keys) == sorted(
         (episode, seat, day) for episode in (0, 1)
         for seat in (0, 1) for day in (4, 5))
+    assert all(len(result.manager_crop_rows) == 4 for result in results)
+    assert all(
+        row["achieved_final_crops"] is not None
+        for result in results for row in result.manager_crop_rows)

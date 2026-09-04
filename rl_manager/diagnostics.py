@@ -17,11 +17,14 @@ fabricated number.
 from __future__ import annotations
 
 import json
+import re
 import statistics
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+
+from bc_manager.constants import CROP_ORDER
 
 DIAGNOSTICS_SCHEMA_VERSION = 1
 ECONOMIC_DIAGNOSTICS_SCHEMA_VERSION = 1
@@ -226,7 +229,295 @@ def _distribution(values: Sequence[float]) -> dict[str, float | int | None]:
     }
 
 
-def aggregate_economic_diagnostics(results: Sequence[Any]) -> dict[str, Any]:
+def _manager_distribution(values: Sequence[float]) -> dict[str, float | int | None]:
+    result = _distribution(values)
+    result["p90"] = (float(np.percentile(sorted(float(value) for value in values), 90))
+                     if values else None)
+    return result
+
+
+def _crop_targets(row: Mapping[str, Any]) -> dict[str, int] | None:
+    targets = row.get("requested_crop_targets")
+    if targets is None:
+        targets = (row.get("requested") or {}).get("crop_targets")
+    if not isinstance(targets, Mapping):
+        return None
+    return {crop: int(targets.get(crop, 0) or 0) for crop in CROP_ORDER}
+
+
+def _achieved_crops(row: Mapping[str, Any]) -> dict[str, int] | None:
+    crops = row.get("achieved_final_crops")
+    if crops is None:
+        crops = (row.get("achieved_final") or {}).get("crops")
+    if not isinstance(crops, Mapping):
+        return None
+    return {crop: int(crops.get(crop, 0) or 0) for crop in CROP_ORDER}
+
+
+def _manager_crop_rows(results: Sequence[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        trainable_seats = {
+            int(record["seat"]) for record in result.policy_identities
+            if record.get("trainable")
+        }
+        rows.extend(
+            row for row in (getattr(result, "manager_crop_rows", None) or [])
+            if isinstance(row, Mapping)
+            and row.get("trainable", int(row.get("seat", -1)) in trainable_seats)
+            and int(row.get("seat", -1)) in trainable_seats
+        )
+    return rows
+
+
+_UNRESOLVED_CROP_RE = re.compile(
+    r"^crop_deficit_unresolved:([^:]+):([0-9]+)$")
+
+
+def _unresolved_crop_units(row: Mapping[str, Any]) -> dict[str, int]:
+    units = {crop: 0 for crop in CROP_ORDER}
+    for entry in row.get("unresolved_generator", []) or []:
+        if not isinstance(entry, str):
+            continue
+        match = _UNRESOLVED_CROP_RE.fullmatch(entry)
+        if match is None or match.group(1) not in units:
+            continue
+        units[match.group(1)] += int(match.group(2))
+    return units
+
+
+def _manager_day_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    by_day: dict[int, list[dict[str, int]]] = {}
+    for row in rows:
+        targets = _crop_targets(row)
+        if targets is not None:
+            by_day.setdefault(int(row["day"]), []).append(targets)
+    return {
+        str(day): {
+            "row_count": len(day_rows),
+            "requested_total_mean": float(
+                sum(sum(targets.values()) for targets in day_rows)
+                / len(day_rows)),
+            "requested_by_species": {
+                crop: float(sum(targets[crop] for targets in day_rows)
+                            / len(day_rows))
+                for crop in CROP_ORDER
+            },
+        }
+        for day, day_rows in sorted(by_day.items())
+    }
+
+
+def _manager_late_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    buckets = (("4-19", 4, 19), ("20-24", 20, 24),
+               ("25-27", 25, 27), ("28-29", 28, 29))
+    result: dict[str, Any] = {}
+    for name, first, last in buckets:
+        bucket = [row for row in rows if first <= int(row["day"]) <= last]
+        targets = [_crop_targets(row) for row in bucket]
+        targets = [target for target in targets if target is not None]
+        result[name] = {
+            "row_count": len(targets),
+            "requested_total_mean": (
+                float(sum(sum(target.values()) for target in targets) / len(targets))
+                if targets else None),
+            "requested_total_median": (
+                float(statistics.median(sum(target.values()) for target in targets))
+                if targets else None),
+            "requested_by_species_mean": {
+                crop: (float(sum(target[crop] for target in targets) / len(targets))
+                       if targets else None)
+                for crop in CROP_ORDER
+            },
+        }
+    return result
+
+
+def _manager_crop_intent(
+        rows: Sequence[Mapping[str, Any]],
+        crop_action_max: int | None,
+        ) -> dict[str, Any]:
+    targets_by_row = [(_crop_targets(row), row) for row in rows]
+    targets_by_row = [(targets, row) for targets, row in targets_by_row
+                      if targets is not None]
+    targets = [targets for targets, _ in targets_by_row]
+    totals = [sum(target.values()) for target in targets]
+    species = {
+        crop: _manager_distribution([target[crop] for target in targets])
+        | {"fraction_nonzero": (
+            sum(target[crop] > 0 for target in targets) / len(targets)
+            if targets else None)}
+        for crop in CROP_ORDER
+    }
+    distinct = [sum(value > 0 for value in target.values()) for target in targets]
+    dominant = [max(target.values()) / total if total else 0.0
+                for target, total in zip(targets, totals)]
+
+    trajectory_rows: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
+    for _, row in targets_by_row:
+        trajectory_rows.setdefault(
+            (int(row["episode_index"]), int(row["seat"])), []).append(row)
+    changed_count = 0
+    comparable_count = 0
+    for trajectory in trajectory_rows.values():
+        trajectory = sorted(trajectory, key=lambda row: int(row["day"]))
+        previous: tuple[int, ...] | None = None
+        for row in trajectory:
+            vector = tuple(_crop_targets(row)[crop] for crop in CROP_ORDER)
+            if previous is not None:
+                comparable_count += 1
+                changed_count += vector != previous
+            previous = vector
+
+    component_count = len(targets) * len(CROP_ORDER)
+    saturation_by_species: dict[str, Any] = {}
+    for crop in CROP_ORDER:
+        at_max = (sum(target[crop] == crop_action_max for target in targets)
+                  if crop_action_max is not None else None)
+        saturation_by_species[crop] = {
+            "action_max": crop_action_max,
+            "fraction_at_max": (at_max / len(targets)
+                                 if at_max is not None and targets else None),
+        }
+    at_max_components = (
+        sum(target[crop] == crop_action_max
+            for target in targets for crop in CROP_ORDER)
+        if crop_action_max is not None else None)
+    all_at_max = (
+        sum(all(target[crop] == crop_action_max for crop in CROP_ORDER)
+            for target in targets)
+        if crop_action_max is not None else None)
+
+    unresolved_by_species = {crop: [] for crop in CROP_ORDER}
+    unresolved_rows = 0
+    for row in rows:
+        units = _unresolved_crop_units(row)
+        if any(units.values()):
+            unresolved_rows += 1
+        for crop in CROP_ORDER:
+            unresolved_by_species[crop].append(units[crop])
+    unresolved_total = sum(sum(values) for values in unresolved_by_species.values())
+
+    eod_rows: list[tuple[dict[str, int], dict[str, int]]] = []
+    for _, row in targets_by_row:
+        achieved = _achieved_crops(row)
+        if achieved is not None:
+            eod_rows.append((_crop_targets(row), achieved))
+    shortfalls = [{
+        crop: max(0, requested[crop] - achieved[crop])
+        for crop in CROP_ORDER
+    } for requested, achieved in eod_rows]
+    shortfall_by_species = {
+        crop: [shortfall[crop] for shortfall in shortfalls]
+        for crop in CROP_ORDER
+    }
+    shortfall_total = sum(sum(shortfall.values()) for shortfall in shortfalls)
+    days_with_shortfall = sum(
+        any(value > 0 for value in shortfall.values())
+        for shortfall in shortfalls)
+    realized_fractions = [
+        min(sum(achieved.values()) / sum(requested.values()), 1.0)
+        for requested, achieved in eod_rows if sum(requested.values()) > 0
+    ]
+
+    manager_row_count = len(rows)
+    eod_day_count = len(eod_rows)
+    return {
+        "requested_total": _manager_distribution(totals),
+        "requested_by_species": species,
+        "mix": {
+            "mean_distinct_species_requested": (
+                float(sum(distinct) / len(distinct)) if distinct else None),
+            "median_distinct_species_requested": (
+                float(statistics.median(distinct)) if distinct else None),
+            "fraction_single_species": (
+                sum(value == 1 for value in distinct) / len(distinct)
+                if distinct else None),
+            "mean_dominant_species_fraction": (
+                float(sum(dominant) / len(dominant)) if dominant else None),
+        },
+        "fraction_target_vector_changed_from_previous_manager_day": {
+            "changed_count": changed_count,
+            "comparable_count": comparable_count,
+            "fraction": (changed_count / comparable_count
+                         if comparable_count else None),
+        },
+        "saturation": {
+            "component_count": component_count,
+            "component_at_max_count": at_max_components,
+            "fraction_crop_components_at_action_max": (
+                at_max_components / component_count
+                if at_max_components is not None and component_count else None),
+            "row_count": len(targets),
+            "all_components_at_max_row_count": all_at_max,
+            "fraction_manager_rows_all_crop_components_at_action_max": (
+                all_at_max / len(targets)
+                if all_at_max is not None and targets else None),
+            "by_species": saturation_by_species,
+        },
+        "by_manager_day": _manager_day_summary(rows),
+        "late_game": _manager_late_summary(rows),
+        "unresolved_crop_deficit": {
+            "manager_row_count": manager_row_count,
+            "rows_with_unresolved_deficit": unresolved_rows,
+            "fraction_rows_with_unresolved_deficit": (
+                unresolved_rows / manager_row_count if manager_row_count else None),
+            "total_units": unresolved_total,
+            "mean_units_per_manager_row": (
+                unresolved_total / manager_row_count if manager_row_count else None),
+            "by_species": {
+                crop: {
+                    "total_units": sum(values),
+                    "mean_units_per_manager_row": (
+                        sum(values) / manager_row_count
+                        if manager_row_count else None),
+                    "fraction_rows_nonzero": (
+                        sum(value > 0 for value in values) / manager_row_count
+                        if manager_row_count else None),
+                }
+                for crop, values in unresolved_by_species.items()
+            },
+        },
+        "end_of_day_shortfall": {
+            "day_count": eod_day_count,
+            "days_with_shortfall": days_with_shortfall,
+            "fraction_days_with_shortfall": (
+                days_with_shortfall / eod_day_count
+                if eod_day_count else None),
+            "total_units": shortfall_total,
+            "mean_units_per_day": (
+                shortfall_total / eod_day_count if eod_day_count else None),
+            "requested_total": _distribution(
+                [sum(requested.values()) for requested, _ in eod_rows]),
+            "achieved_final_crop_total": _distribution(
+                [sum(achieved.values()) for _, achieved in eod_rows]),
+            "by_species": {
+                crop: {
+                    "total_units": sum(values),
+                    "mean_units_per_day": (
+                        sum(values) / eod_day_count if eod_day_count else None),
+                    "fraction_days_nonzero": (
+                        sum(value > 0 for value in values) / eod_day_count
+                        if eod_day_count else None),
+                }
+                for crop, values in shortfall_by_species.items()
+            },
+        },
+        "target_utilization": {
+            "row_count": len(realized_fractions),
+            "mean_realized_fraction": (
+                float(sum(realized_fractions) / len(realized_fractions))
+                if realized_fractions else None),
+            "median_realized_fraction": (
+                float(statistics.median(realized_fractions))
+                if realized_fractions else None),
+        },
+    }
+
+
+def aggregate_economic_diagnostics(
+        results: Sequence[Any], *, crop_action_max: int | None = None,
+        ) -> dict[str, Any]:
     """Aggregate observed economic outcomes for trainable seats only."""
     seats: list[tuple[Any, int, dict[str, Any]]] = []
     for result in results:
@@ -267,6 +558,7 @@ def aggregate_economic_diagnostics(results: Sequence[Any]) -> dict[str, Any]:
                        and snapshot.get("boundary") == "daily"
                        and int(snapshot["day"]) > 4]
     final_snapshots = [snapshot for _, _, snapshot in seats]
+    manager_rows = _manager_crop_rows(results)
     return {
         "trainable_seat_count": len(seats),
         "economic": {
@@ -301,6 +593,8 @@ def aggregate_economic_diagnostics(results: Sequence[Any]) -> dict[str, Any]:
                 float(sum(daily_occupancy) / len(daily_occupancy))
                 if daily_occupancy else None),
         },
+        "manager_crop_intent": _manager_crop_intent(
+            manager_rows, crop_action_max),
     }
 
 
@@ -309,7 +603,9 @@ def _mean(snapshots: Sequence[Mapping[str, Any]], key: str) -> float | None:
     return float(sum(values) / len(values)) if values else None
 
 
-def build_economic_diagnostics(results: Sequence[Any]) -> dict[str, Any]:
+def build_economic_diagnostics(
+        results: Sequence[Any], *, crop_action_max: int | None = None,
+        ) -> dict[str, Any]:
     """Return recomputable per-episode sidecars plus aggregate metrics."""
     episodes = []
     for result in sorted(results, key=lambda item: int(item.episode_index)):
@@ -328,7 +624,8 @@ def build_economic_diagnostics(results: Sequence[Any]) -> dict[str, Any]:
     return {
         "economic_diagnostics_schema_version": ECONOMIC_DIAGNOSTICS_SCHEMA_VERSION,
         "episodes": episodes,
-        "aggregate": aggregate_economic_diagnostics(results),
+        "aggregate": aggregate_economic_diagnostics(
+            results, crop_action_max=crop_action_max),
     }
 
 

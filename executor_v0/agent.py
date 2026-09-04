@@ -1350,6 +1350,23 @@ class ExecutorAgent:
         """Return a defensive copy of the latest primitive-turn snapshot."""
         return copy.deepcopy(self._debug_trace_turn)
 
+    def finalize_diagnostics(self, obs: Mapping, seat: int) -> None:
+        """Complete the current day's realized-state diagnostic at terminal."""
+        if self._day is None or int(obs["day"]) != self._day:
+            return
+        farm = obs["farms"][seat]
+        board = canonical_board(
+            farm["tiles"], int(obs["day"]), int(obs.get("step", 0)))
+        crops, animals, care_done, fert_done = _board_counts(board)
+        record = self._day_records[self._day]
+        record["achieved_final"] = {
+            "crops": crops,
+            "animals": animals,
+            "land_count": len(farm["unlocked_quadrants"]),
+        }
+        record["care_completed_observed"] = care_done
+        record["fertilizer_completed_observed"] = fert_done
+
     def diagnostics_json(self) -> dict[str, Any]:
         diagnostics = {
             "schema_version": _DIAGNOSTICS_SCHEMA_VERSION,

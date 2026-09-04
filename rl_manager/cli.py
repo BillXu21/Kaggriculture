@@ -768,7 +768,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         # a later failure cannot lose the completed rollout evidence.
         from rl_manager.diagnostics import (build_economic_diagnostics,
                                             write_diagnostics)
-        economic = build_economic_diagnostics(results)
+        economic = build_economic_diagnostics(
+            results, crop_action_max=config.count_max)
         rollout_arrays = buffer.finalize()
         target_rates = _target_action_rates(rollout_arrays, exploration)
         economic["unlock_target_rates"] = target_rates
@@ -811,7 +812,29 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                             CURRENT_VS_CURRENT_ECONOMIC else "not_used")
         print(f"learner={candidate.identity.fingerprint} "
               f"rollout_opponent={rollout_opponent} ppo_step={state.step}")
-        print(f"economic={json.dumps(economic['aggregate'], sort_keys=True)}")
+        console_aggregate = dict(economic["aggregate"])
+        console_intent = dict(console_aggregate.get("manager_crop_intent", {}))
+        console_intent.pop("by_manager_day", None)
+        console_aggregate["manager_crop_intent"] = console_intent
+        print(f"economic={json.dumps(console_aggregate, sort_keys=True)}")
+        intent = economic["aggregate"]["manager_crop_intent"]
+        print(
+            "manager_crop_intent "
+            f"requested_total_mean={intent['requested_total']['mean']} "
+            f"distinct_species_mean={intent['mix']['mean_distinct_species_requested']} "
+            "target_vector_change_fraction="
+            f"{intent['fraction_target_vector_changed_from_previous_manager_day']['fraction']} "
+            "component_at_max_fraction="
+            f"{intent['saturation']['fraction_crop_components_at_action_max']} "
+            "all_crop_heads_at_max_fraction="
+            f"{intent['saturation']['fraction_manager_rows_all_crop_components_at_action_max']} "
+            "unresolved_deficit_fraction="
+            f"{intent['unresolved_crop_deficit']['fraction_rows_with_unresolved_deficit']} "
+            "eod_shortfall_mean="
+            f"{intent['end_of_day_shortfall']['mean_units_per_day']} "
+            "late_crop_request_mean_d28_29="
+            f"{intent['late_game']['28-29']['requested_total_mean']}"
+        )
         for name, rate in target_rates.items():
             print(f"unlock_target_rate {name}={rate['target']} "
                   f"sampled_fraction={rate['sampled_fraction']}")

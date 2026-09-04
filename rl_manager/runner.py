@@ -268,6 +268,9 @@ class EpisodeResult:
     executor_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     land_purchase_events: list[dict[str, Any]] = field(default_factory=list)
     utilization_snapshots: list[dict[str, Any]] = field(default_factory=list)
+    # One bounded scalar/vector record per manager row; never model input or
+    # primitive-turn telemetry.
+    manager_crop_rows: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _executor_factory_provenance(factory: Any) -> dict[str, Any]:
@@ -1099,6 +1102,16 @@ class SelfPlayRunner:
         state.ensure_policy_identity()
         state.finalized = True
         state.record_terminal_utilization()
+        # Complete the final day's existing executor state before collecting
+        # the compact manager funnel records. This is diagnostic-only.
+        for seat in range(2):
+            try:
+                finalize_fn = getattr(
+                    state.executors[seat], "finalize_diagnostics", None)
+                if callable(finalize_fn):
+                    finalize_fn(state.obs[seat], seat)
+            except Exception:  # noqa: BLE001 - diagnostics must never break
+                pass
         debug_trace = state.record_terminal_trace()
         # Seal the final day's primitive-action digest and patch rows.
         current_day = int(state.obs[0]["day"])
@@ -1139,6 +1152,7 @@ class SelfPlayRunner:
             })
             for seat, agent in enumerate(state.openings)]
         executor_diagnostics: list[dict[str, Any]] = []
+        manager_crop_rows: list[dict[str, Any]] = []
         for seat, executor in enumerate(state.executors):
             try:
                 diagnostics_fn = getattr(executor, "diagnostics_json", None)
@@ -1153,6 +1167,24 @@ class SelfPlayRunner:
                     if key in diagnostics:
                         compact[key] = copy.deepcopy(diagnostics[key])
                 executor_diagnostics.append(compact)
+                for day, record in (diagnostics.get("days") or {}).items():
+                    requested = (record.get("requested") or {}).get(
+                        "crop_targets")
+                    if not isinstance(requested, Mapping):
+                        continue
+                    achieved = (record.get("achieved_final") or {}).get("crops")
+                    manager_crop_rows.append({
+                        "episode_index": state.spec.episode_index,
+                        "seat": seat,
+                        "day": int(day),
+                        "trainable": seat in state.spec.trainable_seats,
+                        "requested_crop_targets": dict(requested),
+                        "unresolved_generator": list(
+                            record.get("unresolved_generator", [])),
+                        "achieved_final_crops": (
+                            dict(achieved) if isinstance(achieved, Mapping)
+                            else None),
+                    })
             except Exception as exc:  # noqa: BLE001 - report diagnostic failure
                 executor_diagnostics.append({
                     "seat": seat, "runtime_error": repr(exc),
@@ -1197,6 +1229,7 @@ class SelfPlayRunner:
             executor_diagnostics=executor_diagnostics,
             land_purchase_events=copy.deepcopy(state.land_purchase_events),
             utilization_snapshots=copy.deepcopy(state.utilization_snapshots),
+            manager_crop_rows=manager_crop_rows,
         )
 
     # ------------------------------------------------------------- artifact
@@ -1240,6 +1273,10 @@ class SelfPlayRunner:
                     "sells_bins": {
                         anchor: sum(entry["submitted"] for entry in bins.values())
                         for anchor, bins in record.get("sells", {}).items()},
+                    "unresolved_generator": list(
+                        record.get("unresolved_generator", [])),
+                    "achieved_final_crops": dict(
+                        (record.get("achieved_final") or {}).get("crops", {})),
                 }
                 self.buffer.sidecar_records[index].executor_day_diagnostics = \
                     compact
