@@ -39,9 +39,12 @@ from bc_manager_jax.model import (
 
 from rl_manager.gae import advantage_stats, compute_gae, valid_trainable_rows
 from rl_manager.ppo_policy import (
+    CurriculumMaskConfig,
     PPOConfig,
     action_index_tensors,
+    apply_curriculum_mask,
     combined_params_template,
+    curriculum_behavior_fingerprint,
     distribution_logits,
     frozen_leaf_mask,
     group_logprob_and_entropy,
@@ -49,6 +52,7 @@ from rl_manager.ppo_policy import (
     make_ppo_optimizer,
     value_from_representation,
 )
+from rl_manager.policy import params_fingerprint
 
 
 @dataclasses.dataclass(frozen=True)
@@ -158,13 +162,16 @@ class PPOTrainState:
 def init_train_state(frozen_params: Mapping, config: ManagerConfig, *,
                      seed: int, ppo_config: PPOConfig,
                      model_variant: str = "E",
-                     initial_base_params: Mapping | None = None) -> PPOTrainState:
+                     initial_base_params: Mapping | None = None,
+                     curriculum: CurriculumMaskConfig | None = None
+                     ) -> PPOTrainState:
     """Mutable base copy + small value head + fresh optimizer state."""
     from rl_manager.ppo_policy import PPOPolicy  # local: avoids cycle cost
 
     policy = PPOPolicy(frozen_params, config, seed=seed,
                        model_variant=model_variant, ppo_config=ppo_config,
-                       initial_base_params=initial_base_params)
+                       initial_base_params=initial_base_params,
+                       curriculum=curriculum)
     mask = frozen_leaf_mask(policy.params)
     opt_state = make_ppo_optimizer(ppo_config, mask).init(policy.params)
     return PPOTrainState(params=policy.params, opt_state=opt_state,
@@ -194,7 +201,8 @@ def explained_variance(values: jax.Array, returns: jax.Array) -> jax.Array:
 
 @functools.lru_cache(maxsize=None)
 def _compiled_update(config: ManagerConfig, ppo_config: PPOConfig,
-                     model_variant: str = "E"):
+                     model_variant: str = "E",
+                     curriculum: CurriculumMaskConfig = CurriculumMaskConfig()):
     """JIT'd single-minibatch update; cached per architecture/config."""
     template = combined_params_template(config, model_variant)
     optimizer = make_ppo_optimizer(ppo_config, frozen_leaf_mask(template))
@@ -203,15 +211,18 @@ def _compiled_update(config: ManagerConfig, ppo_config: PPOConfig,
                 old_logprob, advantages, returns):
         mut_outputs, representation = _forward_eval_with_representation(
             params["base"], prepared_inputs, config, model_variant)
-        logits = distribution_logits(mut_outputs)
+        logits = apply_curriculum_mask(
+            distribution_logits(mut_outputs), curriculum)
         stats = group_logprob_and_entropy(logits, indices)
         value = value_from_representation(representation, params["value"])
         terms = clipped_surrogate_terms(stats["logprob_total"] - old_logprob,
                                         advantages, ppo_config.clip_eps)
         value_loss = jnp.mean(jnp.square(value - returns))
         entropy = jnp.mean(stats["entropy_total"])
-        frozen_logits = distribution_logits(_forward_eval(
-            frozen_params, prepared_inputs, config, model_variant))
+        frozen_logits = apply_curriculum_mask(
+            distribution_logits(_forward_eval(
+                frozen_params, prepared_inputs, config, model_variant)),
+            curriculum)
         kl_frozen = jnp.mean(kl_to_frozen(logits, frozen_logits))
         loss = (terms["pi_loss"] + ppo_config.value_coef * value_loss
                 - ppo_config.entropy_coef * entropy
@@ -246,19 +257,23 @@ def _compiled_update(config: ManagerConfig, ppo_config: PPOConfig,
 
 @functools.lru_cache(maxsize=None)
 def _compiled_epoch_metrics(config: ManagerConfig, ppo_config: PPOConfig,
-                            model_variant: str = "E"):
+                            model_variant: str = "E",
+                            curriculum: CurriculumMaskConfig = CurriculumMaskConfig()):
     """JIT'd full-batch diagnostics evaluated after each PPO epoch."""
     def evaluate(params, frozen_params, prepared_inputs, indices,
                  old_logprob, advantages, returns):
         mut_outputs, representation = _forward_eval_with_representation(
             params["base"], prepared_inputs, config, model_variant)
-        logits = distribution_logits(mut_outputs)
+        logits = apply_curriculum_mask(
+            distribution_logits(mut_outputs), curriculum)
         stats = group_logprob_and_entropy(logits, indices)
         value = value_from_representation(representation, params["value"])
         terms = clipped_surrogate_terms(stats["logprob_total"] - old_logprob,
                                         advantages, ppo_config.clip_eps)
-        frozen_logits = distribution_logits(_forward_eval(
-            frozen_params, prepared_inputs, config, model_variant))
+        frozen_logits = apply_curriculum_mask(
+            distribution_logits(_forward_eval(
+                frozen_params, prepared_inputs, config, model_variant)),
+            curriculum)
         metrics = {
             "loss": terms["pi_loss"],
             "pi_loss": terms["pi_loss"],
@@ -287,7 +302,9 @@ _METRIC_KEYS = ("loss", "pi_loss", "value_loss", "entropy", "approx_kl",
 
 def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
                ppo_config: PPOConfig, *,
-               model_variant: str = "E") -> tuple[PPOTrainState, dict]:
+               model_variant: str = "E",
+               curriculum: CurriculumMaskConfig | None = None
+               ) -> tuple[PPOTrainState, dict]:
     """Run `epochs` x (N / minibatch_size) jitted minibatch updates.
 
     Shuffle uses an explicit deterministic PRNG stream carried in the train
@@ -298,6 +315,7 @@ def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
     are reported in the returned metadata. A rejected update returns ``state``
     itself, preserving its parameters, optimizer state, RNG, and step.
     """
+    active_curriculum = curriculum or CurriculumMaskConfig()
     n = batch.size
     mb = ppo_config.minibatch_size
     if batch.learner_fingerprints is not None:
@@ -306,18 +324,33 @@ def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
             raise ValueError(
                 "one PPO batch contains trainable rows sampled from multiple "
                 f"learner fingerprints: {sorted(fingerprints)}")
+    if batch.learner_fingerprint is not None:
+        expected_fingerprint = curriculum_behavior_fingerprint(
+            state.params, active_curriculum)
+        legacy_fingerprint = params_fingerprint(state.params)
+        accepted_fingerprints = {expected_fingerprint}
+        if active_curriculum.unrestricted:
+            accepted_fingerprints.add(legacy_fingerprint)
+        if (len(str(batch.learner_fingerprint)) == 64 and
+                batch.learner_fingerprint not in accepted_fingerprints):
+            raise ValueError(
+                "PPO batch learner fingerprint does not match the active "
+                f"policy curriculum/parameters: stored="
+                f"{batch.learner_fingerprint!r}, expected="
+                f"{expected_fingerprint!r}")
     if n % mb != 0:
         raise ValueError(
             f"batch size {n} must be divisible by minibatch_size {mb} "
             f"(fail loud instead of silently dropping rows)")
     variant = model_variant
-    core = _compiled_update(config, ppo_config, variant)
+    core = _compiled_update(config, ppo_config, variant, active_curriculum)
 
     perm_key, next_rng = jax.random.split(state.rng)
     perm = np.asarray(jax.random.permutation(perm_key, n))
     dev_inputs = _prepare_inputs({k: jnp.asarray(v)
                                   for k, v in batch.inputs.items()})
-    dev_indices = action_index_tensors(batch.action_tensors, n)
+    dev_indices = action_index_tensors(
+        batch.action_tensors, n, curriculum=active_curriculum)
     dev_old = jnp.asarray(batch.old_logprob)
     dev_adv = jnp.asarray(batch.advantages)
     dev_ret = jnp.asarray(batch.returns)
@@ -330,7 +363,8 @@ def ppo_update(state: PPOTrainState, batch: PPOBatch, config: ManagerConfig,
     minibatches_ran = 0
     stop_reason = "completed"
     rejection_reason: str | None = None
-    epoch_core = _compiled_epoch_metrics(config, ppo_config, variant)
+    epoch_core = _compiled_epoch_metrics(
+        config, ppo_config, variant, active_curriculum)
 
     def finite_tree(tree) -> bool:
         return all(np.all(np.isfinite(np.asarray(leaf))) for leaf in

@@ -26,6 +26,8 @@ Architecture decisions implemented here (packet root decisions 3/4/6/7/9):
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import math
 from typing import Mapping
 
@@ -42,6 +44,7 @@ from bc_manager.model import (
     SELL_BIN_COUNT,
     SELL_PRESENCE_CELLS,
 )
+from bc_manager.constants import ANIMAL_ORDER
 from bc_manager_jax.model import (
     ECONOMIC_CONTEXT_KEY,
     ManagerConfig,
@@ -54,6 +57,7 @@ from bc_manager_jax.model import (
 )
 
 from rl_manager.decode import ACTION_TENSOR_SHAPES
+from rl_manager.policy import params_fingerprint
 
 #: Land is stored internally as index 0..3 and decoded to plan value +1.
 LAND_INDEX_OFFSET = 1
@@ -70,6 +74,80 @@ CATEGORICAL_GROUP_SIZES: dict[str, int] = {
 #: All stochastic PPO groups: five categorical groups + sell presence.
 PPO_GROUPS: tuple[str, ...] = (
     "crop", "animal", "land", "fertilizer", "care", "sell_presence")
+
+CURRICULUM_MASK_VERSION = "static-strategic-curriculum-v1"
+ANIMAL_TARGET_MAX = 100
+
+
+@dataclasses.dataclass(frozen=True)
+class CurriculumMaskConfig:
+    """Static support restrictions for land and named animal targets."""
+
+    max_land: int | None = None
+    max_goose: int | None = None
+    max_cow: int | None = None
+    max_sheep: int | None = None
+
+    def __post_init__(self) -> None:
+        values = {
+            "max_land": self.max_land,
+            "max_goose": self.max_goose,
+            "max_cow": self.max_cow,
+            "max_sheep": self.max_sheep,
+        }
+        for name, value in values.items():
+            if value is not None and (isinstance(value, bool)
+                                      or not isinstance(value, int)):
+                raise ValueError(f"{name} must be an int or None, got {value!r}")
+        if self.max_land is not None and not 1 <= self.max_land <= 4:
+            raise ValueError(
+                f"max_land must be in decoded target range [1, 4], got "
+                f"{self.max_land}")
+        for name in ("max_goose", "max_cow", "max_sheep"):
+            value = getattr(self, name)
+            if value is not None and not 0 <= value <= ANIMAL_TARGET_MAX:
+                raise ValueError(
+                    f"{name} must be in [0, {ANIMAL_TARGET_MAX}], got {value}")
+
+    @property
+    def unrestricted(self) -> bool:
+        return all(value is None for value in (
+            self.max_land, self.max_goose, self.max_cow, self.max_sheep))
+
+    def to_json_dict(self) -> dict[str, int | str | None]:
+        return {
+            "version": CURRICULUM_MASK_VERSION,
+            "max_land": self.max_land,
+            "max_goose": self.max_goose,
+            "max_cow": self.max_cow,
+            "max_sheep": self.max_sheep,
+        }
+
+    @classmethod
+    def from_json_dict(cls, value: Mapping[str, object] | None
+                       ) -> "CurriculumMaskConfig":
+        if value is None:
+            return cls()
+        version = value.get("version", CURRICULUM_MASK_VERSION)
+        if version != CURRICULUM_MASK_VERSION:
+            raise ValueError(f"unknown curriculum mask version {version!r}")
+        return cls(max_land=value.get("max_land"),
+                   max_goose=value.get("max_goose"),
+                   max_cow=value.get("max_cow"),
+                   max_sheep=value.get("max_sheep"))
+
+
+def curriculum_behavior_fingerprint(
+        params: Mapping,
+        curriculum: CurriculumMaskConfig | None = None) -> str:
+    """Fingerprint PPO parameters plus their effective curriculum support."""
+    active = curriculum or CurriculumMaskConfig()
+    digest = hashlib.sha256()
+    digest.update(b"rl_manager.ppo.behavior.v1\0")
+    digest.update(params_fingerprint(params).encode("ascii"))
+    digest.update(json.dumps(active.to_json_dict(), sort_keys=True,
+                             separators=(",", ":")).encode("ascii"))
+    return digest.hexdigest()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -164,6 +242,37 @@ def distribution_logits(outputs: Mapping[str, jax.Array]) -> dict[str, jax.Array
     }
 
 
+def apply_curriculum_mask(
+        logits: dict[str, jax.Array],
+        curriculum: CurriculumMaskConfig | None = None
+        ) -> dict[str, jax.Array]:
+    """Restrict strategic categorical support with finite masked logits."""
+    active = curriculum or CurriculumMaskConfig()
+    if active.unrestricted:
+        return logits
+    masked = dict(logits)
+    if active.max_land is not None:
+        if logits["land"].shape[-1] != NUM_LAND_CLASSES:
+            raise ValueError("land logits do not match the four target classes")
+        sentinel = jnp.finfo(logits["land"].dtype).min
+        masked["land"] = logits["land"].at[..., active.max_land:].set(sentinel)
+    animal_maxima = (active.max_goose, active.max_cow, active.max_sheep)
+    if any(value is not None for value in animal_maxima):
+        if logits["animal"].shape[-2] != len(ANIMAL_ORDER):
+            raise ValueError("animal logits do not match named species order")
+        animal = logits["animal"]
+        sentinel = jnp.finfo(animal.dtype).min
+        for species_index, maximum in enumerate(animal_maxima):
+            if maximum is not None:
+                if maximum >= animal.shape[-1]:
+                    raise ValueError(
+                        f"max_{ANIMAL_ORDER[species_index].lower()}={maximum} "
+                        f"exceeds model count_max {animal.shape[-1] - 1}")
+                animal = animal.at[:, species_index, maximum + 1:].set(sentinel)
+        masked["animal"] = animal
+    return masked
+
+
 def _sum_components(per_row: jax.Array) -> jax.Array:
     """Sum component axes into [B]; handles both [B, K, ...] and [B]."""
     return jnp.sum(per_row.reshape(per_row.shape[0], -1), axis=-1)
@@ -221,8 +330,9 @@ def bernoulli_kl_to_frozen(logits: jax.Array,
                    axis=-1)
 
 
-def action_index_tensors(action_tensors: Mapping[str, object],
-                         batch_size: int) -> dict[str, jax.Array]:
+def action_index_tensors(
+        action_tensors: Mapping[str, object], batch_size: int, *,
+        curriculum: CurriculumMaskConfig | None = None) -> dict[str, jax.Array]:
     """Stage-A action tensors -> internal index tensors (validated eagerly).
 
     Land plan values 1..4 become indices 0..3; sell presence [B, 6, 9]
@@ -254,6 +364,18 @@ def action_index_tensors(action_tensors: Mapping[str, object],
     checked("fertilizer", fertilizer, 100)
     checked("care", care, 100)
     checked("sell_presence", presence, 1)
+    active = curriculum or CurriculumMaskConfig()
+    if active.max_land is not None and np.any(
+            land + LAND_INDEX_OFFSET > active.max_land):
+        raise ValueError(
+            f"stored land action is outside curriculum max_land={active.max_land}")
+    for species_index, maximum in enumerate((
+            active.max_goose, active.max_cow, active.max_sheep)):
+        if maximum is not None and np.any(animal[:, species_index] > maximum):
+            species = ANIMAL_ORDER[species_index].lower()
+            raise ValueError(
+                f"stored {species} action is outside curriculum "
+                f"max_{species}={maximum}")
     return {
         "crop": jnp.asarray(crop, dtype=jnp.int32),
         "animal": jnp.asarray(animal, dtype=jnp.int32),
@@ -445,7 +567,8 @@ class PPOPolicy:
     def __init__(self, frozen_params: Mapping, config: ManagerConfig, *,
                  seed: int, model_variant: str = "E",
                  ppo_config: PPOConfig | None = None,
-                 initial_base_params: Mapping | None = None) -> None:
+                 initial_base_params: Mapping | None = None,
+                 curriculum: CurriculumMaskConfig | None = None) -> None:
         variant = resolve_model_variant(model_variant)
         if variant != "E":
             raise ValueError(
@@ -453,6 +576,14 @@ class PPOPolicy:
                 f"{variant!r}")
         self._variant = variant
         self._config = config
+        self.curriculum = curriculum or CurriculumMaskConfig()
+        for species, maximum in zip(ANIMAL_ORDER, (
+                self.curriculum.max_goose, self.curriculum.max_cow,
+                self.curriculum.max_sheep)):
+            if maximum is not None and maximum > config.count_max:
+                raise ValueError(
+                    f"max_{species.lower()}={maximum} exceeds model "
+                    f"count_max {config.count_max}")
         self.ppo_config = ppo_config or PPOConfig()
         # Immutable frozen snapshot: independent copies, never written to.
         self.frozen_params = jax.tree_util.tree_map(
@@ -506,7 +637,8 @@ class PPOPolicy:
         mut_outputs, representation = forward_with_representation(
             self.params["base"], inputs, self._config,
             model_variant=self._variant)
-        logits = distribution_logits(mut_outputs)
+        logits = apply_curriculum_mask(
+            distribution_logits(mut_outputs), self.curriculum)
         if deterministic:
             indices = deterministic_action_indices(logits)
         else:
@@ -560,9 +692,11 @@ class PPOPolicy:
         mut_outputs, representation = forward_with_representation(
             self.params["base"], inputs, self._config,
             model_variant=self._variant)
-        logits = distribution_logits(mut_outputs)
+        logits = apply_curriculum_mask(
+            distribution_logits(mut_outputs), self.curriculum)
         batch = int(prepared["board_kind"].shape[0])
-        indices = action_index_tensors(action_tensors, batch)
+        indices = action_index_tensors(
+            action_tensors, batch, curriculum=self.curriculum)
         stats = group_logprob_and_entropy(logits, indices)
         value = np.asarray(value_from_representation(
             representation, self.params["value"]), dtype=np.float32)
@@ -601,12 +735,16 @@ class PPOPolicy:
 
 
 __all__ = [
+    "ANIMAL_TARGET_MAX",
     "CATEGORICAL_GROUP_SIZES",
+    "CURRICULUM_MASK_VERSION",
+    "CurriculumMaskConfig",
     "LAND_INDEX_OFFSET",
     "PPOConfig",
     "PPO_GROUPS",
     "PPOPolicy",
     "action_index_tensors",
+    "apply_curriculum_mask",
     "bernoulli_entropy",
     "bernoulli_kl_to_frozen",
     "bernoulli_logprobs",
@@ -614,6 +752,7 @@ __all__ = [
     "categorical_kl_to_frozen",
     "categorical_logprobs",
     "combined_params_template",
+    "curriculum_behavior_fingerprint",
     "deterministic_action_indices",
     "distribution_logits",
     "enforce_own_only_e_inputs",

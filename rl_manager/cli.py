@@ -30,6 +30,8 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 from rl_manager.evaluation import evaluate_promotion
 from rl_manager.evaluation import format_promotion_result
 from rl_manager.evaluation import summarize_evaluation
@@ -47,6 +49,7 @@ from rl_manager.types import (CANDIDATE_VS_FROZEN,
                                CURRENT_VS_CURRENT_ECONOMIC)
 from rl_manager.reward import (REWARD_MODES, RewardConfig,
                                TERMINAL_OWN_BANK)
+from rl_manager.ppo_policy import CurriculumMaskConfig
 
 #: Fixed evaluation seed sets (issue #9 Evaluation section).
 SMOKE_SEEDS: tuple[int, ...] = (17, 42, 2026)
@@ -84,6 +87,17 @@ def _add_inference_batch_options(parser: argparse.ArgumentParser) -> None:
                         help="Maximum central batch wait before dispatch (ms).")
 
 
+def _add_curriculum_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--curriculum-max-land", type=int, default=None,
+                        help="Maximum decoded land target (1..4).")
+    parser.add_argument("--curriculum-max-goose", type=int, default=None,
+                        help="Maximum absolute GOOSE target (0..count_max).")
+    parser.add_argument("--curriculum-max-cow", type=int, default=None,
+                        help="Maximum absolute COW target (0..count_max).")
+    parser.add_argument("--curriculum-max-sheep", type=int, default=None,
+                        help="Maximum absolute SHEEP target (0..count_max).")
+
+
 # --------------------------------------------------------------- parser
 
 
@@ -107,6 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--init-mode", choices=("bc", "scratch"),
                        default="bc",
                        help="Mutable manager initialization (default: bc).")
+    train.add_argument("--resume-checkpoint", default=None,
+                       help="Resume PPO state at this run/update boundary.")
     train.add_argument("--training-composition", choices=TRAINING_COMPOSITIONS,
                        default=CANDIDATE_VS_FROZEN)
     train.add_argument("--reward-mode", choices=REWARD_MODES,
@@ -152,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--e-history-version", choices=E_HISTORY_VERSIONS,
                        default=E_HISTORY_CORRECTED_V1,
                        help="Explicit E input semantics; legacy is compatibility-only.")
+    _add_curriculum_options(train)
 
     ev = sub.add_parser("eval",
                         help="Fixed-seed paired evaluation vs frozen E.")
@@ -172,7 +189,8 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--seed-set", required=True, choices=sorted(SEED_SETS))
     ev.add_argument("--output-json", required=True)
     ev.add_argument("--e-history-version", choices=E_HISTORY_VERSIONS,
-                    default=E_HISTORY_CORRECTED_V1)
+                     default=E_HISTORY_CORRECTED_V1)
+    _add_curriculum_options(ev)
     ev.add_argument(CONFIRM_FLAG, action="store_true",
                     help="Required for the expensive dev/holdout panels.")
 
@@ -264,6 +282,16 @@ def _validate_common(args: argparse.Namespace) -> dict[str, Any]:
             "backend": args.backend}
 
 
+def _curriculum_from_args(args: argparse.Namespace) -> CurriculumMaskConfig:
+    """Build the explicit static strategic support for one run boundary."""
+    return CurriculumMaskConfig(
+        max_land=getattr(args, "curriculum_max_land", None),
+        max_goose=getattr(args, "curriculum_max_goose", None),
+        max_cow=getattr(args, "curriculum_max_cow", None),
+        max_sheep=getattr(args, "curriculum_max_sheep", None),
+    )
+
+
 def _resolve_executor_factory(
         identifier: str, *, low_telemetry: bool = False) -> Any:
     """Resolve the explicit registry entry in the owner before spawning."""
@@ -286,6 +314,7 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
     """Validate a train invocation into an explicit plan dict (no side
     effects beyond validation)."""
     plan = _validate_common(args)
+    curriculum = _curriculum_from_args(args)
     if args.master_seed < 0:
         raise ValueError("--master-seed must be nonnegative")
     opening = str(getattr(args, "opening", "standard_mixed"))
@@ -298,6 +327,13 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
     init_mode = str(getattr(args, "init_mode", "bc"))
     if init_mode not in ("bc", "scratch"):
         raise ValueError("--init-mode must be one of ('bc', 'scratch')")
+    resume_checkpoint = getattr(args, "resume_checkpoint", None)
+    if resume_checkpoint is not None and init_mode != "bc":
+        raise ValueError("--resume-checkpoint cannot be combined with "
+                         "--init-mode scratch")
+    if resume_checkpoint is not None and not Path(resume_checkpoint).is_file():
+        raise FileNotFoundError(
+            f"--resume-checkpoint {resume_checkpoint} does not exist")
     composition = str(getattr(args, "training_composition",
                               CANDIDATE_VS_FROZEN))
     if composition not in TRAINING_COMPOSITIONS:
@@ -349,6 +385,9 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
         "manager_start_day": manager_start_day,
         "manager_decisions_per_seat": decisions_per_seat,
         "init_mode": init_mode,
+        "resume_checkpoint": (None if resume_checkpoint is None else
+                               str(Path(resume_checkpoint))),
+        "curriculum": curriculum.to_json_dict(),
         "training_composition": composition,
         "reward": reward_config.to_json_dict(),
         "expected_trainable_rows": expected_rows,
@@ -381,6 +420,7 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
 def plan_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     """Validate an eval invocation into an explicit plan dict (no games)."""
     plan = _validate_common(args)
+    curriculum = _curriculum_from_args(args)
     seeds = SEED_SETS[args.seed_set]
     expensive = args.seed_set in ("dev", "holdout")
     if expensive and not args.confirm_expensive:
@@ -395,6 +435,7 @@ def plan_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         "planned_games": len(seeds) * 2,
         "e_checkpoint": str(Path(args.e_checkpoint)),
         "checkpoint": str(Path(args.checkpoint)),
+        "curriculum": curriculum.to_json_dict(),
         "output_json": str(Path(args.output_json)),
     })
     print(f"planned evaluation: {plan['planned_games']} games "
@@ -475,13 +516,16 @@ def _rollout_candidate_from_state(
     previous: Any | None = None,
     deterministic: bool | None = None,
     e_history_version: str = E_HISTORY_CORRECTED_V1,
+    curriculum: CurriculumMaskConfig | None = None,
 ) -> Any:
     """Build a rollout adapter bound to the exact returned train state."""
     from rl_manager.ppo_adapter import ppo_batched_policy_from_state
 
     if deterministic is None:
         deterministic = (previous.deterministic if previous is not None
-                         else False)
+                          else False)
+    if curriculum is None and previous is not None:
+        curriculum = previous.curriculum
     return ppo_batched_policy_from_state(
         state,
         config,
@@ -494,7 +538,8 @@ def _rollout_candidate_from_state(
         e_history_version=(previous.identity.e_history_version
                            if previous is not None
                            and previous.identity.e_history_version is not None
-                           else e_history_version),
+                            else e_history_version),
+        curriculum=curriculum,
     )
 
 
@@ -504,6 +549,7 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
 
     from rl_manager.ppo import build_ppo_batch, init_train_state, ppo_update
     from rl_manager.ppo_adapter import ppo_snapshot_from_state
+    from rl_manager.ppo_checkpoint import load_ppo_checkpoint
     from rl_manager.ppo_checkpoint import save_ppo_snapshot
     from rl_manager.ppo_policy import PPOConfig
     from rl_manager.policy import JaxEPlanPolicy
@@ -517,20 +563,30 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
         plan["e_checkpoint"],
         expected_e_history_version=plan["e_history_version"])
     config = ManagerConfig(**metadata["model_config"])
+    curriculum = CurriculumMaskConfig.from_json_dict(plan["curriculum"])
     ppo_config = PPOConfig(**plan["ppo"])
     initial_base_params = None
     initialization_seed = None
-    if plan["init_mode"] == "scratch":
-        initialization_seed = SeedStream(
-            plan["master_seed"]).initialization_seed()
-        initial_base_params = init_train_params(
-            config, seed=initialization_seed, model_variant="E")
-    state = init_train_state(frozen_params, config,
-                             seed=plan["master_seed"], ppo_config=ppo_config,
-                             initial_base_params=initial_base_params)
+    parent_meta: Mapping[str, Any] | None = None
+    if plan.get("resume_checkpoint") is not None:
+        state, parent_meta = load_ppo_checkpoint(
+            plan["resume_checkpoint"], config=config,
+            ppo_config=ppo_config,
+            expected_e_history_version=plan["e_history_version"])
+    else:
+        if plan["init_mode"] == "scratch":
+            initialization_seed = SeedStream(
+                plan["master_seed"]).initialization_seed()
+            initial_base_params = init_train_params(
+                config, seed=initialization_seed, model_variant="E")
+        state = init_train_state(
+            frozen_params, config, seed=plan["master_seed"],
+            ppo_config=ppo_config, initial_base_params=initial_base_params,
+            curriculum=curriculum)
     candidate = _rollout_candidate_from_state(
         state, config, ppo_config,
-        e_history_version=plan["e_history_version"])
+        e_history_version=plan["e_history_version"], curriculum=curriculum)
+    print(f"curriculum={json.dumps(curriculum.to_json_dict(), sort_keys=True)}")
     original_bc_e = JaxEPlanPolicy(
         frozen_params, config, name="frozen_e",
         e_history_version=plan["e_history_version"])
@@ -588,11 +644,22 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
             buffer.finalize(), gamma=ppo_config.gamma,
             gae_lambda=ppo_config.gae_lambda,
             sidecar_records=buffer.sidecar_records)
-        state, metrics = ppo_update(state, batch, config, ppo_config)
+        recomputed = candidate._policy.evaluate_actions(
+            batch.inputs, batch.action_tensors)
+        if not np.allclose(recomputed["logprob_total"], batch.old_logprob,
+                           rtol=0.0, atol=1e-5):
+            max_error = float(np.max(np.abs(
+                recomputed["logprob_total"] - batch.old_logprob)))
+            raise ValueError(
+                "rollout stored logprobs do not match active PPO policy "
+                f"recomputation (max_abs_error={max_error})")
+        state, metrics = ppo_update(
+            state, batch, config, ppo_config, curriculum=curriculum)
         if metrics["accepted"]:
             candidate = _rollout_candidate_from_state(
                 state, config, ppo_config, previous=candidate,
-                e_history_version=plan["e_history_version"])
+                e_history_version=plan["e_history_version"],
+                curriculum=curriculum)
         update_number = update_index + 1
         print(f"UPDATE {update_number}")
         rollout_opponent = (ratchet.current_opponent.identity.fingerprint
@@ -614,7 +681,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
             eval_candidate = _rollout_candidate_from_state(
                 state, config, ppo_config, previous=candidate,
                 deterministic=True,
-                e_history_version=plan["e_history_version"])
+                e_history_version=plan["e_history_version"],
+                curriculum=curriculum)
             eval_runner = (ParallelSelfPlayRunner(
                 runner_config, num_workers=plan["knobs"]["num_workers"],
                 executor_factory=executor_factory)
@@ -641,6 +709,7 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                     "update": update_number,
                     "ppo_step": int(state.step),
                     "init_mode": plan["init_mode"],
+                    "curriculum": curriculum.to_json_dict(),
                 })
             decision = evaluate_promotion(summary)
             summary["promotion"] = decision.to_dict()
@@ -648,7 +717,8 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                 state, config, ppo_config=ppo_config,
                 name=f"promotion_{ratchet.promotions + 1:03d}",
                 version="ratchet-v1",
-                e_history_version=plan["e_history_version"])
+                e_history_version=plan["e_history_version"],
+                curriculum=curriculum)
             gate = "PASS" if decision.passed else "HOLD"
             print(
                 f"RATCHET update={update_number} "
@@ -674,8 +744,10 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                         "original_bc_e": original_bc_e.identity.to_json_dict(),
                         "evaluation_seed_set": promotion["seed_set"],
                         "init_mode": plan["init_mode"],
+                        "curriculum": curriculum.to_json_dict(),
                     },
-                    e_history_version=plan["e_history_version"])
+                    e_history_version=plan["e_history_version"],
+                    curriculum=curriculum)
                 eval_path = promotion_dir / (
                     f"promotion_{promotion_number:03d}_eval.json")
                 eval_path.parent.mkdir(parents=True, exist_ok=True)
@@ -704,7 +776,12 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                         "training_composition": plan["training_composition"],
                         "reward_config": dict(plan["reward"]),
                         "init_mode": plan["init_mode"],
-                        "initialization_seed": initialization_seed})
+                        "initialization_seed": initialization_seed,
+                        "curriculum": curriculum.to_json_dict(),
+                        "parent_checkpoint": plan.get("resume_checkpoint"),
+                        "parent_curriculum": (None if parent_meta is None else
+                                               parent_meta.get("curriculum"))},
+            curriculum=curriculum)
         history.append({"update": update_index, "metrics": metrics,
                         "checkpoint": str(path),
                         "init_mode": plan["init_mode"],
@@ -724,7 +801,12 @@ def execute_training(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no c
                     "training_composition": plan["training_composition"],
                     "reward_config": dict(plan["reward"]),
                     "init_mode": plan["init_mode"],
-                    "initialization_seed": initialization_seed})
+                    "initialization_seed": initialization_seed,
+                    "curriculum": curriculum.to_json_dict(),
+                    "parent_checkpoint": plan.get("resume_checkpoint"),
+                    "parent_curriculum": (None if parent_meta is None else
+                                           parent_meta.get("curriculum"))},
+        curriculum=curriculum)
     return {"history": history, "promotion_checks": promotion_checks,
             "init_mode": plan["init_mode"],
             "promotions": ratchet.promotions,
@@ -748,12 +830,15 @@ def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no
         plan["e_checkpoint"],
         expected_e_history_version=plan["e_history_version"])
     config = ManagerConfig(**metadata["model_config"])
+    curriculum = CurriculumMaskConfig.from_json_dict(plan["curriculum"])
     state, checkpoint_meta = load_ppo_checkpoint(
         plan["checkpoint"], config=config,
         expected_e_history_version=plan["e_history_version"])
     candidate = ppo_batched_policy_from_state(
         state, config, name="ppo_candidate", deterministic=True,
-        e_history_version=plan["e_history_version"])
+        e_history_version=plan["e_history_version"],
+        curriculum=curriculum)
+    print(f"curriculum={json.dumps(curriculum.to_json_dict(), sort_keys=True)}")
     frozen_policy = JaxEPlanPolicy(
         frozen_params, config, name="frozen_e",
         e_history_version=plan["e_history_version"])
@@ -785,6 +870,8 @@ def execute_evaluation(plan: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no
             "seed_set": plan["seed_set"],
             "candidate_identity": candidate.identity.to_json_dict(),
             "opponent_identity": frozen_policy.identity.to_json_dict(),
+            "curriculum": curriculum.to_json_dict(),
+            "checkpoint_curriculum": checkpoint_meta.get("curriculum"),
             "init_mode": checkpoint_meta.get("provenance", {}).get(
                 "init_mode"),
         },

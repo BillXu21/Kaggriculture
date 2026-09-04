@@ -19,7 +19,7 @@ from rl_manager.ppo import (
     init_train_state,
     ppo_update,
 )
-from rl_manager.ppo_policy import PPOConfig, PPOPolicy
+from rl_manager.ppo_policy import (CurriculumMaskConfig, PPOConfig, PPOPolicy)
 
 
 def _encoded(day: int = 4, money: float = 3000.0):
@@ -200,6 +200,34 @@ def test_tiny_update_finite_changes_expected_params(tiny_e):
         leaves(new_state.params["value"]), leaves(state.params["value"])))
     assert trunk_changed and value_changed
     assert new_state.step == ppo_config.epochs * 1
+
+
+def test_masked_ppo_update_and_frozen_kl_are_finite(tiny_e):
+    params, config = tiny_e
+    curriculum = CurriculumMaskConfig(max_land=1, max_goose=0)
+    inputs = _two_row_inputs()
+    policy = PPOPolicy(params, config, seed=17, curriculum=curriculum)
+    batch = _make_batch(policy, inputs)
+    ppo_config = PPOConfig(minibatch_size=2, epochs=1,
+                           kl_to_frozen_coef=0.1)
+    state = init_train_state(params, config, seed=42,
+                             ppo_config=ppo_config, curriculum=curriculum)
+    new_state, metrics = ppo_update(
+        state, batch, config, ppo_config, curriculum=curriculum)
+    assert new_state.step == 1
+    assert all(np.isfinite(float(metrics[key])) for key in (
+        "loss", "entropy", "kl_to_frozen"))
+
+    invalid = {name: np.array(value, copy=True)
+               for name, value in batch.action_tensors.items()}
+    invalid["land"][0] = 2
+    bad_batch = PPOBatch(inputs=batch.inputs, action_tensors=invalid,
+                         old_logprob=batch.old_logprob,
+                         advantages=batch.advantages, returns=batch.returns,
+                         values=batch.values)
+    with pytest.raises(ValueError, match="max_land"):
+        ppo_update(state, bad_batch, config, ppo_config,
+                   curriculum=curriculum)
 
 
 def test_target_kl_stops_after_first_epoch_and_reports_counts(tiny_e):

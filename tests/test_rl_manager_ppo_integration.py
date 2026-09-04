@@ -32,7 +32,8 @@ from rl_manager.ppo_adapter import (
     select_ppo_subset,
 )
 from rl_manager.ppo_checkpoint import load_ppo_checkpoint, save_ppo_checkpoint
-from rl_manager.ppo_policy import PPO_GROUPS, PPOConfig, PPOPolicy
+from rl_manager.ppo_policy import (PPO_GROUPS, PPOConfig, PPOPolicy,
+                                    curriculum_behavior_fingerprint)
 from rl_manager.policy import JaxEPlanPolicy, params_fingerprint
 from rl_manager.runner import (
     GAME_TURNS,
@@ -149,7 +150,8 @@ def test_adapter_exact_output_fields_and_single_batched_call(smoke):
         assert np.asarray(out.action_tensors[name]).shape == (4,) + shape
     assert adapter.identity.name == "adapter"
     assert adapter.identity.version == "v-test"
-    assert adapter.identity.fingerprint == params_fingerprint(policy.params)
+    assert adapter.identity.fingerprint == curriculum_behavior_fingerprint(
+        policy.params, policy.curriculum)
     # ONE batched call for the whole request batch — never per row/env.
     assert adapter.call_count == 1
     assert adapter.batch_size_history == [4]
@@ -304,6 +306,8 @@ def test_trajectory_to_gae_to_subset_to_update_pipeline(smoke, tmp_path):
                                     smoke.ppo_config)
     assert new_state.step == 1
     for key, value in metrics.items():
+        if value is None or isinstance(value, (list, dict, str)):
+            continue
         assert np.isfinite(float(value)), key
     assert float(metrics["clip_fraction"]) >= 0.0
 

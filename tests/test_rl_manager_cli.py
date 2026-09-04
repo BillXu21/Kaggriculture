@@ -35,7 +35,8 @@ from rl_manager.debug_trace import load_trace
 from rl_manager.policy import PassPlanPolicy
 from rl_manager.policy import params_fingerprint
 from rl_manager.ppo import init_train_state
-from rl_manager.ppo_policy import PPOConfig
+from rl_manager.ppo_policy import (CurriculumMaskConfig, PPOConfig,
+                                    curriculum_behavior_fingerprint)
 from rl_manager.runner import build_episode_spec
 from rl_manager.types import CURRENT_VS_CURRENT_ECONOMIC, E_VS_E, E_VS_PASS
 from tests.test_rl_manager_runner import (
@@ -113,6 +114,9 @@ def test_parser_defaults_are_safe_single_process():
     assert args.minibatch_size == 8
     assert args.target_kl is None
     assert args.reject_update_kl is None
+    assert (args.curriculum_max_land, args.curriculum_max_goose,
+            args.curriculum_max_cow, args.curriculum_max_sheep) == \
+        (None, None, None, None)
 
     ev = build_parser().parse_args([
         "eval", "--checkpoint", "ppo.npz", "--e-checkpoint", "ck.pt",
@@ -157,6 +161,19 @@ def test_plan_exposes_ppo_stability_controls(tmp_path):
     plan = plan_training(args)
     assert plan["ppo"]["target_kl"] == 0.03
     assert plan["ppo"]["reject_update_kl"] == 2.0
+
+
+def test_plan_records_exact_curriculum_caps(tmp_path):
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"placeholder")
+    args = build_parser().parse_args([
+        "train", "--e-checkpoint", str(checkpoint),
+        "--executor-factory", "executor_v0@stage-a-v1", "--master-seed", "17",
+        "--curriculum-max-land", "1", "--curriculum-max-goose", "0",
+        "--curriculum-max-cow", "2", "--curriculum-max-sheep", "3",
+        "--output-dir", "out", "--checkpoint", "out/ppo.npz"])
+    assert plan_training(args)["curriculum"] == CurriculumMaskConfig(
+        max_land=1, max_goose=0, max_cow=2, max_sheep=3).to_json_dict()
 
 
 def test_scratch_init_mode_is_recorded_in_training_plan(tmp_path):
@@ -339,9 +356,10 @@ def test_debug_trace_short_smoke_writes_valid_artifact(
 # ----------------------------------------------------------- train planning
 
 
-def test_train_plan_fails_loud_when_checkpoint_missing():
+def test_train_plan_fails_loud_when_checkpoint_missing(tmp_path):
     with pytest.raises(FileNotFoundError, match="e-checkpoint"):
-        plan_training(_train_args())
+        plan_training(_train_args(
+            e_checkpoint=str(tmp_path / "missing-e-checkpoint.pt")))
 
 
 def test_train_plan_accepts_parallel_worker_knob(tmp_path):
@@ -446,7 +464,8 @@ def test_training_rebinds_next_rollout_candidate_to_returned_state():
     assert candidate is not old_candidate
     assert candidate.identity.name == old_candidate.identity.name
     assert candidate.identity.version == old_candidate.identity.version
-    assert candidate.identity.fingerprint == params_fingerprint(new_state.params)
+    assert candidate.identity.fingerprint == curriculum_behavior_fingerprint(
+        new_state.params, candidate.curriculum)
     assert candidate.identity.fingerprint != old_candidate.identity.fingerprint
     assert not np.array_equal(new_actions["land"], old_actions["land"])
 

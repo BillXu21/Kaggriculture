@@ -1,6 +1,7 @@
 """RL PPO checkpoint tests: roundtrip + deterministic resume (req. 5)."""
 
 import jax
+import json
 import numpy as np
 import pytest
 
@@ -13,7 +14,9 @@ from rl_manager.ppo_checkpoint import (
     save_ppo_checkpoint,
 )
 from rl_manager.ppo_retention import BestCheckpointRetention
-from rl_manager.ppo_policy import PPOConfig, PPOPolicy
+from rl_manager.ppo_policy import (CurriculumMaskConfig, PPOConfig, PPOPolicy,
+                                    curriculum_behavior_fingerprint)
+from rl_manager.ppo_adapter import ppo_batched_policy_from_state
 
 
 def _encoded(day: int = 4, money: float = 3000.0):
@@ -73,7 +76,8 @@ def test_roundtrip_full_state_and_provenance(env, tmp_path):
     assert meta["model_variant"] == "E"
     assert meta["step"] == state.step
     assert meta["rollout_seed"] == 2026
-    assert meta["provenance"] == provenance
+    assert meta["provenance"] == {
+        **provenance, "curriculum": CurriculumMaskConfig().to_json_dict()}
     for got, want in zip(_leaves(loaded.params), _leaves(state.params)):
         assert np.array_equal(got, want)
     for got, want in zip(_leaves(loaded.frozen_params),
@@ -84,6 +88,47 @@ def test_roundtrip_full_state_and_provenance(env, tmp_path):
         assert np.array_equal(got, want)
     assert np.array_equal(np.asarray(loaded.rng), np.asarray(state.rng))
     assert loaded.step == state.step
+
+
+def test_curriculum_roundtrip_old_default_and_rebind_without_parameter_mutation(
+        env, tmp_path):
+    config, ppo_config, _batch, state = env
+    restricted = CurriculumMaskConfig(max_land=1, max_goose=0)
+    path = save_ppo_checkpoint(tmp_path / "masked.npz", state, config,
+                               ppo_config, curriculum=restricted,
+                               provenance={"run": "masked"})
+    loaded, meta = load_ppo_checkpoint(path)
+    assert meta["curriculum"] == restricted.to_json_dict()
+    assert meta["provenance"]["curriculum"] == restricted.to_json_dict()
+
+    before = _leaves(loaded.params)
+    unrestricted = ppo_batched_policy_from_state(
+        loaded, config, ppo_config=ppo_config)
+    masked = ppo_batched_policy_from_state(
+        loaded, config, ppo_config=ppo_config, curriculum=restricted)
+    assert unrestricted.identity.fingerprint == curriculum_behavior_fingerprint(
+        loaded.params)
+    assert unrestricted.identity.fingerprint != masked.identity.fingerprint
+    assert all(np.array_equal(got, want)
+               for got, want in zip(before, _leaves(loaded.params)))
+
+
+def test_old_checkpoint_without_curriculum_metadata_loads_unrestricted(
+        env, tmp_path):
+    config, ppo_config, _batch, state = env
+    original = save_ppo_checkpoint(tmp_path / "old.npz", state, config,
+                                   ppo_config)
+    with np.load(original, allow_pickle=False) as archive:
+        items = {key: archive[key] for key in archive.files}
+    meta = json.loads(items["__meta__"].tobytes().decode("utf-8"))
+    meta.pop("curriculum")
+    meta["provenance"].pop("curriculum")
+    items["__meta__"] = np.frombuffer(
+        json.dumps(meta, sort_keys=True).encode("utf-8"), dtype=np.uint8)
+    old_path = tmp_path / "old-format-metadata.npz"
+    np.savez(old_path, **items)
+    _loaded, loaded_meta = load_ppo_checkpoint(old_path)
+    assert loaded_meta["curriculum"] == CurriculumMaskConfig().to_json_dict()
 
 
 def test_resume_next_update_bit_identical(env, tmp_path):

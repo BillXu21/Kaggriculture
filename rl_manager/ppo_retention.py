@@ -11,6 +11,7 @@ import numpy as np
 
 from bc_manager.economics import E_HISTORY_CORRECTED_V1
 from rl_manager.ppo_checkpoint import save_ppo_checkpoint
+from rl_manager.ppo_policy import CurriculumMaskConfig
 
 
 def _checkpoint_score(path: Path) -> float | None:
@@ -54,6 +55,7 @@ class BestCheckpointRetention:
         provenance: Mapping[str, Any] | None = None,
         model_variant: str = "E",
         e_history_version: str = E_HISTORY_CORRECTED_V1,
+        curriculum: CurriculumMaskConfig | None = None,
     ) -> bool:
         """Save ``state`` only when ``score`` strictly improves that named best."""
         score = float(score)
@@ -67,6 +69,7 @@ class BestCheckpointRetention:
         save_ppo_checkpoint(
             path, state, config, ppo_config, model_variant=model_variant,
             e_history_version=e_history_version,
+            curriculum=curriculum,
             provenance={
                 "best_retention": {
                     "name": name,

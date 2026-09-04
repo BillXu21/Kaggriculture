@@ -13,12 +13,15 @@ from bc_manager_jax.model import (
     tiny_manager_config,
 )
 from rl_manager.ppo_policy import (
+    CurriculumMaskConfig,
     PPO_GROUPS,
     PPOPolicy,
+    apply_curriculum_mask,
     bernoulli_entropy,
     bernoulli_logprobs,
     categorical_entropy,
     categorical_logprobs,
+    curriculum_behavior_fingerprint,
 )
 from rl_manager.decode import ACTION_TENSOR_SHAPES
 from rl_manager.policy import JaxEPlanPolicy
@@ -180,6 +183,87 @@ def test_stochastic_requires_rng(tiny_e, batch):
     policy = PPOPolicy(tiny_e[0], config, seed=1)
     with pytest.raises(ValueError, match="rng"):
         policy.act(batch, deterministic=False)
+
+
+def test_unrestricted_mask_is_exact_noop_and_identity_is_stable(tiny_e, batch):
+    params, config = tiny_e
+    logits = {"crop": jax.numpy.zeros((4, 5, 101)),
+              "animal": jax.numpy.zeros((4, 3, 101)),
+              "land": jax.numpy.zeros((4, 4)),
+              "fertilizer": jax.numpy.zeros((4, 5, 101)),
+              "care": jax.numpy.zeros((4, 3, 101)),
+              "sell_presence": jax.numpy.zeros((4, 54))}
+    assert apply_curriculum_mask(logits) is logits
+    first = PPOPolicy(params, config, seed=7)
+    second = PPOPolicy(params, config, seed=7,
+                       curriculum=CurriculumMaskConfig())
+    for name, value in first.act(batch, deterministic=True)["action_tensors"].items():
+        assert np.array_equal(value, second.act(
+            batch, deterministic=True)["action_tensors"][name])
+    assert curriculum_behavior_fingerprint(
+        params) == curriculum_behavior_fingerprint(params, CurriculumMaskConfig())
+
+
+def test_curriculum_restricts_land_and_named_animals_without_other_masks(
+        tiny_e, batch):
+    params, config = tiny_e
+    curriculum = CurriculumMaskConfig(max_land=2, max_goose=0,
+                                      max_cow=2, max_sheep=1)
+    policy = PPOPolicy(params, config, seed=7, curriculum=curriculum)
+    for seed in range(8):
+        result = policy.act(batch, rng=jax.random.PRNGKey(seed))
+        actions = result["action_tensors"]
+        assert np.all(actions["land"] <= 2)
+        assert np.all(actions["animal"][:, 0] == 0)
+        assert np.all(actions["animal"][:, 1] <= 2)
+        assert np.all(actions["animal"][:, 2] <= 1)
+        assert np.all(np.isfinite(result["entropy_total"]))
+        recomputed = policy.evaluate_actions(batch, actions)
+        assert np.array_equal(result["logprob_total"],
+                              recomputed["logprob_total"])
+    greedy = policy.act(batch, deterministic=True)["action_tensors"]
+    assert np.all(greedy["land"] <= 2)
+    assert np.all(greedy["animal"][:, 0] == 0)
+    unrestricted = PPOPolicy(params, config, seed=7).act(
+        batch, deterministic=True)["action_tensors"]
+    for name in ("crop", "fertilizer", "care", "sell_presence",
+                 "sell_quantity"):
+        assert np.array_equal(greedy[name], unrestricted[name]), name
+    goose_two = PPOPolicy(params, config, seed=7,
+                          curriculum=CurriculumMaskConfig(max_goose=2))
+    for seed in range(4):
+        assert np.all(goose_two.act(
+            batch, rng=jax.random.PRNGKey(seed))["action_tensors"][
+                "animal"][:, 0] <= 2)
+    assert curriculum_behavior_fingerprint(
+        params, CurriculumMaskConfig(max_goose=0)) != \
+        curriculum_behavior_fingerprint(params, CurriculumMaskConfig(max_land=1))
+
+
+def test_curriculum_rejects_out_of_support_stored_actions(tiny_e, batch):
+    policy = PPOPolicy(tiny_e[0], tiny_e[1], seed=7,
+                       curriculum=CurriculumMaskConfig(max_land=1,
+                                                        max_goose=0))
+    sampled = policy.act(batch, rng=jax.random.PRNGKey(3))
+    invalid_land = {name: np.array(value, copy=True)
+                    for name, value in sampled["action_tensors"].items()}
+    invalid_land["land"][0] = 2
+    with pytest.raises(ValueError, match="max_land"):
+        policy.evaluate_actions(batch, invalid_land)
+    invalid_goose = {name: np.array(value, copy=True)
+                     for name, value in sampled["action_tensors"].items()}
+    invalid_goose["animal"][0, 0] = 1
+    with pytest.raises(ValueError, match="goose"):
+        policy.evaluate_actions(batch, invalid_goose)
+
+
+def test_curriculum_config_rejects_invalid_values():
+    with pytest.raises(ValueError, match="max_land"):
+        CurriculumMaskConfig(max_land=0)
+    with pytest.raises(ValueError, match="max_goose"):
+        CurriculumMaskConfig(max_goose=-1)
+    with pytest.raises(ValueError, match="int"):
+        CurriculumMaskConfig(max_cow=True)
 
 
 def test_logprob_recomputation_exact_from_stored_actions(tiny_e, batch):

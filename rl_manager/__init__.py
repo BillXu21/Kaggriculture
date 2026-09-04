@@ -49,6 +49,12 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "PPOBatch": ("rl_manager.ppo", "PPOBatch"),
     "PPOBatchedPolicy": ("rl_manager.ppo_adapter", "PPOBatchedPolicy"),
     "PPOConfig": ("rl_manager.ppo_policy", "PPOConfig"),
+    "CurriculumMaskConfig": (
+        "rl_manager.ppo_policy", "CurriculumMaskConfig"),
+    "apply_curriculum_mask": (
+        "rl_manager.ppo_policy", "apply_curriculum_mask"),
+    "curriculum_behavior_fingerprint": (
+        "rl_manager.ppo_policy", "curriculum_behavior_fingerprint"),
     "PPOPolicy": ("rl_manager.ppo_policy", "PPOPolicy"),
     "PPOTrainState": ("rl_manager.ppo", "PPOTrainState"),
     "PPO_SNAPSHOT_FORMAT": (

@@ -41,6 +41,7 @@ from bc_manager_jax.model import (
 )
 
 from rl_manager.ppo_policy import (
+    CurriculumMaskConfig,
     PPOConfig,
     combined_params_template,
     frozen_leaf_mask,
@@ -69,6 +70,7 @@ def save_ppo_checkpoint(
     model_variant: str = "E",
     e_history_version: str = E_HISTORY_CORRECTED_V1,
     provenance: Mapping[str, Any] | None = None,
+    curriculum: CurriculumMaskConfig | None = None,
 ) -> Path:
     """Save train state + configs + provenance atomically, pickle-free."""
     variant = resolve_model_variant(model_variant)
@@ -76,6 +78,7 @@ def save_ppo_checkpoint(
         raise ValueError(
             f"RL PPO checkpoints store variant E only, got {variant!r}")
     history_version = normalize_e_history_version(e_history_version)
+    active_curriculum = curriculum or CurriculumMaskConfig()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -96,16 +99,19 @@ def save_ppo_checkpoint(
                          f"{rng.shape}/{rng.dtype}")
     flat["rng"] = rng
 
+    checkpoint_provenance = dict(provenance) if provenance else {}
+    checkpoint_provenance["curriculum"] = active_curriculum.to_json_dict()
     meta = {
         "format": RL_PPO_CHECKPOINT_FORMAT,
         "model_config": dataclasses.asdict(config),
         "ppo_config": dataclasses.asdict(ppo_config),
         "model_variant": variant,
         "e_history_version": history_version,
+        "curriculum": active_curriculum.to_json_dict(),
         "step": int(state.step),
         "rollout_seed": (None if state.rollout_seed is None
                          else int(state.rollout_seed)),
-        "provenance": dict(provenance) if provenance else {},
+        "provenance": checkpoint_provenance,
         "n_param_leaves": len(jax.tree_util.tree_leaves(state.params)),
         "n_frozen_leaves": len(jax.tree_util.tree_leaves(state.frozen_params)),
         "n_opt_leaves": len(opt_leaves),
@@ -170,6 +176,12 @@ def load_ppo_checkpoint(
             f"the requested variant is {variant!r}")
     stored_history = normalize_e_history_version(
         meta.get("e_history_version", E_HISTORY_LEGACY))
+    stored_curriculum = CurriculumMaskConfig.from_json_dict(
+        meta.get("curriculum") or meta.get("provenance", {}).get("curriculum"))
+    meta["curriculum"] = stored_curriculum.to_json_dict()
+    meta["provenance"] = dict(meta.get("provenance") or {})
+    meta["provenance"].setdefault(
+        "curriculum", stored_curriculum.to_json_dict())
     if expected_e_history_version is not None and stored_history != \
             normalize_e_history_version(expected_e_history_version):
         raise ValueError(
@@ -248,13 +260,19 @@ def save_ppo_snapshot(
     snapshot_identity: Mapping[str, Any],
     e_history_version: str = E_HISTORY_CORRECTED_V1,
     provenance: Mapping[str, Any] | None = None,
+    curriculum: CurriculumMaskConfig | None = None,
 ) -> Path:
     """Persist only the detached policy/frozen-E trees for a ratchet snapshot."""
     variant = resolve_model_variant("E")
     history_version = normalize_e_history_version(e_history_version)
+    active_curriculum = curriculum or CurriculumMaskConfig()
     identity_history = snapshot_identity.get("e_history_version")
     if identity_history not in (None, history_version):
         raise ValueError("snapshot identity e_history_version does not match payload")
+    identity_curriculum = snapshot_identity.get("curriculum")
+    if identity_curriculum is not None and \
+            identity_curriculum != active_curriculum.to_json_dict():
+        raise ValueError("snapshot identity curriculum does not match payload")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     flat: dict[str, np.ndarray] = {}
@@ -264,15 +282,18 @@ def save_ppo_snapshot(
             state.frozen_params)[0]:
         flat["frozenparam:" + _leaf_path(tokens)] = np.asarray(
             leaf, dtype=np.float32)
+    snapshot_provenance = dict(provenance) if provenance else {}
+    snapshot_provenance["curriculum"] = active_curriculum.to_json_dict()
     meta = {
         "format": PPO_SNAPSHOT_FORMAT,
         "model_config": dataclasses.asdict(config),
         "ppo_config": dataclasses.asdict(ppo_config),
         "model_variant": variant,
         "e_history_version": history_version,
+        "curriculum": active_curriculum.to_json_dict(),
         "step": int(state.step),
         "snapshot_identity": dict(snapshot_identity),
-        "provenance": dict(provenance) if provenance else {},
+        "provenance": snapshot_provenance,
     }
     flat["__meta__"] = np.frombuffer(
         json.dumps(meta, sort_keys=True).encode("utf-8"), dtype=np.uint8)
@@ -313,6 +334,13 @@ def load_ppo_snapshot(
         raise ValueError(f"{path}: PPO snapshots require model variant E")
     stored_history = normalize_e_history_version(
         meta.get("e_history_version", E_HISTORY_LEGACY))
+    curriculum_metadata_present = "curriculum" in meta
+    stored_curriculum = CurriculumMaskConfig.from_json_dict(
+        meta.get("curriculum") or meta.get("provenance", {}).get("curriculum"))
+    meta["curriculum"] = stored_curriculum.to_json_dict()
+    meta["provenance"] = dict(meta.get("provenance") or {})
+    meta["provenance"].setdefault(
+        "curriculum", stored_curriculum.to_json_dict())
     if expected_e_history_version is not None and stored_history != \
             normalize_e_history_version(expected_e_history_version):
         raise ValueError(
@@ -350,10 +378,14 @@ def load_ppo_snapshot(
         state, stored_config, ppo_config=stored_ppo,
         name=str(identity.get("name", "ppo_snapshot")),
         version=str(identity.get("version", "ratchet-v1")),
-        e_history_version=stored_history)
+        e_history_version=stored_history, curriculum=stored_curriculum)
     if identity.get("e_history_version") not in (None, stored_history):
         raise ValueError(f"{path}: snapshot identity history version mismatch")
-    if identity.get("fingerprint") != policy.identity.fingerprint:
+    from rl_manager.policy import params_fingerprint
+    expected_fingerprint = (params_fingerprint(state.params)
+                            if not curriculum_metadata_present else
+                            policy.identity.fingerprint)
+    if identity.get("fingerprint") != expected_fingerprint:
         raise ValueError(f"{path}: snapshot fingerprint does not match arrays")
     return policy, meta
 
