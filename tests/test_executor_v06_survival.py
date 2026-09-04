@@ -343,6 +343,149 @@ def test_prior_debt_toggle_false_keeps_current_feed_suppression():
         "expansion_suppressed_current"] is True
 
 
+def test_prior_debt_keeps_land_but_suppresses_animal_expansion():
+    agent = agent_for(_prior_debt_plan(), config=AgentConfig(turn_trace=True))
+    day3, day4 = _prior_debt_observations()
+    agent(day3)
+    action = agent(make_obs(
+        day=4, hour=0, money=3000.0, unlocked=("NW",),
+        tiles=empty_tiles()))
+
+    assert [order for order in action["market"] if order[0] == "BUY_LAND"] == [
+        ["BUY_LAND"]]
+    assert not any(order[0] == "BUY_ANIMAL" for order in action["market"])
+    day = agent.diagnostics_json()["days"]["4"]
+    assert day["end_of_day_work_debt"] == {
+        "all": [], "survival": [], "maintenance": [],
+        "productive": [], "manager": [],
+    }
+    assert day["survival"]["expansion_suppressed_from_prior_debt"] is True
+    assert day["land_purchase"] == {
+        "requested": True, "task_present": True,
+        "suppressed_prior_debt": False,
+        "suppressed_current_survival": False,
+        "affordable_before_hires": True,
+        "unaffordable_before_hires": False,
+        "submitted": True,
+        "land_cost": 1000.0,
+        "cash_before_land": 3000.0,
+    }
+    assert agent.diagnostics_json()["days"]["4"]["turn_trace"][0][
+        "land_purchase"]["suppressed_prior_debt"] is False
+
+
+def test_current_starvation_suppresses_requested_land():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("GOOSE", consecutive_unfed=1)
+    agent = agent_for(plan(
+        animal_targets={"GOOSE": 1, "COW": 0, "SHEEP": 0}, land_count=2),
+        config=AgentConfig(turn_trace=True))
+
+    action = agent(make_obs(
+        unlocked=("NW",), money=10_000.0, tiles=tiles,
+        inventories=[{"WHEAT": 1}]))
+
+    assert not any(order[0] == "BUY_LAND" for order in action["market"])
+    land = agent.diagnostics_json()["days"]["3"]["land_purchase"]
+    assert land["requested"] is True
+    assert land["task_present"] is True
+    assert land["suppressed_prior_debt"] is False
+    assert land["suppressed_current_survival"] is True
+    assert land["submitted"] is False
+
+
+def test_current_feed_shortage_buys_feed_and_suppresses_requested_land():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("GOOSE")
+    agent = agent_for(plan(
+        animal_targets={"GOOSE": 1, "COW": 0, "SHEEP": 0}, land_count=2),
+        config=AgentConfig(turn_trace=True))
+
+    action = agent(make_obs(unlocked=("NW",), money=10_000.0, tiles=tiles))
+
+    assert action["market"][0][:2] == ["BUY_PRODUCT", "WHEAT"]
+    assert not any(order[0] == "BUY_LAND" for order in action["market"])
+    land = agent.diagnostics_json()["days"]["3"]["land_purchase"]
+    assert land["suppressed_current_survival"] is True
+    assert land["submitted"] is False
+
+
+def test_land_is_reserved_before_workload_hiring():
+    tiles = empty_tiles()
+    tiles[1][0] = plant_tile(watered_today=False)
+    agent = agent_for(plan(
+        crop_targets={"WHEAT": 0, "CARROT": 0, "TOMATO": 0,
+                      "STRAWBERRY": 0, "MELON": 0},
+        land_count=2), config=AgentConfig(tasks_per_worker=10))
+
+    action = agent(make_obs(unlocked=("NW",), money=1000.0, tiles=tiles))
+
+    assert action["market"] == [["BUY_LAND"]]
+    land = agent.diagnostics_json()["days"]["3"]["land_purchase"]
+    assert land["affordable_before_hires"] is True
+    assert land["submitted"] is True
+
+
+def test_land_and_workload_hire_both_fit_in_cash():
+    tiles = empty_tiles()
+    tiles[1][0] = plant_tile(watered_today=False)
+    agent = agent_for(plan(land_count=2), config=AgentConfig(tasks_per_worker=10))
+
+    action = agent(make_obs(unlocked=("NW",), money=1001.0, tiles=tiles))
+
+    assert action["market"][:2] == [["BUY_LAND"], ["HIRE"]]
+    assert agent.diagnostics_json()["days"]["3"]["land_purchase"][
+        "submitted"] is True
+
+
+def test_unaffordable_land_does_not_reserve_cash_from_hiring():
+    tiles = empty_tiles()
+    tiles[1][0] = plant_tile(watered_today=False)
+    agent = agent_for(plan(land_count=2), config=AgentConfig(tasks_per_worker=10))
+
+    action = agent(make_obs(unlocked=("NW",), money=999.0, tiles=tiles))
+
+    assert action["market"] == [["HIRE"]]
+    land = agent.diagnostics_json()["days"]["3"]["land_purchase"]
+    assert land["affordable_before_hires"] is False
+    assert land["unaffordable_before_hires"] is True
+    assert land["submitted"] is False
+
+
+def test_market_cap_keeps_land_ahead_of_workload_hiring():
+    tiles = empty_tiles()
+    tiles[1][0] = plant_tile(watered_today=False)
+    daily = plan(land_count=2, wheat_sell=1)
+    agent = agent_for(daily, config=AgentConfig(
+        tasks_per_worker=10, max_market_orders=2))
+
+    action = agent(make_obs(
+        unlocked=("NW",), money=1000.0, shed={"WHEAT": 1}, tiles=tiles))
+
+    assert action["market"] == [["SELL", "WHEAT", 1], ["BUY_LAND"]]
+    assert agent.diagnostics_json()["days"]["3"]["land_purchase"][
+        "submitted"] is True
+
+
+def test_market_queue_places_land_before_hire_and_other_buy():
+    tiles = empty_tiles()
+    tiles[1][0] = plant_tile(watered_today=False)
+    daily = plan(
+        crop_targets={"WHEAT": 2, "CARROT": 0, "TOMATO": 0,
+                      "STRAWBERRY": 0, "MELON": 0},
+        land_count=2, wheat_sell=1)
+    agent = agent_for(daily, config=AgentConfig(tasks_per_worker=10))
+
+    action = agent(make_obs(
+        unlocked=("NW",), money=1001.0, shed={"WHEAT": 1},
+        seeds={}, tiles=tiles))
+
+    assert action["market"] == [
+        ["SELL", "WHEAT", 1], ["BUY_LAND"], ["HIRE"],
+        ["BUY_SEED", "WHEAT", 1],
+    ]
+
+
 def test_prior_debt_toggle_does_not_change_safe_actions_or_ordinary_diagnostics():
     observations = [
         make_obs(day=3, hour=0),

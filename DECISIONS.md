@@ -2,6 +2,24 @@
 
 This file records decisions that remain authoritative across chats and work sessions. A decision should include the reason, evidence, and conditions for revisiting it.
 
+## D-053 - Prioritize Requested Land Before Workload Hiring
+
+- Date: 2026-09-04
+- Status: active executor mechanical correction
+- Decision: Prior-day worker debt does not suppress `BUY_LAND`. Current
+  starvation or feed shortage still suppresses it. After sells and mandatory
+  survival feed, an affordable generated land purchase reserves capital before
+  workload hiring; unaffordable land does not reserve cash and hiring proceeds
+  normally.
+- Rationale: empty land creates no feed, animal-care, watering, or mandatory
+  worker-load obligation. Charging workload hires before land allowed otherwise
+  affordable land to be displaced by discretionary staffing.
+- Evidence: focused executor regressions cover prior debt, current starvation
+  and feed shortage, land/hire affordability, and generated task diagnostics;
+  existing animal placement and survival tests remain covered.
+- Revisit when: land acquisition creates mandatory work in the engine or a
+  bounded official-engine panel shows that this executor priority is harmful.
+
 ## D-052 - Version Corrected E Economic History
 
 - Date: 2026-08-31
@@ -145,8 +163,9 @@ This file records decisions that remain authoritative across chats and work sess
 - Date: 2026-08-29
 - Status: active issue #25 correction
 - Decision: prior-day debt or current capital suppression removes new
-  BUILD/BUY_ANIMAL/BUY_LAND work, but does not remove a dependency-free PLACE
-  into an already-existing compatible empty structure. A PLACE dependent on a
+  BUILD/BUY_ANIMAL work; current survival pressure also removes BUY_LAND, but
+  prior-day debt does not. Neither removes a dependency-free PLACE into an
+  already-existing compatible empty structure. A PLACE dependent on a
   suppressed BUILD is removed with that BUILD, so no invalid placement leaks
   through. True starvation dispatch remains FEED-only, and hard weed-boundary
   WATER retains priority over an underfoot PLACE.
@@ -187,8 +206,9 @@ This file records decisions that remain authoritative across chats and work sess
 - Date: 2026-08-29
 - Status: active issue #25 correction
 - Decision: prior-day debt or current capital suppression removes new
-  BUILD/BUY_ANIMAL/BUY_LAND work, but does not remove a dependency-free PLACE
-  into an already-existing compatible empty structure. A PLACE dependent on a
+  BUILD/BUY_ANIMAL work; current survival pressure also removes BUY_LAND, but
+  prior-day debt does not. Neither removes a dependency-free PLACE into an
+  already-existing compatible empty structure. A PLACE dependent on a
   suppressed BUILD is removed with that BUILD, so no invalid placement leaks
   through. True starvation dispatch remains FEED-only, and hard weed-boundary
   WATER retains priority over an underfoot PLACE.

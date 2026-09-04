@@ -19,10 +19,10 @@ simplifications" and "Implementation status" sections.
    priority-dominated greedy assignment, shed routing for carried items,
    one legal Manhattan step, global-seed reservation for PLANT.
 6. Market queue under the 10-order cap, deterministic SELL -> survival WHEAT
-   -> HIRE -> other buys: six-bin sells clipped to actual shed inventory
-   (`clip_sell`), survival feed purchases before hiring, turn-aware any-hour
-   workload hiring, exact-shortage BUY_SEED/BUY_PRODUCT/BUY_ANIMAL and single
-   BUY_LAND.
+   -> BUY_LAND -> HIRE -> other buys: six-bin sells clipped to actual shed
+   inventory (`clip_sell`), survival feed purchases before hiring, affordable
+   requested land before workload hiring, turn-aware any-hour workload hiring,
+   exact-shortage BUY_SEED/BUY_PRODUCT/BUY_ANIMAL and single BUY_LAND.
 7. Output: `{"farmer": [...], "hands": [[...]], "market": [[...]]}` plus JSON
    diagnostics (requested/feasible/achieved/submitted/observed) and a
    deterministic all-PASS fallback on any runtime failure.
@@ -35,7 +35,10 @@ V0.7 survival contract: the executor uses the official/default
 the prior-debt expansion suppression heuristic defaults **ON**. This default
 is explicit architectural debt bounded to the three-seed/two-seat PASS panel;
 it is not a learned economic policy or a generalization claim. Survival work
-and WHEAT purchases remain ahead of hiring.
+and WHEAT purchases remain ahead of hiring. Prior-day worker debt suppresses
+new animal/housing commitments but does not suppress BUY_LAND; current
+starvation or feed shortage suppresses land as well. After sells and mandatory
+survival feed, an affordable generated BUY_LAND reserves cash before hiring.
 
 Stage 4 lifecycle realization: when a legally harvestable non-ongoing crop is
 inside the existing productive `water_yield_window`, its same-tile HARVEST is

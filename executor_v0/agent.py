@@ -16,8 +16,8 @@ One class, `ExecutorAgent`, closes the loop every primitive turn:
 - hard survival guardrails keep existing animals ahead of discretionary
   expansion: current-day feed is protected from WHEAT sells, starvation
   boundary FEED work preempts non-survival tile work, feed-shortage purchases
-  execute before hiring/discretionary buys, and new animal/land commitments
-  pause while current survival or prior-day work debt is unresolved;
+  execute before discretionary buys, current survival pauses all expansion,
+  and prior-day work debt pauses animal/housing commitments but not empty land;
 - end-of-day work debt is measured from tasks still requiring work after the
   final primitive action, so temporary dependency/travel waiting that resolves
   during the day is not mislabeled as unfinished work;
@@ -70,8 +70,11 @@ _INTERACTION_OPS = frozenset({
     "WATER", "HARVEST", "DIG", "PLANT", "BUILD_COOP", "BUILD_PASTURE",
     "PLACE", "FEED", "CARE", "FERTILIZE", "COLLECT_FERTILIZER",
 })
-_EXPANSION_TASK_KINDS = frozenset({
+_CURRENT_SURVIVAL_SUPPRESSED_TASK_KINDS = frozenset({
     "BUILD_COOP", "BUILD_PASTURE", "BUY_ANIMAL", "BUY_LAND",
+})
+_PRIOR_DEBT_SUPPRESSED_TASK_KINDS = frozenset({
+    "BUILD_COOP", "BUILD_PASTURE", "BUY_ANIMAL",
 })
 
 
@@ -413,6 +416,17 @@ class ExecutorAgent:
                 "feed_reserve_protected_units": 0,
                 "feed_shortage_turns": 0,
                 "partial_feed_buys": 0,
+            },
+            "land_purchase": {
+                "requested": False,
+                "task_present": False,
+                "suppressed_prior_debt": False,
+                "suppressed_current_survival": False,
+                "affordable_before_hires": False,
+                "unaffordable_before_hires": False,
+                "submitted": False,
+                "land_cost": None,
+                "cash_before_land": None,
             },
             "errors": [],
         }
@@ -826,6 +840,7 @@ class ExecutorAgent:
         hour: int,
         feed: Mapping[str, int],
         expansion_suppressed: bool,
+        land_purchase: Mapping[str, Any],
         tasks: tuple[Task, ...],
         dispatch_tasks: tuple[Task, ...],
         cleanup_tasks: tuple[Task, ...],
@@ -916,6 +931,7 @@ class ExecutorAgent:
                 "suppressed_from_prior": bool(self._suppress_expansion_today),
                 "reasons": reasons,
             },
+            "land_purchase": dict(land_purchase),
             "survival_tasks": {
                 "feed": [self._trace_task(task, farm) for task in survival_tasks
                          if task.kind == "FEED"],
@@ -1052,13 +1068,40 @@ class ExecutorAgent:
         feed = _animal_feed_state(obs, seat, board=board)
         current_survival_pressure = bool(feed["starving"] or feed["shortage"])
         expansion_suppressed = self._suppress_expansion_today or current_survival_pressure
-        if expansion_suppressed:
+        if current_survival_pressure:
+            suppressed_kinds = _CURRENT_SURVIVAL_SUPPRESSED_TASK_KINDS
+        elif self._suppress_expansion_today:
+            suppressed_kinds = _PRIOR_DEBT_SUPPRESSED_TASK_KINDS
+        else:
+            suppressed_kinds = frozenset()
+        generated_land_tasks = tuple(
+            task for task in tasks if task.kind == "BUY_LAND")
+        land_purchase_turn = {
+            "requested": bool(
+                self._requested is not None
+                and self._requested.land_count
+                > len(obs["farms"][seat]["unlocked_quadrants"])
+            ),
+            "task_present": bool(generated_land_tasks),
+            "suppressed_prior_debt": bool(
+                generated_land_tasks and self._suppress_expansion_today
+                and "BUY_LAND" in _PRIOR_DEBT_SUPPRESSED_TASK_KINDS
+            ),
+            "suppressed_current_survival": bool(
+                generated_land_tasks and current_survival_pressure),
+            "affordable_before_hires": False,
+            "unaffordable_before_hires": False,
+            "submitted": False,
+            "land_cost": None,
+            "cash_before_land": None,
+        }
+        if suppressed_kinds:
             suppressed_keys = {
-                t.key for t in tasks if t.kind in _EXPANSION_TASK_KINDS
+                t.key for t in tasks if t.kind in suppressed_kinds
             }
             tasks = tuple(
                 t for t in tasks
-                if t.kind not in _EXPANSION_TASK_KINDS
+                if t.kind not in suppressed_kinds
                 and not (
                     t.kind == "PLACE"
                     and any(dep in suppressed_keys for dep in t.depends_on)
@@ -1092,6 +1135,13 @@ class ExecutorAgent:
 
         record = self._day_records[day]
         survival_record = record["survival"]
+        land_purchase_record = record["land_purchase"]
+        for key in (
+            "requested", "task_present", "suppressed_prior_debt",
+            "suppressed_current_survival",
+        ):
+            land_purchase_record[key] = bool(
+                land_purchase_record[key] or land_purchase_turn[key])
         survival_record["expansion_suppressed_current"] = bool(
             survival_record["expansion_suppressed_current"] or expansion_suppressed)
         if feed["starving"]:
@@ -1112,14 +1162,16 @@ class ExecutorAgent:
             t for t in all_market_tasks
             if t.kind == "BUY_PRODUCT" and t.product == "WHEAT" and feed["shortage"] > 0
         ]
+        land_buys = [t for t in all_market_tasks if t.kind == "BUY_LAND"]
         other_buys = [
             t for t in all_market_tasks
-            if t.kind in ("BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL", "BUY_LAND")
+            if t.kind in ("BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL")
             and t not in survival_feed_buys
         ]
 
         candidates = [("sell", c) for c in sell_candidates]
         trace_market_by_payload: dict[int, tuple[str, str]] = {}
+        land_candidate_ids: set[int] = set()
         unaffordable_orders = []
         for task in survival_feed_buys:
             op, cost, quantity = self._affordable_survival_feed_buy(obs, task, unlocked_count, running_cash)
@@ -1135,6 +1187,27 @@ class ExecutorAgent:
             candidates.append(("buy", op))
             if self.config.turn_trace:
                 trace_market_by_payload[id(op)] = ("survival", task.key)
+
+        for task in land_buys:
+            op = self._buy_op(task)
+            cost = self._buy_order_cost(obs, task, unlocked_count)
+            if op is None or cost is None:
+                continue
+            land_purchase_turn["land_cost"] = cost
+            land_purchase_turn["cash_before_land"] = running_cash
+            if running_cash + _MONEY_EPSILON < cost:
+                land_purchase_turn["unaffordable_before_hires"] = True
+                unaffordable_orders.append({
+                    "task": task.key, "cost": cost,
+                    "cash_available": running_cash, "survival": False,
+                })
+                continue
+            land_purchase_turn["affordable_before_hires"] = True
+            running_cash -= cost
+            candidates.append(("buy", op))
+            land_candidate_ids.add(id(op))
+            if self.config.turn_trace:
+                trace_market_by_payload[id(op)] = ("expansion", task.key)
 
         hire_orders, hires_requested = self._hire_orders(
             obs, seat,
@@ -1166,6 +1239,19 @@ class ExecutorAgent:
 
         included = candidates[:self.config.max_market_orders]
         orders = [payload["order"] if kind == "sell" else payload for kind, payload in included]
+        land_purchase_turn["submitted"] = any(
+            kind == "buy" and id(payload) in land_candidate_ids
+            for kind, payload in included
+        )
+        for key in (
+            "affordable_before_hires", "unaffordable_before_hires", "submitted",
+        ):
+            land_purchase_record[key] = bool(
+                land_purchase_record[key] or land_purchase_turn[key])
+        if land_purchase_turn["land_cost"] is not None:
+            land_purchase_record["land_cost"] = land_purchase_turn["land_cost"]
+            land_purchase_record["cash_before_land"] = land_purchase_turn[
+                "cash_before_land"]
 
         self._commit_sells(obs, day, [payload for kind, payload in included if kind == "sell"])
         if self.config.aggressive_sell_all:
@@ -1218,7 +1304,8 @@ class ExecutorAgent:
         if self.config.turn_trace:
             try:
                 self._record_turn_trace(
-                    obs, seat, day, hour, feed, expansion_suppressed, tasks,
+                    obs, seat, day, hour, feed, expansion_suppressed,
+                    land_purchase_turn, tasks,
                     dispatch_tasks, optional_tasks, foreman_result, pending,
                     trace_market_by_payload, included, unaffordable_orders)
             except Exception:

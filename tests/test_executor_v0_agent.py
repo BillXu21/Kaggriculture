@@ -897,6 +897,7 @@ def test_turn_trace_entry_shape_contains_survival_routing_and_counts():
     entry = trace[0]
     assert set(entry) == {
         "day", "hour", "feed", "expansion", "survival_tasks",
+        "land_purchase",
         "assignments", "unassigned_survival_task_keys",
         "pending_survival_task_keys", "counts", "market",
     }
