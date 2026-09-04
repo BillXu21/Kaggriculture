@@ -1,6 +1,6 @@
 # 2026-09-04 PPO curriculum findings and next decisions
 
-This note records the durable conclusions from the recent scratch-PPO curriculum experiments, the executor land fix, and the new manager-intent telemetry. It is intended to be folded into the root durable-decision index when that file is next edited normally.
+This note records the durable conclusions from the recent scratch-PPO curriculum experiments, the executor land fix, the new manager-intent telemetry, and the first BC-E-initialized PPO runs. It is intended to be folded into the root durable-decision index when that file is next edited normally.
 
 ## D-054 - Persist manager intent separately from executor outcomes
 
@@ -31,10 +31,29 @@ This note records the durable conclusions from the recent scratch-PPO curriculum
 ## D-057 - Keep BC-E PPO on its stored E contract before the next architecture change
 
 - **Status:** active experiment sequencing.
-- **Decision:** The next serious PPO quality experiments initialize from the real promoted BC-E checkpoint and use its stored own-only E architecture/config unchanged for the first comparison. Do not silently enable opponent-board tokens, J/JE joint decision tokens, or delta targets in that baseline. After the BC-E-initialized PPO baseline is measured with manager-intent telemetry, JE is the preferred next architecture candidate to investigate through a JAX port and E->JE transfer/distillation; delta targets remain a separate action-parameterization redesign requiring a compatible new training/transfer path.
+- **Decision:** The serious PPO quality experiments initialize from the real promoted BC-E checkpoint and use its stored own-only E architecture/config unchanged for the baseline. Do not silently enable opponent-board tokens, J/JE joint decision tokens, or delta targets in that baseline. JE remains the preferred next architecture candidate to investigate through a JAX port and E->JE transfer/distillation; delta targets remain a separate action-parameterization redesign requiring a compatible new training/transfer path.
 - **Rationale:** current JAX PPO supports V0/E only and the RL seam intentionally enforces the own-only E contract. The BC-E checkpoint gives meaningful initialization for the existing absolute heads; changing inputs and decoder structure at the same time would confound whether BC initialization itself solves the scratch semantic/exploration failure. JE is attractive because it adds cross-task coordination while preserving the existing output semantics, whereas delta targets change the action contract itself.
-- **Evidence:** D-027 records that J/JE remain PyTorch-only while BC-E is the JAX production target; current PPO uses independent crop/animal/fertilizer/care categorical heads. The 2026-09-04 scratch diagnostics above show that the present absolute heads can remain poorly learned from terminal-bank PPO even while realized bank improves through the executor.
-- **Revisit when:** BC-E manager-intent telemetry is itself incoherent, BC-E PPO fails to improve under a controlled run, or a tested JE/delta transfer path is available with exact checkpoint/input compatibility.
+- **Evidence:** D-027 records that J/JE remain PyTorch-only while BC-E is the JAX production target; current PPO uses independent crop/animal/fertilizer/care categorical heads. D-058 now confirms that the stored BC-E policy itself has coherent absolute-count semantics, so BC-E remains a valid baseline despite the scratch failure of the same action representation.
+- **Revisit when:** BC-E PPO plateaus under stable small updates, a tested JE transfer path is available, or delta actions can be trained/distilled without conflating the architecture comparison.
+
+## D-058 - Treat the BC-E plus executor rollout as a competent semantic baseline
+
+- **Status:** active baseline interpretation.
+- **Decision:** Use the fresh BC-E rollout before PPO as the semantic/economic baseline for the existing E architecture. The old absolute target heads are not intrinsically meaningless: when initialized from BC-E they request crop counts on the physical scale of the farm, show selective crop composition and late-game taper, and are mostly realizable by the executor. Therefore the scratch `~250`-crop behavior is primarily an initialization/learning failure, not evidence that the executor or action decoder always forces incoherent targets.
+- **Evidence:** fresh unrestricted BC-E (`M_bce_fullspace_ppo_s43046`, rollout/update 1 before the first PPO update) produced mean bank `58,962`, median `60,602`, p10 `42,218`, with `96.875%` of trainable seats above `30k`. Manager crop request total mean was `41.62` / median `48`, mean distinct requested species `2.781`, unresolved crop-deficit rows only `9.01%`, and mean realized/requested fraction `80.62%`. Requested crop total tapered to mean `13.40` on days `28-29`, versus roughly `40-53` during the working farm. This sharply contrasts with scratch's `~258` requested crops, `~100%` unresolved rows, `~19%` target utilization, and no late-game taper.
+- **Land/use context:** the unrestricted BC-E baseline also bought three plots essentially universally (`766/768` seats ended on three quadrants, two on four), with NE purchase around day `6.98` and SW around day `11.38`. Existing daily utilization snapshots show substantial post-d4 productive occupancy (~`0.619` mean), but current aggregates are not yet per-quadrant, so ownership is proven more strongly than exact field-3 utilization.
+- **Interpretation boundary:** this is BC-E plus the deterministic executor, not proof that the manager alone contains every low-level heuristic. The relevant result is that manager intent is coherent enough to survive the D-054 diagnostics rather than being repaired from diffuse random targets.
+- **Revisit when:** a JE/delta model establishes a stronger semantic baseline, or executor changes materially alter the request-to-realization funnel.
+
+## D-059 - Use small PPO steps from BC-E; `3e-4` is catastrophically destructive while `1e-5` is stable
+
+- **Status:** active PPO optimization rule.
+- **Decision:** BC-initialized PPO should begin with learning rate `1e-5` and otherwise conservative updates. Do not reuse the scratch/curriculum escape setting `3e-4` as the BC fine-tuning default. Before adding stronger KL shaping, use preservation of manager-intent semantics as a hard diagnostic: a useful PPO update must keep crop requests near the BC physical scale and avoid returning to near-uniform absolute-count sampling.
+- **Evidence, destructive run:** starting fresh from BC-E with `lr=3e-4`, 2 epochs, no frozen-KL penalty, and no target-KL produced the good D-058 rollout at update 1, then destroyed it after one PPO update. Update 2 mean bank fell to `13,519`, crop request mean jumped to `239.22`, unresolved-deficit fraction hit `100%`, mean target utilization fell to `1.64%`, and `717/768` seats ended with all four quadrants. Updates 3-5 stayed in the diffuse failure regime (`~235-273` requested crops/day and `100%` unresolved rows). This is catastrophic policy drift, not a gradual economic tradeoff.
+- **Evidence, stable run:** a fresh BC-E run with the same unrestricted space and `lr=1e-5` preserved coherent manager behavior for 10 updates while bank improved modestly. First-five versus last-five averages were mean bank `61,293 -> 63,089` (`+1,796`), median `62,733 -> 64,261` (`+1,529`), and p10 `44,773 -> 47,748` (`+2,975`). Update 1 to update 10 moved roughly `59.6k -> 63.6k` mean, `60.7k -> 64.7k` median, and `42.6k -> 48.5k` p10. Crop request total remained roughly `41.7 -> 42.3`, unresolved-deficit fraction only drifted from about `9.0% -> 9.8%`, and late d28-29 crop request remained around `14-15` rather than exploding toward `200+`.
+- **Interpretation:** `1e-5` is not yet evidence of a large PPO gain, but it is the first regime where economics move positively without destroying the BC semantics. The small increase in unresolved/late crop intent is a drift warning to monitor. If bank plateaus while semantic diagnostics degrade, add a mild frozen-BC KL constraint rather than first increasing LR.
+- **Next experiment:** continue the `1e-5` lineage from its u10 checkpoint for another bounded block before changing optimizer/KL settings. Compare bank mean/median/p10 together with requested crop total, unresolved-deficit fraction, late-game crop request, final animals, and land timing.
+- **Revisit when:** the continuation shows sustained improvement, a clear plateau, or semantic drift sufficient to justify frozen-BC KL regularization.
 
 ## Supporting artifact identities
 
@@ -43,4 +62,7 @@ This note records the durable conclusions from the recent scratch-PPO curriculum
 - Severe scratch parent retained at `F_severe_s1_u15_no_targetkl/final.npz`.
 - Executor-fixed land-2 continuation retained at `J_land2_from_severe_u15_executorfix/final.npz`.
 - Wider-animal land-2 continuation retained at `K_land2_animals_2g6c4s_from_Ju10/final.npz`.
-- Land-3 continuation is diagnostic evidence; do not promote it solely from the first rollout.
+- Land-3 scratch continuation is diagnostic evidence; do not promote it.
+- Destructive unrestricted BC-E PPO run retained at `M_bce_fullspace_ppo_s43046/final.npz` only as a failure artifact; do not use it as a parent.
+- Stable unrestricted BC-E PPO run retained at `N_bce_fullspace_lr1e5_s43047/final.npz`; this is the current PPO parent.
+- Continuation from N u10 is `O_bce_fullspace_lr1e5_from_Nu10_s43048`; evaluate before changing LR/KL settings.
