@@ -22,7 +22,7 @@ Final tie-break is the stable task key; the foreman later adds distance.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import Any
 
@@ -328,6 +328,8 @@ def generate_tasks(
     reconcile_result: CropReconciliationResult | None = None,
     animal_layout_result: AnimalLayoutResult | None = None,
     canonical_board_value: list[list[Any]] | None = None,
+    heuristic_care: bool = False,
+    heuristic_fertilizer: bool = False,
 ) -> GenerationResult:
     """Regenerate the full V0 task set from the current observation.
 
@@ -595,26 +597,50 @@ def generate_tasks(
     for animal, count in animal_layout_result.unresolved:
         unresolved.append(f"animal_deficit_unresolved:{animal}:{count}")
 
+    from executor_v0.upkeep import care_has_payoff, fertilizer_extra_units
+
     # ---- MANAGER: CARE / FERTILIZE exact allocations --------------------
     care_requests = _plan_counts(feasible_plan.care_by_animal_dict,
                                  ANIMAL_ORDER)
     for species in ANIMAL_ORDER:
-        budget = care_requests[species]
-        for coord in by_proximity(care_eligible[species])[:budget]:
+        eligible = care_eligible[species]
+        if heuristic_care:
+            eligible = [c for c in eligible if care_has_payoff(
+                _tile_at(board, c), int(obs["day"]))]
+        budget = len(eligible) if heuristic_care else care_requests[species]
+        for coord in by_proximity(eligible)[:budget]:
             tasks.append(Task(key=f"CARE:{species}:{coord[0]},{coord[1]}",
                               kind="CARE", priority=Priority.MANAGER,
                               tile=coord, animal=species, quantity=1,
-                              source="manager_allocation"))
+                              source="heuristic_care_v1" if heuristic_care else "manager_allocation"))
     fert_requests = _plan_counts(feasible_plan.fertilizer_by_crop_dict,
                                  CROP_ORDER)
+    prices = (obs.get("market") or {}).get("prices") or {}
+    blocked = {t.tile for t in tasks if t.kind == "DIG"}
     for crop in CROP_ORDER:
-        budget = fert_requests[crop]
-        for coord in by_proximity(fert_eligible[crop])[:budget]:
-            tasks.append(Task(key=f"FERTILIZE:{crop}:{coord[0]},{coord[1]}",
-                              kind="FERTILIZE", priority=Priority.MANAGER,
-                              tile=coord, crop=crop,
+        eligible = fert_eligible[crop]
+        if heuristic_fertilizer:
+            eligible = [c for c in eligible if c not in blocked
+                        and fertilizer_extra_units(_tile_at(board, c), int(obs["day"]))
+                        * float(prices.get(crop, 0))
+                        > float(prices.get("FERTILIZER", float("inf"))) * 1.25]
+        budget = len(eligible) if heuristic_fertilizer else fert_requests[crop]
+        for coord in by_proximity(eligible)[:budget]:
+            key = f"FERTILIZE:{crop}:{coord[0]},{coord[1]}"
+            if heuristic_fertilizer and not CROPS[crop]["ongoing"]:
+                water_key = f"WATER:{coord[0]},{coord[1]}"
+                water = next((t for t in tasks if t.key == water_key), None)
+                # Never block survival watering on fertilizer logistics.
+                if water is not None and water.priority == Priority.MAINTENANCE:
+                    continue
+                if water is not None:
+                    tasks = [replace(t, depends_on=t.depends_on + (key,))
+                             if t.key == water_key else t for t in tasks]
+            tasks.append(Task(key=key, kind="FERTILIZE",
+                              priority=Priority.MANAGER, tile=coord, crop=crop,
                               required_item=_FERTILIZER_ITEM, quantity=1,
-                              source="manager_allocation"))
+                              source="heuristic_fertilizer_v1"
+                              if heuristic_fertilizer else "manager_allocation"))
 
     # ---- MANAGER: land -------------------------------------------------
     current_land = len(unlocked)

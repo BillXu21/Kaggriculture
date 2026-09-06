@@ -97,6 +97,8 @@ class AgentConfig:
     optional_spare_watering: bool = False
     immediate_plant_water: bool = True
     record_turn_snapshot: bool = True
+    heuristic_care: bool = False
+    heuristic_fertilizer: bool = False
 
     @property
     def idle_cleanup_enabled(self) -> bool:
@@ -1033,7 +1035,9 @@ class ExecutorAgent:
         generation = generate_tasks(
             obs, seat, feasible_plan=self._feasible,
             remaining_sells=self._remaining_sells,
-            canonical_board_value=board)
+            canonical_board_value=board,
+            heuristic_care=self.config.heuristic_care,
+            heuristic_fertilizer=self.config.heuristic_fertilizer)
         generated_tasks = generation.sorted_tasks()
         worker_positions = [
             (int(obs["farms"][seat]["farmer"][1]),
@@ -1378,6 +1382,8 @@ class ExecutorAgent:
                 "aggressive_sell_all": self.config.aggressive_sell_all,
                 "optional_idle_cleanup": self.config.idle_cleanup_enabled,
                 "optional_spare_watering": self.config.optional_spare_watering,
+                "heuristic_care": self.config.heuristic_care,
+                "heuristic_fertilizer": self.config.heuristic_fertilizer,
                 "optional_idle_cleanup_mode": self.config.cleanup_mode,
                 "cleanup_mode": self.config.cleanup_mode,
                 "immediate_plant_water": self.config.immediate_plant_water,
