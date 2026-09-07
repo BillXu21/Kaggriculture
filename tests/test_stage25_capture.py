@@ -155,7 +155,8 @@ def test_episode_ids_match_original_panel_and_survive_filtering():
     assert episode_id_for(25, len(seeds), 1, 0) == 102
     assert episode_id_for(25, len(seeds), 1, 1) == 103
     # Variant subset never enters the formula.
-    for variant in ("baseline", "care", "fertilizer", "combined"):
+    for variant in ("baseline", "care", "fertilizer", "fertilizer_wheat3",
+                    "combined", "combined_wheat3"):
         UpkeepFactory(0, variant)  # must not raise
     # Identity-preserving single-game selection keeps original numbering.
     selected = parse_game_filter(["144368101:1"], seeds)

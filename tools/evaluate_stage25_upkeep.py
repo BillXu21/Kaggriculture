@@ -20,8 +20,22 @@ import subprocess
 
 from rl_manager.stage25_capture import game_dir, write_game_capture
 
-VARIANTS = {'baseline': (False, False), 'care': (True, False),
-            'fertilizer': (False, True), 'combined': (True, True)}
+VARIANTS = {
+    'baseline': (False, False, False),
+    'care': (True, False, False),
+    'fertilizer': (False, True, False),
+    'fertilizer_wheat3': (False, True, True),
+    'combined': (True, True, False),
+    'combined_wheat3': (True, True, True),
+}
+COMPARISON_REFERENCES = {
+    'baseline': None,
+    'care': 'baseline',
+    'fertilizer': 'baseline',
+    'fertilizer_wheat3': 'fertilizer',
+    'combined': 'baseline',
+    'combined_wheat3': 'combined',
+}
 
 
 def episode_id_for(master_seed: int, num_seeds: int, index: int,
@@ -70,13 +84,16 @@ class UpkeepFactory:
 
     def create(self, *, backend_name, seat, configuration, provider):
         from executor_v0.agent import AgentConfig, make_agent
-        care, fert = VARIANTS[self.variant] if seat == self.candidate_seat else (False, False)
+        care, fert, wheat3 = (
+            VARIANTS[self.variant] if seat == self.candidate_seat
+            else (False, False, False))
         # Capture enables read-only per-turn snapshots only; the returned
         # primitive action is computed before any snapshot exists.
         return make_agent(provider=provider, seat=seat, config=AgentConfig(
             strict=True, optional_spare_watering=True,
             record_turn_snapshot=self.capture,
-            heuristic_care=care, heuristic_fertilizer=fert))
+            heuristic_care=care, heuristic_fertilizer=fert,
+            wheat_harvest_threshold=wheat3))
 
 
 def main(argv=None) -> None:
@@ -98,8 +115,15 @@ def main(argv=None) -> None:
         p.error('seeds and variants must be unique')
     if args.master_seed < 0:
         p.error('master seed must be nonnegative')
-    if 'baseline' not in args.variants:
-        p.error('include baseline for a paired comparison')
+    missing_threshold_refs = [
+        f'{variant} -> {COMPARISON_REFERENCES[variant]}'
+        for variant in ('fertilizer_wheat3', 'combined_wheat3')
+        if variant in args.variants
+        and COMPARISON_REFERENCES[variant] not in args.variants
+    ]
+    if missing_threshold_refs:
+        p.error('include threshold comparison references: ' +
+                ', '.join(missing_threshold_refs))
     try:
         game_selection = parse_game_filter(args.game_filter, list(args.seeds))
     except ValueError as exc:
@@ -113,6 +137,8 @@ def main(argv=None) -> None:
     manifest={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
     manifest.update(schema_version=1, stochastic=True, opening='standard_mixed',
                     games=2*len(args.seeds)*len(args.variants),
+                    comparison_references={name: COMPARISON_REFERENCES[name]
+                                           for name in args.variants},
                     source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
                     source_dirty=bool(subprocess.check_output(['git','status','--porcelain'],text=True)),
                     source_diff_sha256=hashlib.sha256(subprocess.check_output(['git','diff','HEAD'])).hexdigest())
@@ -166,6 +192,7 @@ def main(argv=None) -> None:
                 bank=float(result.final_banks[seat]);opp=float(result.final_banks[1-seat])
                 row={'variant':variant,'seed':seed,'seat':seat,'episode_id':episode_id,
                      'bank':bank,'opponent_bank':opp,
+                     'margin':bank-opp,
                      'statuses':list(result.statuses)}
                 if capture:
                     directory=game_dir(args.capture_dir,variant,episode_id,seed,seat)
@@ -211,15 +238,34 @@ def main(argv=None) -> None:
                           'note':'game-filter run preserves original episode IDs; '
                                  'rerun the full panel for summaries/comparison'}),flush=True)
         return
-    baseline={(r['seed'],r['seat']):r for r in all_rows if r['variant']=='baseline'}
+    rows_by_variant = {
+        variant: {(r['seed'], r['seat']): r for r in all_rows
+                  if r['variant'] == variant}
+        for variant in args.variants
+    }
     comparison=[]
     for variant in args.variants:
         rows=[r for r in all_rows if r['variant']==variant]
-        deltas=[r['bank']-baseline[r['seed'],r['seat']]['bank'] for r in rows]
+        reference = COMPARISON_REFERENCES[variant]
+        reference_rows = rows_by_variant.get(reference, {}) if reference else {}
+        deltas = [r['bank'] - reference_rows[r['seed'], r['seat']]['bank']
+                  for r in rows if reference and
+                  (r['seed'], r['seat']) in reference_rows]
+        margin_deltas = [
+            r['margin'] - reference_rows[r['seed'], r['seat']]['margin']
+            for r in rows if reference and
+            (r['seed'], r['seat']) in reference_rows]
         comparison.append({'variant':variant,'games':len(rows),
                            'mean_bank':sum(r['bank'] for r in rows)/len(rows),
-                           'mean_paired_bank_delta':sum(deltas)/len(deltas),
-                           'paired_bank_deltas':deltas})
+                           'mean_opponent_bank': sum(r['opponent_bank'] for r in rows) / len(rows),
+                           'mean_margin': sum(r['margin'] for r in rows) / len(rows),
+                           'comparison_reference': reference,
+                           'mean_paired_bank_delta': (sum(deltas)/len(deltas)
+                                                      if deltas else None),
+                           'paired_bank_deltas':deltas,
+                           'mean_paired_margin_delta': (sum(margin_deltas) / len(margin_deltas)
+                                                       if margin_deltas else None),
+                           'paired_margin_deltas': margin_deltas})
     (args.output_dir/'comparison.json').write_text(json.dumps(comparison,indent=2)+'\n')
     print(json.dumps(comparison,indent=2),flush=True)
 

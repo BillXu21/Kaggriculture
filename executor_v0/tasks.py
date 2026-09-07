@@ -112,6 +112,7 @@ class Task:
 class GenerationResult:
     tasks: tuple[Task, ...]
     unresolved: tuple[str, ...] = ()
+    diagnostics: tuple[str, ...] = ()
 
     def sorted_tasks(self) -> tuple[Task, ...]:
         return tuple(sorted(self.tasks, key=lambda t: t.sort_key))
@@ -330,6 +331,7 @@ def generate_tasks(
     canonical_board_value: list[list[Any]] | None = None,
     heuristic_care: bool = False,
     heuristic_fertilizer: bool = False,
+    wheat_harvest_threshold: bool = False,
 ) -> GenerationResult:
     """Regenerate the full V0 task set from the current observation.
 
@@ -356,6 +358,7 @@ def generate_tasks(
     anchor = SHED_HUB_ANCHOR
     hour = int(obs["hour"])
     unresolved: list[str] = []
+    diagnostics: list[str] = []
     tasks: list[Task] = []
 
     # Existing on-board animals always count toward the feasible targets;
@@ -435,8 +438,28 @@ def generate_tasks(
                     water_yield_targets.append(coord)
                 derived = tile.get("derived") or {}
                 if derived.get("currently_harvestable"):
-                    harvest_plant_targets.append(coord)
+                    if wheat_harvest_threshold and tile.get("crop") == "WHEAT":
+                        from executor_v0.upkeep import wheat_harvest_eligibility
+                        current_step = int(obs.get(
+                            "step", int(obs["day"]) * _TURNS_PER_DAY
+                            + int(obs["hour"])))
+                        eligible, reason = wheat_harvest_eligibility(
+                            tile, int(obs["day"]), current_step)
+                        diagnostics.append(
+                            f"wheat_harvest:{coord[0]},{coord[1]}:"
+                            f"{'eligible' if eligible else 'deferred'}:{reason}")
+                        if eligible:
+                            harvest_plant_targets.append(coord)
+                    else:
+                        harvest_plant_targets.append(coord)
                 crop = tile.get("crop")
+                if heuristic_fertilizer and wheat_harvest_threshold \
+                        and crop == "WHEAT":
+                    from executor_v0.upkeep import fertilizer_extra_units
+                    benefit = fertilizer_extra_units(
+                        tile, int(obs["day"]), wheat_harvest_threshold=True)
+                    diagnostics.append(
+                        f"wheat_fertilizer_benefit:{coord[0]},{coord[1]}:{benefit}")
                 fertilizer_available = tile.get("fertilizer_available")
                 if fertilizer_available is None:
                     fertilizer_available = not derived.get("fertilizer_active")
@@ -620,10 +643,15 @@ def generate_tasks(
     for crop in CROP_ORDER:
         eligible = fert_eligible[crop]
         if heuristic_fertilizer:
-            eligible = [c for c in eligible if c not in blocked
-                        and fertilizer_extra_units(_tile_at(board, c), int(obs["day"]))
-                        * float(prices.get(crop, 0))
-                        > float(prices.get("FERTILIZER", float("inf"))) * 1.25]
+            profitable = []
+            for coord in eligible:
+                benefit = fertilizer_extra_units(
+                    _tile_at(board, coord), int(obs["day"]),
+                    wheat_harvest_threshold=wheat_harvest_threshold)
+                if coord not in blocked and benefit * float(prices.get(crop, 0)) \
+                        > float(prices.get("FERTILIZER", float("inf"))) * 1.25:
+                    profitable.append(coord)
+            eligible = profitable
         budget = len(eligible) if heuristic_fertilizer else fert_requests[crop]
         for coord in by_proximity(eligible)[:budget]:
             key = f"FERTILIZE:{crop}:{coord[0]},{coord[1]}"
@@ -705,4 +733,5 @@ def generate_tasks(
     if len(keys) != len(set(keys)):
         raise RuntimeError(f"duplicate task keys generated: {keys}")
 
-    return GenerationResult(tasks=tuple(tasks), unresolved=tuple(unresolved))
+    return GenerationResult(tasks=tuple(tasks), unresolved=tuple(unresolved),
+                            diagnostics=tuple(diagnostics))

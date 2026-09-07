@@ -99,6 +99,7 @@ class AgentConfig:
     record_turn_snapshot: bool = True
     heuristic_care: bool = False
     heuristic_fertilizer: bool = False
+    wheat_harvest_threshold: bool = False
 
     @property
     def idle_cleanup_enabled(self) -> bool:
@@ -741,6 +742,7 @@ class ExecutorAgent:
             },
             "tasks": [task.to_json_dict() for task in generated_tasks],
             "unresolved_tasks": list(generation.unresolved),
+            "generation_diagnostics": list(generation.diagnostics),
             "assignments": assignments,
             "unassigned": {
                 "task_keys": [task.key for task in foreman_result.unassigned_tile_tasks],
@@ -1037,7 +1039,8 @@ class ExecutorAgent:
             remaining_sells=self._remaining_sells,
             canonical_board_value=board,
             heuristic_care=self.config.heuristic_care,
-            heuristic_fertilizer=self.config.heuristic_fertilizer)
+            heuristic_fertilizer=self.config.heuristic_fertilizer,
+            wheat_harvest_threshold=self.config.wheat_harvest_threshold)
         generated_tasks = generation.sorted_tasks()
         worker_positions = [
             (int(obs["farms"][seat]["farmer"][1]),
@@ -1384,6 +1387,7 @@ class ExecutorAgent:
                 "optional_spare_watering": self.config.optional_spare_watering,
                 "heuristic_care": self.config.heuristic_care,
                 "heuristic_fertilizer": self.config.heuristic_fertilizer,
+                "wheat_harvest_threshold": self.config.wheat_harvest_threshold,
                 "optional_idle_cleanup_mode": self.config.cleanup_mode,
                 "cleanup_mode": self.config.cleanup_mode,
                 "immediate_plant_water": self.config.immediate_plant_water,

@@ -104,6 +104,23 @@ def _task_tile(key: Any) -> tuple[int, int] | None:
         return None
 
 
+def _state_tile(state: Mapping[str, Any], seat: int,
+                tile: tuple[int, int] | None) -> Mapping[str, Any] | None:
+    """Read one canonical tile without inferring inventory movement."""
+    if tile is None:
+        return None
+    farms = state.get("farms") or []
+    if seat >= len(farms) or not _is_mapping(farms[seat]):
+        return None
+    tiles = farms[seat].get("tiles") or []
+    y, x = tile
+    if y < 0 or y >= len(tiles) or not isinstance(tiles[y], list) \
+            or x < 0 or x >= len(tiles[y]):
+        return None
+    value = tiles[y][x]
+    return value if _is_mapping(value) else None
+
+
 class AuditError(ValueError):
     """Raised when capture inputs are missing or not auditable."""
 
@@ -159,6 +176,19 @@ def analyze_game(game: Mapping[str, Any]) -> dict[str, Any]:
     idle_with_queued = {0: 0, 1: 0}
     care_assignments = {0: 0, 1: 0}
     fertilizer_assignments = {0: 0, 1: 0}
+    wheat_plantings = {0: 0, 1: 0}
+    wheat_waterings = {0: 0, 1: 0}
+    wheat_harvests = {0: 0, 1: 0}
+    wheat_collected = {0: 0, 1: 0}
+    wheat_harvest_ages: dict[int, list[int]] = {0: [], 1: []}
+    wheat_harvest_exceptions = {0: 0, 1: 0}
+    wheat_harvest_unattributed = {0: 0, 1: 0}
+    wheat_purchases = {0: 0, 1: 0}
+    wheat_spending: dict[int, float] = {0: 0.0, 1: 0.0}
+    wheat_spending_reliable = {0: True, 1: True}
+    wheat_threshold_deferred = {0: 0, 1: 0}
+    wheat_threshold_eligible = {0: 0, 1: 0}
+    wheat_exception_diagnostics = {0: 0, 1: 0}
 
     prev_keys: dict[int, dict[int, str | None]] = {0: {}, 1: {}}
     prev_interaction: dict[int, dict[int, bool]] = {0: {}, 1: {}}
@@ -182,7 +212,7 @@ def analyze_game(game: Mapping[str, Any]) -> dict[str, Any]:
             "hires_0": 0, "hires_1": 0,
         })
 
-    for turn in turns:
+    for turn_index, turn in enumerate(turns):
         day = int(turn["day"])
         row = day_row(day)
         state = turn.get("canonical_state") or {}
@@ -207,6 +237,10 @@ def analyze_game(game: Mapping[str, Any]) -> dict[str, Any]:
             continue  # terminal snapshot: state only, no decision
         for seat in (0, 1):
             actions = joint.get(str(seat)) or {}
+            task_details = {
+                item.get("key"): item for item in (debug.get(str(seat)) or {}).get(
+                    "tasks", []) if _is_mapping(item) and isinstance(item.get("key"), str)
+            }
             worker_actions = [actions.get("farmer") or ["PASS"]]
             worker_actions.extend(actions.get("hands") or [])
             worker_turns[seat] += len(worker_actions)
@@ -225,6 +259,17 @@ def analyze_game(game: Mapping[str, Any]) -> dict[str, Any]:
                 if kind == "SELL":
                     market_submitted[seat]["SELL"] += 1
                     row[f"sells_{seat}"] += 1
+                elif kind == "BUY_PRODUCT" and len(order) >= 3 \
+                        and order[1] == "WHEAT":
+                    market_submitted[seat][kind] += 1
+                    row[f"buys_{seat}"] += 1
+                    quantity = int(order[2])
+                    wheat_purchases[seat] += quantity
+                    price = (state.get("market") or {}).get("prices", {}).get("WHEAT")
+                    if isinstance(price, (int, float)):
+                        wheat_spending[seat] += quantity * float(price)
+                    else:
+                        wheat_spending_reliable[seat] = False
                 elif kind.startswith("BUY"):
                     market_submitted[seat][kind] += 1
                     row[f"buys_{seat}"] += 1
@@ -255,6 +300,46 @@ def analyze_game(game: Mapping[str, Any]) -> dict[str, Any]:
                             care_assignments[seat] += 1
                         elif key.startswith("FERTILIZE:"):
                             fertilizer_assignments[seat] += 1
+                        task = task_details.get(key) or {}
+                        crop = task.get("crop")
+                        if crop == "WHEAT":
+                            if op == "PLANT":
+                                wheat_plantings[seat] += 1
+                            elif op == "WATER":
+                                wheat_waterings[seat] += 1
+                            elif op == "HARVEST":
+                                wheat_harvests[seat] += 1
+                                target = assignment.get("target")
+                                tile = _task_tile(key)
+                                pre = _state_tile(state, seat, tile)
+                                next_state = (turns[turn_index + 1].get(
+                                    "canonical_state") if turn_index + 1 < len(turns)
+                                    else None)
+                                post = (_state_tile(next_state, seat, tile)
+                                        if _is_mapping(next_state) else None)
+                                if (isinstance(pre, Mapping)
+                                        and isinstance(pre.get("yield_units"), int)
+                                        and _is_mapping(next_state)
+                                        and (post is None or post.get("kind") != "PLANT"
+                                             or (isinstance(post.get("yield_units"), int)
+                                                 and post["yield_units"] < pre["yield_units"]))):
+                                    collected = int(pre["yield_units"])
+                                    if (isinstance(post, Mapping)
+                                            and post.get("kind") == "PLANT"):
+                                        collected -= int(post.get("yield_units", 0))
+                                    wheat_collected[seat] += collected
+                                    wheat_harvest_ages[seat].append(
+                                        int(turn.get("day", 0)) - int(pre.get("planted_day", 0)))
+                                else:
+                                    wheat_harvest_unattributed[seat] += 1
+                                if isinstance(pre, Mapping) and int(pre.get("yield_units", 0)) < 3:
+                                    for diagnostic in snapshot.get("generation_diagnostics") or []:
+                                        if isinstance(diagnostic, str) and diagnostic.startswith(
+                                                f"wheat_harvest:{tile[0]},{tile[1]}:eligible:"):
+                                            reason = diagnostic.rsplit(":", 1)[-1]
+                                            if reason in {"expiry", "terminal_horizon", "no_further_growth"}:
+                                                wheat_harvest_exceptions[seat] += 1
+                                            break
                         if is_interaction and _task_tile(key) is not None:
                             target = assignment.get("target")
                             tile = _task_tile(key)
@@ -306,6 +391,16 @@ def analyze_game(game: Mapping[str, Any]) -> dict[str, Any]:
                     ended_unobserved[seat][kind] += 1
             live_keys[seat] = {k for k in known if _task_tile(k) is not None}
             interacted_keys[seat] &= live_keys[seat]
+            for diagnostic in snapshot.get("generation_diagnostics") or []:
+                if not isinstance(diagnostic, str) or not diagnostic.startswith("wheat_harvest:"):
+                    continue
+                if ":deferred:" in diagnostic:
+                    wheat_threshold_deferred[seat] += 1
+                elif ":eligible:" in diagnostic:
+                    wheat_threshold_eligible[seat] += 1
+                    if any(f":eligible:{reason}" in diagnostic for reason in (
+                            "expiry", "terminal_horizon", "no_further_growth")):
+                        wheat_exception_diagnostics[seat] += 1
             prev_keys[seat] = current
             prev_interaction[seat] = interacted_now
 
@@ -380,6 +475,20 @@ def analyze_game(game: Mapping[str, Any]) -> dict[str, Any]:
         game_row[f"{tag}_idle_with_queued"] = idle_with_queued[seat]
         game_row[f"{tag}_care_assignments"] = care_assignments[seat]
         game_row[f"{tag}_fertilizer_assignments"] = fertilizer_assignments[seat]
+        game_row[f"{tag}_wheat_plantings"] = wheat_plantings[seat]
+        game_row[f"{tag}_wheat_waterings"] = wheat_waterings[seat]
+        game_row[f"{tag}_wheat_harvests"] = wheat_harvests[seat]
+        game_row[f"{tag}_wheat_collected_yield"] = wheat_collected[seat]
+        game_row[f"{tag}_wheat_harvest_ages"] = wheat_harvest_ages[seat]
+        game_row[f"{tag}_wheat_harvest_exceptions"] = wheat_harvest_exceptions[seat]
+        game_row[f"{tag}_wheat_harvest_unattributed"] = wheat_harvest_unattributed[seat]
+        game_row[f"{tag}_wheat_purchases"] = wheat_purchases[seat]
+        game_row[f"{tag}_wheat_spending"] = (wheat_spending[seat]
+                                                if wheat_spending_reliable[seat]
+                                                else None)
+        game_row[f"{tag}_wheat_threshold_deferred"] = wheat_threshold_deferred[seat]
+        game_row[f"{tag}_wheat_threshold_eligible"] = wheat_threshold_eligible[seat]
+        game_row[f"{tag}_wheat_exception_diagnostics"] = wheat_exception_diagnostics[seat]
         game_row[f"{tag}_completed"] = dict(sorted(completed[seat].items()))
         game_row[f"{tag}_ended_unobserved"] = dict(
             sorted(ended_unobserved[seat].items()))
@@ -488,6 +597,20 @@ def pair_report(variant: str, analyses: Mapping[tuple, dict[str, Any]],
             "cand_care_delta": _delta(grow, brow, "cand_care_assignments"),
             "cand_fertilizer_delta": _delta(
                 grow, brow, "cand_fertilizer_assignments"),
+            "cand_wheat_plantings_delta": _delta(
+                grow, brow, "cand_wheat_plantings"),
+            "cand_wheat_waterings_delta": _delta(
+                grow, brow, "cand_wheat_waterings"),
+            "cand_wheat_harvests_delta": _delta(
+                grow, brow, "cand_wheat_harvests"),
+            "cand_wheat_collected_yield_delta": _delta(
+                grow, brow, "cand_wheat_collected_yield"),
+            "cand_wheat_purchases_delta": _delta(
+                grow, brow, "cand_wheat_purchases"),
+            "cand_wheat_spending_delta": _delta(
+                grow, brow, "cand_wheat_spending"),
+            "cand_wheat_harvest_exceptions_delta": _delta(
+                grow, brow, "cand_wheat_harvest_exceptions"),
             "divergence": divergence,
         }
         pairs.append(entry)
@@ -589,6 +712,16 @@ def render_markdown(analyses: Mapping[tuple, dict[str, Any]],
             "Care-assignment delta "
             f"{_fmt_delta(pair['cand_care_delta'])}; fertilizer-assignment "
             f"delta {_fmt_delta(pair['cand_fertilizer_delta'])}.")
+        lines.append(
+            "Wheat workload delta: planting "
+            f"{_fmt_delta(pair['cand_wheat_plantings_delta'])}, watering "
+            f"{_fmt_delta(pair['cand_wheat_waterings_delta'])}, harvests "
+            f"{_fmt_delta(pair['cand_wheat_harvests_delta'])}; collected-yield "
+            f"delta {_fmt_delta(pair['cand_wheat_collected_yield_delta'])}; "
+            f"purchases {_fmt_delta(pair['cand_wheat_purchases_delta'])}, "
+            f"spending {_fmt_delta(pair['cand_wheat_spending_delta'])}; "
+            "subthreshold-exception delta "
+            f"{_fmt_delta(pair['cand_wheat_harvest_exceptions_delta'])}.")
         lines.append("")
     lines += ["## Combined vs fertilizer-only (observations, not causes)", ""]
     both = [p for p in focus
@@ -655,7 +788,17 @@ def render_markdown(analyses: Mapping[tuple, dict[str, Any]],
     signals.sort(key=lambda item: -item[0])
     lines.extend([text for _, text in signals[:20]] or
                  ["No strong workload signals in this capture slice."])
-    lines += ["", "## Reading cautions", "",
+    lines += ["", "## Wheat accounting", "",
+              "Harvest counts include explicit HARVEST interactions. Collected "
+              "yield and harvest ages use only explicit actions followed by a "
+              "verifiable tile transition; events without that transition are "
+              "reported in `*_wheat_harvest_unattributed` and excluded from "
+              "collected-yield totals. No midnight inventory transfer is used "
+              "as a harvest attribution.", "",
+              "The game rows include wheat planting/watering workload, wheat "
+              "purchases and price-based spending, harvest ages, threshold "
+              "defer/eligible diagnostics, and subthreshold exception counts.",
+              "", "## Reading cautions", "",
               f"{CAUTIONS} No route optimizer or counterfactual scheduler "
               "was used.", ""]
     return "\n".join(lines) + "\n"

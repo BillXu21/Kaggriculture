@@ -76,12 +76,13 @@ def test_ablation_factory_changes_candidate_only():
     class Provider:
         def daily_plan(self,obs,seat,previous_execution=None):return make_plan()
     for seat in (0,1):
-        factory=UpkeepFactory(seat,'combined')
+        factory=UpkeepFactory(seat,'combined_wheat3')
         for acting_seat in (0,1):
             agent=factory.create(backend_name='official',seat=acting_seat,
                                  configuration={},provider=Provider())
             assert agent.config.heuristic_care == (seat==acting_seat)
             assert agent.config.heuristic_fertilizer == (seat==acting_seat)
+            assert agent.config.wheat_harvest_threshold == (seat==acting_seat)
 
 
 def test_fertilizer_order_never_blocks_survival():
