@@ -140,6 +140,8 @@ class RunnerConfig:
     record_debug_trace: bool = False  # capture canonical viewer trace opt-in
     debug_trace_seat: int | None = None  # requested private-seat/view selector
     debug_trace_view: str = "joint"
+    record_executor_full_diagnostics: bool = False  # stage 2.5 capture: full per-seat executor days
+    record_official_replay: bool = False  # stage 2.5 capture: official toJSON + status history
     reward_config: RewardConfig = field(default_factory=RewardConfig)
     openings: tuple[str, str] | None = None
 
@@ -264,6 +266,11 @@ class EpisodeResult:
     # artifact metadata never depends on caller-side policy bookkeeping.
     policy_identities: tuple[dict[str, Any], ...]
     debug_trace: dict[str, Any] | None = None
+    # Stage 2.5 paired-capture only (None unless the matching
+    # `record_*` runner flag is enabled; never part of training data).
+    executor_full_diagnostics: list[dict[str, Any]] | None = None
+    official_replay: dict[str, Any] | None = None
+    status_history: list[list[str]] | None = None
     # Keep runtime failures separate from informational opening handoff data.
     executor_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     land_purchase_events: list[dict[str, Any]] = field(default_factory=list)
@@ -1113,6 +1120,45 @@ class SelfPlayRunner:
             except Exception:  # noqa: BLE001 - diagnostics must never break
                 pass
         debug_trace = state.record_terminal_trace()
+        # Stage 2.5 opt-in capture only: read-only serializers that must
+        # never affect policy sampling, scheduling, or submitted actions.
+        # All three stay None unless their `record_*` flag is enabled.
+        full_diagnostics: list[dict[str, Any]] | None = None
+        if self.config.record_executor_full_diagnostics:
+            full_diagnostics = []
+            for seat in range(2):
+                try:
+                    diagnostics_fn = getattr(
+                        state.executors[seat], "diagnostics_json", None)
+                    if callable(diagnostics_fn):
+                        full_diagnostics.append(
+                            copy.deepcopy(diagnostics_fn()))
+                    else:
+                        full_diagnostics.append(
+                            {"seat": seat, "unavailable": True})
+                except Exception as exc:  # noqa: BLE001 - capture never breaks
+                    full_diagnostics.append(
+                        {"seat": seat, "runtime_error": repr(exc)})
+        official_replay: dict[str, Any] | None = None
+        status_history: list[list[str]] | None = None
+        if self.config.record_official_replay:
+            to_json = getattr(
+                getattr(state.backend, "env", None), "toJSON", None)
+            if callable(to_json):
+                try:
+                    replay = to_json()
+                    official_replay = copy.deepcopy(dict(replay)) \
+                        if isinstance(replay, Mapping) else None
+                except Exception:  # noqa: BLE001 - capture never breaks
+                    official_replay = None
+            history_fn = getattr(state.backend, "status_history", None)
+            if callable(history_fn):
+                try:
+                    status_history = [
+                        [str(status) for status in entry]
+                        for entry in history_fn()]
+                except Exception:  # noqa: BLE001 - capture never breaks
+                    status_history = None
         # Seal the final day's primitive-action digest and patch rows.
         current_day = int(state.obs[0]["day"])
         state.seal_day_digest(current_day)
@@ -1226,6 +1272,9 @@ class SelfPlayRunner:
                 }
                 for seat in range(2)),
             debug_trace=debug_trace,
+            executor_full_diagnostics=full_diagnostics,
+            official_replay=official_replay,
+            status_history=status_history,
             executor_diagnostics=executor_diagnostics,
             land_purchase_events=copy.deepcopy(state.land_purchase_events),
             utilization_snapshots=copy.deepcopy(state.utilization_snapshots),

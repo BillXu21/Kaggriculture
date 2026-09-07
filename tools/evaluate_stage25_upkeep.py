@@ -1,6 +1,14 @@
 """Paired old-PPO upkeep ablation; candidate-only changes, stochastic decode.
 
 Run as python -m tools.evaluate_stage25_upkeep --help. No training occurs.
+
+Episode identity contract (do not change): for a seeds list of length N run
+with ``--master-seed M``, the game for ``seeds[index]`` at seat ``s`` always
+uses ``episode_id = M * (2 * N) + 2 * index + s``, independent of the variant
+and of how many variants are selected. ``--game-filter SEED:SEAT`` selects a
+subset of games while preserving these identities; passing a shorter
+``--seeds`` list instead DOES renumber every game and must not be compared
+against a panel run with different seeds.
 """
 from __future__ import annotations
 import argparse
@@ -10,8 +18,42 @@ import json
 from pathlib import Path
 import subprocess
 
+from rl_manager.stage25_capture import game_dir, write_game_capture
+
 VARIANTS = {'baseline': (False, False), 'care': (True, False),
             'fertilizer': (False, True), 'combined': (True, True)}
+
+
+def episode_id_for(master_seed: int, num_seeds: int, index: int,
+                   seat: int) -> int:
+    """Original sampling identity; depends on the FULL seeds list order."""
+    return master_seed * (2 * num_seeds) + 2 * index + seat
+
+
+def parse_game_filter(values: list[str] | None,
+                      seeds: list[int]) -> set[tuple[int, int]] | None:
+    """Validate SEED:SEAT selections against the full seeds list.
+
+    Returns ``{(index, seat)}`` using positions in the original ``seeds``
+    order so episode IDs are preserved, or None when no filter was given.
+    """
+    if not values:
+        return None
+    selected: set[tuple[int, int]] = set()
+    for value in values:
+        try:
+            seed_text, seat_text = value.split(':', 1)
+            seed, seat = int(seed_text), int(seat_text)
+        except (AttributeError, ValueError):
+            raise ValueError(f'game filter must be SEED:SEAT, got {value!r}')
+        if seat not in (0, 1):
+            raise ValueError(f'game filter seat must be 0 or 1, got {value!r}')
+        if seed not in seeds:
+            raise ValueError(
+                f'game filter seed {seed} is not in --seeds {seeds}; '
+                'extend --seeds instead of renumbering')
+        selected.add((seeds.index(seed), seat))
+    return selected
 
 
 @dataclass(frozen=True)
@@ -19,20 +61,25 @@ class UpkeepFactory:
     candidate_seat: int
     variant: str
     name: str = 'stage25_upkeep'
+    capture: bool = False
 
     @property
     def version(self) -> str:
-        return f'v1:{self.variant}:candidate-seat-{self.candidate_seat}'
+        base = f'v1:{self.variant}:candidate-seat-{self.candidate_seat}'
+        return base + ':capture' if self.capture else base
 
     def create(self, *, backend_name, seat, configuration, provider):
         from executor_v0.agent import AgentConfig, make_agent
         care, fert = VARIANTS[self.variant] if seat == self.candidate_seat else (False, False)
+        # Capture enables read-only per-turn snapshots only; the returned
+        # primitive action is computed before any snapshot exists.
         return make_agent(provider=provider, seat=seat, config=AgentConfig(
-            strict=True, optional_spare_watering=True, record_turn_snapshot=False,
+            strict=True, optional_spare_watering=True,
+            record_turn_snapshot=self.capture,
             heuristic_care=care, heuristic_fertilizer=fert))
 
 
-def main() -> None:
+def main(argv=None) -> None:
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--checkpoint', required=True, type=Path)
     p.add_argument('--e-checkpoint', required=True, type=Path)
@@ -42,15 +89,26 @@ def main() -> None:
     p.add_argument('--variants', nargs='+', choices=list(VARIANTS), default=list(VARIANTS))
     p.add_argument('--backend', choices=['fast','official'], default='official')
     p.add_argument('--e-history-version', default='E_LEGACY', choices=['E_LEGACY','E_CORRECTED_V1'])
-    args=p.parse_args()
+    p.add_argument('--capture-dir', default=None, type=Path,
+                   help='opt-in paired replay/executor capture root; default off (no capture)')
+    p.add_argument('--game-filter', nargs='*', default=None, metavar='SEED:SEAT',
+                   help='run only these SEED:SEAT games, preserving original episode IDs')
+    args=p.parse_args(argv)
     if len(set(args.seeds)) != len(args.seeds) or len(set(args.variants)) != len(args.variants):
         p.error('seeds and variants must be unique')
     if args.master_seed < 0:
         p.error('master seed must be nonnegative')
     if 'baseline' not in args.variants:
         p.error('include baseline for a paired comparison')
+    try:
+        game_selection = parse_game_filter(args.game_filter, list(args.seeds))
+    except ValueError as exc:
+        p.error(str(exc))
     for path in (args.checkpoint,args.e_checkpoint):
         if not path.is_file():p.error(f'missing checkpoint: {path}')
+    capture = args.capture_dir is not None
+    if capture:
+        args.capture_dir.mkdir(parents=True,exist_ok=False)
     args.output_dir.mkdir(parents=True,exist_ok=False)
     manifest={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
     manifest.update(schema_version=1, stochastic=True, opening='standard_mixed',
@@ -58,6 +116,8 @@ def main() -> None:
                     source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
                     source_dirty=bool(subprocess.check_output(['git','status','--porcelain'],text=True)),
                     source_diff_sha256=hashlib.sha256(subprocess.check_output(['git','diff','HEAD'])).hexdigest())
+    if capture:
+        manifest.update(capture_schema_version=1)
     for name,path in [('ppo',args.checkpoint),('bc_e',args.e_checkpoint)]:
         manifest[name+'_sha256']=hashlib.sha256(path.read_bytes()).hexdigest()
     (args.output_dir/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
@@ -77,33 +137,80 @@ def main() -> None:
         e_history_version=args.e_history_version,curriculum=CurriculumMaskConfig.from_json_dict(checkpoint_meta.get('curriculum')))
     opponent=JaxEPlanPolicy(frozen,config,name='frozen_e',e_history_version=args.e_history_version)
     runner_config=RunnerConfig(backend_name=args.backend,e_history_version=args.e_history_version,
-                               low_telemetry=True,backend_configuration={'seed':0,'numThreads':1})
+                               low_telemetry=True,backend_configuration={'seed':0,'numThreads':1},
+                               record_rollout=capture, record_debug_trace=capture,
+                               record_executor_full_diagnostics=capture,
+                               record_official_replay=capture)
     all_rows=[]
     for variant in args.variants:
         results=[]
         for index,seed in enumerate(args.seeds):
             for seat,orientation in enumerate(('candidate_vs_frozen','frozen_vs_candidate')):
-                episode_id=args.master_seed * (2 * len(args.seeds)) + 2*index+seat
+                if game_selection is not None and (index,seat) not in game_selection:
+                    continue
+                episode_id=episode_id_for(args.master_seed,len(args.seeds),index,seat)
                 spec=build_episode_spec(episode_id,seed,orientation,candidate,opponent)
-                runner=SelfPlayRunner(runner_config,executor_factory=UpkeepFactory(seat,variant),master_seed=args.master_seed)
+                runner=SelfPlayRunner(runner_config,
+                                      executor_factory=UpkeepFactory(seat,variant,capture=capture),
+                                      master_seed=args.master_seed)
                 result=runner.run([spec])[0]
-                results.append(result)
-                summary=summarize_evaluation(results,expected_seeds=args.seeds,
-                    provenance={'manifest':manifest,'variant':variant,
-                                'engine':runner.provenance['backend'],
-                                'executor':{'name':runner.executor_factory.name,'version':runner.executor_factory.version},
-                                'candidate_identity':candidate.identity.to_json_dict(),
-                                'opponent_identity':opponent.identity.to_json_dict()})
-                (args.output_dir/f'{variant}.partial.json').write_text(json.dumps(summary,indent=2,allow_nan=False)+'\n')
+                if game_selection is None:
+                    results.append(result)
+                    summary=summarize_evaluation(results,expected_seeds=args.seeds,
+                        provenance={'manifest':manifest,'variant':variant,
+                                    'engine':runner.provenance['backend'],
+                                    'executor':{'name':runner.executor_factory.name,'version':runner.executor_factory.version},
+                                    'candidate_identity':candidate.identity.to_json_dict(),
+                                    'opponent_identity':opponent.identity.to_json_dict()})
+                    (args.output_dir/f'{variant}.partial.json').write_text(json.dumps(summary,indent=2,allow_nan=False)+'\n')
                 bank=float(result.final_banks[seat]);opp=float(result.final_banks[1-seat])
-                row={'variant':variant,'seed':seed,'seat':seat,'bank':bank,'opponent_bank':opp,
+                row={'variant':variant,'seed':seed,'seat':seat,'episode_id':episode_id,
+                     'bank':bank,'opponent_bank':opp,
                      'statuses':list(result.statuses)}
+                if capture:
+                    directory=game_dir(args.capture_dir,variant,episode_id,seed,seat)
+                    meta={'variant':variant,'seed':seed,'seat':seat,
+                          'episode_id':episode_id,'master_seed':args.master_seed,
+                          'candidate_seat':seat,'composition':orientation,
+                          'final_banks':[float(b) for b in result.final_banks],
+                          'margin':float(result.margin),
+                          'winner_seat':int(result.winner_seat),
+                          'rewards':[float(r) for r in result.rewards],
+                          'statuses':list(result.statuses),
+                          'terminated':bool(result.terminated),
+                          'trace_digest':str(result.trace_digest),
+                          'engine':runner.provenance['backend'],
+                          'executor':{'name':runner.executor_factory.name,
+                                      'version':runner.executor_factory.version},
+                          'candidate_identity':candidate.identity.to_json_dict(),
+                          'opponent_identity':opponent.identity.to_json_dict()}
+                    report=write_game_capture(
+                        directory, meta=meta, debug_trace=result.debug_trace,
+                        rollout=result.rollout,
+                        executor_full_diagnostics=result.executor_full_diagnostics,
+                        official_replay=result.official_replay,
+                        status_history=result.status_history)
+                    row['capture']=str(directory)
+                    row['capture_complete']=bool(report.get('complete'))
+                    print(json.dumps({'capture':row['capture'],
+                                      'complete':row['capture_complete'],
+                                      **({'capture_error':report['capture_error']}
+                                         if not report.get('complete') else {})}),flush=True)
+                    if not report.get('complete'):
+                        print(f"WARNING: partial capture for {row['capture']}; "
+                              f"game result stands, investigate before the panel",flush=True)
                 all_rows.append(row)
                 with (args.output_dir/'games.jsonl').open('a') as stream:stream.write(json.dumps(row)+'\n')
                 print(json.dumps(row),flush=True)
                 if list(result.statuses)!=['DONE','DONE'] or not result.terminated:
                     raise RuntimeError('Incomplete/failed game; partial results saved; stop before comparing')
-        (args.output_dir/f'{variant}.partial.json').rename(args.output_dir/f'{variant}.json')
+        if game_selection is None:
+            (args.output_dir/f'{variant}.partial.json').rename(args.output_dir/f'{variant}.json')
+    if game_selection is not None:
+        print(json.dumps({'filtered_games':len(all_rows),
+                          'note':'game-filter run preserves original episode IDs; '
+                                 'rerun the full panel for summaries/comparison'}),flush=True)
+        return
     baseline={(r['seed'],r['seat']):r for r in all_rows if r['variant']=='baseline'}
     comparison=[]
     for variant in args.variants:
