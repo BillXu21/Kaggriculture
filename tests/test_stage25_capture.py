@@ -283,6 +283,40 @@ def test_capture_writer_roundtrip_and_partial(tmp_path: Path):
                    for g in iter_captured_games(tmp_path))
 
 
+def test_audit_runs_on_real_scripted_capture(tmp_path: Path):
+    """Audit must tolerate real executor snapshot shapes (truncated game)."""
+    from rl_manager.stage25_capture import write_game_capture as _write
+
+    result, _ = _run_short_game(capture=True)
+    directory = game_dir(tmp_path / "captures", "baseline", 100,
+                         144368101, 0)
+    meta = {"variant": "baseline", "seed": 144368101, "seat": 0,
+            "episode_id": 100, "master_seed": 25, "candidate_seat": 0,
+            "composition": E_VS_E,
+            "final_banks": [float(b) for b in result.final_banks],
+            "margin": float(result.margin),
+            "winner_seat": int(result.winner_seat),
+            "rewards": [float(r) for r in result.rewards],
+            "statuses": list(result.statuses),
+            "terminated": bool(result.terminated),
+            "trace_digest": str(result.trace_digest)}
+    report = _write(
+        directory, meta=meta, debug_trace=result.debug_trace,
+        rollout=result.rollout,
+        executor_full_diagnostics=result.executor_full_diagnostics,
+        official_replay=result.official_replay,
+        status_history=result.status_history)
+    assert report["complete"] is True
+    summary = run_audit(capture_dir=tmp_path / "captures",
+                        output_dir=tmp_path / "audit",
+                        baseline_variant="baseline", focus_pairs=4)
+    assert summary["games"] == 1
+    assert summary["day_rows"] >= 5  # d0..d4 covered by the short game
+    game = analyze_game(load_game(directory))
+    assert game["game"]["cand_worker_turns"] > 0
+    assert (tmp_path / "audit" / "audit.md").is_file()
+
+
 # ------------------------------------------------------- audit fixture
 
 

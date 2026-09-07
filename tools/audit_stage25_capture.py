@@ -183,7 +183,7 @@ def analyze_game(game: Mapping[str, Any]) -> dict[str, Any]:
         })
 
     for turn in turns:
-        day, hour = int(turn["day"]), int(turn["hour"])
+        day = int(turn["day"])
         row = day_row(day)
         state = turn.get("canonical_state") or {}
         farms = state.get("farms") or []
