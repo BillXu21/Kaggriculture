@@ -48,7 +48,7 @@ The tests cover default-off behavior, underfoot output ordering, queue retention
 
 ## Evaluation handoff
 
-Run [the paired-evaluation notebook](../notebooks/stage25_executor_schedule_ablation.ipynb). It checks out `cfbf56c2facc8cb74503058fc220b3baead879a5`, keeps P-final sampling stochastic and BC-E on `E_LEGACY`, uses the official `kaggle_environments==1.32.7` authority, and launches four independent one-CPU processes. The default comparison is:
+Run [the paired-evaluation notebook](../notebooks/stage25_executor_schedule_ablation.ipynb). It checks out `3431dbf065044a66ea469884dc85e68f74e72769`, keeps P-final sampling stochastic and BC-E on `E_LEGACY`, uses the official `kaggle_environments==1.32.7` authority, and launches four independent one-CPU processes. The default comparison is 32 seed/seat games per arm on the verified `combined_wheat3` baseline variant:
 
 1. Control: `underfoot-first + deadline-safe-planting + deadline-safe-hiring`.
 2. Treatment: the same controls plus `persistent-worker-queues`.
