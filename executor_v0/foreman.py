@@ -383,7 +383,6 @@ def run_foreman(
         # A persistent queue owns its head until it completes or becomes
         # invalid.  Only a strictly more urgent underfoot task may preempt it;
         # equal/lower-priority incidental work must wait for the route.
-        committed = None
         if chosen is None and not underfoot_only:
             queue = (worker_queues or {}).get(worker.index, ())
             queued = queue[0] if queue else None
@@ -396,7 +395,6 @@ def run_foreman(
                         and _interaction_op(candidate) is not None
                         and (_carried(worker, candidate.required_item)
                              or _shed_available(obs, seat, candidate.required_item) > 0)):
-                    committed = candidate
                     urgent = next((task for task in tile_tasks
                                     if task.tile == worker.position
                                     and task.priority < candidate.priority

@@ -32,7 +32,6 @@ No opponent private state is read; only ``obs["farms"][seat]`` and own
 only loaded when an explicit path is supplied (never fabricated).
 """
 
-from collections.abc import Mapping
 import copy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -54,6 +53,7 @@ from replay_daily.constants import (
 from replay_daily.lifecycle import canonical_board
 
 from .foreman import ForemanConfig, apply_idle_cleanup, run_foreman
+from .hiring import HiringRecommendation, recommend_hires
 from .scheduler import PersistentTaskScheduler
 from .tasks import (
     GenerationResult,
@@ -244,6 +244,7 @@ class ExecutorAgent:
         self._plant_attempts: dict[int, _PlantAttempt] = {}
         self._plant_water_continuations: dict[int, Task] = {}
         self._last_hire_rejections: list[dict[str, Any]] = []
+        self._last_hiring_recommendation: HiringRecommendation | None = None
         self._scheduler = PersistentTaskScheduler()
         self._last_scheduler_result: Any | None = None
         self._last_step: int | None = None
@@ -547,6 +548,22 @@ class ExecutorAgent:
             entry["remaining"] = self._remaining_sells[product]
 
     def _hire_orders(self, obs: Mapping, seat: int, tile_tasks: list[Task], available_cash: float) -> tuple[list[list], int]:
+        self._last_hiring_recommendation = None
+        if self.config.schedule_informed_hiring:
+            recommendation = recommend_hires(
+                obs, seat, tile_tasks,
+                scheduler_result=(self._last_scheduler_result
+                                  if self.config.persistent_worker_queues else None),
+                available_cash=available_cash,
+                hire_cost_mult=self.config.hire_cost_mult,
+                market_order_limit=self.config.max_market_orders,
+            )
+            self._last_hiring_recommendation = recommendation
+            self._last_hire_rejections = [
+                dict(item) for item in recommendation.rejection_diagnostics
+            ]
+            return recommendation.orders, recommendation.wanted_hires
+
         farm = obs["farms"][seat]
         current_hands = len(farm.get("hands") or [])
         positions = [farm.get("farmer") or [0, 0]]
@@ -1346,6 +1363,9 @@ class ExecutorAgent:
         record["hires"]["requested"] = max(record["hires"]["requested"], hires_requested)
         record["hires"]["submitted"] += submitted_hires
         record["hires"]["observed_max"] = self._max_hires_today
+        if self._last_hiring_recommendation is not None:
+            record["hiring_recommendation"] = (
+                self._last_hiring_recommendation.to_json_dict())
         if self._last_hire_rejections:
             record.setdefault("hire_rejections", []).extend(
                 self._last_hire_rejections)

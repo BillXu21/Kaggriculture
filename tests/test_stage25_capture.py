@@ -188,6 +188,31 @@ def test_factory_versions_distinguish_capture_without_changing_defaults():
         assert agent.config.heuristic_fertilizer == (acting_seat == 0)
 
 
+def test_new_executor_controls_are_candidate_only():
+    class Provider:
+        def daily_plan(self, obs, seat, previous_execution=None):
+            return make_plan()
+
+    factory = UpkeepFactory(
+        0, "combined", underfoot_first=True,
+        deadline_safe_planting=True, deadline_safe_hiring=True,
+        persistent_worker_queues=True, schedule_informed_hiring=True)
+    candidate = factory.create(backend_name="fast", seat=0,
+                               configuration={}, provider=Provider())
+    opponent = factory.create(backend_name="fast", seat=1,
+                              configuration={}, provider=Provider())
+    assert candidate.config.foreman.underfoot_first is True
+    assert candidate.config.deadline_safe_planting is True
+    assert candidate.config.deadline_safe_hiring is True
+    assert candidate.config.persistent_worker_queues is True
+    assert candidate.config.schedule_informed_hiring is True
+    assert opponent.config.foreman.underfoot_first is False
+    assert opponent.config.deadline_safe_planting is False
+    assert opponent.config.deadline_safe_hiring is False
+    assert opponent.config.persistent_worker_queues is False
+    assert opponent.config.schedule_informed_hiring is False
+
+
 # ------------------------------------------------------- capture writer
 
 

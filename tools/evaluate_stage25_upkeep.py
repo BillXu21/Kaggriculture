@@ -76,6 +76,11 @@ class UpkeepFactory:
     variant: str
     name: str = 'stage25_upkeep'
     capture: bool = False
+    underfoot_first: bool = False
+    deadline_safe_planting: bool = False
+    deadline_safe_hiring: bool = False
+    persistent_worker_queues: bool = False
+    schedule_informed_hiring: bool = False
 
     @property
     def version(self) -> str:
@@ -84,14 +89,22 @@ class UpkeepFactory:
 
     def create(self, *, backend_name, seat, configuration, provider):
         from executor_v0.agent import AgentConfig, make_agent
+        from executor_v0.foreman import ForemanConfig
+        candidate = seat == self.candidate_seat
         care, fert, wheat3 = (
-            VARIANTS[self.variant] if seat == self.candidate_seat
+            VARIANTS[self.variant] if candidate
             else (False, False, False))
         # Capture enables read-only per-turn snapshots only; the returned
         # primitive action is computed before any snapshot exists.
         return make_agent(provider=provider, seat=seat, config=AgentConfig(
             strict=True, optional_spare_watering=True,
             record_turn_snapshot=self.capture,
+            foreman=ForemanConfig(
+                underfoot_first=self.underfoot_first and candidate),
+            deadline_safe_planting=(self.deadline_safe_planting and candidate),
+            deadline_safe_hiring=(self.deadline_safe_hiring and candidate),
+            persistent_worker_queues=(self.persistent_worker_queues and candidate),
+            schedule_informed_hiring=(self.schedule_informed_hiring and candidate),
             heuristic_care=care, heuristic_fertilizer=fert,
             wheat_harvest_threshold=wheat3))
 
@@ -108,6 +121,11 @@ def main(argv=None) -> None:
     p.add_argument('--e-history-version', default='E_LEGACY', choices=['E_LEGACY','E_CORRECTED_V1'])
     p.add_argument('--capture-dir', default=None, type=Path,
                    help='opt-in paired replay/executor capture root; default off (no capture)')
+    p.add_argument('--underfoot-first', action='store_true')
+    p.add_argument('--deadline-safe-planting', action='store_true')
+    p.add_argument('--deadline-safe-hiring', action='store_true')
+    p.add_argument('--persistent-worker-queues', action='store_true')
+    p.add_argument('--schedule-informed-hiring', action='store_true')
     p.add_argument('--game-filter', nargs='*', default=None, metavar='SEED:SEAT',
                    help='run only these SEED:SEAT games, preserving original episode IDs')
     args=p.parse_args(argv)
@@ -128,8 +146,9 @@ def main(argv=None) -> None:
         game_selection = parse_game_filter(args.game_filter, list(args.seeds))
     except ValueError as exc:
         p.error(str(exc))
-    for path in (args.checkpoint,args.e_checkpoint):
-        if not path.is_file():p.error(f'missing checkpoint: {path}')
+    for path in (args.checkpoint, args.e_checkpoint):
+        if not path.is_file():
+            p.error(f'missing checkpoint: {path}')
     capture = args.capture_dir is not None
     if capture:
         args.capture_dir.mkdir(parents=True,exist_ok=False)
@@ -177,7 +196,13 @@ def main(argv=None) -> None:
                 episode_id=episode_id_for(args.master_seed,len(args.seeds),index,seat)
                 spec=build_episode_spec(episode_id,seed,orientation,candidate,opponent)
                 runner=SelfPlayRunner(runner_config,
-                                      executor_factory=UpkeepFactory(seat,variant,capture=capture),
+                                      executor_factory=UpkeepFactory(
+                                          seat, variant, capture=capture,
+                                          underfoot_first=args.underfoot_first,
+                                          deadline_safe_planting=args.deadline_safe_planting,
+                                          deadline_safe_hiring=args.deadline_safe_hiring,
+                                          persistent_worker_queues=args.persistent_worker_queues,
+                                          schedule_informed_hiring=args.schedule_informed_hiring),
                                       master_seed=args.master_seed)
                 result=runner.run([spec])[0]
                 if game_selection is None:
@@ -189,7 +214,8 @@ def main(argv=None) -> None:
                                     'candidate_identity':candidate.identity.to_json_dict(),
                                     'opponent_identity':opponent.identity.to_json_dict()})
                     (args.output_dir/f'{variant}.partial.json').write_text(json.dumps(summary,indent=2,allow_nan=False)+'\n')
-                bank=float(result.final_banks[seat]);opp=float(result.final_banks[1-seat])
+                bank = float(result.final_banks[seat])
+                opp = float(result.final_banks[1-seat])
                 row={'variant':variant,'seed':seed,'seat':seat,'episode_id':episode_id,
                      'bank':bank,'opponent_bank':opp,
                      'margin':bank-opp,
@@ -227,7 +253,8 @@ def main(argv=None) -> None:
                         print(f"WARNING: partial capture for {row['capture']}; "
                               f"game result stands, investigate before the panel",flush=True)
                 all_rows.append(row)
-                with (args.output_dir/'games.jsonl').open('a') as stream:stream.write(json.dumps(row)+'\n')
+                with (args.output_dir/'games.jsonl').open('a') as stream:
+                    stream.write(json.dumps(row)+'\n')
                 print(json.dumps(row),flush=True)
                 if list(result.statuses)!=['DONE','DONE'] or not result.terminated:
                     raise RuntimeError('Incomplete/failed game; partial results saved; stop before comparing')
@@ -270,4 +297,5 @@ def main(argv=None) -> None:
     print(json.dumps(comparison,indent=2),flush=True)
 
 
-if __name__=='__main__':main()
+if __name__ == '__main__':
+    main()
