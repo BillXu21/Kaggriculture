@@ -34,8 +34,10 @@ only loaded when an explicit path is supplied (never fabricated).
 
 from collections.abc import Mapping
 import copy
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import math
+import time
 from typing import Any, Callable
 
 from bc_manager.constants import ANIMAL_ORDER, CROP_ORDER
@@ -52,6 +54,7 @@ from replay_daily.constants import (
 from replay_daily.lifecycle import canonical_board
 
 from .foreman import ForemanConfig, apply_idle_cleanup, run_foreman
+from .scheduler import PersistentTaskScheduler
 from .tasks import (
     GenerationResult,
     Task,
@@ -98,6 +101,8 @@ class AgentConfig:
     immediate_plant_water: bool = True
     deadline_safe_planting: bool = False
     deadline_safe_hiring: bool = False
+    persistent_worker_queues: bool = False
+    schedule_informed_hiring: bool = False
     record_turn_snapshot: bool = True
     heuristic_care: bool = False
     heuristic_fertilizer: bool = False
@@ -239,6 +244,9 @@ class ExecutorAgent:
         self._plant_attempts: dict[int, _PlantAttempt] = {}
         self._plant_water_continuations: dict[int, Task] = {}
         self._last_hire_rejections: list[dict[str, Any]] = []
+        self._scheduler = PersistentTaskScheduler()
+        self._last_scheduler_result: Any | None = None
+        self._last_step: int | None = None
         self._cleanup_metrics: dict[str, int] = {
             "baseline_pass_worker_actions": 0,
             "cleanup_replacements": 0,
@@ -296,6 +304,9 @@ class ExecutorAgent:
             and self._valid_unwatered_plant(
                 board, task.tile, task.crop, int(obs["day"]))
         }
+
+        if self._last_step is not None and int(obs.get("step", 0)) < self._last_step:
+            self._scheduler.reset()
 
     def _record_plant_attempts(
         self,
@@ -1140,13 +1151,32 @@ class ExecutorAgent:
             {} if feed["starving"] else self._plant_water_continuations
         )
 
+        worker_queues: Mapping[int, Sequence[Task]] | None = None
+        if self.config.persistent_worker_queues:
+            scheduler_start = time.perf_counter_ns()
+            self._last_scheduler_result = self._scheduler.schedule(
+                obs, seat, normal_dispatch_tasks,
+                worker_count=len(worker_positions),
+            )
+            scheduler_runtime_ms = (time.perf_counter_ns() - scheduler_start) / 1_000_000
+            worker_queues = self._last_scheduler_result.worker_queues
+            scheduler_record = self._day_records[day].setdefault(
+                "scheduler", {"events": [], "runtime_ms": 0.0, "queue_lengths": {}})
+            scheduler_record["events"].extend(self._last_scheduler_result.events)
+            scheduler_record["runtime_ms"] += scheduler_runtime_ms
+            scheduler_record["queue_lengths"] = {
+                str(worker): len(queue)
+                for worker, queue in sorted(worker_queues.items())
+            }
+
         # Normal dispatch is deliberately completed in isolation.  Cleanup is
         # a second layer over only literal normal PASS actions.
         normal_foreman = run_foreman(obs, seat, normal_dispatch_tasks,
                                      config=self.config.foreman,
                                      worker_continuations=worker_continuations,
                                      deadline_safe_planting=(
-                                         self.config.deadline_safe_planting))
+                                         self.config.deadline_safe_planting),
+                                     worker_queues=worker_queues)
         optional_tasks: tuple[Task, ...] = ()
         foreman_result = normal_foreman
         if self.config.idle_cleanup_enabled:
@@ -1366,6 +1396,7 @@ class ExecutorAgent:
             self._debug_trace_turn = None
 
         self._record_plant_attempts(obs, tasks, foreman_result)
+        self._last_step = int(obs.get("step", day * 24 + hour))
 
         return {
             "farmer": list(foreman_result.farmer_action),
@@ -1414,6 +1445,8 @@ class ExecutorAgent:
                 "immediate_plant_water": self.config.immediate_plant_water,
                 "deadline_safe_planting": self.config.deadline_safe_planting,
                 "deadline_safe_hiring": self.config.deadline_safe_hiring,
+                "persistent_worker_queues": self.config.persistent_worker_queues,
+                "schedule_informed_hiring": self.config.schedule_informed_hiring,
                 "record_turn_snapshot": self.config.record_turn_snapshot,
             },
             "cleanup_metrics": self._cleanup_diagnostics(),

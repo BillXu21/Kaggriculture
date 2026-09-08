@@ -711,6 +711,26 @@ def test_deadline_safe_hiring_respects_future_worker_turn_and_terminal_step(
         assert rejection["future_worker_actions"] == 0
 
 
+def test_persistent_queue_flag_integrates_scheduler_diagnostics_without_inference_changes():
+    plan = simple_plan(crop_targets={
+        "WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    agent = ExecutorAgent(
+        FixedPlanProvider(plan), seat=0,
+        config=AgentConfig(persistent_worker_queues=True))
+    obs = make_obs(day=3, hour=2, farmer=(4, 4), seeds={"WHEAT": 1})
+
+    action = agent(obs)
+
+    assert_legal_shape(action, obs)
+    record = agent.diagnostics_json()["days"]["3"]
+    assert record["scheduler"]["runtime_ms"] >= 0.0
+    assert record["scheduler"]["queue_lengths"]
+    assert agent.diagnostics_json()["config"][
+        "persistent_worker_queues"] is True
+
+
 def test_hire_follows_workload_any_hour_within_affordability():
     """Workload-derived hiring at any hour; no arbitrary daily cap (issue #7).
 

@@ -9,6 +9,7 @@ harness (`python -m executor_v0.smoke`).
 """
 
 from .agent import AgentConfig, ExecutorAgent, make_agent
+from .scheduler import PersistentTaskScheduler, SchedulerConfig, SchedulerResult
 from .manager import (
     CachingPlanProvider,
     CheckpointPlanProvider,
@@ -38,4 +39,7 @@ __all__ = [
     "AgentConfig",
     "ExecutorAgent",
     "make_agent",
+    "PersistentTaskScheduler",
+    "SchedulerConfig",
+    "SchedulerResult",
 ]

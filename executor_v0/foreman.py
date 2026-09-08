@@ -276,6 +276,7 @@ def run_foreman(
     config: ForemanConfig = ForemanConfig(),
     worker_continuations: Mapping[int, Task] | None = None,
     deadline_safe_planting: bool = False,
+    worker_queues: Mapping[int, Sequence[Task]] | None = None,
 ) -> ForemanResult:
     """Run one greedy dispatch turn. Pure; inputs never mutated."""
     farm = obs["farms"][seat]
@@ -308,6 +309,7 @@ def run_foreman(
             continue  # unknown kinds are never dispatched
     tile_tasks.sort(key=lambda t: t.sort_key)
     market_tasks.sort(key=lambda t: t.sort_key)
+    tile_by_key = {task.key: task for task in tile_tasks}
 
     # Global own seed pool: planting consumes `private.seeds[crop]`
     # atomically at the engine. Workers never PICKUP or carry seeds; this
@@ -377,6 +379,37 @@ def run_foreman(
                 and continuation.tile == worker.position \
                 and _interaction_op(continuation) is not None:
             chosen, reason = continuation, "same_worker_plant_continuation"
+
+        # A persistent queue owns its head until it completes or becomes
+        # invalid.  Only a strictly more urgent underfoot task may preempt it;
+        # equal/lower-priority incidental work must wait for the route.
+        committed = None
+        if chosen is None and not underfoot_only:
+            queue = (worker_queues or {}).get(worker.index, ())
+            queued = queue[0] if queue else None
+            candidate = tile_by_key.get(queued.key) if queued is not None else None
+            if candidate is not None:
+                deadline_ok, deadline_reason = _plant_deadline_feasible(
+                    obs, worker, candidate, enabled=deadline_safe_planting,
+                    remaining_turns=remaining_turns)
+                if (deadline_ok and seeds_available(candidate)
+                        and _interaction_op(candidate) is not None
+                        and (_carried(worker, candidate.required_item)
+                             or _shed_available(obs, seat, candidate.required_item) > 0)):
+                    committed = candidate
+                    urgent = next((task for task in tile_tasks
+                                    if task.tile == worker.position
+                                    and task.priority < candidate.priority
+                                    and task.key not in claimed
+                                    and seeds_available(task)
+                                    and _interaction_op(task) is not None
+                                    and _carried(worker, task.required_item)), None)
+                    if urgent is not None:
+                        chosen, reason = urgent, "urgent_preemption"
+                    else:
+                        chosen, reason = candidate, "persistent_queue"
+                elif not deadline_ok:
+                    unassigned_reasons.setdefault(candidate.key, deadline_reason)
 
         # 1. Underfoot: highest-priority actionable task at our tile.
         for task in tile_tasks if chosen is None else ():
