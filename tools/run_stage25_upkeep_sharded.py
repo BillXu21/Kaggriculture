@@ -183,13 +183,6 @@ def _validate_config(
         raise ValueError("master seed must be nonnegative")
     if processes < 1:
         raise ValueError("processes must be positive")
-    missing = [
-        f"{variant} -> {COMPARISON_REFERENCES[variant]}"
-        for variant in ("fertilizer_wheat3", "combined_wheat3")
-        if variant in variants and COMPARISON_REFERENCES[variant] not in variants
-    ]
-    if missing:
-        raise ValueError("include threshold comparison references: " + ", ".join(missing))
 
 
 def _config_manifest(
