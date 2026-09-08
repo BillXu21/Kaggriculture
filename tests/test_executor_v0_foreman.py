@@ -155,6 +155,28 @@ def test_two_workers_claim_distinct_tasks_deterministically():
     assert result.hands_actions[0] == ("WATER",)
 
 
+def test_underfoot_first_reserves_local_work_and_restores_worker_output_order():
+    obs = make_obs(farmer=(0, 0), hands=[[5, 0]], inventories=[{}, {}])
+    tasks = [
+        task("WATER:0,5", "WATER", (0, 5), priority=Priority.MAINTENANCE),
+    ]
+
+    legacy = run_foreman(obs, 0, tasks=tasks)
+    underfoot = run_foreman(
+        obs, 0, tasks=tasks,
+        config=ForemanConfig(underfoot_first=True),
+    )
+
+    assert legacy.assignments[0].task_key == "WATER:0,5"
+    assert legacy.farmer_action == ("EAST",)
+    assert underfoot.farmer_action == ("PASS",)
+    assert underfoot.hands_actions == (("WATER",),)
+    assert [a.worker_index for a in underfoot.assignments] == [0, 1]
+    assert [a.task_key for a in underfoot.assignments] == [
+        None, "WATER:0,5"
+    ]
+
+
 # --------------------------------------------------------- soft specialization
 
 

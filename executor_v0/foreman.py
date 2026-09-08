@@ -64,6 +64,7 @@ _MARKET_TASK_KINDS = frozenset({
 _PRIORITY_STEP = 100_000     # priority dominates any distance
 _VARIETY_PENALTY = 50_000    # adding a new carried item type past the cap
 _CARRY_AFFINITY_BONUS = 10   # soft bonus when the required item is carried
+_TOTAL_ACTIONS = 30 * 24 - 1  # step 718 is the final actionable step
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ class ForemanConfig:
     max_carried_item_types: int = 2
     pickup_batch: int = 5
     shed_access_tiles: tuple[tuple[int, int], ...] = SHED_ACCESS_TILES
+    underfoot_first: bool = False
 
 
 @dataclass(frozen=True)
@@ -234,6 +236,35 @@ def _nearest_access(pos: tuple[int, int],
                key=lambda a: (abs(pos[0] - a[0]) + abs(pos[1] - a[1]), a))
 
 
+def _remaining_actionable_turns(obs: Mapping) -> int:
+    """Return inclusive worker actions before reset or terminal state."""
+    hour = int(obs.get("hour", 0))
+    step = int(obs.get("step", int(obs.get("day", 0)) * 24 + hour))
+    return max(0, min(24 - hour, _TOTAL_ACTIONS - step))
+
+
+def _plant_deadline_feasible(
+    obs: Mapping,
+    worker: WorkerView,
+    task: Task,
+    *,
+    enabled: bool,
+    remaining_turns: int,
+) -> tuple[bool, str]:
+    """Check travel + PLANT + protected same-worker WATER budget."""
+    if not enabled or task.kind != "PLANT" or task.tile is None:
+        return True, ""
+    travel = abs(worker.position[0] - task.tile[0]) \
+        + abs(worker.position[1] - task.tile[1])
+    required = travel + 2
+    if required <= remaining_turns:
+        return True, ""
+    return False, (
+        f"plant_deadline_insufficient_turns:required={required}:"
+        f"remaining={remaining_turns}:travel={travel}"
+    )
+
+
 # ------------------------------------------------------------------- foreman
 
 
@@ -244,12 +275,14 @@ def run_foreman(
     *,
     config: ForemanConfig = ForemanConfig(),
     worker_continuations: Mapping[int, Task] | None = None,
+    deadline_safe_planting: bool = False,
 ) -> ForemanResult:
     """Run one greedy dispatch turn. Pure; inputs never mutated."""
     farm = obs["farms"][seat]
     board = farm["tiles"]
     unlocked = list(farm["unlocked_quadrants"])
     workers = _worker_views(obs, seat)
+    remaining_turns = _remaining_actionable_turns(obs)
 
     all_tasks = list(tasks)
     dep_keys = {t.key for t in all_tasks}
@@ -314,7 +347,18 @@ def run_foreman(
         if all(u.key != task_.key for u in unassigned):
             unassigned.append(task_)
 
-    for worker in workers:
+    # Underfoot-first is the experimentally captured baseline contract:
+    # reserve local work for every worker before allowing distant claims.
+    # The disabled path intentionally retains legacy worker-order behavior.
+    dispatch_order = (
+        [(worker, True) for worker in workers]
+        + [(worker, False) for worker in workers]
+        if config.underfoot_first else [(worker, False) for worker in workers]
+    )
+    assigned_workers: set[int] = set()
+    for worker, underfoot_only in dispatch_order:
+        if worker.index in assigned_workers:
+            continue
         chosen: Task | None = None
         reason = ""
         feasible_priorities = [
@@ -340,6 +384,12 @@ def run_foreman(
                 continue
             if not _carried(worker, task.required_item):
                 continue
+            deadline_ok, deadline_reason = _plant_deadline_feasible(
+                obs, worker, task, enabled=deadline_safe_planting,
+                remaining_turns=remaining_turns)
+            if not deadline_ok:
+                unassigned_reasons.setdefault(task.key, deadline_reason)
+                continue
             if task.kind == "PLACE" and best_feasible_priority is not None \
                     and int(task.priority) > best_feasible_priority:
                 continue
@@ -352,6 +402,9 @@ def run_foreman(
             chosen, reason = task, "underfoot_execution"
             break
 
+        if underfoot_only and chosen is None:
+            continue
+
         # 2. Greedy assignment minimizing priority-dominated score.
         if chosen is None:
             best_score = None
@@ -361,6 +414,12 @@ def run_foreman(
                 if not seeds_available(task):
                     unassigned_reasons.setdefault(task.key,
                                                   "no_global_seeds")
+                    continue
+                deadline_ok, deadline_reason = _plant_deadline_feasible(
+                    obs, worker, task, enabled=deadline_safe_planting,
+                    remaining_turns=remaining_turns)
+                if not deadline_ok:
+                    unassigned_reasons.setdefault(task.key, deadline_reason)
                     continue
                 carried_ok = _carried(worker, task.required_item)
                 if not carried_ok:
@@ -398,6 +457,7 @@ def run_foreman(
             continue
 
         claimed.add(chosen.key)
+        assigned_workers.add(worker.index)
         reserve_seeds(chosen)
         needs_pickup = (chosen.required_item is not None
                         and not _carried(worker, chosen.required_item))
@@ -468,6 +528,17 @@ def run_foreman(
         if task.key not in claimed \
                 and all(u.key != task.key for u in unassigned):
             unassigned.append(task)
+        if (task.key in {u.key for u in unassigned}
+                and task.kind == "PLANT" and deadline_safe_planting
+                and task.key not in unassigned_reasons):
+            unassigned_reasons[task.key] = (
+                "plant_deadline_infeasible_for_all_workers:"
+                f"remaining={remaining_turns}"
+            )
+
+    if config.underfoot_first:
+        assignments.sort(key=lambda assignment: assignment.worker_index)
+        actions = [assignment.action for assignment in assignments]
 
     return ForemanResult(
         farmer_action=actions[0],

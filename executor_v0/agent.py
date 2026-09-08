@@ -96,6 +96,8 @@ class AgentConfig:
     optional_idle_cleanup: bool = False
     optional_spare_watering: bool = False
     immediate_plant_water: bool = True
+    deadline_safe_planting: bool = False
+    deadline_safe_hiring: bool = False
     record_turn_snapshot: bool = True
     heuristic_care: bool = False
     heuristic_fertilizer: bool = False
@@ -236,6 +238,7 @@ class ExecutorAgent:
         self._debug_trace_turn: dict[str, Any] | None = None
         self._plant_attempts: dict[int, _PlantAttempt] = {}
         self._plant_water_continuations: dict[int, Task] = {}
+        self._last_hire_rejections: list[dict[str, Any]] = []
         self._cleanup_metrics: dict[str, int] = {
             "baseline_pass_worker_actions": 0,
             "cleanup_replacements": 0,
@@ -543,7 +546,10 @@ class ExecutorAgent:
                 anchors.append((int(pos[1]), int(pos[0])))
         if not anchors:
             anchors = [(4, 4)]
-        turns_left = max(24 - int(obs["hour"]), 1)
+        hour = int(obs["hour"])
+        step = int(obs.get("step", int(obs["day"]) * 24 + hour))
+        inclusive_turns_left = max(0, min(24 - hour, 30 * 24 - 1 - step))
+        turns_left = max(inclusive_turns_left, 1)
 
         def turns_needed(tasks_):
             total = 0
@@ -561,6 +567,16 @@ class ExecutorAgent:
             maint_workers = math.ceil(turns_needed(maintenance) / max(turns_left, 1))
             desired = max(desired, min(maint_workers, current_hands + 1 + len(maintenance)))
         wanted = max(desired - current_hands, 0)
+        self._last_hire_rejections = []
+        if self.config.deadline_safe_hiring and wanted > 0 \
+                and inclusive_turns_left <= 1:
+            self._last_hire_rejections.append({
+                "reason": "no_future_worker_action_before_reset_or_terminal",
+                "wanted": wanted,
+                "inclusive_turns_left": inclusive_turns_left,
+                "future_worker_actions": max(0, inclusive_turns_left - 1),
+            })
+            return [], wanted
         already_today = int(farm.get("hires_today", 0))
         cash = available_cash
         affordable = 0
@@ -1128,7 +1144,9 @@ class ExecutorAgent:
         # a second layer over only literal normal PASS actions.
         normal_foreman = run_foreman(obs, seat, normal_dispatch_tasks,
                                      config=self.config.foreman,
-                                     worker_continuations=worker_continuations)
+                                     worker_continuations=worker_continuations,
+                                     deadline_safe_planting=(
+                                         self.config.deadline_safe_planting))
         optional_tasks: tuple[Task, ...] = ()
         foreman_result = normal_foreman
         if self.config.idle_cleanup_enabled:
@@ -1298,6 +1316,9 @@ class ExecutorAgent:
         record["hires"]["requested"] = max(record["hires"]["requested"], hires_requested)
         record["hires"]["submitted"] += submitted_hires
         record["hires"]["observed_max"] = self._max_hires_today
+        if self._last_hire_rejections:
+            record.setdefault("hire_rejections", []).extend(
+                self._last_hire_rejections)
         record["unresolved_generator"] = list(generation.unresolved)
 
         crops, animals, care_done, fert_done = _board_counts(board)
@@ -1391,6 +1412,8 @@ class ExecutorAgent:
                 "optional_idle_cleanup_mode": self.config.cleanup_mode,
                 "cleanup_mode": self.config.cleanup_mode,
                 "immediate_plant_water": self.config.immediate_plant_water,
+                "deadline_safe_planting": self.config.deadline_safe_planting,
+                "deadline_safe_hiring": self.config.deadline_safe_hiring,
                 "record_turn_snapshot": self.config.record_turn_snapshot,
             },
             "cleanup_metrics": self._cleanup_diagnostics(),

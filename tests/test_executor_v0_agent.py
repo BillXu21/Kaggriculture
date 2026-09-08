@@ -266,6 +266,119 @@ def test_starvation_preemption_remains_ahead_of_plant_water_continuation():
     assert action["hands"] == [["PASS"]]
 
 
+def test_deadline_flags_off_match_default_action_parity():
+    plan = simple_plan(crop_targets={
+        "WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    observations = [
+        make_obs(day=3, hour=22, farmer=(4, 4), seeds={"WHEAT": 1}),
+        make_obs(day=3, hour=23, farmer=(4, 4), seeds={"WHEAT": 1}),
+    ]
+    default_agent = ExecutorAgent(FixedPlanProvider(plan), seat=0)
+    explicit_off_agent = ExecutorAgent(
+        FixedPlanProvider(plan), seat=0,
+        config=AgentConfig(deadline_safe_planting=False,
+                           deadline_safe_hiring=False))
+
+    default_actions = [default_agent(obs) for obs in observations]
+    explicit_off_actions = [explicit_off_agent(obs) for obs in observations]
+
+    assert AgentConfig().deadline_safe_planting is False
+    assert AgentConfig().deadline_safe_hiring is False
+    assert explicit_off_actions == default_actions
+    assert explicit_off_agent.diagnostics_json() == \
+        default_agent.diagnostics_json()
+
+
+def test_deadline_safe_planting_allows_hour_22_then_same_worker_water_hour_23():
+    plan = simple_plan(crop_targets={
+        "WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    agent = ExecutorAgent(
+        FixedPlanProvider(plan), seat=0,
+        config=AgentConfig(deadline_safe_planting=True))
+
+    first = make_obs(day=3, hour=22, farmer=(4, 4), seeds={"WHEAT": 1})
+    assert agent(first)["farmer"] == ["PLANT", "WHEAT"]
+
+    planted = empty_tiles()
+    planted[4][4] = plant_tile(
+        "WHEAT", planted_day=3, consecutive_unwatered=1,
+        watered_today=False)
+    second = make_obs(
+        day=3, hour=23, farmer=(4, 4), seeds={}, tiles=planted)
+    assert agent(second)["farmer"] == ["WATER"]
+    assert agent.debug_trace_turn["assignments"][0]["reason"] == \
+        "same_worker_plant_continuation"
+
+
+@pytest.mark.parametrize(
+    ("hour", "step", "farmer", "required", "remaining", "travel"),
+    (
+        (23, None, (4, 4), 2, 1, 0),
+        (22, None, (0, 0), 10, 2, 8),
+    ),
+    ids=("hour_23", "travel_cannot_fit"),
+)
+def test_deadline_safe_planting_rejects_infeasible_plant_and_keeps_it_outstanding(
+        hour, step, farmer, required, remaining, travel):
+    plan = simple_plan(crop_targets={
+        "WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    agent = ExecutorAgent(
+        FixedPlanProvider(plan), seat=0,
+        config=AgentConfig(deadline_safe_planting=True,
+                           deadline_safe_hiring=True))
+    obs = make_obs(day=3, hour=hour, step=step, farmer=farmer,
+                   seeds={"WHEAT": 1})
+
+    assert agent(obs)["farmer"] == ["PASS"]
+    plant_key = "PLANT:WHEAT:4,4"
+    unassigned = agent.debug_trace_turn["unassigned"]
+    assert plant_key in unassigned["task_keys"]
+    assert unassigned["reasons"][plant_key] == (
+        f"plant_deadline_insufficient_turns:required={required}:"
+        f"remaining={remaining}:travel={travel}"
+    )
+
+
+def test_deadline_safe_planting_uses_step_for_final_day_terminal_boundary():
+    plan = simple_plan(crop_targets={
+        "WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    config = AgentConfig(deadline_safe_planting=True,
+                         deadline_safe_hiring=True)
+    agent = ExecutorAgent(FixedPlanProvider(plan), seat=0, config=config)
+
+    step_717 = make_obs(day=29, hour=21, step=717,
+                        farmer=(4, 4), seeds={"WHEAT": 1})
+    assert agent(step_717)["farmer"] == ["PLANT", "WHEAT"]
+
+    planted = empty_tiles()
+    planted[4][4] = plant_tile(
+        "WHEAT", planted_day=29, consecutive_unwatered=1,
+        watered_today=False)
+    step_718 = make_obs(day=29, hour=22, step=718,
+                        farmer=(4, 4), seeds={}, tiles=planted)
+    assert agent(step_718)["farmer"] == ["WATER"]
+
+    terminal_agent = ExecutorAgent(
+        FixedPlanProvider(plan), seat=0, config=config)
+    rejected = make_obs(day=29, hour=22, step=718,
+                        farmer=(4, 4), seeds={"WHEAT": 1})
+    assert terminal_agent(rejected)["farmer"] == ["PASS"]
+    plant_key = "PLANT:WHEAT:4,4"
+    unassigned = terminal_agent.debug_trace_turn["unassigned"]
+    assert plant_key in unassigned["task_keys"]
+    assert unassigned["reasons"][plant_key] == (
+        "plant_deadline_insufficient_turns:required=2:remaining=1:travel=0"
+    )
+
+
 # ------------------------------------------------------- manager once / days
 
 
@@ -553,6 +666,49 @@ def test_inactive_bin_never_sells_and_new_bin_resets_ledger():
 
 def workload_plan():
     return simple_plan()
+
+
+@pytest.mark.parametrize(
+    ("day", "hour", "step", "hire_allowed"),
+    (
+        # At ordinary hour 22, two inclusive turns remain: this HIRE leaves
+        # one future worker turn available for the generated workload.
+        (3, 22, None, True),
+        (3, 23, None, False),
+        # Step 718 is terminal even though the clock hour is only 22.
+        (29, 22, 718, False),
+    ),
+    ids=("ordinary_hour_22", "ordinary_hour_23", "final_terminal_step_718"),
+)
+def test_deadline_safe_hiring_respects_future_worker_turn_and_terminal_step(
+        day, hour, step, hire_allowed):
+    tiles = empty_tiles()
+    for y in range(5):
+        tiles[y][0] = plant_tile()
+    agent = ExecutorAgent(
+        FixedPlanProvider(workload_plan()), seat=0,
+        config=AgentConfig(deadline_safe_hiring=True))
+
+    action = agent(make_obs(day=day, hour=hour, step=step, tiles=tiles,
+                            money=3000.0))
+    if hire_allowed:
+        assert ["HIRE"] in action["market"]
+    else:
+        assert ["HIRE"] not in action["market"]
+
+    hires = agent.diagnostics_json()["days"][str(day)]["hires"]
+    assert hires == {
+        "requested": 1,
+        "submitted": int(hire_allowed),
+        "observed_max": 0,
+    }
+    if not hire_allowed:
+        rejection = agent.diagnostics_json()["days"][str(day)][
+            "hire_rejections"][-1]
+        assert rejection["reason"] == (
+            "no_future_worker_action_before_reset_or_terminal")
+        assert rejection["wanted"] == 1
+        assert rejection["future_worker_actions"] == 0
 
 
 def test_hire_follows_workload_any_hour_within_affordability():
