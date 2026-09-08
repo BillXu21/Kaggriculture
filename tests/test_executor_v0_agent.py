@@ -279,13 +279,17 @@ def test_deadline_flags_off_match_default_action_parity():
     explicit_off_agent = ExecutorAgent(
         FixedPlanProvider(plan), seat=0,
         config=AgentConfig(deadline_safe_planting=False,
-                           deadline_safe_hiring=False))
+                           deadline_safe_hiring=False,
+                           persistent_worker_queues=False,
+                           schedule_informed_hiring=False))
 
     default_actions = [default_agent(obs) for obs in observations]
     explicit_off_actions = [explicit_off_agent(obs) for obs in observations]
 
     assert AgentConfig().deadline_safe_planting is False
     assert AgentConfig().deadline_safe_hiring is False
+    assert AgentConfig().persistent_worker_queues is False
+    assert AgentConfig().schedule_informed_hiring is False
     assert explicit_off_actions == default_actions
     assert explicit_off_agent.diagnostics_json() == \
         default_agent.diagnostics_json()

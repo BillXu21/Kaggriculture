@@ -670,6 +670,9 @@ def run_sharded(
                 command, cwd=repo_root, stdin=subprocess.DEVNULL,
                 stdout=stdout, stderr=stderr, text=True,
             )
+            print(
+                f"launched shard {shard.index}: {len(shard.games)} seed/seat pairs",
+                flush=True)
     except Exception:
         for stdout, stderr in logs.values():
             stdout.close()
@@ -684,6 +687,7 @@ def run_sharded(
         stdout, stderr = logs[index]
         stdout.close()
         stderr.close()
+        print(f"completed shard {index}: returncode={return_codes[index]}", flush=True)
     failed = {index: code for index, code in return_codes.items() if code != 0}
     if failed:
         manifest["status"] = "child_failed"
