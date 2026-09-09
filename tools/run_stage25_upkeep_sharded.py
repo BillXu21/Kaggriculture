@@ -37,8 +37,27 @@ TELEMETRY_FIELDS: dict[str, tuple[str, ...]] = {
     "candidate_bank": ("candidate_bank", "bank"),
     "opponent_bank": ("opponent_bank",),
     "margin": ("margin",),
-    "completed_work": ("completed_work", "work_completed", "completed_tasks"),
+    "completed_useful_work": (
+        "completed_useful_work", "completed_work", "work_completed",
+        "completed_tasks",
+    ),
     "missed_maintenance": ("missed_maintenance", "missed_maintenance_total"),
+    "duplicate_claims": (
+        "duplicate_claims", "duplicate_claim", "coassigned_turns",
+    ),
+    "target_abandonment": (
+        "target_abandonment", "target_abandoned", "target_abandonments",
+        "ended_unobserved",
+    ),
+    "movement_between_interactions": (
+        "movement_between_interactions", "movement_between_actions",
+        "cand_movement", "movement",
+    ),
+    "hiring_expense": (
+        "hiring_expense", "hiring_cost", "hire_cost", "hiring_cost_total",
+    ),
+    # Backward-compatible surface retained for existing consumers.
+    "completed_work": ("completed_work", "work_completed", "completed_tasks"),
     "travel_abandonment": (
         "travel_abandonment", "travel_abandoned", "travel_abandonments",
     ),
@@ -193,7 +212,7 @@ def _config_manifest(
     game_pairs: Sequence[GamePair], preflight_only: bool, capture_dir: Path | None,
     underfoot_first: bool, deadline_safe_planting: bool,
     deadline_safe_hiring: bool, persistent_worker_queues: bool,
-    schedule_informed_hiring: bool,
+    queue_ownership_repair: bool, schedule_informed_hiring: bool,
 ) -> dict[str, Any]:
     diff = _git(repo_root, "diff", "HEAD")
     return {
@@ -216,6 +235,7 @@ def _config_manifest(
             "deadline_safe_planting": deadline_safe_planting,
             "deadline_safe_hiring": deadline_safe_hiring,
             "persistent_worker_queues": persistent_worker_queues,
+            "queue_ownership_repair": queue_ownership_repair,
             "schedule_informed_hiring": schedule_informed_hiring,
         },
         "source": {
@@ -389,6 +409,22 @@ def _flatten_matches(value: Any, key_names: set[str], path: str = "") -> list[tu
     return matches
 
 
+def _telemetry_numbers(value: Any) -> list[float]:
+    """Turn exposed scalar/count containers into numeric observations."""
+    if isinstance(value, bool):
+        return [float(value)]
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return [float(value)]
+    if isinstance(value, Mapping):
+        numeric = [float(item) for item in value.values()
+                   if isinstance(item, (int, float)) and not isinstance(item, bool)
+                   and math.isfinite(float(item))]
+        return numeric if numeric else [float(len(value))]
+    if isinstance(value, (list, tuple, set)):
+        return [float(len(value))]
+    return []
+
+
 def aggregate_telemetry(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Traverse raw rows and report numeric totals plus unavailable fields.
 
@@ -411,11 +447,8 @@ def aggregate_telemetry(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             count += len(matches)
             locations.extend(path for path, _ in matches[:8])
             for _, value in matches:
-                if isinstance(value, bool):
-                    numeric_sum += int(value)
-                    numeric_count += 1
-                elif isinstance(value, (int, float)) and math.isfinite(float(value)):
-                    numeric_sum += float(value)
+                for number in _telemetry_numbers(value):
+                    numeric_sum += number
                     numeric_count += 1
         output["fields"][field] = {
             "available": count > 0,
@@ -455,6 +488,7 @@ def _child_command(
     e_history_version: str, game_pairs: Sequence[GamePair],
     underfoot_first: bool = False, deadline_safe_planting: bool = False,
     deadline_safe_hiring: bool = False, persistent_worker_queues: bool = False,
+    queue_ownership_repair: bool = False,
     schedule_informed_hiring: bool = False,
 ) -> list[str]:
     filters = [f"{seeds[index]}:{seat}" for index, seat in game_pairs]
@@ -473,6 +507,8 @@ def _child_command(
         (deadline_safe_planting, "--deadline-safe-planting"),
         (deadline_safe_hiring, "--deadline-safe-hiring"),
         (persistent_worker_queues, "--persistent-worker-queues"),
+        (queue_ownership_repair and persistent_worker_queues,
+         "--queue-ownership-repair"),
         (schedule_informed_hiring, "--schedule-informed-hiring"),
     ):
         if enabled:
@@ -488,6 +524,7 @@ def run_sharded(
     capture_dir: Path | None = None, preflight_only: bool = False,
     underfoot_first: bool = False, deadline_safe_planting: bool = False,
     deadline_safe_hiring: bool = False, persistent_worker_queues: bool = False,
+    queue_ownership_repair: bool = False,
     schedule_informed_hiring: bool = False,
     resume: bool = False,
     popen_factory: Callable[..., Any] | None = None,
@@ -495,6 +532,8 @@ def run_sharded(
     """Run children and merge outputs; raises while retaining failed artifacts."""
     seeds, game_pairs = plan_game_pairs(seeds, game_filters)
     variants = list(variants)
+    queue_ownership_repair = bool(
+        queue_ownership_repair and persistent_worker_queues)
     _validate_config(seeds, variants, master_seed, processes)
     if backend not in ("fast", "official"):
         raise ValueError("backend must be fast or official")
@@ -535,6 +574,7 @@ def run_sharded(
             "deadline_safe_planting": deadline_safe_planting,
             "deadline_safe_hiring": deadline_safe_hiring,
             "persistent_worker_queues": persistent_worker_queues,
+            "queue_ownership_repair": queue_ownership_repair,
             "schedule_informed_hiring": schedule_informed_hiring,
         }
         mismatches = {
@@ -576,6 +616,7 @@ def run_sharded(
         deadline_safe_planting=deadline_safe_planting,
         deadline_safe_hiring=deadline_safe_hiring,
         persistent_worker_queues=persistent_worker_queues,
+        queue_ownership_repair=queue_ownership_repair,
         schedule_informed_hiring=schedule_informed_hiring,
     )
     manifest["shards"] = [
@@ -641,6 +682,7 @@ def run_sharded(
                 deadline_safe_planting=deadline_safe_planting,
                 deadline_safe_hiring=deadline_safe_hiring,
                 persistent_worker_queues=persistent_worker_queues,
+                queue_ownership_repair=queue_ownership_repair,
                 schedule_informed_hiring=schedule_informed_hiring,
             )
             shard_manifest = {
@@ -762,6 +804,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--deadline-safe-planting", action="store_true")
     parser.add_argument("--deadline-safe-hiring", action="store_true")
     parser.add_argument("--persistent-worker-queues", action="store_true")
+    parser.add_argument("--queue-ownership-repair", action="store_true",
+                        help="candidate-only repair; effective only with persistent worker queues")
     parser.add_argument("--schedule-informed-hiring", action="store_true")
     parser.add_argument("--resume", action="store_true")
     return parser
@@ -783,6 +827,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             deadline_safe_planting=args.deadline_safe_planting,
             deadline_safe_hiring=args.deadline_safe_hiring,
             persistent_worker_queues=args.persistent_worker_queues,
+            queue_ownership_repair=args.queue_ownership_repair,
             schedule_informed_hiring=args.schedule_informed_hiring,
             resume=args.resume,
         )

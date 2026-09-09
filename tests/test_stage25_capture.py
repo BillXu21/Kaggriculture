@@ -196,7 +196,8 @@ def test_new_executor_controls_are_candidate_only():
     factory = UpkeepFactory(
         0, "combined", underfoot_first=True,
         deadline_safe_planting=True, deadline_safe_hiring=True,
-        persistent_worker_queues=True, schedule_informed_hiring=True)
+        persistent_worker_queues=True, queue_ownership_repair=True,
+        schedule_informed_hiring=True)
     candidate = factory.create(backend_name="fast", seat=0,
                                configuration={}, provider=Provider())
     opponent = factory.create(backend_name="fast", seat=1,
@@ -205,12 +206,20 @@ def test_new_executor_controls_are_candidate_only():
     assert candidate.config.deadline_safe_planting is True
     assert candidate.config.deadline_safe_hiring is True
     assert candidate.config.persistent_worker_queues is True
+    assert candidate.config.queue_ownership_repair is True
     assert candidate.config.schedule_informed_hiring is True
     assert opponent.config.foreman.underfoot_first is False
     assert opponent.config.deadline_safe_planting is False
     assert opponent.config.deadline_safe_hiring is False
     assert opponent.config.persistent_worker_queues is False
+    assert opponent.config.queue_ownership_repair is False
     assert opponent.config.schedule_informed_hiring is False
+
+    repair_without_queues = UpkeepFactory(
+        0, "combined", queue_ownership_repair=True)
+    ignored = repair_without_queues.create(
+        backend_name="fast", seat=0, configuration={}, provider=Provider())
+    assert ignored.config.queue_ownership_repair is False
 
 
 # ------------------------------------------------------- capture writer

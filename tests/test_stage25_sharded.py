@@ -89,12 +89,24 @@ def test_child_command_propagates_executor_controls():
         e_history_version="E_LEGACY", game_pairs=[(0, 0)],
         underfoot_first=True, deadline_safe_planting=True,
         deadline_safe_hiring=True, persistent_worker_queues=True,
+        queue_ownership_repair=True,
         schedule_informed_hiring=True)
     for flag in (
             "--underfoot-first", "--deadline-safe-planting",
             "--deadline-safe-hiring", "--persistent-worker-queues",
+            "--queue-ownership-repair",
             "--schedule-informed-hiring"):
         assert flag in command
+
+
+def test_queue_repair_is_ignored_without_persistent_queues():
+    command = sharded._child_command(
+        checkpoint=Path("ppo"), e_checkpoint=Path("e"),
+        output_dir=Path("out"), capture_dir=None, seeds=SEEDS,
+        master_seed=25, variants=["baseline"], backend="fast",
+        e_history_version="E_LEGACY", game_pairs=[(0, 0)],
+        queue_ownership_repair=True)
+    assert "--queue-ownership-repair" not in command
 
 
 def test_fake_children_merge_canonically_and_emit_pair_bootstrap(tmp_path: Path):

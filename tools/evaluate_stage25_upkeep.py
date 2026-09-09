@@ -12,6 +12,7 @@ against a panel run with different seeds.
 """
 from __future__ import annotations
 import argparse
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
@@ -70,6 +71,57 @@ def parse_game_filter(values: list[str] | None,
     return selected
 
 
+def _capture_telemetry(result, candidate_seat: int) -> dict[str, object]:
+    """Extract only scalar telemetry already exposed by executor capture.
+
+    Capture/audit-only measures such as completed useful work, duplicate claims,
+    and target abandonment are intentionally not inferred here.  The sharded
+    report will mark them unavailable until the capture audit exposes them.
+    """
+    diagnostics = getattr(result, 'executor_full_diagnostics', None)
+    if not isinstance(diagnostics, (list, tuple)) \
+            or candidate_seat >= len(diagnostics):
+        return {}
+    candidate = diagnostics[candidate_seat]
+    if not isinstance(candidate, Mapping):
+        return {}
+    days = candidate.get('days')
+    if not isinstance(days, Mapping):
+        return {}
+    hiring_expense = 0.0
+    missed_maintenance = 0
+    movement = 0
+    scheduler_runtime = 0.0
+    for record in days.values():
+        if not isinstance(record, Mapping):
+            continue
+        previous_labor = record.get('previous_labor')
+        if isinstance(previous_labor, Mapping):
+            value = previous_labor.get('hire_cost')
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                hiring_expense += float(value)
+        missed = record.get('missed_maintenance')
+        if isinstance(missed, (list, tuple, set, Mapping)):
+            missed_maintenance += len(missed)
+        foreman_counts = record.get('foreman_counts')
+        if isinstance(foreman_counts, Mapping):
+            value = foreman_counts.get('movement')
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                movement += int(value)
+        scheduler = record.get('scheduler')
+        if isinstance(scheduler, Mapping):
+            value = scheduler.get('runtime_ms')
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                scheduler_runtime += float(value)
+    return {
+        'hiring_expense': hiring_expense,
+        'missed_maintenance': missed_maintenance,
+        'movement_between_interactions': movement,
+        'scheduler_runtime': scheduler_runtime,
+        'source': 'executor_full_diagnostics',
+    }
+
+
 @dataclass(frozen=True)
 class UpkeepFactory:
     candidate_seat: int
@@ -80,11 +132,16 @@ class UpkeepFactory:
     deadline_safe_planting: bool = False
     deadline_safe_hiring: bool = False
     persistent_worker_queues: bool = False
+    queue_ownership_repair: bool = False
     schedule_informed_hiring: bool = False
 
     @property
     def version(self) -> str:
         base = f'v1:{self.variant}:candidate-seat-{self.candidate_seat}'
+        if self.persistent_worker_queues:
+            base += ':persistent-worker-queues'
+            if self.queue_ownership_repair:
+                base += ':queue-ownership-repair'
         return base + ':capture' if self.capture else base
 
     def create(self, *, backend_name, seat, configuration, provider):
@@ -104,6 +161,10 @@ class UpkeepFactory:
             deadline_safe_planting=(self.deadline_safe_planting and candidate),
             deadline_safe_hiring=(self.deadline_safe_hiring and candidate),
             persistent_worker_queues=(self.persistent_worker_queues and candidate),
+            queue_ownership_repair=(
+                self.queue_ownership_repair
+                and self.persistent_worker_queues
+                and candidate),
             schedule_informed_hiring=(self.schedule_informed_hiring and candidate),
             heuristic_care=care, heuristic_fertilizer=fert,
             wheat_harvest_threshold=wheat3))
@@ -125,6 +186,8 @@ def main(argv=None) -> None:
     p.add_argument('--deadline-safe-planting', action='store_true')
     p.add_argument('--deadline-safe-hiring', action='store_true')
     p.add_argument('--persistent-worker-queues', action='store_true')
+    p.add_argument('--queue-ownership-repair', action='store_true',
+                   help='candidate-only repair; effective only with persistent worker queues')
     p.add_argument('--schedule-informed-hiring', action='store_true')
     p.add_argument('--game-filter', nargs='*', default=None, metavar='SEED:SEAT',
                    help='run only these SEED:SEAT games, preserving original episode IDs')
@@ -202,6 +265,7 @@ def main(argv=None) -> None:
                                           deadline_safe_planting=args.deadline_safe_planting,
                                           deadline_safe_hiring=args.deadline_safe_hiring,
                                           persistent_worker_queues=args.persistent_worker_queues,
+                                          queue_ownership_repair=args.queue_ownership_repair,
                                           schedule_informed_hiring=args.schedule_informed_hiring),
                                       master_seed=args.master_seed)
                 result=runner.run([spec])[0]
@@ -221,6 +285,7 @@ def main(argv=None) -> None:
                      'margin':bank-opp,
                      'statuses':list(result.statuses)}
                 if capture:
+                    row['telemetry'] = _capture_telemetry(result, seat)
                     directory=game_dir(args.capture_dir,variant,episode_id,seed,seat)
                     meta={'variant':variant,'seed':seed,'seat':seat,
                           'episode_id':episode_id,'master_seed':args.master_seed,
