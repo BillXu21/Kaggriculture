@@ -52,8 +52,9 @@ python -m tools.run_stage25_upkeep_sharded \
 ```
 
 The notebook contains the same commands for the full ordered panel, with
-capture disabled for the panel arms. Its editable `CODE_SHA` placeholder must
-be replaced with the commit containing this handoff before the Kaggle run.
+capture disabled for the panel arms. It pins evaluator/source commit `9d0035a`;
+the final notebook-only commit intentionally follows that source commit so the
+clone contains all evaluator artifacts.
 
 ## Provenance and reporting
 
