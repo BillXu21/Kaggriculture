@@ -102,6 +102,7 @@ class AgentConfig:
     deadline_safe_planting: bool = False
     deadline_safe_hiring: bool = False
     persistent_worker_queues: bool = False
+    queue_ownership_repair: bool = False
     schedule_informed_hiring: bool = False
     record_turn_snapshot: bool = True
     heuristic_care: bool = False
@@ -1192,8 +1193,17 @@ class ExecutorAgent:
                                      config=self.config.foreman,
                                      worker_continuations=worker_continuations,
                                      deadline_safe_planting=(
-                                         self.config.deadline_safe_planting),
-                                     worker_queues=worker_queues)
+                                          self.config.deadline_safe_planting),
+                                      worker_queues=worker_queues,
+                                      queue_ownership_repair=(
+                                          self.config.queue_ownership_repair
+                                          and self.config.persistent_worker_queues),
+                                      scheduler_reservations=(
+                                          self._last_scheduler_result.reservations
+                                          if self.config.queue_ownership_repair
+                                          and self.config.persistent_worker_queues
+                                          and self._last_scheduler_result is not None
+                                          else None))
         optional_tasks: tuple[Task, ...] = ()
         foreman_result = normal_foreman
         if self.config.idle_cleanup_enabled:
@@ -1204,6 +1214,15 @@ class ExecutorAgent:
                 obs, seat, normal_foreman, optional_tasks)
         self._record_cleanup_telemetry(
             normal_foreman, foreman_result, optional_tasks)
+
+        if self.config.queue_ownership_repair and self.config.persistent_worker_queues:
+            reconciliation = self._scheduler.reconcile_dispatch(
+                seat, foreman_result)
+            scheduler_record = self._day_records[day].setdefault(
+                "scheduler", {"events": [], "runtime_ms": 0.0, "queue_lengths": {}})
+            scheduler_record["events"].extend(reconciliation)
+            scheduler_record["events"].extend(
+                dict(item) for item in (foreman_result.diagnostics or ()))
 
         record = self._day_records[day]
         survival_record = record["survival"]
@@ -1466,6 +1485,7 @@ class ExecutorAgent:
                 "deadline_safe_planting": self.config.deadline_safe_planting,
                 "deadline_safe_hiring": self.config.deadline_safe_hiring,
                 "persistent_worker_queues": self.config.persistent_worker_queues,
+                "queue_ownership_repair": self.config.queue_ownership_repair,
                 "schedule_informed_hiring": self.config.schedule_informed_hiring,
                 "record_turn_snapshot": self.config.record_turn_snapshot,
             },

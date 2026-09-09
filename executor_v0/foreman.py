@@ -112,9 +112,10 @@ class ForemanResult:
     market_tasks: tuple[Task, ...]
     counts: dict[str, int]
     unassigned_reasons: dict[str, str] = field(default_factory=dict)
+    diagnostics: tuple[dict[str, Any], ...] = ()
 
     def to_json_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "farmer_action": list(self.farmer_action),
             "hands_actions": [list(a) for a in self.hands_actions],
             "assignments": [a.to_json_dict() for a in self.assignments],
@@ -124,6 +125,9 @@ class ForemanResult:
             "counts": dict(self.counts),
             "unassigned_reasons": dict(self.unassigned_reasons),
         }
+        if self.diagnostics:
+            payload["diagnostics"] = [dict(item) for item in self.diagnostics]
+        return payload
 
 
 # ------------------------------------------------------------------ helpers
@@ -277,6 +281,8 @@ def run_foreman(
     worker_continuations: Mapping[int, Task] | None = None,
     deadline_safe_planting: bool = False,
     worker_queues: Mapping[int, Sequence[Task]] | None = None,
+    queue_ownership_repair: bool = False,
+    scheduler_reservations: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> ForemanResult:
     """Run one greedy dispatch turn. Pure; inputs never mutated."""
     farm = obs["farms"][seat]
@@ -311,6 +317,58 @@ def run_foreman(
     market_tasks.sort(key=lambda t: t.sort_key)
     tile_by_key = {task.key: task for task in tile_tasks}
 
+    # The repair is deliberately a separate opt-in layer.  In particular,
+    # the legacy path below keeps its iteration order, claims, and RNG-free
+    # decisions unchanged when no persistent queues (or no flag) are present.
+    repair = bool(queue_ownership_repair and worker_queues is not None)
+    queue_diagnostics: list[dict[str, Any]] = []
+    queue_by_worker: dict[int, list[Task]] = {
+        worker.index: [] for worker in workers
+    }
+    queue_owner: dict[str, int] = {}
+    queue_task_by_key: dict[str, Task] = {}
+    queue_blocked: set[str] = set()
+    transferred_keys: set[str] = set()
+
+    def queue_diag(event: str, *, task_key: str | None = None,
+                   **extra: Any) -> None:
+        if len(queue_diagnostics) >= 128:
+            return
+        payload: dict[str, Any] = {"event": event}
+        if task_key is not None:
+            payload["task_key"] = str(task_key)
+        payload.update(extra)
+        queue_diagnostics.append(payload)
+
+    if repair:
+        for worker in workers:
+            for queued in (worker_queues or {}).get(worker.index, ()):
+                key = str(getattr(queued, "key", ""))
+                current = tile_by_key.get(getattr(queued, "key", None))
+                if current is None:
+                    queue_diag("queue_release", task_key=key,
+                               worker_index=worker.index, reason="not_current")
+                    continue
+                if key in queue_owner:
+                    queue_diag(
+                        "prevented_conflicting_claim", task_key=key,
+                        old_worker_index=queue_owner[key],
+                        new_worker_index=worker.index,
+                        reason="duplicate_queue_reservation",
+                    )
+                    continue
+                blocked_by = next((dep for dep in current.depends_on
+                                   if dep in dep_keys), None)
+                if blocked_by is not None:
+                    queue_blocked.add(key)
+                    queue_diag("queue_release", task_key=key,
+                               worker_index=worker.index,
+                               reason=f"dependency_current:{blocked_by}")
+                    continue
+                queue_owner[key] = worker.index
+                queue_task_by_key[key] = current
+                queue_by_worker[worker.index].append(current)
+
     # Global own seed pool: planting consumes `private.seeds[crop]`
     # atomically at the engine. Workers never PICKUP or carry seeds; this
     # per-turn budget reserves seeds deterministically across workers so we
@@ -321,6 +379,68 @@ def run_foreman(
     shed_budget = {str(k): max(0, int(v))
                    for k, v in (private.get("shed") or {}).items()
                    if int(v) > 0}
+
+    # Scheduler reservations are part of the repaired ownership contract:
+    # incidental pickups may use only stock left after exclusive queue work.
+    # A queued task receives its own reservation back when it is dispatched.
+    reserved_shed: dict[str, int] = {}
+    reserved_seeds: dict[str, int] = {}
+    reservation_by_key: dict[str, dict[str, Any]] = {}
+    if repair and scheduler_reservations:
+        for raw_key, raw_reservation in scheduler_reservations.items():
+            key = str(raw_key)
+            if key not in queue_owner or not isinstance(raw_reservation, Mapping):
+                continue
+            reservation = dict(raw_reservation)
+            reservation_by_key[key] = reservation
+            amount = max(0, int(reservation.get("amount", 0)))
+            item = str(reservation.get("item", ""))
+            if reservation.get("kind") == "seed":
+                reserved_seeds[item] = reserved_seeds.get(item, 0) + amount
+            else:
+                reserved_shed[item] = reserved_shed.get(item, 0) + amount
+        for item, amount in reserved_shed.items():
+            shed_budget[item] = max(0, shed_budget.get(item, 0) - amount)
+        for crop, amount in reserved_seeds.items():
+            seed_budget[crop] = max(0, seed_budget.get(crop, 0) - amount)
+
+    released_reservations: set[str] = set()
+
+    def release_queue_reservation(task_: Task) -> None:
+        key = str(task_.key)
+        if key in released_reservations:
+            return
+        reservation = reservation_by_key.get(key)
+        if reservation is None:
+            return
+        amount = max(0, int(reservation.get("amount", 0)))
+        item = str(reservation.get("item", ""))
+        if reservation.get("kind") == "seed":
+            seed_budget[item] = seed_budget.get(item, 0) + amount
+        else:
+            shed_budget[item] = shed_budget.get(item, 0) + amount
+        released_reservations.add(key)
+
+    def queue_shed_available(task_: Task) -> int:
+        item = task_.required_item
+        if item is None:
+            return 0
+        available = shed_budget.get(str(item), 0)
+        if str(task_.key) in queue_owner and str(task_.key) not in released_reservations:
+            reservation = reservation_by_key.get(str(task_.key))
+            if reservation and reservation.get("kind") != "seed":
+                available += max(0, int(reservation.get("amount", 0)))
+        return available
+
+    def queue_seeds_available(task_: Task) -> bool:
+        if task_.kind != "PLANT" or not task_.crop:
+            return True
+        available = seed_budget.get(str(task_.crop), 0)
+        if str(task_.key) in queue_owner and str(task_.key) not in released_reservations:
+            reservation = reservation_by_key.get(str(task_.key))
+            if reservation and reservation.get("kind") == "seed":
+                available += max(0, int(reservation.get("amount", 0)))
+        return available > 0
 
     def seeds_available(task_: Task) -> bool:
         if task_.kind != "PLANT":
@@ -348,6 +468,83 @@ def run_foreman(
         claimed.discard(task_.key)
         if all(u.key != task_.key for u in unassigned):
             unassigned.append(task_)
+
+    def repaired_underfoot_ok(worker: WorkerView, task: Task) -> bool:
+        """Apply the ordinary underfoot/resource/deadline gates."""
+        if task.key in claimed or task.tile != worker.position:
+            return False
+        if _interaction_op(task) is None or not queue_seeds_available(task):
+            return False
+        deadline_ok, deadline_reason = _plant_deadline_feasible(
+            obs, worker, task, enabled=deadline_safe_planting,
+            remaining_turns=remaining_turns)
+        if not deadline_ok:
+            unassigned_reasons.setdefault(task.key, deadline_reason)
+            return False
+        feasible_priorities = [
+            int(other.priority) for other in tile_tasks
+            if other.key not in claimed
+            and other.tile is not None
+            and _carried(worker, other.required_item)
+            and _interaction_op(other) is not None
+        ]
+        if task.kind == "PLACE" and feasible_priorities \
+                and int(task.priority) > min(feasible_priorities):
+            return False
+        if not _carried(worker, task.required_item):
+            return False
+        return True
+
+    if repair:
+        # Resolve transfers before any worker dispatch.  This is the crucial
+        # atomicity point: an earlier old owner cannot route toward a task
+        # that a later worker is executing from underfoot.
+        for worker in workers:
+            candidate = next(
+                (task for task in tile_tasks
+                 if repaired_underfoot_ok(worker, task)),
+                None,
+            )
+            if candidate is None:
+                continue
+            key = str(candidate.key)
+            old_worker = queue_owner.get(key)
+            if old_worker is None or old_worker == worker.index \
+                    or key in transferred_keys:
+                continue
+            queue_by_worker[old_worker] = [
+                task for task in queue_by_worker[old_worker]
+                if str(task.key) != key
+            ]
+            queue_by_worker[worker.index].insert(0, candidate)
+            queue_owner[key] = worker.index
+            transferred_keys.add(key)
+            queue_diag(
+                "queue_transfer", task_key=key,
+                old_worker_index=old_worker,
+                new_worker_index=worker.index,
+                reason="queued_underfoot_atomic_transfer",
+            )
+
+    def repaired_queue_valid(worker: WorkerView, task: Task) -> tuple[bool, str]:
+        if task.key in claimed or task.key in queue_blocked:
+            return False, "already_claimed"
+        if task.tile is None or _interaction_op(task) is None:
+            return False, "no_actionable_target"
+        blocked_by = next((dep for dep in task.depends_on if dep in dep_keys), None)
+        if blocked_by is not None:
+            return False, f"dependency_current:{blocked_by}"
+        if not queue_seeds_available(task):
+            return False, "no_global_seeds"
+        deadline_ok, deadline_reason = _plant_deadline_feasible(
+            obs, worker, task, enabled=deadline_safe_planting,
+            remaining_turns=remaining_turns)
+        if not deadline_ok:
+            return False, deadline_reason
+        if not _carried(worker, task.required_item) \
+                and queue_shed_available(task) <= 0:
+            return False, f"shed_lacks_item:{task.required_item}"
+        return True, ""
 
     # Underfoot-first is the experimentally captured baseline contract:
     # reserve local work for every worker before allowing distant claims.
@@ -377,13 +574,106 @@ def run_foreman(
                 and continuation.kind == "WATER" \
                 and continuation.tile is not None \
                 and continuation.tile == worker.position \
-                and _interaction_op(continuation) is not None:
+                and _interaction_op(continuation) is not None \
+                and (not repair or (
+                    str(continuation.key) not in claimed
+                    and queue_owner.get(str(continuation.key), worker.index)
+                    == worker.index)):
             chosen, reason = continuation, "same_worker_plant_continuation"
+
+        if repair and chosen is None and not underfoot_only:
+            queue = queue_by_worker[worker.index]
+            queued = None
+            while queue:
+                candidate = queue[0]
+                key = str(candidate.key)
+                if queue_owner.get(key) != worker.index or candidate.key in claimed:
+                    queue.pop(0)
+                    continue
+                valid, invalid_reason = repaired_queue_valid(worker, candidate)
+                if valid:
+                    queued = candidate
+                    break
+                queue.pop(0)
+                queue_owner.pop(key, None)
+                queue_task_by_key.pop(key, None)
+                queue_blocked.add(key)
+                release_queue_reservation(candidate)
+                queue_diag("queue_release", task_key=key,
+                           worker_index=worker.index, reason=invalid_reason)
+
+            if queued is not None:
+                higher = next(
+                    (task for task in tile_tasks
+                     if int(task.priority) < int(queued.priority)
+                     and repaired_underfoot_ok(worker, task)
+                     and queue_owner.get(str(task.key)) in (None, worker.index)),
+                    None,
+                )
+                if higher is not None:
+                    chosen, reason = higher, "urgent_preemption"
+                    queue_diag(
+                        "queue_preemption", task_key=str(higher.key),
+                        worker_index=worker.index,
+                        displaced_task_key=str(queued.key),
+                        reason="strictly_higher_priority_underfoot",
+                    )
+                else:
+                    chosen, reason = queued, (
+                        "queue_transfer" if str(queued.key) in transferred_keys
+                        else "persistent_queue"
+                    )
+                    queue_diag("queue_retention", task_key=str(queued.key),
+                               worker_index=worker.index,
+                               reason="valid_queue_head")
+            else:
+                chosen = next(
+                    (task for task in tile_tasks
+                     if repaired_underfoot_ok(worker, task)
+                     and queue_owner.get(str(task.key)) in (None, worker.index)),
+                    None,
+                )
+                if chosen is not None:
+                    reason = "underfoot_execution"
+
+        if repair and chosen is None:
+            queue_head = None
+            if underfoot_only:
+                queue = queue_by_worker[worker.index]
+                while queue:
+                    candidate_head = queue[0]
+                    key = str(candidate_head.key)
+                    if queue_owner.get(key) != worker.index or candidate_head.key in claimed:
+                        queue.pop(0)
+                        continue
+                    valid, invalid_reason = repaired_queue_valid(worker, candidate_head)
+                    if valid:
+                        queue_head = candidate_head
+                        break
+                    queue.pop(0)
+                    queue_owner.pop(key, None)
+                    queue_task_by_key.pop(key, None)
+                    queue_blocked.add(key)
+                    release_queue_reservation(candidate_head)
+                    queue_diag("queue_release", task_key=key,
+                               worker_index=worker.index, reason=invalid_reason)
+            chosen = next(
+                (task for task in tile_tasks
+                 if repaired_underfoot_ok(worker, task)
+                 and queue_owner.get(str(task.key)) in (None, worker.index)),
+                None,
+            )
+            if queue_head is not None and chosen is not None \
+                    and chosen.key != queue_head.key \
+                    and int(chosen.priority) >= int(queue_head.priority):
+                chosen = None
+            if chosen is not None:
+                reason = "underfoot_execution"
 
         # A persistent queue owns its head until it completes or becomes
         # invalid.  Only a strictly more urgent underfoot task may preempt it;
         # equal/lower-priority incidental work must wait for the route.
-        if chosen is None and not underfoot_only:
+        if chosen is None and not underfoot_only and not repair:
             queue = (worker_queues or {}).get(worker.index, ())
             queued = queue[0] if queue else None
             candidate = tile_by_key.get(queued.key) if queued is not None else None
@@ -410,7 +700,7 @@ def run_foreman(
                     unassigned_reasons.setdefault(candidate.key, deadline_reason)
 
         # 1. Underfoot: highest-priority actionable task at our tile.
-        for task in tile_tasks if chosen is None else ():
+        for task in tile_tasks if chosen is None and not repair else ():
             if task.key in claimed or task.tile != worker.position:
                 continue
             if not _carried(worker, task.required_item):
@@ -442,7 +732,14 @@ def run_foreman(
             for task in tile_tasks:
                 if task.key in claimed or task.tile is None:
                     continue
-                if not seeds_available(task):
+                if repair and (str(task.key) in queue_owner
+                               or str(task.key) in queue_blocked):
+                    # A valid queue owns the task even when its head is not
+                    # currently executable; a released/blocked head cannot
+                    # be silently reclaimed by greedy fallback.
+                    continue
+                if not (queue_seeds_available(task) if repair
+                        else seeds_available(task)):
                     unassigned_reasons.setdefault(task.key,
                                                   "no_global_seeds")
                     continue
@@ -456,7 +753,10 @@ def run_foreman(
                 if not carried_ok:
                     # Executable only if the shed can supply the item;
                     # otherwise the task stays unassigned this turn.
-                    if _shed_available(obs, seat, task.required_item) <= 0:
+                    available_shed = (queue_shed_available(task) if repair
+                                      else _shed_available(obs, seat,
+                                                           task.required_item))
+                    if available_shed <= 0:
                         continue
                 distance = (
                     abs(worker.position[0] - task.tile[0])
@@ -489,9 +789,11 @@ def run_foreman(
 
         claimed.add(chosen.key)
         assigned_workers.add(worker.index)
-        reserve_seeds(chosen)
         needs_pickup = (chosen.required_item is not None
                         and not _carried(worker, chosen.required_item))
+        if repair and chosen.kind == "PLANT":
+            release_queue_reservation(chosen)
+        reserve_seeds(chosen)
 
         if chosen.tile == worker.position and not needs_pickup:
             op = _interaction_op(chosen)
@@ -505,11 +807,21 @@ def run_foreman(
             actions.append(op)
             assignments.append(Assignment(worker.index, chosen.key, op, reason))
             counts["interaction"] += 1
+            if repair and str(chosen.key) in queue_owner:
+                queue_diag("queue_completion", task_key=str(chosen.key),
+                           worker_index=worker.index, reason="interaction_dispatched")
             continue
 
         if needs_pickup:
             access = _nearest_access(worker.position, config)
             if worker.position == access:
+                if repair:
+                    # Consume this queued task's exclusive shed reservation
+                    # atomically at the pickup point.  A traveling owner must
+                    # retain the reservation until it actually reaches the
+                    # shed; releasing it during route selection would let a
+                    # separate greedy task steal the stock this turn.
+                    release_queue_reservation(chosen)
                 remaining = shed_budget.get(chosen.required_item, 0)
                 if remaining <= 0:
                     # Unreachable when the greedy filter already dropped
@@ -579,6 +891,7 @@ def run_foreman(
         market_tasks=tuple(market_tasks),
         counts=counts,
         unassigned_reasons=unassigned_reasons,
+        diagnostics=tuple(queue_diagnostics[:128]),
     )
 
 
@@ -659,4 +972,5 @@ def apply_idle_cleanup(
         market_tasks=normal_result.market_tasks,
         counts=counts,
         unassigned_reasons=dict(normal_result.unassigned_reasons),
+        diagnostics=normal_result.diagnostics,
     )

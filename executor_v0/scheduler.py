@@ -50,6 +50,7 @@ class SchedulerResult(Mapping[str, Any]):
     events: list[dict[str, Any]] = field(default_factory=list)
     seat: int = 0
     day: int = 0
+    reservations: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def worker_queues(self) -> dict[int, list[Task]]:
@@ -60,7 +61,7 @@ class SchedulerResult(Mapping[str, Any]):
         return self.queues
 
     def to_json_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "seat": self.seat,
             "day": self.day,
             "queues": {
@@ -70,6 +71,12 @@ class SchedulerResult(Mapping[str, Any]):
             "diagnostics": list(self.diagnostics),
             "events": list(self.events),
         }
+        if self.reservations:
+            payload["reservations"] = {
+                str(key): dict(value)
+                for key, value in sorted(self.reservations.items())
+            }
+        return payload
 
     # Mapping compatibility makes integration code pleasantly unopinionated.
     def __getitem__(self, key: str) -> Any:
@@ -408,7 +415,9 @@ class PersistentTaskScheduler:
         for worker in range(worker_count):
             for task in ((old.queues.get(worker, []) if old else [])):
                 if task.key in seen:
-                    emit("release", task, worker_index=worker, reason="duplicate_key")
+                    emit("release", task, worker_index=worker,
+                         reason="duplicate_key",
+                         prevented_conflicting_claim=True)
                     continue
                 seen.add(task.key)
                 current = task_map.get(task.key)
@@ -623,4 +632,122 @@ class PersistentTaskScheduler:
             queues={worker: list(queue) for worker, queue in sorted(state.queues.items())},
             diagnostics=diagnostics,
             events=list(events), seat=int(seat), day=day,
+            reservations={key: dict(value)
+                          for key, value in sorted(state.reservations.items())},
         )
+
+    def reconcile_dispatch(
+        self,
+        seat: int,
+        foreman_result: Any | None = None,
+        *,
+        completed_task_keys: Sequence[str] = (),
+        released_task_keys: Sequence[str] = (),
+        transfers: Sequence[Mapping[str, Any]] = (),
+    ) -> list[dict[str, Any]]:
+        """Reconcile persistent ownership after one actual foreman turn.
+
+        ``schedule`` is intentionally observational, while the engine applies
+        the returned actions afterward.  The caller should invoke this seam
+        with the actual :class:`~executor_v0.foreman.ForemanResult` so an
+        interaction removes its completed head and an opt-in foreman transfer
+        moves the still-live task to its new owner before the next schedule.
+        Explicit key lists are accepted for integrations that do not retain a
+        ForemanResult.  The method mutates only scheduler state and returns a
+        bounded, JSON-safe event list.
+        """
+        state = self._states.get(int(seat))
+        if state is None:
+            return []
+
+        events: list[dict[str, Any]] = []
+        completed = {str(key) for key in completed_task_keys}
+        released = {str(key) for key in released_task_keys}
+        transfer_events: list[Mapping[str, Any]] = [
+            value for value in transfers if isinstance(value, Mapping)
+        ]
+
+        if foreman_result is not None:
+            assignments = getattr(foreman_result, "assignments", ())
+            for assignment in assignments:
+                action = tuple(getattr(assignment, "action", ()) or ())
+                task_key = getattr(assignment, "task_key", None)
+                if task_key is not None and action and action[0] in _TILE_KINDS:
+                    completed.add(str(task_key))
+            for diagnostic in getattr(foreman_result, "diagnostics", ()) or ():
+                if not isinstance(diagnostic, Mapping):
+                    continue
+                event = str(diagnostic.get("event", ""))
+                task_key = diagnostic.get("task_key")
+                if task_key is None:
+                    continue
+                if event in {"queue_release", "release"}:
+                    released.add(str(task_key))
+                elif event in {"queue_transfer", "transfer"}:
+                    transfer_events.append(diagnostic)
+
+        def remove_key(task_key: str) -> list[int]:
+            owners: list[int] = []
+            for worker, queue in state.queues.items():
+                kept = []
+                for task in queue:
+                    if str(task.key) == task_key:
+                        owners.append(worker)
+                    else:
+                        kept.append(task)
+                state.queues[worker] = kept
+            return owners
+
+        for task_key in sorted(completed | released):
+            owners = remove_key(task_key)
+            if task_key in state.reservations:
+                state.reservations.pop(task_key, None)
+            events.append({
+                "event": "reconcile",
+                "task_key": task_key,
+                "reason": "completed" if task_key in completed else "released",
+                "worker_indices": owners,
+            })
+
+        for transfer in transfer_events:
+            task_key = transfer.get("task_key")
+            new_worker = transfer.get("new_worker_index",
+                                      transfer.get("worker_index"))
+            if task_key is None or new_worker is None:
+                continue
+            task_key = str(task_key)
+            try:
+                new_worker = int(new_worker)
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= new_worker < state.worker_count or task_key in completed:
+                continue
+            found = next(
+                (task for queue in state.queues.values() for task in queue
+                 if str(task.key) == task_key),
+                None,
+            )
+            remove_key(task_key)
+            if found is None:
+                # A transferred task is normally still present in the queue
+                # snapshot.  Keep this event auditable even if a caller also
+                # supplied an explicit completion/release for it.
+                events.append({
+                    "event": "reconcile",
+                    "task_key": task_key,
+                    "new_worker_index": new_worker,
+                    "reason": "transfer_without_live_task",
+                })
+                continue
+            state.queues[new_worker].insert(0, found)
+            events.append({
+                "event": "reconcile",
+                "task_key": task_key,
+                "new_worker_index": new_worker,
+                "reason": "transferred",
+            })
+
+        state.reservations = {
+            str(key): dict(value) for key, value in state.reservations.items()
+        }
+        return events[:128]
