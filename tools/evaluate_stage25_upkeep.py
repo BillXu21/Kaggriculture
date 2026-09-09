@@ -217,6 +217,10 @@ def main(argv=None) -> None:
         args.capture_dir.mkdir(parents=True,exist_ok=False)
     args.output_dir.mkdir(parents=True,exist_ok=False)
     manifest={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
+    # Record the effective control state, not an ineffective repair request
+    # supplied without its persistent-queue prerequisite.
+    manifest['queue_ownership_repair'] = bool(
+        args.queue_ownership_repair and args.persistent_worker_queues)
     manifest.update(schema_version=1, stochastic=True, opening='standard_mixed',
                     games=2*len(args.seeds)*len(args.variants),
                     comparison_references={name: COMPARISON_REFERENCES[name]
