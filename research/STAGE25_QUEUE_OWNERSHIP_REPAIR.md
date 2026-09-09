@@ -52,7 +52,8 @@ python -m tools.run_stage25_upkeep_sharded \
 ```
 
 The notebook contains the same commands for the full ordered panel, with
-capture disabled for the panel arms. It pins evaluator/source commit `9d0035a`;
+capture disabled for the panel arms. It pins evaluator/source commit
+`9d0035a9cc9bbb04de4d0174c0ca15755a6b0703`;
 the final notebook-only commit intentionally follows that source commit so the
 clone contains all evaluator artifacts.
 
