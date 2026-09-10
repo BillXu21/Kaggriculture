@@ -560,6 +560,28 @@ def _economic_benefits(
     return values
 
 
+def _economic_upper_bound(
+    category_by_key: Mapping[str, str],
+    policy: ScheduleHiringPolicy,
+) -> float:
+    """Bound total candidate benefit without assuming schedule monotonicity.
+
+    Every completed task earns at most its configured category value.  Summing
+    those maxima over the complete merged task map therefore overestimates any
+    schedule: dependencies, shared resources, route limits, and duplicate
+    PLANT/WATER credit can only reduce the realized total.  The merged map also
+    includes tasks supplied only through persistent worker queues.
+    """
+    category_values = {
+        "maintenance": float(policy.maintenance_benefit),
+        "productive": float(policy.productive_benefit),
+        "manager": float(policy.manager_benefit),
+        "logistics": float(policy.logistics_benefit),
+    }
+    return sum(category_values.get(category, 0.0)
+               for category in category_by_key.values())
+
+
 def _economic_evaluate(
     task_map: Mapping[str, Task],
     queue_owner: Mapping[str, int],
@@ -940,6 +962,7 @@ def _recommend_economic_repair(
 
     future = _future_actions(obs, policy)
     useful_keys = set(useful)
+    benefit_upper_bound = _economic_upper_bound(category_by_key, policy)
     baseline = _economic_evaluate(
         task_map, queue_owner, positions, inventories, future, 0,
         obs, seat, policy, category_by_key, queue_rank)
@@ -955,9 +978,14 @@ def _recommend_economic_repair(
     for cost in candidate_costs:
         running_cost += cost
         prefix_costs.append(running_cost)
+    bound_applicable = all(cost >= 0 for cost in candidate_costs)
 
-    evaluations: list[_EconomicEvaluation] = []
-    benefits: list[dict[str, float]] = []
+    # Candidate counts remain dense in ``outcomes`` for diagnostics, but only
+    # candidates that pass the conservative benefit bound have an evaluation.
+    # Keep those evaluated schedules keyed by hire count so market clipping
+    # cannot accidentally index into a sparse evaluation sequence.
+    evaluations: dict[int, _EconomicEvaluation] = {0: baseline}
+    benefits: dict[int, dict[str, float]] = {}
     outcomes: list[dict[str, Any]] = []
     baseline_benefits = _economic_benefits(
         baseline, task_map, category_by_key, current_keys, policy)
@@ -965,6 +993,29 @@ def _recommend_economic_repair(
     previous_eval: _EconomicEvaluation | None = None
     previous_total_benefit = baseline_total_benefit
     for candidate_hires in range(max_candidates + 1):
+        cumulative_cost = (prefix_costs[candidate_hires - 1]
+                           if candidate_hires else 0)
+        if (candidate_hires and bound_applicable
+                and cumulative_cost > benefit_upper_bound + _EPSILON):
+            outcomes.append({
+                "event": "candidate_outcome",
+                "candidate_hires": candidate_hires,
+                "worker_count": count + candidate_hires,
+                "marginal_index": candidate_hires - 1,
+                "marginal_cost": candidate_costs[candidate_hires - 1],
+                "cumulative_cost": cumulative_cost,
+                "benefit_upper_bound": benefit_upper_bound,
+                "evaluated": False,
+                "status": "not_evaluated",
+                "economically_viable": False,
+                "accepted": False,
+                "accepted_reason": None,
+                "rejected_reason": "cumulative_cost_exceeds_benefit_upper_bound",
+            })
+            # Do not infer anything about schedule coverage from this bound;
+            # later candidate counts are still considered independently.
+            continue
+
         evaluation = (baseline if candidate_hires == 0 else _economic_evaluate(
             task_map, queue_owner, positions, inventories, future,
             candidate_hires, obs, seat, policy, category_by_key, queue_rank))
@@ -973,8 +1024,8 @@ def _recommend_economic_repair(
         else:
             candidate_benefits = _economic_benefits(
                 evaluation, task_map, category_by_key, current_keys, policy)
-        evaluations.append(evaluation)
-        benefits.append(candidate_benefits)
+        evaluations[candidate_hires] = evaluation
+        benefits[candidate_hires] = candidate_benefits
         total_benefit = sum(candidate_benefits.values())
         newly_from_zero = sorted(evaluation.assigned - baseline.assigned)
         prior_assigned = baseline.assigned if previous_eval is None \
@@ -984,8 +1035,6 @@ def _recommend_economic_repair(
         previous_benefit = previous_total_benefit
         marginal_benefit = total_benefit - previous_benefit
         benefit_delta = total_benefit - baseline_total_benefit
-        cumulative_cost = (prefix_costs[candidate_hires - 1]
-                           if candidate_hires else 0)
         if candidate_hires == 0:
             economic_reason = "zero_hire_baseline"
             economically_viable = False
@@ -1016,6 +1065,8 @@ def _recommend_economic_repair(
             "marginal_cost": (candidate_costs[candidate_hires - 1]
                               if candidate_hires else 0),
             "cumulative_cost": cumulative_cost,
+            "benefit_upper_bound": benefit_upper_bound,
+            "evaluated": True,
             "baseline_completed_task_keys": sorted(baseline.assigned),
             "baseline_benefit": baseline_total_benefit,
             "completed_task_keys": sorted(evaluation.assigned),
@@ -1109,9 +1160,9 @@ def _recommend_economic_repair(
         affordable += 1
         costs.append(cost)
     submittable = min(selected_hires, affordable, max(0, int(market_order_limit)))
-    actual_index = min(submittable, len(evaluations) - 1)
-    actual_eval = evaluations[actual_index]
-    actual_benefits = benefits[actual_index]
+    actual_hires = min(submittable, selected_hires)
+    actual_eval = evaluations[actual_hires]
+    actual_benefits = benefits[actual_hires]
     for outcome in outcomes:
         candidate_hires = int(outcome["candidate_hires"])
         if candidate_hires != selected_hires:
@@ -1129,8 +1180,7 @@ def _recommend_economic_repair(
     category_counts["blocked"] += len(blocked_actual)
     for key in sorted(useful_keys):
         detail = actual_eval.task_details.get(key)
-        selected_detail = (evaluations[selected_hires].task_details.get(key)
-                           if selected_hires < len(evaluations) else None)
+        selected_detail = evaluations[selected_hires].task_details.get(key)
         item = next((item for item in diagnostics
                      if item.get("task_key") == key), None)
         if item is None:
@@ -1184,12 +1234,13 @@ def _recommend_economic_repair(
                 "reason": outcome["rejected_reason"] or "not_selected",
                 "candidate_hires": outcome["candidate_hires"],
                 "marginal_cost": outcome["marginal_cost"],
-                "benefit": outcome["benefit"],
+                "benefit": outcome.get("benefit", 0.0),
                 "newly_completed_task_keys": list(
-                    outcome["newly_completed_task_keys"]),
-                "residual_blockers": list(outcome["residual_blockers"]),
-                "residual_deadlines": list(outcome["residual_deadlines"]),
-                "residual_resources": list(outcome["residual_resources"]),
+                    outcome.get("newly_completed_task_keys", [])),
+                "residual_blockers": list(outcome.get("residual_blockers", [])),
+                "residual_deadlines": list(outcome.get("residual_deadlines", [])),
+                "residual_resources": list(outcome.get("residual_resources", [])),
+                "evaluated": bool(outcome["evaluated"]),
             })
 
     diagnostics.append({
@@ -1200,7 +1251,10 @@ def _recommend_economic_repair(
         "submitted_hires": submittable,
         "selected_candidate_benefit": (
             float(selected_outcome["benefit"]) if selected_outcome else 0.0),
+        "benefit_upper_bound": benefit_upper_bound,
+        "benefit_bound_applicable": bound_applicable,
         "candidate_count": len(outcomes),
+        "evaluated_candidate_count": len(evaluations),
         "assumptions": {
             "maintenance_benefit": policy.maintenance_benefit,
             "productive_benefit": policy.productive_benefit,

@@ -256,8 +256,11 @@ def test_economic_repair_rejects_expensive_low_benefit_manager_work():
     assert result.wanted_hires == result.submittable_hires == 0
     outcome = next(d for d in economic_candidates(result)
                    if d["candidate_hires"] == 1)
-    assert outcome["rejected_reason"] == "marginal_benefit_below_cost"
-    assert any(d["reason"] == "marginal_benefit_below_cost"
+    assert outcome["evaluated"] is False
+    assert outcome["status"] == "not_evaluated"
+    assert outcome["rejected_reason"] == \
+        "cumulative_cost_exceeds_benefit_upper_bound"
+    assert any(d["reason"] == "cumulative_cost_exceeds_benefit_upper_bound"
                for d in result.rejection_diagnostics)
 
 
@@ -341,6 +344,115 @@ def test_economic_repair_compares_all_candidates_against_one_baseline():
                for item in candidates)
     assert any(item["rejected_reason"] == "not_best_net_benefit"
                for item in candidates[1:])
+
+
+def test_economic_repair_upper_bound_includes_queue_only_tasks():
+    queued = [task(f"Q{i}", tile=(4, 4)) for i in range(3)]
+    result = recommend_hires(
+        make_obs(hour=22, step=94), 0, [],
+        scheduler_result=SchedulerResult(queues={0: queued}),
+        available_cash=100,
+        hires_today=1,
+        policy=ScheduleHiringPolicy(manager_benefit=1, max_hires=3),
+        economic_repair=True,
+    )
+
+    candidates = economic_candidates(result)
+    by_count = {item["candidate_hires"]: item for item in candidates}
+    summary = next(item for item in result.diagnostics
+                   if item.get("event") == "economic_repair")
+    assert summary["benefit_upper_bound"] == 3
+    assert by_count[2]["evaluated"] is True  # cumulative cost is exactly U
+    assert by_count[3]["evaluated"] is False
+    assert by_count[3]["status"] == "not_evaluated"
+    assert "completed_task_keys" not in by_count[3]
+
+
+def test_economic_repair_upper_bound_equality_is_evaluated():
+    result = recommend_hires(
+        make_obs(hour=22, step=94), 0,
+        [task("M0", tile=(4, 4)), task("M1", tile=(4, 4))],
+        available_cash=100,
+        hires_today=1,
+        policy=ScheduleHiringPolicy(manager_benefit=1.5),
+        economic_repair=True,
+    )
+
+    outcome = next(item for item in economic_candidates(result)
+                   if item["candidate_hires"] == 2)
+    assert outcome["cumulative_cost"] == 3
+    assert outcome["benefit_upper_bound"] == 3
+    assert outcome["evaluated"] is True
+
+
+def test_economic_repair_zero_benefit_model_skips_without_indexing_failures():
+    result = recommend_hires(
+        make_obs(hour=22, step=94), 0,
+        [task(f"M{i}", tile=(4, 4)) for i in range(3)],
+        available_cash=100,
+        policy=ScheduleHiringPolicy(
+            max_hires=4,
+            maintenance_benefit=0,
+            productive_benefit=0,
+            manager_benefit=0,
+            logistics_benefit=0,
+        ),
+        economic_repair=True,
+    )
+
+    candidates = economic_candidates(result)
+    assert result.wanted_hires == result.submittable_hires == 0
+    assert [item["evaluated"] for item in candidates] == [True, False, False, False]
+    assert all(item["status"] == "not_evaluated"
+               for item in candidates[1:])
+    json.dumps(result.to_json_dict())
+
+
+def test_economic_repair_skips_after_shared_resource_evaluation():
+    result = recommend_hires(
+        make_obs(hour=21, step=93, shed={"WHEAT": 1}), 0,
+        [
+            task("FEED_A", "FEED", tile=(4, 4),
+                 priority=Priority.MAINTENANCE, item="WHEAT"),
+            task("FEED_B", "FEED", tile=(5, 4),
+                 priority=Priority.MAINTENANCE, item="WHEAT"),
+        ],
+        available_cash=100,
+        hires_today=1,
+        policy=ScheduleHiringPolicy(maintenance_benefit=1),
+        economic_repair=True,
+    )
+
+    candidates = economic_candidates(result)
+    by_count = {item["candidate_hires"]: item for item in candidates}
+    assert by_count[1]["evaluated"] is True
+    assert len(by_count[1]["completed_task_keys"]) == 1
+    assert by_count[2]["evaluated"] is False
+    assert result.wanted_hires == 1
+
+
+def test_economic_repair_sparse_candidates_preserve_order_clipping_schedule():
+    result = recommend_hires(
+        make_obs(hour=22, step=94), 0,
+        [
+            task("M0", tile=(4, 4)),
+            task("M1", tile=(4, 4)),
+            task("L0", tile=(4, 4), priority=Priority.LOGISTICS),
+        ],
+        available_cash=100,
+        hires_today=1,
+        market_order_limit=0,
+        policy=ScheduleHiringPolicy(manager_benefit=2),
+        economic_repair=True,
+    )
+
+    candidates = economic_candidates(result)
+    by_count = {item["candidate_hires"]: item for item in candidates}
+    assert result.wanted_hires == 1
+    assert result.submittable_hires == 0
+    assert by_count[1]["accepted"] is True
+    assert by_count[3]["evaluated"] is False
+    assert result.predicted_workload == 0  # market cap clips back to baseline
 
 
 def test_economic_repair_false_is_legacy_output_equivalent():
