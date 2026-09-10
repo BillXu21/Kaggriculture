@@ -85,6 +85,25 @@ def test_ablation_factory_changes_candidate_only():
             assert agent.config.wheat_harvest_threshold == (seat==acting_seat)
 
 
+def test_prior_debt_expansion_veto_ablation_is_candidate_only():
+    from tools.evaluate_stage25_upkeep import UpkeepFactory
+
+    class Provider:
+        def daily_plan(self, obs, seat, previous_execution=None):
+            return make_plan()
+
+    factory = UpkeepFactory(
+        0, 'baseline', suppress_expansion_from_prior_debt=False)
+    candidate = factory.create(
+        backend_name='official', seat=0, configuration={}, provider=Provider())
+    opponent = factory.create(
+        backend_name='official', seat=1, configuration={}, provider=Provider())
+
+    assert candidate.config.suppress_expansion_from_prior_debt is False
+    assert opponent.config.suppress_expansion_from_prior_debt is True
+    assert factory.version.endswith(':prior-debt-expansion-veto-off')
+
+
 def test_fertilizer_order_never_blocks_survival():
     board=[[None]*10 for _ in range(10)]
     board[0][0]=plant_tile('WHEAT',planted_day=0,watered_today=False,yield_units=1)

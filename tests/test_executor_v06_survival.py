@@ -70,7 +70,7 @@ def make_obs(*, day=3, hour=0, farmer=(4, 4), hands=(), money=3000.0,
 
 
 def plan(*, crop_targets=None, animal_targets=None, land_count=1,
-         wheat_sell=0):
+         wheat_sell=0, fertilizer_by_crop=None):
     sells = {
         product: {anchor: 0 for anchor in (0, 4, 8, 12, 16, 20)}
         for product in PRODUCTS
@@ -83,7 +83,7 @@ def plan(*, crop_targets=None, animal_targets=None, land_count=1,
         },
         animal_targets=animal_targets or {"GOOSE": 0, "COW": 0, "SHEEP": 0},
         land_count=land_count,
-        fertilizer_by_crop={
+        fertilizer_by_crop=fertilizer_by_crop or {
             "WHEAT": 0, "CARROT": 0, "TOMATO": 0,
             "STRAWBERRY": 0, "MELON": 0,
         },
@@ -320,6 +320,53 @@ def test_prior_debt_toggle_false_preserves_debt_and_allows_expansion():
     expansion = diagnostics["days"]["4"]["turn_trace"][0]["expansion"]
     assert expansion["suppressed_from_prior"] is False
     assert "prior_day_work_debt" not in expansion["reasons"]
+
+
+@pytest.mark.parametrize("debt_kind", ("PLANT", "FERTILIZE"))
+def test_prior_debt_ablation_allows_animal_investment_after_upkeep_debt(debt_kind):
+    tiles = empty_tiles()
+    if debt_kind == "FERTILIZE":
+        tiles[2][2] = plant_tile("WHEAT")
+    daily = plan(
+        crop_targets={"WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+                      "STRAWBERRY": 0, "MELON": 0},
+        animal_targets={"GOOSE": 1, "COW": 0, "SHEEP": 0},
+        fertilizer_by_crop={"WHEAT": int(debt_kind == "FERTILIZE"),
+                            "CARROT": 0, "TOMATO": 0,
+                            "STRAWBERRY": 0, "MELON": 0},
+    )
+    agent = agent_for(daily, config=AgentConfig(
+        suppress_expansion_from_prior_debt=False, turn_trace=True))
+    agent(make_obs(day=3, hour=23, farmer=(0, 0), tiles=tiles))
+    day3 = agent.diagnostics_json()["days"]["3"]
+    assert any(key.startswith(debt_kind + ":")
+               for key in day3["end_of_day_work_debt"]["all"])
+
+    action = agent(make_obs(day=4, hour=0, farmer=(0, 0), tiles=empty_tiles()))
+    assert any(order[0] == "BUY_ANIMAL" for order in action["market"])
+    expansion = agent.diagnostics_json()["days"]["4"]["turn_trace"][0]["expansion"]
+    assert expansion["suppressed_from_prior"] is False
+    assert "prior_day_work_debt" not in expansion["reasons"]
+
+
+def test_enabled_prior_debt_veto_retains_historical_animal_suppression():
+    tiles = empty_tiles()
+    tiles[2][2] = plant_tile("WHEAT")
+    daily = plan(
+        crop_targets={"WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+                      "STRAWBERRY": 0, "MELON": 0},
+        animal_targets={"GOOSE": 1, "COW": 0, "SHEEP": 0},
+        fertilizer_by_crop={"WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+                            "STRAWBERRY": 0, "MELON": 0},
+    )
+    agent = agent_for(daily, config=AgentConfig(turn_trace=True))
+    agent(make_obs(day=3, hour=23, farmer=(0, 0), tiles=tiles))
+    action = agent(make_obs(day=4, hour=0, farmer=(0, 0), tiles=empty_tiles()))
+    assert not any(order[0] == "BUY_ANIMAL" for order in action["market"])
+    day4 = agent.diagnostics_json()["days"]["4"]
+    assert day4["survival"]["expansion_suppressed_from_prior_debt"] is True
+    assert day4["turn_trace"][0]["expansion"]["reasons"] == [
+        "prior_day_work_debt"]
 
 
 def test_prior_debt_toggle_false_keeps_current_feed_suppression():

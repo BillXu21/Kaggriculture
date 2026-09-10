@@ -66,6 +66,7 @@ def test_identity_formula_and_full_seed_list_preflight(tmp_path: Path):
     assert payload["coverage"]["expected_identities"] == 16 * 2 * 6
     assert result["config"]["starvation_workload_visibility_repair"] is False
     assert result["config"]["schedule_hiring_economic_repair"] is False
+    assert result["config"]["suppress_expansion_from_prior_debt"] is True
     assert result["planned_games"] == 32
     assert payload["expected_episode_ids"][0] == sharded.episode_id_for(25, 16, 0, 0)
     assert payload["expected_episode_ids"][-1] == sharded.episode_id_for(25, 16, 15, 1)
@@ -95,7 +96,8 @@ def test_child_command_propagates_executor_controls():
         batch_reserved_supplies=True, underfoot_queue_insertion=True,
         schedule_informed_hiring=True,
         schedule_hiring_economic_repair=True,
-        starvation_workload_visibility_repair=True)
+        starvation_workload_visibility_repair=True,
+        suppress_expansion_from_prior_debt=False)
     for flag in (
             "--underfoot-first", "--deadline-safe-planting",
             "--deadline-safe-hiring", "--persistent-worker-queues",
@@ -105,6 +107,7 @@ def test_child_command_propagates_executor_controls():
             "--schedule-hiring-economic-repair",
             "--starvation-workload-visibility-repair"):
         assert flag in command
+    assert command[command.index("--suppress-expansion-from-prior-debt") + 1] == "off"
 
 
 def test_queue_repair_is_ignored_without_persistent_queues():
@@ -134,6 +137,18 @@ def test_preflight_manifest_records_normalized_starvation_visibility(tmp_path: P
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["config"]["starvation_workload_visibility_repair"] is True
     assert manifest["config"]["schedule_hiring_economic_repair"] is True
+
+
+def test_preflight_manifest_records_prior_debt_ablation(tmp_path: Path):
+    output = tmp_path / "preflight"
+    result = sharded.run_sharded(
+        checkpoint=None, e_checkpoint=None, seeds=SEEDS, output_dir=output,
+        backend="fast", preflight_only=True,
+        suppress_expansion_from_prior_debt=False,
+    )
+    assert result["config"]["suppress_expansion_from_prior_debt"] is False
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["config"]["suppress_expansion_from_prior_debt"] is False
 
 
 def test_fake_children_merge_canonically_and_emit_pair_bootstrap(tmp_path: Path):

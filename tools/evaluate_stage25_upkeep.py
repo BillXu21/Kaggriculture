@@ -138,6 +138,7 @@ class UpkeepFactory:
     schedule_informed_hiring: bool = False
     schedule_hiring_economic_repair: bool = False
     starvation_workload_visibility_repair: bool = False
+    suppress_expansion_from_prior_debt: bool = True
 
     @property
     def version(self) -> str:
@@ -154,6 +155,8 @@ class UpkeepFactory:
             base += ':schedule-informed-hiring'
             if self.schedule_hiring_economic_repair:
                 base += ':economic-repair'
+        if not self.suppress_expansion_from_prior_debt:
+            base += ':prior-debt-expansion-veto-off'
         return base + ':capture' if self.capture else base
 
     def create(self, *, backend_name, seat, configuration, provider):
@@ -168,6 +171,8 @@ class UpkeepFactory:
         return make_agent(provider=provider, seat=seat, config=AgentConfig(
             strict=True, optional_spare_watering=True,
             record_turn_snapshot=self.capture,
+            suppress_expansion_from_prior_debt=(
+                self.suppress_expansion_from_prior_debt if candidate else True),
             foreman=ForemanConfig(
                 underfoot_first=self.underfoot_first and candidate),
             deadline_safe_planting=(self.deadline_safe_planting and candidate),
@@ -223,6 +228,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help='candidate-only repair; meaningful with schedule-informed hiring')
     p.add_argument('--starvation-workload-visibility-repair', action='store_true',
                    help='candidate-only repair')
+    p.add_argument('--suppress-expansion-from-prior-debt',
+                   choices=('on', 'off'), default='on',
+                   help='candidate-only prior-day work-debt expansion veto; historical default is on')
     p.add_argument('--game-filter', nargs='*', default=None, metavar='SEED:SEAT',
                    help='run only these SEED:SEAT games, preserving original episode IDs')
     return p
@@ -266,6 +274,8 @@ def main(argv=None) -> None:
         args.underfoot_queue_insertion and manifest['queue_ownership_repair'])
     manifest['starvation_workload_visibility_repair'] = bool(
         args.starvation_workload_visibility_repair)
+    manifest['suppress_expansion_from_prior_debt'] = (
+        args.suppress_expansion_from_prior_debt == 'on')
     manifest.update(schema_version=1, stochastic=True, opening='standard_mixed',
                     games=2*len(args.seeds)*len(args.variants),
                     comparison_references={name: COMPARISON_REFERENCES[name]
@@ -321,8 +331,10 @@ def main(argv=None) -> None:
                                           schedule_hiring_economic_repair=(
                                               args.schedule_hiring_economic_repair),
                                           starvation_workload_visibility_repair=(
-                                              args.starvation_workload_visibility_repair)),
-                                      master_seed=args.master_seed)
+                                              args.starvation_workload_visibility_repair),
+                                          suppress_expansion_from_prior_debt=(
+                                              args.suppress_expansion_from_prior_debt == 'on')),
+                                       master_seed=args.master_seed)
                 result=runner.run([spec])[0]
                 if game_selection is None:
                     results.append(result)

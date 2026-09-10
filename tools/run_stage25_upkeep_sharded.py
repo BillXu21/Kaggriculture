@@ -216,6 +216,7 @@ def _config_manifest(
     batch_reserved_supplies: bool, underfoot_queue_insertion: bool,
     schedule_hiring_economic_repair: bool,
     starvation_workload_visibility_repair: bool,
+    suppress_expansion_from_prior_debt: bool,
 ) -> dict[str, Any]:
     diff = _git(repo_root, "diff", "HEAD")
     return {
@@ -245,6 +246,8 @@ def _config_manifest(
             "schedule_hiring_economic_repair": schedule_hiring_economic_repair,
             "starvation_workload_visibility_repair": (
                 starvation_workload_visibility_repair),
+            "suppress_expansion_from_prior_debt": (
+                suppress_expansion_from_prior_debt),
         },
         "source": {
             "commit": _git(repo_root, "rev-parse", "HEAD"),
@@ -502,6 +505,7 @@ def _child_command(
     schedule_informed_hiring: bool = False,
     schedule_hiring_economic_repair: bool = False,
     starvation_workload_visibility_repair: bool = False,
+    suppress_expansion_from_prior_debt: bool = True,
 ) -> list[str]:
     filters = [f"{seeds[index]}:{seat}" for index, seat in game_pairs]
     command = [
@@ -510,6 +514,8 @@ def _child_command(
         "--output-dir", str(output_dir), "--seeds", *(str(seed) for seed in seeds),
         "--master-seed", str(master_seed), "--variants", *variants,
         "--backend", backend, "--e-history-version", e_history_version,
+        "--suppress-expansion-from-prior-debt",
+        "on" if suppress_expansion_from_prior_debt else "off",
         "--game-filter", *filters,
     ]
     if capture_dir is not None:
@@ -550,6 +556,7 @@ def run_sharded(
     schedule_informed_hiring: bool = False,
     schedule_hiring_economic_repair: bool = False,
     starvation_workload_visibility_repair: bool = False,
+    suppress_expansion_from_prior_debt: bool = True,
     resume: bool = False,
     popen_factory: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
@@ -565,6 +572,8 @@ def run_sharded(
     starvation_workload_visibility_repair = bool(
         starvation_workload_visibility_repair)
     schedule_hiring_economic_repair = bool(schedule_hiring_economic_repair)
+    suppress_expansion_from_prior_debt = bool(
+        suppress_expansion_from_prior_debt)
     _validate_config(seeds, variants, master_seed, processes)
     if backend not in ("fast", "official"):
         raise ValueError("backend must be fast or official")
@@ -612,6 +621,8 @@ def run_sharded(
             "schedule_hiring_economic_repair": schedule_hiring_economic_repair,
             "starvation_workload_visibility_repair": (
                 starvation_workload_visibility_repair),
+            "suppress_expansion_from_prior_debt": (
+                suppress_expansion_from_prior_debt),
         }
         mismatches = {
             key: (prior_config.get(key), value)
@@ -660,6 +671,8 @@ def run_sharded(
             schedule_hiring_economic_repair),
         starvation_workload_visibility_repair=(
             starvation_workload_visibility_repair),
+        suppress_expansion_from_prior_debt=(
+            suppress_expansion_from_prior_debt),
     )
     manifest["shards"] = [
         {"index": shard.index, "games": [
@@ -732,6 +745,8 @@ def run_sharded(
                     schedule_hiring_economic_repair),
                 starvation_workload_visibility_repair=(
                     starvation_workload_visibility_repair),
+                suppress_expansion_from_prior_debt=(
+                    suppress_expansion_from_prior_debt),
             )
             shard_manifest = {
                 "schema_version": SCHEMA_VERSION, "shard_index": shard.index,
@@ -863,6 +878,9 @@ def _parser() -> argparse.ArgumentParser:
                         help="candidate-only repair; meaningful with schedule-informed hiring")
     parser.add_argument("--starvation-workload-visibility-repair", action="store_true",
                         help="candidate-only repair")
+    parser.add_argument("--suppress-expansion-from-prior-debt",
+                        choices=("on", "off"), default="on",
+                        help="candidate-only prior-day work-debt expansion veto; historical default is on")
     parser.add_argument("--resume", action="store_true")
     return parser
 
@@ -891,6 +909,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.schedule_hiring_economic_repair),
             starvation_workload_visibility_repair=(
                 args.starvation_workload_visibility_repair),
+            suppress_expansion_from_prior_debt=(
+                args.suppress_expansion_from_prior_debt == "on"),
             resume=args.resume,
         )
     except (FileExistsError, FileNotFoundError, RuntimeError, ValueError) as exc:
