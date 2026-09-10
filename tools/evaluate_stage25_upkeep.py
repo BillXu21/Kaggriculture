@@ -133,6 +133,8 @@ class UpkeepFactory:
     deadline_safe_hiring: bool = False
     persistent_worker_queues: bool = False
     queue_ownership_repair: bool = False
+    batch_reserved_supplies: bool = False
+    underfoot_queue_insertion: bool = False
     schedule_informed_hiring: bool = False
     schedule_hiring_economic_repair: bool = False
     starvation_workload_visibility_repair: bool = False
@@ -144,6 +146,10 @@ class UpkeepFactory:
             base += ':persistent-worker-queues'
             if self.queue_ownership_repair:
                 base += ':queue-ownership-repair'
+                if self.batch_reserved_supplies:
+                    base += ':batch-reserved-supplies'
+                if self.underfoot_queue_insertion:
+                    base += ':underfoot-queue-insertion'
         if self.schedule_informed_hiring:
             base += ':schedule-informed-hiring'
             if self.schedule_hiring_economic_repair:
@@ -169,6 +175,16 @@ class UpkeepFactory:
             persistent_worker_queues=(self.persistent_worker_queues and candidate),
             queue_ownership_repair=(
                 self.queue_ownership_repair
+                and self.persistent_worker_queues
+                and candidate),
+            batch_reserved_supplies=(
+                self.batch_reserved_supplies
+                and self.queue_ownership_repair
+                and self.persistent_worker_queues
+                and candidate),
+            underfoot_queue_insertion=(
+                self.underfoot_queue_insertion
+                and self.queue_ownership_repair
                 and self.persistent_worker_queues
                 and candidate),
             schedule_informed_hiring=(self.schedule_informed_hiring and candidate),
@@ -198,6 +214,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--persistent-worker-queues', action='store_true')
     p.add_argument('--queue-ownership-repair', action='store_true',
                    help='candidate-only repair; effective only with persistent worker queues')
+    p.add_argument('--batch-reserved-supplies', action='store_true',
+                   help='candidate-only repair; effective with queue ownership repair')
+    p.add_argument('--underfoot-queue-insertion', action='store_true',
+                   help='candidate-only repair; effective with queue ownership repair')
     p.add_argument('--schedule-informed-hiring', action='store_true')
     p.add_argument('--schedule-hiring-economic-repair', action='store_true',
                    help='candidate-only repair; meaningful with schedule-informed hiring')
@@ -240,6 +260,10 @@ def main(argv=None) -> None:
     # supplied without its persistent-queue prerequisite.
     manifest['queue_ownership_repair'] = bool(
         args.queue_ownership_repair and args.persistent_worker_queues)
+    manifest['batch_reserved_supplies'] = bool(
+        args.batch_reserved_supplies and manifest['queue_ownership_repair'])
+    manifest['underfoot_queue_insertion'] = bool(
+        args.underfoot_queue_insertion and manifest['queue_ownership_repair'])
     manifest['starvation_workload_visibility_repair'] = bool(
         args.starvation_workload_visibility_repair)
     manifest.update(schema_version=1, stochastic=True, opening='standard_mixed',
@@ -291,6 +315,8 @@ def main(argv=None) -> None:
                                           deadline_safe_hiring=args.deadline_safe_hiring,
                                           persistent_worker_queues=args.persistent_worker_queues,
                                           queue_ownership_repair=args.queue_ownership_repair,
+                                          batch_reserved_supplies=args.batch_reserved_supplies,
+                                          underfoot_queue_insertion=args.underfoot_queue_insertion,
                                           schedule_informed_hiring=args.schedule_informed_hiring,
                                           schedule_hiring_economic_repair=(
                                               args.schedule_hiring_economic_repair),

@@ -213,6 +213,7 @@ def _config_manifest(
     underfoot_first: bool, deadline_safe_planting: bool,
     deadline_safe_hiring: bool, persistent_worker_queues: bool,
     queue_ownership_repair: bool, schedule_informed_hiring: bool,
+    batch_reserved_supplies: bool, underfoot_queue_insertion: bool,
     schedule_hiring_economic_repair: bool,
     starvation_workload_visibility_repair: bool,
 ) -> dict[str, Any]:
@@ -238,6 +239,8 @@ def _config_manifest(
             "deadline_safe_hiring": deadline_safe_hiring,
             "persistent_worker_queues": persistent_worker_queues,
             "queue_ownership_repair": queue_ownership_repair,
+            "batch_reserved_supplies": batch_reserved_supplies,
+            "underfoot_queue_insertion": underfoot_queue_insertion,
             "schedule_informed_hiring": schedule_informed_hiring,
             "schedule_hiring_economic_repair": schedule_hiring_economic_repair,
             "starvation_workload_visibility_repair": (
@@ -494,6 +497,8 @@ def _child_command(
     underfoot_first: bool = False, deadline_safe_planting: bool = False,
     deadline_safe_hiring: bool = False, persistent_worker_queues: bool = False,
     queue_ownership_repair: bool = False,
+    batch_reserved_supplies: bool = False,
+    underfoot_queue_insertion: bool = False,
     schedule_informed_hiring: bool = False,
     schedule_hiring_economic_repair: bool = False,
     starvation_workload_visibility_repair: bool = False,
@@ -516,6 +521,10 @@ def _child_command(
         (persistent_worker_queues, "--persistent-worker-queues"),
         (queue_ownership_repair and persistent_worker_queues,
          "--queue-ownership-repair"),
+        (batch_reserved_supplies and queue_ownership_repair and persistent_worker_queues,
+         "--batch-reserved-supplies"),
+        (underfoot_queue_insertion and queue_ownership_repair and persistent_worker_queues,
+         "--underfoot-queue-insertion"),
         (schedule_informed_hiring, "--schedule-informed-hiring"),
         (schedule_hiring_economic_repair,
          "--schedule-hiring-economic-repair"),
@@ -536,6 +545,8 @@ def run_sharded(
     underfoot_first: bool = False, deadline_safe_planting: bool = False,
     deadline_safe_hiring: bool = False, persistent_worker_queues: bool = False,
     queue_ownership_repair: bool = False,
+    batch_reserved_supplies: bool = False,
+    underfoot_queue_insertion: bool = False,
     schedule_informed_hiring: bool = False,
     schedule_hiring_economic_repair: bool = False,
     starvation_workload_visibility_repair: bool = False,
@@ -547,6 +558,10 @@ def run_sharded(
     variants = list(variants)
     queue_ownership_repair = bool(
         queue_ownership_repair and persistent_worker_queues)
+    batch_reserved_supplies = bool(
+        batch_reserved_supplies and queue_ownership_repair)
+    underfoot_queue_insertion = bool(
+        underfoot_queue_insertion and queue_ownership_repair)
     starvation_workload_visibility_repair = bool(
         starvation_workload_visibility_repair)
     schedule_hiring_economic_repair = bool(schedule_hiring_economic_repair)
@@ -591,6 +606,8 @@ def run_sharded(
             "deadline_safe_hiring": deadline_safe_hiring,
             "persistent_worker_queues": persistent_worker_queues,
             "queue_ownership_repair": queue_ownership_repair,
+            "batch_reserved_supplies": batch_reserved_supplies,
+            "underfoot_queue_insertion": underfoot_queue_insertion,
             "schedule_informed_hiring": schedule_informed_hiring,
             "schedule_hiring_economic_repair": schedule_hiring_economic_repair,
             "starvation_workload_visibility_repair": (
@@ -636,6 +653,8 @@ def run_sharded(
         deadline_safe_hiring=deadline_safe_hiring,
         persistent_worker_queues=persistent_worker_queues,
         queue_ownership_repair=queue_ownership_repair,
+        batch_reserved_supplies=batch_reserved_supplies,
+        underfoot_queue_insertion=underfoot_queue_insertion,
         schedule_informed_hiring=schedule_informed_hiring,
         schedule_hiring_economic_repair=(
             schedule_hiring_economic_repair),
@@ -706,6 +725,8 @@ def run_sharded(
                 deadline_safe_hiring=deadline_safe_hiring,
                 persistent_worker_queues=persistent_worker_queues,
                 queue_ownership_repair=queue_ownership_repair,
+                batch_reserved_supplies=batch_reserved_supplies,
+                underfoot_queue_insertion=underfoot_queue_insertion,
                 schedule_informed_hiring=schedule_informed_hiring,
                 schedule_hiring_economic_repair=(
                     schedule_hiring_economic_repair),
@@ -833,6 +854,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--persistent-worker-queues", action="store_true")
     parser.add_argument("--queue-ownership-repair", action="store_true",
                         help="candidate-only repair; effective only with persistent worker queues")
+    parser.add_argument("--batch-reserved-supplies", action="store_true",
+                        help="candidate-only repair; effective with queue ownership repair")
+    parser.add_argument("--underfoot-queue-insertion", action="store_true",
+                        help="candidate-only repair; effective with queue ownership repair")
     parser.add_argument("--schedule-informed-hiring", action="store_true")
     parser.add_argument("--schedule-hiring-economic-repair", action="store_true",
                         help="candidate-only repair; meaningful with schedule-informed hiring")
@@ -859,6 +884,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             deadline_safe_hiring=args.deadline_safe_hiring,
             persistent_worker_queues=args.persistent_worker_queues,
             queue_ownership_repair=args.queue_ownership_repair,
+            batch_reserved_supplies=args.batch_reserved_supplies,
+            underfoot_queue_insertion=args.underfoot_queue_insertion,
             schedule_informed_hiring=args.schedule_informed_hiring,
             schedule_hiring_economic_repair=(
                 args.schedule_hiring_economic_repair),

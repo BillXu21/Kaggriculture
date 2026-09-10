@@ -92,6 +92,7 @@ def test_child_command_propagates_executor_controls():
         underfoot_first=True, deadline_safe_planting=True,
         deadline_safe_hiring=True, persistent_worker_queues=True,
         queue_ownership_repair=True,
+        batch_reserved_supplies=True, underfoot_queue_insertion=True,
         schedule_informed_hiring=True,
         schedule_hiring_economic_repair=True,
         starvation_workload_visibility_repair=True)
@@ -99,6 +100,7 @@ def test_child_command_propagates_executor_controls():
             "--underfoot-first", "--deadline-safe-planting",
             "--deadline-safe-hiring", "--persistent-worker-queues",
             "--queue-ownership-repair",
+            "--batch-reserved-supplies", "--underfoot-queue-insertion",
             "--schedule-informed-hiring",
             "--schedule-hiring-economic-repair",
             "--starvation-workload-visibility-repair"):
@@ -113,6 +115,8 @@ def test_queue_repair_is_ignored_without_persistent_queues():
         e_history_version="E_LEGACY", game_pairs=[(0, 0)],
         queue_ownership_repair=True)
     assert "--queue-ownership-repair" not in command
+    assert "--batch-reserved-supplies" not in command
+    assert "--underfoot-queue-insertion" not in command
     assert "--starvation-workload-visibility-repair" not in command
 
 

@@ -604,6 +604,106 @@ def run_foreman(
             return False, f"shed_lacks_item:{task.required_item}"
         return True, ""
 
+    def task_route_cost(worker: WorkerView, task: Task,
+                        inventory: Mapping[str, int]) -> int:
+        """Conservative local cost for one queued task, including interaction."""
+        if task.tile is None:
+            return 1
+        required = max(1, int(task.quantity))
+        carried = max(0, int(inventory.get(str(task.required_item), 0))) \
+            if task.required_item is not None else 0
+        missing = max(0, required - carried) \
+            if task.required_item is not None else 0
+        if missing:
+            batch = max(1, int(config.pickup_batch))
+            pickup_turns = (missing + batch - 1) // batch
+            return (_route_distance(worker.position, task.tile, config)
+                    + pickup_turns + 1)
+        return (abs(worker.position[0] - task.tile[0])
+                + abs(worker.position[1] - task.tile[1]) + 1)
+
+    def retained_route_safe(worker: WorkerView, queue: Sequence[Task],
+                            inserted: Task | None = None) -> tuple[bool, str]:
+        """Check that one inserted interaction preserves the retained route."""
+        position = worker.position
+        inventory = dict(worker.inventory)
+        elapsed = 1  # the accepted underfoot interaction itself
+        if inserted is not None and inserted.required_item is not None:
+            item = str(inserted.required_item)
+            inventory[item] = max(
+                0, int(inventory.get(item, 0))
+                - max(1, int(inserted.quantity)))
+        for retained in queue:
+            retained_worker = WorkerView(
+                index=worker.index, position=position, inventory=inventory,
+                item_types=tuple(sorted(
+                    str(item) for item, amount in inventory.items()
+                    if int(amount) > 0)),
+            )
+            elapsed += task_route_cost(retained_worker, retained, inventory)
+            if retained.deadline_hour is not None:
+                deadline_budget = max(
+                    0, int(retained.deadline_hour) - int(obs.get("hour", 0)) + 1)
+                if elapsed > deadline_budget:
+                    return False, (
+                        "retained_route_deadline:"
+                        f"task={retained.key}:required={elapsed}:"
+                        f"available={deadline_budget}")
+            if retained.tile is not None:
+                position = retained.tile
+            if retained.required_item is not None:
+                item = str(retained.required_item)
+                inventory[item] = max(
+                    0, int(inventory.get(item, 0))
+                    - max(1, int(retained.quantity)))
+        if elapsed > remaining_turns:
+            return False, (
+                "retained_route_horizon:"
+                f"required={elapsed}:available={remaining_turns}")
+        return True, ""
+
+    def underfoot_insertion_candidate(
+            worker: WorkerView, candidate: Task,
+            retained_queue: Sequence[Task]) -> tuple[bool, str]:
+        """Return whether an unowned equal-priority task may run once."""
+        if candidate.key in claimed:
+            return False, "candidate_already_claimed"
+        owner = queue_owner.get(str(candidate.key))
+        if owner is not None:
+            return False, f"candidate_owned_by_worker:{owner}"
+        if candidate.tile != worker.position:
+            return False, "candidate_not_underfoot"
+        if _interaction_op(candidate) is None:
+            return False, "candidate_not_interactable"
+        blocked_by = next(
+            (dep for dep in candidate.depends_on if dep in dep_keys), None)
+        if blocked_by is not None:
+            return False, f"candidate_dependency_current:{blocked_by}"
+        if not queue_seeds_available(candidate):
+            return False, "candidate_no_global_seeds"
+        if not _carried(worker, candidate.required_item):
+            return False, f"candidate_resource_not_carried:{candidate.required_item}"
+        if (batch_supplies and candidate.required_item is not None
+                and int(worker.inventory.get(str(candidate.required_item), 0))
+                < max(1, int(candidate.quantity))):
+            return False, (
+                f"candidate_resource_insufficient:{candidate.required_item}")
+        deadline_ok, deadline_reason = _plant_deadline_feasible(
+            obs, worker, candidate, enabled=deadline_safe_planting,
+            remaining_turns=remaining_turns)
+        if not deadline_ok:
+            return False, f"candidate_{deadline_reason}"
+        if candidate.deadline_hour is not None:
+            deadline_budget = max(
+                0, int(candidate.deadline_hour) - int(obs.get("hour", 0)) + 1)
+            if deadline_budget < 1:
+                return False, "candidate_deadline_expired"
+        safe, route_reason = retained_route_safe(
+            worker, retained_queue, inserted=candidate)
+        if not safe:
+            return False, route_reason
+        return True, "accepted_equal_priority_underfoot"
+
     # Underfoot-first is the experimentally captured baseline contract:
     # reserve local work for every worker before allowing distant claims.
     # The disabled path intentionally retains legacy worker-order behavior.
@@ -677,13 +777,63 @@ def run_foreman(
                         reason="strictly_higher_priority_underfoot",
                     )
                 else:
-                    chosen, reason = queued, (
-                        "queue_transfer" if str(queued.key) in transferred_keys
-                        else "persistent_queue"
-                    )
+                    inserted = None
+                    insertion_reason = "no_equal_priority_underfoot_candidate"
+                    if underfoot_queue_insertion:
+                        equal_underfoot = [
+                            task for task in tile_tasks
+                            if task.key != queued.key
+                            and int(task.priority) == int(queued.priority)
+                            and task.tile == worker.position
+                        ]
+                        for candidate in equal_underfoot:
+                            safe, candidate_reason = (
+                                underfoot_insertion_candidate(
+                                    worker, candidate, queue))
+                            if safe:
+                                inserted = candidate
+                                insertion_reason = candidate_reason
+                                queue_diag(
+                                    "queue_underfoot_insertion",
+                                    task_key=str(candidate.key),
+                                    worker_index=worker.index,
+                                    accepted=True,
+                                    reason=candidate_reason,
+                                    retained_task_key=str(queued.key),
+                                    retained_destination=list(queued.tile),
+                                )
+                                break
+                            insertion_reason = candidate_reason
+                            queue_diag(
+                                "queue_underfoot_insertion",
+                                task_key=str(candidate.key),
+                                worker_index=worker.index,
+                                accepted=False,
+                                reason=candidate_reason,
+                                retained_task_key=str(queued.key),
+                                retained_destination=list(queued.tile),
+                            )
+                        if inserted is None and not equal_underfoot:
+                            queue_diag(
+                                "queue_underfoot_insertion",
+                                worker_index=worker.index,
+                                accepted=False,
+                                reason=insertion_reason,
+                                retained_task_key=str(queued.key),
+                                retained_destination=list(queued.tile),
+                            )
+                    if inserted is not None:
+                        chosen, reason = inserted, "queue_underfoot_insertion"
+                    else:
+                        chosen, reason = queued, (
+                            "queue_transfer" if str(queued.key) in transferred_keys
+                            else "persistent_queue"
+                        )
                     queue_diag("queue_retention", task_key=str(queued.key),
                                worker_index=worker.index,
-                               reason="valid_queue_head")
+                               reason=("valid_queue_head_after_underfoot_insertion"
+                                       if inserted is not None
+                                       else "valid_queue_head"))
             else:
                 chosen = next(
                     (task for task in tile_tasks
@@ -724,9 +874,28 @@ def run_foreman(
             if queue_head is not None and chosen is not None \
                     and chosen.key != queue_head.key \
                     and int(chosen.priority) >= int(queue_head.priority):
-                chosen = None
+                if (underfoot_queue_insertion
+                        and int(chosen.priority) == int(queue_head.priority)):
+                    safe, insertion_reason = underfoot_insertion_candidate(
+                        worker, chosen, queue)
+                    queue_diag(
+                        "queue_underfoot_insertion",
+                        task_key=str(chosen.key),
+                        worker_index=worker.index,
+                        accepted=safe,
+                        reason=insertion_reason,
+                        retained_task_key=str(queue_head.key),
+                        retained_destination=list(queue_head.tile),
+                    )
+                    if safe:
+                        reason = "queue_underfoot_insertion"
+                    else:
+                        chosen = None
+                else:
+                    chosen = None
             if chosen is not None:
-                reason = "underfoot_execution"
+                if not reason:
+                    reason = "underfoot_execution"
 
         # A persistent queue owns its head until it completes or becomes
         # invalid.  Only a strictly more urgent underfoot task may preempt it;
