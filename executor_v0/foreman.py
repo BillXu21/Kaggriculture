@@ -282,6 +282,8 @@ def run_foreman(
     deadline_safe_planting: bool = False,
     worker_queues: Mapping[int, Sequence[Task]] | None = None,
     queue_ownership_repair: bool = False,
+    batch_reserved_supplies: bool = False,
+    underfoot_queue_insertion: bool = False,
     scheduler_reservations: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> ForemanResult:
     """Run one greedy dispatch turn. Pure; inputs never mutated."""
@@ -321,6 +323,7 @@ def run_foreman(
     # the legacy path below keeps its iteration order, claims, and RNG-free
     # decisions unchanged when no persistent queues (or no flag) are present.
     repair = bool(queue_ownership_repair and worker_queues is not None)
+    batch_supplies = bool(batch_reserved_supplies and repair)
     queue_diagnostics: list[dict[str, Any]] = []
     queue_by_worker: dict[int, list[Task]] = {
         worker.index: [] for worker in workers
@@ -431,6 +434,61 @@ def run_foreman(
             if reservation and reservation.get("kind") != "seed":
                 available += max(0, int(reservation.get("amount", 0)))
         return available
+
+    def batch_supply_plan(worker: WorkerView, item: str) -> tuple[int, int]:
+        """Return (needed, own_reserved) for this worker's queued supply.
+
+        The carried amount is shared by the worker's queue, so subtract it
+        once from aggregate demand rather than once per task.  The shed
+        budget already excludes every queue owner's reservation; adding back
+        only this worker's reservations keeps another worker's stock fenced
+        off while still allowing the owner to collect its reserved batch.
+        """
+        queue = queue_by_worker[worker.index]
+        demand = sum(
+            max(1, int(task.quantity))
+            for task in queue
+            if task.required_item is not None
+            and str(task.required_item) == item
+        )
+        carried = max(0, int(worker.inventory.get(item, 0)))
+        needed = max(0, demand - carried)
+        own_reserved = sum(
+            max(0, int(reservation_by_key[str(task.key)].get("amount", 0)))
+            for task in queue
+            if str(task.key) in reservation_by_key
+            and str(task.key) not in released_reservations
+            and reservation_by_key[str(task.key)].get("kind") != "seed"
+            and str(reservation_by_key[str(task.key)].get("item", "")) == item
+        )
+        available = max(0, int(shed_budget.get(item, 0))) + own_reserved
+        return min(needed, available), own_reserved
+
+    def consume_batch_reservations(worker: WorkerView, item: str,
+                                   quantity: int) -> int:
+        """Mark this pickup's reserved units as carried, in queue order."""
+        remaining = quantity
+        consumed = 0
+        for task in queue_by_worker[worker.index]:
+            if remaining <= 0:
+                break
+            key = str(task.key)
+            reservation = reservation_by_key.get(key)
+            if (reservation is None
+                    or key in released_reservations
+                    or reservation.get("kind") == "seed"
+                    or str(reservation.get("item", "")) != item):
+                continue
+            reserved = max(0, int(reservation.get("amount", 0)))
+            used = min(remaining, reserved)
+            if used <= 0:
+                continue
+            reservation["amount"] = reserved - used
+            remaining -= used
+            consumed += used
+            queue_diag("queue_reservation_consumed", task_key=key,
+                       worker_index=worker.index, item=item, amount=used)
+        return consumed
 
     def queue_seeds_available(task_: Task) -> bool:
         if task_.kind != "PLANT" or not task_.crop:
@@ -790,7 +848,13 @@ def run_foreman(
         claimed.add(chosen.key)
         assigned_workers.add(worker.index)
         needs_pickup = (chosen.required_item is not None
-                        and not _carried(worker, chosen.required_item))
+                        and (
+                            max(0, int(worker.inventory.get(
+                                str(chosen.required_item), 0)))
+                            < max(1, int(chosen.quantity))
+                            if batch_supplies else
+                            not _carried(worker, chosen.required_item)
+                        ))
         if repair and chosen.kind == "PLANT":
             release_queue_reservation(chosen)
         reserve_seeds(chosen)
@@ -815,6 +879,34 @@ def run_foreman(
         if needs_pickup:
             access = _nearest_access(worker.position, config)
             if worker.position == access:
+                batch_plan = (
+                    batch_supply_plan(worker, str(chosen.required_item))
+                    if batch_supplies else None
+                )
+                if batch_plan is not None and batch_plan[1] > 0:
+                    needed, _own_reserved = batch_plan
+                    quantity = min(config.pickup_batch, needed)
+                    if quantity <= 0:
+                        actions.append(("PASS",))
+                        assignments.append(Assignment(
+                            worker.index, chosen.key, ("PASS",),
+                            "shed_lacks_item"))
+                        counts["pass"] += 1
+                        release(chosen)
+                        continue
+                    reserved_used = consume_batch_reservations(
+                        worker, str(chosen.required_item), quantity)
+                    shed_budget[chosen.required_item] = (
+                        shed_budget.get(chosen.required_item, 0)
+                        - (quantity - reserved_used)
+                    )
+                    op = ("PICKUP", chosen.required_item, quantity)
+                    actions.append(op)
+                    assignments.append(Assignment(
+                        worker.index, chosen.key, op,
+                        "shed_reserved_batch_pickup"))
+                    counts["pickup"] += 1
+                    continue
                 if repair:
                     # Consume this queued task's exclusive shed reservation
                     # atomically at the pickup point.  A traveling owner must

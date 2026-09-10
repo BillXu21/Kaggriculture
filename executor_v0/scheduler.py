@@ -663,6 +663,7 @@ class PersistentTaskScheduler:
         events: list[dict[str, Any]] = []
         completed = {str(key) for key in completed_task_keys}
         released = {str(key) for key in released_task_keys}
+        reservation_consumptions: list[tuple[str, str, int]] = []
         transfer_events: list[Mapping[str, Any]] = [
             value for value in transfers if isinstance(value, Mapping)
         ]
@@ -685,6 +686,38 @@ class PersistentTaskScheduler:
                     released.add(str(task_key))
                 elif event in {"queue_transfer", "transfer"}:
                     transfer_events.append(diagnostic)
+                elif event == "queue_reservation_consumed":
+                    item = str(diagnostic.get("item", ""))
+                    try:
+                        amount = max(0, int(diagnostic.get("amount", 0)))
+                    except (TypeError, ValueError):
+                        amount = 0
+                    if amount:
+                        reservation_consumptions.append(
+                            (str(task_key), item, amount))
+
+        for task_key, item, amount in reservation_consumptions:
+            reservation = state.reservations.get(task_key)
+            if reservation is None or reservation.get("kind") == "seed":
+                continue
+            if str(reservation.get("item", "")) != item:
+                continue
+            existing = max(0, int(reservation.get("amount", 0)))
+            used = min(existing, amount)
+            if used <= 0:
+                continue
+            remaining = existing - used
+            if remaining:
+                reservation["amount"] = remaining
+            else:
+                state.reservations.pop(task_key, None)
+            events.append({
+                "event": "reconcile",
+                "task_key": task_key,
+                "reason": "reservation_to_carried",
+                "item": item,
+                "amount": used,
+            })
 
         def remove_key(task_key: str) -> list[int]:
             owners: list[int] = []

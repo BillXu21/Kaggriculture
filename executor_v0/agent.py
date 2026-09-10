@@ -103,6 +103,8 @@ class AgentConfig:
     deadline_safe_hiring: bool = False
     persistent_worker_queues: bool = False
     queue_ownership_repair: bool = False
+    batch_reserved_supplies: bool = False
+    underfoot_queue_insertion: bool = False
     schedule_informed_hiring: bool = False
     schedule_hiring_economic_repair: bool = False
     starvation_workload_visibility_repair: bool = False
@@ -1574,6 +1576,14 @@ class ExecutorAgent:
                                       queue_ownership_repair=(
                                           self.config.queue_ownership_repair
                                           and self.config.persistent_worker_queues),
+                                      batch_reserved_supplies=(
+                                          self.config.batch_reserved_supplies
+                                          and self.config.queue_ownership_repair
+                                          and self.config.persistent_worker_queues),
+                                      underfoot_queue_insertion=(
+                                          self.config.underfoot_queue_insertion
+                                          and self.config.queue_ownership_repair
+                                          and self.config.persistent_worker_queues),
                                       scheduler_reservations=(
                                           self._last_scheduler_result.reservations
                                           if self.config.queue_ownership_repair
@@ -1911,6 +1921,8 @@ class ExecutorAgent:
                 "deadline_safe_hiring": self.config.deadline_safe_hiring,
                 "persistent_worker_queues": self.config.persistent_worker_queues,
                 "queue_ownership_repair": self.config.queue_ownership_repair,
+                "batch_reserved_supplies": self.config.batch_reserved_supplies,
+                "underfoot_queue_insertion": self.config.underfoot_queue_insertion,
                 "schedule_informed_hiring": self.config.schedule_informed_hiring,
                 "schedule_hiring_economic_repair": (
                     self.config.schedule_hiring_economic_repair),
