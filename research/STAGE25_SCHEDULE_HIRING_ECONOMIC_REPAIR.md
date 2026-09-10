@@ -65,7 +65,17 @@ seed/episode/opening identities. Compare these arms in order:
 3. Control (schedule-informed hiring absent) versus repaired schedule hiring.
 
 Set `PPO_CHECKPOINT` and `BC_E_CHECKPOINT` to immutable files and run from the
-repository root. The sharder uses four bounded CPU workers and records the
+repository root. Pin every comparison arm to evaluator/source commit
+`d892bf4dade5d5e9053e9ea7af57badb4f1abdd5` (the pushed hiring-repair head);
+check out that exact commit before running any arm so the existing, repaired,
+and control arms all evaluate the same source:
+
+```powershell
+git fetch origin d892bf4dade5d5e9053e9ea7af57badb4f1abdd5
+git checkout --detach d892bf4dade5d5e9053e9ea7af57badb4f1abdd5
+```
+
+The sharder uses four bounded CPU workers and records the
 source, patch, checkpoint, engine, seed, seat, and episode identities:
 
 ```powershell
