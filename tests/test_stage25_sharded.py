@@ -64,6 +64,7 @@ def test_identity_formula_and_full_seed_list_preflight(tmp_path: Path):
     payload = json.loads((output / "preflight.json").read_text())
     assert payload["ordered_seeds"] == SEEDS
     assert payload["coverage"]["expected_identities"] == 16 * 2 * 6
+    assert result["config"]["starvation_workload_visibility_repair"] is False
     assert result["planned_games"] == 32
     assert payload["expected_episode_ids"][0] == sharded.episode_id_for(25, 16, 0, 0)
     assert payload["expected_episode_ids"][-1] == sharded.episode_id_for(25, 16, 15, 1)
@@ -90,12 +91,14 @@ def test_child_command_propagates_executor_controls():
         underfoot_first=True, deadline_safe_planting=True,
         deadline_safe_hiring=True, persistent_worker_queues=True,
         queue_ownership_repair=True,
-        schedule_informed_hiring=True)
+        schedule_informed_hiring=True,
+        starvation_workload_visibility_repair=True)
     for flag in (
             "--underfoot-first", "--deadline-safe-planting",
             "--deadline-safe-hiring", "--persistent-worker-queues",
             "--queue-ownership-repair",
-            "--schedule-informed-hiring"):
+            "--schedule-informed-hiring",
+            "--starvation-workload-visibility-repair"):
         assert flag in command
 
 
@@ -107,6 +110,20 @@ def test_queue_repair_is_ignored_without_persistent_queues():
         e_history_version="E_LEGACY", game_pairs=[(0, 0)],
         queue_ownership_repair=True)
     assert "--queue-ownership-repair" not in command
+    assert "--starvation-workload-visibility-repair" not in command
+
+
+def test_preflight_manifest_records_normalized_starvation_visibility(tmp_path: Path):
+    output = tmp_path / "preflight"
+    result = sharded.run_sharded(
+        checkpoint=None, e_checkpoint=None, seeds=SEEDS, output_dir=output,
+        backend="fast", preflight_only=True,
+        starvation_workload_visibility_repair=True,
+    )
+    assert result["config"]["starvation_workload_visibility_repair"] is True
+    assert result["config"]["schedule_informed_hiring"] is False
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["config"]["starvation_workload_visibility_repair"] is True
 
 
 def test_fake_children_merge_canonically_and_emit_pair_bootstrap(tmp_path: Path):

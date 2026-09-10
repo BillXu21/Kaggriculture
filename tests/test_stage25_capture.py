@@ -34,7 +34,7 @@ from rl_manager.types import E_VS_E, PolicyIdentity, PolicyOutputs
 from test_executor_v0_tasks import make_obs, make_plan
 from tools.audit_stage25_capture import analyze_game, load_game, run_audit
 from tools.evaluate_stage25_upkeep import (
-    UpkeepFactory, episode_id_for, parse_game_filter,
+    UpkeepFactory, build_parser, episode_id_for, parse_game_filter,
 )
 
 
@@ -197,7 +197,8 @@ def test_new_executor_controls_are_candidate_only():
         0, "combined", underfoot_first=True,
         deadline_safe_planting=True, deadline_safe_hiring=True,
         persistent_worker_queues=True, queue_ownership_repair=True,
-        schedule_informed_hiring=True)
+        schedule_informed_hiring=True,
+        starvation_workload_visibility_repair=True)
     candidate = factory.create(backend_name="fast", seat=0,
                                configuration={}, provider=Provider())
     opponent = factory.create(backend_name="fast", seat=1,
@@ -208,18 +209,30 @@ def test_new_executor_controls_are_candidate_only():
     assert candidate.config.persistent_worker_queues is True
     assert candidate.config.queue_ownership_repair is True
     assert candidate.config.schedule_informed_hiring is True
+    assert candidate.config.starvation_workload_visibility_repair is True
     assert opponent.config.foreman.underfoot_first is False
     assert opponent.config.deadline_safe_planting is False
     assert opponent.config.deadline_safe_hiring is False
     assert opponent.config.persistent_worker_queues is False
     assert opponent.config.queue_ownership_repair is False
     assert opponent.config.schedule_informed_hiring is False
+    assert opponent.config.starvation_workload_visibility_repair is False
 
     repair_without_queues = UpkeepFactory(
         0, "combined", queue_ownership_repair=True)
     ignored = repair_without_queues.create(
         backend_name="fast", seat=0, configuration={}, provider=Provider())
     assert ignored.config.queue_ownership_repair is False
+
+
+def test_starvation_visibility_cli_is_default_off_and_parseable():
+    parser = build_parser()
+    common = ["--checkpoint", "ppo", "--e-checkpoint", "e",
+              "--output-dir", "out", "--seeds", "0"]
+    assert parser.parse_args(common).starvation_workload_visibility_repair is False
+    assert parser.parse_args(
+        common + ["--starvation-workload-visibility-repair"]
+    ).starvation_workload_visibility_repair is True
 
 
 # ------------------------------------------------------- capture writer

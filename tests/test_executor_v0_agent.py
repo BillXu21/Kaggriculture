@@ -266,6 +266,185 @@ def test_starvation_preemption_remains_ahead_of_plant_water_continuation():
     assert action["hands"] == [["PASS"]]
 
 
+def test_starvation_visibility_marks_only_boundary_feed_as_urgent():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("SHEEP", fed_today=False,
+                               consecutive_unfed=1)
+    tiles[0][0] = pasture_tile("GOOSE", fed_today=False,
+                               consecutive_unfed=0)
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(starvation_workload_visibility_repair=True))
+
+    assert agent(make_obs(day=3, hour=2, farmer=(4, 4),
+                          inventories=[{"WHEAT": 1}], shed={"WHEAT": 2},
+                          tiles=tiles))["farmer"] == ["FEED"]
+    visibility = agent.diagnostics_json()["days"]["3"][
+        "starvation_visibility"]
+    assert visibility["critical_feed_keys"] == ["FEED:4,4"]
+    assert any(item["key"] == "FEED:0,0"
+               for item in visibility["deferred_work"])
+    assert visibility["starving_animals"][0]["animal"] == "SHEEP"
+
+
+def test_starvation_visibility_releases_safe_crop_water_with_extra_worker():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("SHEEP", fed_today=False,
+                               consecutive_unfed=1)
+    tiles[4][5] = plant_tile(consecutive_unwatered=1, watered_today=False)
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(starvation_workload_visibility_repair=True))
+
+    action = agent(make_obs(day=3, hour=2, farmer=(4, 4), hands=[(5, 4)],
+                            inventories=[{"WHEAT": 1}, {}], shed={"WHEAT": 2},
+                            tiles=tiles))
+    assert action["farmer"] == ["FEED"]
+    assert action["hands"] == [["WATER"]]
+    visibility = agent.diagnostics_json()["days"]["3"][
+        "starvation_visibility"]
+    assert any(item["key"] == "WATER:4,5"
+               for item in visibility["safe_deferred_work"])
+    assert visibility["missed_survival_work_at_boundary"] == []
+
+
+def test_starvation_visibility_reserves_feeder_before_crop_capacity():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("SHEEP", fed_today=False,
+                               consecutive_unfed=1)
+    tiles[4][5] = plant_tile(consecutive_unwatered=1, watered_today=False)
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(starvation_workload_visibility_repair=True))
+
+    action = agent(make_obs(day=3, hour=23, farmer=(4, 4),
+                            inventories=[{"WHEAT": 1}], tiles=tiles))
+    assert action["farmer"] == ["FEED"]
+    visibility = agent.diagnostics_json()["days"]["3"][
+        "starvation_visibility"]
+    assert visibility["reserved_worker_eta"] == [{
+        "worker_index": 0, "reserved_feed_eta": 1,
+        "remaining_after_feed": 0,
+    }]
+    assert any(item["key"] == "WATER:4,5"
+               for item in visibility["deferred_work"])
+
+
+def test_resource_blocked_feed_is_diagnostic_without_hiding_crop_work():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("SHEEP", fed_today=False,
+                               consecutive_unfed=1)
+    tiles[4][5] = plant_tile(consecutive_unwatered=1, watered_today=False)
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(starvation_workload_visibility_repair=True))
+
+    action = agent(make_obs(day=3, hour=2, farmer=(5, 4), tiles=tiles))
+    assert action["farmer"] == ["WATER"]
+    visibility = agent.diagnostics_json()["days"]["3"][
+        "starvation_visibility"]
+    feed = next(item for item in visibility["feed_coverage"]
+                if item["task_key"] == "FEED:4,4")
+    assert feed["status"] == "uncovered"
+    assert feed["reason"] == "resource_blocked"
+    assert any(item["key"] == "WATER:4,5"
+               for item in visibility["eligible_workload"])
+    assert any(item["key"] == "WATER:4,5"
+               for item in visibility["complete_workload"])
+
+
+def test_starvation_visibility_keeps_safe_same_worker_continuation():
+    plan = simple_plan(crop_targets={
+        "WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    config = AgentConfig(starvation_workload_visibility_repair=True)
+    agent = ExecutorAgent(FixedPlanProvider(plan), seat=0, config=config)
+    first_tiles = empty_tiles()
+    first_tiles[4][5] = plant_tile("CARROT", watered_today=False)
+    first = make_obs(day=3, hour=2, farmer=(5, 4), hands=[(4, 4)],
+                     seeds={"WHEAT": 1}, inventories=[{}, {}],
+                     tiles=first_tiles)
+    agent(first)
+
+    second_tiles = empty_tiles()
+    second_tiles[4][5] = pasture_tile("SHEEP", fed_today=False,
+                                      consecutive_unfed=1)
+    second_tiles[4][4] = plant_tile(
+        "WHEAT", planted_day=3, consecutive_unwatered=1,
+        watered_today=False)
+    action = agent(make_obs(day=3, hour=3, farmer=(5, 4), hands=[(4, 4)],
+                            inventories=[{"WHEAT": 1}, {}],
+                            tiles=second_tiles))
+    assert action["farmer"] == ["FEED"]
+    assert action["hands"] == [["WATER"]]
+
+
+def test_starvation_visibility_flag_off_preserves_actions_and_diagnostics():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("SHEEP", fed_today=False,
+                               consecutive_unfed=1)
+    tiles[4][5] = plant_tile(consecutive_unwatered=1, watered_today=False)
+    plan = simple_plan()
+    default = ExecutorAgent(FixedPlanProvider(plan), seat=0)
+    explicit_off = ExecutorAgent(
+        FixedPlanProvider(plan), seat=0,
+        config=AgentConfig(starvation_workload_visibility_repair=False))
+    obs = make_obs(day=3, hour=2, farmer=(4, 4), hands=[(5, 4)],
+                   inventories=[{"WHEAT": 1}, {}], tiles=tiles)
+    assert explicit_off(obs) == default(copy.deepcopy(obs))
+    assert explicit_off.diagnostics_json() == default.diagnostics_json()
+    assert "starvation_workload_visibility_repair" not in \
+        explicit_off.diagnostics_json()["config"]
+
+
+def test_starvation_visibility_reports_unaffordable_hiring_without_submitting():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("SHEEP", fed_today=False,
+                               consecutive_unfed=1)
+    for x in (1, 2, 3):
+        tiles[4][x] = plant_tile(consecutive_unwatered=1,
+                                  watered_today=False)
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(
+            starvation_workload_visibility_repair=True,
+            tasks_per_worker=1))
+
+    action = agent(make_obs(day=3, hour=2, farmer=(4, 4), money=0.0,
+                            inventories=[{"WHEAT": 1}], tiles=tiles))
+    assert action["market"] == []
+    day = agent.diagnostics_json()["days"]["3"]
+    visibility = day["starvation_visibility"]
+    assert day["hires"]["requested"] > 0
+    assert day["hires"]["submitted"] == 0
+    assert visibility["hire_hourly_marginal_costs"]
+
+
+def test_starvation_visibility_feeds_complete_workload_to_opt_in_schedule_hiring():
+    tiles = empty_tiles()
+    tiles[4][4] = pasture_tile("SHEEP", fed_today=False,
+                               consecutive_unfed=1)
+    tiles[0][0] = pasture_tile("GOOSE", fed_today=False,
+                               consecutive_unfed=0)
+    tiles[4][5] = plant_tile(consecutive_unwatered=1, watered_today=False)
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(
+            starvation_workload_visibility_repair=True,
+            schedule_informed_hiring=True))
+
+    agent(make_obs(day=3, hour=2, farmer=(4, 4), hands=[(5, 4)],
+                   inventories=[{"WHEAT": 1}, {}], shed={"WHEAT": 1},
+                   tiles=tiles))
+    recommendation = agent.diagnostics_json()["days"]["3"][
+        "hiring_recommendation"]
+    diagnostic_keys = {
+        item.get("task_key") for item in recommendation["diagnostics"]}
+    assert "FEED:0,0" in diagnostic_keys
+    assert "WATER:4,5" in diagnostic_keys
+
+
 def test_deadline_flags_off_match_default_action_parity():
     plan = simple_plan(crop_targets={
         "WHEAT": 1, "CARROT": 0, "TOMATO": 0,

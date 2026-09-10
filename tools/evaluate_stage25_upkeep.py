@@ -134,6 +134,7 @@ class UpkeepFactory:
     persistent_worker_queues: bool = False
     queue_ownership_repair: bool = False
     schedule_informed_hiring: bool = False
+    starvation_workload_visibility_repair: bool = False
 
     @property
     def version(self) -> str:
@@ -166,11 +167,13 @@ class UpkeepFactory:
                 and self.persistent_worker_queues
                 and candidate),
             schedule_informed_hiring=(self.schedule_informed_hiring and candidate),
+            starvation_workload_visibility_repair=(
+                self.starvation_workload_visibility_repair and candidate),
             heuristic_care=care, heuristic_fertilizer=fert,
             wheat_harvest_threshold=wheat3))
 
 
-def main(argv=None) -> None:
+def build_parser() -> argparse.ArgumentParser:
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--checkpoint', required=True, type=Path)
     p.add_argument('--e-checkpoint', required=True, type=Path)
@@ -189,8 +192,15 @@ def main(argv=None) -> None:
     p.add_argument('--queue-ownership-repair', action='store_true',
                    help='candidate-only repair; effective only with persistent worker queues')
     p.add_argument('--schedule-informed-hiring', action='store_true')
+    p.add_argument('--starvation-workload-visibility-repair', action='store_true',
+                   help='candidate-only repair')
     p.add_argument('--game-filter', nargs='*', default=None, metavar='SEED:SEAT',
                    help='run only these SEED:SEAT games, preserving original episode IDs')
+    return p
+
+
+def main(argv=None) -> None:
+    p=build_parser()
     args=p.parse_args(argv)
     if len(set(args.seeds)) != len(args.seeds) or len(set(args.variants)) != len(args.variants):
         p.error('seeds and variants must be unique')
@@ -221,6 +231,8 @@ def main(argv=None) -> None:
     # supplied without its persistent-queue prerequisite.
     manifest['queue_ownership_repair'] = bool(
         args.queue_ownership_repair and args.persistent_worker_queues)
+    manifest['starvation_workload_visibility_repair'] = bool(
+        args.starvation_workload_visibility_repair)
     manifest.update(schema_version=1, stochastic=True, opening='standard_mixed',
                     games=2*len(args.seeds)*len(args.variants),
                     comparison_references={name: COMPARISON_REFERENCES[name]
@@ -270,7 +282,9 @@ def main(argv=None) -> None:
                                           deadline_safe_hiring=args.deadline_safe_hiring,
                                           persistent_worker_queues=args.persistent_worker_queues,
                                           queue_ownership_repair=args.queue_ownership_repair,
-                                          schedule_informed_hiring=args.schedule_informed_hiring),
+                                          schedule_informed_hiring=args.schedule_informed_hiring,
+                                          starvation_workload_visibility_repair=(
+                                              args.starvation_workload_visibility_repair)),
                                       master_seed=args.master_seed)
                 result=runner.run([spec])[0]
                 if game_selection is None:

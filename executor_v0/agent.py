@@ -34,7 +34,7 @@ only loaded when an explicit path is supplied (never fabricated).
 
 import copy
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 import time
 from typing import Any, Callable
@@ -104,6 +104,7 @@ class AgentConfig:
     persistent_worker_queues: bool = False
     queue_ownership_repair: bool = False
     schedule_informed_hiring: bool = False
+    starvation_workload_visibility_repair: bool = False
     record_turn_snapshot: bool = True
     heuristic_care: bool = False
     heuristic_fertilizer: bool = False
@@ -219,6 +220,95 @@ class _PlantAttempt:
     expected_step: int
 
 
+@dataclass(frozen=True)
+class _StarvationVisibility:
+    """Flag-only partition between visible workload and safe dispatch work."""
+
+    complete_tasks: tuple[Task, ...]
+    eligible_tasks: tuple[Task, ...]
+    hiring_tasks: tuple[Task, ...]
+    critical_feeds: tuple[Task, ...] = ()
+    safe_deferred: tuple[Task, ...] = ()
+    deferred_tasks: tuple[Task, ...] = ()
+    starving_animals: tuple[dict[str, Any], ...] = ()
+    feed_coverage: tuple[dict[str, Any], ...] = ()
+    reserved_worker_eta: tuple[dict[str, Any], ...] = ()
+    deferred_reasons: dict[str, str] = field(default_factory=dict)
+    forecast_before: dict[str, Any] = field(default_factory=dict)
+    forecast_after: dict[str, Any] = field(default_factory=dict)
+
+
+def _worker_turns_left(obs: Mapping) -> int:
+    hour = int(obs.get("hour", 0))
+    step = int(obs.get("step", int(obs.get("day", 0)) * 24 + hour))
+    inclusive = max(0, min(24 - hour, 30 * 24 - 1 - step))
+    return max(inclusive, 0)
+
+
+def _canonical_worker_states(
+    obs: Mapping,
+    seat: int,
+) -> tuple[list[tuple[int, int]], list[dict[str, int]]]:
+    farm = obs["farms"][seat]
+    positions = [farm.get("farmer") or [0, 0]]
+    positions.extend(farm.get("hands") or [])
+    canonical = [
+        (int(position[1]), int(position[0]))
+        for position in positions
+        if isinstance(position, (list, tuple)) and len(position) == 2
+    ] or [(0, 0)]
+    inventories = list(((obs.get("private") or {}).get("inventories") or ()))
+    states = [
+        {str(item): max(0, int(quantity)) for item, quantity in
+         (inventories[index] if index < len(inventories) else {}).items()}
+        for index in range(len(canonical))
+    ]
+    return canonical, states
+
+
+def _task_route_eta(
+    position: tuple[int, int],
+    inventory: Mapping[str, int],
+    shed_wheat: int,
+    task: Task,
+    config: ForemanConfig,
+) -> tuple[int | None, int, tuple[int, int], dict[str, int], int]:
+    """Return ETA plus the copied worker/resource state after one task."""
+    if task.tile is None:
+        return None, 0, position, dict(inventory), shed_wheat
+    target = (int(task.tile[0]), int(task.tile[1]))
+    updated_inventory = dict(inventory)
+    updated_shed = int(shed_wheat)
+    if task.kind == "FEED" and task.required_item == "WHEAT":
+        demand = max(1, int(task.quantity))
+        carried = max(0, int(updated_inventory.get("WHEAT", 0)))
+        missing = max(0, demand - carried)
+        if missing > updated_shed:
+            return None, missing, position, updated_inventory, updated_shed
+        if missing:
+            access = min(
+                config.shed_access_tiles,
+                key=lambda tile: (
+                    abs(position[0] - tile[0]) + abs(position[1] - tile[1]),
+                    tile,
+                ),
+            )
+            eta = (
+                abs(position[0] - access[0])
+                + abs(position[1] - access[1])
+                + math.ceil(missing / max(1, config.pickup_batch))
+                + abs(access[0] - target[0])
+                + abs(access[1] - target[1])
+                + 1
+            )
+            updated_shed -= missing
+            updated_inventory["WHEAT"] = carried + missing - demand
+            return eta, missing, target, updated_inventory, updated_shed
+        updated_inventory["WHEAT"] = carried - demand
+    eta = abs(position[0] - target[0]) + abs(position[1] - target[1]) + 1
+    return eta, 0, target, updated_inventory, updated_shed
+
+
 class ExecutorAgent:
     def __init__(self, provider: PlanProvider, *, seat: int | None = None,
                  config: AgentConfig | None = None) -> None:
@@ -331,6 +421,256 @@ class ExecutorAgent:
                 continue
             self._plant_attempts[assignment.worker_index] = _PlantAttempt(
                 assignment.worker_index, task.tile, task.crop, expected_step)
+
+    def _labor_forecast(
+        self,
+        obs: Mapping,
+        seat: int,
+        tasks: Sequence[Task],
+    ) -> dict[str, Any]:
+        """Make a diagnostic-only lower-bound route forecast."""
+        positions, inventories = _canonical_worker_states(obs, seat)
+        shed_wheat = int(((obs.get("private") or {}).get("shed") or {})
+                         .get("WHEAT", 0) or 0)
+        route_turns = 0
+        feasible = 0
+        unroutable: list[str] = []
+        tile_tasks = [task for task in tasks if task.tile is not None]
+        for task in sorted(tile_tasks, key=lambda item: item.sort_key):
+            estimates = [
+                _task_route_eta(position, inventory, shed_wheat, task,
+                                self.config.foreman)[0]
+                for position, inventory in zip(positions, inventories)
+            ]
+            eta = min((value for value in estimates if value is not None),
+                      default=None)
+            if eta is None:
+                unroutable.append(task.key)
+            else:
+                feasible += 1
+                route_turns += eta
+        return {
+            "task_count": len(tile_tasks),
+            "feasible_task_count": feasible,
+            "route_turns_lower_bound": route_turns,
+            "unroutable_task_keys": unroutable,
+            "worker_count": len(positions),
+            "remaining_turns": _worker_turns_left(obs),
+        }
+
+    def _derive_starvation_visibility(
+        self,
+        obs: Mapping,
+        seat: int,
+        board: list[list[Any]],
+        tasks: tuple[Task, ...],
+        continuation_keys: set[str],
+        feed: Mapping[str, int],
+    ) -> _StarvationVisibility:
+        """Partition starvation-boundary work without changing the flag-off path."""
+        hiring_tasks = tuple(
+            task for task in tasks if task.key not in continuation_keys)
+        if not self.config.starvation_workload_visibility_repair:
+            return _StarvationVisibility(
+                complete_tasks=tasks,
+                eligible_tasks=tasks,
+                hiring_tasks=hiring_tasks,
+            )
+        before = self._labor_forecast(obs, seat, tasks)
+        if not feed["starving"]:
+            return _StarvationVisibility(
+                complete_tasks=tasks,
+                eligible_tasks=tasks,
+                hiring_tasks=hiring_tasks,
+                forecast_before=before,
+                forecast_after=dict(before),
+            )
+
+        hour = int(obs["hour"])
+        starving_animals: list[dict[str, Any]] = []
+        starving_coords: set[tuple[int, int]] = set()
+        for y, row in enumerate(board):
+            for x, tile in enumerate(row):
+                if not isinstance(tile, Mapping) or "animal" not in tile \
+                        or tile.get("fed_today") is True \
+                        or int(tile.get("consecutive_unfed") or 0) < 1:
+                    continue
+                starving_coords.add((y, x))
+                starving_animals.append({
+                    "identity": f"{tile.get('animal')}:{y},{x}",
+                    "animal": tile.get("animal"),
+                    "tile": [y, x],
+                    "consecutive_unfed": int(tile.get("consecutive_unfed") or 0),
+                })
+
+        critical_feeds: list[Task] = []
+        critical_by_key: dict[str, Task] = {}
+        for task in tasks:
+            if task.kind != "FEED" or task.tile not in starving_coords:
+                continue
+            urgent = replace(task, deadline_hour=hour,
+                             source="starvation_boundary")
+            critical_feeds.append(urgent)
+            critical_by_key[task.key] = urgent
+        critical_feeds.sort(key=lambda task: task.sort_key)
+
+        positions, inventories = _canonical_worker_states(obs, seat)
+        shed_wheat = int(((obs.get("private") or {}).get("shed") or {})
+                         .get("WHEAT", 0) or 0)
+        remaining_turns = _worker_turns_left(obs)
+        reserved_eta = [0] * len(positions)
+        feed_coverage: list[dict[str, Any]] = []
+        for task in critical_feeds:
+            candidates: list[tuple[int, int, int, tuple[int, int], dict[str, int], int]] = []
+            resource_candidates: list[int] = []
+            for worker_index, (position, inventory) in enumerate(
+                    zip(positions, inventories)):
+                eta, missing, new_position, new_inventory, new_shed = \
+                    _task_route_eta(position, inventory, shed_wheat, task,
+                                    self.config.foreman)
+                if eta is not None:
+                    resource_candidates.append(worker_index)
+                    if eta <= remaining_turns - reserved_eta[worker_index]:
+                        candidates.append((
+                            eta + reserved_eta[worker_index], eta, worker_index,
+                            new_position, new_inventory, new_shed))
+            coverage = {
+                "task_key": task.key,
+                "animal": task.animal,
+                "tile": list(task.tile) if task.tile is not None else None,
+                "feasible_workers": [item[2] for item in candidates],
+                "resource_feasible_workers": resource_candidates,
+                "reserved_worker": None,
+                "reserved_eta": None,
+                "status": "uncovered",
+            }
+            if candidates:
+                _, eta, worker_index, new_position, new_inventory, new_shed = \
+                    min(candidates, key=lambda item: (item[0], item[2]))
+                positions[worker_index] = new_position
+                inventories[worker_index] = new_inventory
+                shed_wheat = new_shed
+                reserved_eta[worker_index] += eta
+                coverage.update(
+                    reserved_worker=worker_index,
+                    reserved_eta=reserved_eta[worker_index],
+                    status="reserved_forecast",
+                )
+            elif not resource_candidates:
+                coverage["reason"] = "resource_blocked"
+            else:
+                coverage["reason"] = "deadline_infeasible"
+            feed_coverage.append(coverage)
+
+        safe_deferred: list[Task] = []
+        deferred_reasons: dict[str, str] = {}
+        for task in tasks:
+            if task.kind != "WATER" or task.key in continuation_keys \
+                    or task.source != "water_must_weed_boundary":
+                continue
+            possible = any(
+                (eta := _task_route_eta(
+                    position, inventory, shed_wheat, task,
+                    self.config.foreman)[0]) is not None
+                and reserved_eta[index] + eta <= remaining_turns
+                for index, (position, inventory) in enumerate(
+                    zip(positions, inventories))
+            )
+            if possible:
+                # Keep the existing maintenance task visible, but make the
+                # released crop work yield to boundary FEED in the foreman.
+                released = replace(task, priority=Priority.PRODUCTIVE)
+                safe_deferred.append(released)
+            else:
+                deferred_reasons[task.key] = "feed_reservation_or_deadline"
+
+        safe_continuations: list[Task] = []
+        continuation_by_key = {task.key: task for task in tasks
+                               if task.key in continuation_keys}
+        for worker_index, task in self._plant_water_continuations.items():
+            if task.key not in continuation_by_key or worker_index >= len(positions):
+                continue
+            eta = _task_route_eta(
+                positions[worker_index], inventories[worker_index], shed_wheat,
+                task, self.config.foreman)[0]
+            if reserved_eta[worker_index] == 0 and eta is not None \
+                    and eta <= remaining_turns:
+                safe_continuations.append(task)
+            else:
+                deferred_reasons[task.key] = "feed_reservation_or_deadline"
+
+        eligible_by_key = {task.key: task for task in critical_feeds}
+        eligible_by_key.update({task.key: task for task in safe_deferred})
+        eligible_by_key.update({task.key: task for task in safe_continuations})
+        eligible = tuple(
+            task for task in tasks
+            if task.tile is None or task.key in eligible_by_key
+        )
+        deferred = tuple(
+            task for task in tasks
+            if task.tile is not None and task.key not in eligible_by_key
+        )
+        hiring = tuple(
+            critical_by_key.get(task.key, task)
+            for task in tasks if task.key not in continuation_keys
+        )
+        forecast_after = self._labor_forecast(obs, seat, eligible)
+        for task in deferred:
+            deferred_reasons.setdefault(
+                task.key,
+                "ordinary_daily_feed" if task.kind == "FEED"
+                else "starvation_boundary_noncritical_work",
+            )
+        for coverage in feed_coverage:
+            if coverage["status"] == "uncovered":
+                deferred_reasons.setdefault(coverage["task_key"],
+                                            coverage.get("reason", "uncovered"))
+        return _StarvationVisibility(
+            complete_tasks=tasks,
+            eligible_tasks=eligible,
+            hiring_tasks=hiring,
+            critical_feeds=tuple(critical_feeds),
+            safe_deferred=tuple((*safe_deferred, *safe_continuations)),
+            deferred_tasks=deferred,
+            starving_animals=tuple(starving_animals),
+            feed_coverage=tuple(feed_coverage),
+            deferred_reasons=dict(deferred_reasons),
+            reserved_worker_eta=tuple({
+                "worker_index": index,
+                "reserved_feed_eta": value,
+                "remaining_after_feed": max(0, remaining_turns - value),
+            } for index, value in enumerate(reserved_eta)),
+            forecast_before=before,
+            forecast_after=forecast_after,
+        )
+
+    @staticmethod
+    def _visibility_json(visibility: _StarvationVisibility) -> dict[str, Any]:
+        return {
+            "complete_workload": [task.to_json_dict()
+                                   for task in visibility.complete_tasks],
+            "eligible_workload": [task.to_json_dict()
+                                   for task in visibility.eligible_tasks],
+            "hiring_workload": [task.to_json_dict()
+                                 for task in visibility.hiring_tasks],
+            "critical_feed_keys": [task.key for task in visibility.critical_feeds],
+            "starving_animals": list(visibility.starving_animals),
+            "feed_coverage": [dict(item) for item in visibility.feed_coverage],
+            "reserved_worker_eta": [dict(item)
+                                     for item in visibility.reserved_worker_eta],
+            "safe_deferred_work": [task.to_json_dict()
+                                    for task in visibility.safe_deferred],
+            "deferred_work": [
+                {"key": task.key, "kind": task.kind,
+                 "reason": visibility.deferred_reasons.get(
+                     task.key,
+                     "ordinary_daily_feed" if task.kind == "FEED"
+                     else "starvation_boundary_noncritical_work")}
+                for task in visibility.deferred_tasks
+            ],
+            "labor_forecast_before_filtering": dict(visibility.forecast_before),
+            "labor_forecast_after_filtering": dict(visibility.forecast_after),
+        }
 
     def __call__(self, obs: Mapping) -> dict[str, Any]:
         try:
@@ -548,8 +888,19 @@ class ExecutorAgent:
             entry["submitted"] += executed
             entry["remaining"] = self._remaining_sells[product]
 
-    def _hire_orders(self, obs: Mapping, seat: int, tile_tasks: list[Task], available_cash: float) -> tuple[list[list], int]:
+    def _hire_orders(
+        self,
+        obs: Mapping,
+        seat: int,
+        tile_tasks: list[Task],
+        available_cash: float,
+        *,
+        visibility: _StarvationVisibility | None = None,
+    ) -> tuple[list[list], int]:
         self._last_hiring_recommendation = None
+        if visibility is not None and self.config.starvation_workload_visibility_repair:
+            tile_tasks = [task for task in visibility.hiring_tasks
+                          if task.tile is not None]
         if self.config.schedule_informed_hiring:
             recommendation = recommend_hires(
                 obs, seat, tile_tasks,
@@ -818,6 +1169,9 @@ class ExecutorAgent:
                 "eod_work_debt": eod_work_debt,
             },
         }
+        if self.config.starvation_workload_visibility_repair:
+            snapshot["starvation_visibility"] = self._day_records[day].get(
+                "starvation_visibility", {})
         if self.config.aggressive_sell_all:
             submitted_sells = []
             skipped_sells = []
@@ -1003,6 +1357,9 @@ class ExecutorAgent:
                 for category, values in submitted.items()
             },
         }
+        if self.config.starvation_workload_visibility_repair:
+            entry["starvation_visibility"] = self._day_records[day].get(
+                "starvation_visibility", {})
         trace = self._day_records[day].setdefault("turn_trace", [])
         for index, prior in enumerate(trace):
             if prior.get("hour") == hour:
@@ -1160,14 +1517,24 @@ class ExecutorAgent:
                 )
             )
 
-        dispatch_tasks = tasks
-        if feed["starving"]:
-            dispatch_tasks = tuple(t for t in tasks if t.tile is None or t.kind == "FEED")
+        visibility = self._derive_starvation_visibility(
+            obs, seat, board, tasks, continuation_keys, feed)
+        dispatch_tasks = visibility.eligible_tasks
+        if feed["starving"] and not self.config.starvation_workload_visibility_repair:
+            dispatch_tasks = tuple(
+                task for task in tasks if task.tile is None or task.kind == "FEED")
         normal_dispatch_tasks = tuple(
             task for task in dispatch_tasks if task.key not in continuation_keys)
-        worker_continuations = (
-            {} if feed["starving"] else self._plant_water_continuations
-        )
+        if self.config.starvation_workload_visibility_repair and feed["starving"]:
+            worker_continuations = {
+                worker_index: task
+                for worker_index, task in self._plant_water_continuations.items()
+                if task.key in {item.key for item in visibility.safe_deferred}
+            }
+        else:
+            worker_continuations = (
+                {} if feed["starving"] else self._plant_water_continuations
+            )
 
         worker_queues: Mapping[int, Sequence[Task]] | None = None
         if self.config.persistent_worker_queues:
@@ -1305,6 +1672,7 @@ class ExecutorAgent:
             [t for t in normal_dispatch_tasks
              if t.tile is not None and t.kind in _foreman_mod._TILE_TASK_KINDS],
             running_cash,
+            visibility=visibility,
         )
         already_today = int(obs["farms"][seat].get("hires_today", 0))
         for k, order in enumerate(hire_orders):
@@ -1388,6 +1756,36 @@ class ExecutorAgent:
         if self._last_hire_rejections:
             record.setdefault("hire_rejections", []).extend(
                 self._last_hire_rejections)
+        if self.config.starvation_workload_visibility_repair:
+            visibility_record = self._visibility_json(visibility)
+            already_today = int(obs["farms"][seat].get("hires_today", 0))
+            visibility_record["hire_hourly_marginal_costs"] = [
+                int(hire_cost(already_today + index, self.config.hire_cost_mult))
+                for index in range(max(0, hires_requested))
+            ]
+            completed_interactions = {
+                assignment.task_key
+                for assignment in foreman_result.assignments
+                if assignment.task_key is not None
+                and assignment.action
+                and assignment.action[0] in _INTERACTION_OPS
+            }
+            boundary_turn = (
+                int(obs.get("hour", 0)) == 23
+                or int(obs.get("step", int(day) * 24 + int(hour))) >= 718
+            )
+            visibility_record["missed_survival_work_at_boundary"] = [
+                {
+                    "task_key": task.key,
+                    "kind": task.kind,
+                    "reason": foreman_result.unassigned_reasons.get(
+                        task.key, "not_completed_at_boundary"),
+                }
+                for task in (*visibility.critical_feeds,
+                             *visibility.safe_deferred)
+                if boundary_turn and task.key not in completed_interactions
+            ]
+            record["starvation_visibility"] = visibility_record
         record["unresolved_generator"] = list(generation.unresolved)
 
         crops, animals, care_done, fert_done = _board_counts(board)
@@ -1498,6 +1896,8 @@ class ExecutorAgent:
             },
             "fallback_errors": [dict(e) for e in self._errors],
         }
+        if self.config.starvation_workload_visibility_repair:
+            diagnostics["config"]["starvation_workload_visibility_repair"] = True
         provider_diagnostics = getattr(self.provider, "diagnostics_json", None)
         if callable(provider_diagnostics):
             diagnostics["provider_diagnostics"] = provider_diagnostics()
