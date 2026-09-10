@@ -32,6 +32,11 @@ def task(key, kind="WATER", tile=(4, 4), *, priority=Priority.MANAGER,
                 depends_on=tuple(depends_on), source=source)
 
 
+def economic_candidates(result):
+    return [item for item in result.diagnostics
+            if item.get("event") == "candidate_outcome"]
+
+
 def test_hour_22_can_hire_for_one_future_action_but_hour_23_and_final_cannot():
     work = task("W", tile=(0, 0))
     ordinary = recommend_hires(make_obs(day=3, hour=22, step=94), 0, [work],
@@ -151,3 +156,203 @@ def test_deterministic_repeated_json_safe_output():
     second = recommend_hires(make_obs(), 0, tasks, available_cash=100)
     assert first.to_json_dict() == second.to_json_dict()
     json.dumps(first.to_json_dict())
+
+
+def test_economic_repair_keeps_impossible_resources_blocked_but_rescues_water():
+    result = recommend_hires(
+        make_obs(hour=22, step=94), 0,
+        [
+            task("NO_SEED", "PLANT", tile=(4, 4), crop="WHEAT"),
+            task("NO_FERTILIZER", "FERTILIZE", tile=(4, 4),
+                 item="FERTILIZER"),
+            task("WATER_RESCUED", "WATER", tile=(4, 4),
+                 priority=Priority.MAINTENANCE),
+        ],
+        available_cash=100,
+        economic_repair=True,
+    )
+
+    assert result.wanted_hires == 1
+    water = next(d for d in result.diagnostics
+                 if d.get("task_key") == "WATER_RESCUED")
+    plant = next(d for d in result.diagnostics
+                 if d.get("task_key") == "NO_SEED")
+    fertilizer = next(d for d in result.diagnostics
+                      if d.get("task_key") == "NO_FERTILIZER")
+    assert water["status"] == "scheduled"
+    assert water["worker_index"] == 1
+    assert plant["status"] == fertilizer["status"] == "blocked"
+    assert plant["reason"].startswith("no_global_seeds")
+    assert fertilizer["reason"] == "shed_lacks_item:FERTILIZER"
+
+
+def test_economic_repair_accounts_for_feed_pickup_and_accepts_rescue():
+    result = recommend_hires(
+        make_obs(hour=11, step=83, shed={"WHEAT": 1}), 0,
+        [task("FEED_RESCUED", "FEED", tile=(8, 8),
+             priority=Priority.MAINTENANCE, item="WHEAT")],
+        available_cash=100,
+        economic_repair=True,
+    )
+
+    detail = next(d for d in result.diagnostics
+                  if d.get("task_key") == "FEED_RESCUED")
+    assert result.submittable_hires == 1
+    assert detail["status"] == "scheduled"
+    assert detail["cost"] == 10  # travel, pickup, and interaction
+
+
+def test_economic_repair_shared_resources_do_not_create_phantom_completion():
+    result = recommend_hires(
+        make_obs(hour=21, step=93, shed={"WHEAT": 1}), 0,
+        [
+            task("FEED_A", "FEED", tile=(4, 4),
+                 priority=Priority.MAINTENANCE, item="WHEAT"),
+            task("FEED_B", "FEED", tile=(5, 4),
+                 priority=Priority.MAINTENANCE, item="WHEAT"),
+        ],
+        available_cash=100,
+        economic_repair=True,
+    )
+
+    candidates = economic_candidates(result)
+    assert [item["candidate_hires"] for item in candidates] == [0, 1, 2]
+    assert len(candidates[0]["completed_task_keys"]) == 0
+    assert all(len(item["completed_task_keys"]) == 1
+               for item in candidates[1:])
+    assert result.wanted_hires == 1
+
+
+def test_economic_repair_rejects_no_added_work_and_accepts_cheap_useful_work():
+    already_done = recommend_hires(
+        make_obs(hour=22, step=94), 0,
+        [task("DONE", tile=(0, 0))], available_cash=100,
+        economic_repair=True)
+    cheap = recommend_hires(
+        make_obs(hour=22, step=94), 0,
+        [task("CHEAP", tile=(4, 4))], available_cash=100,
+        economic_repair=True)
+
+    assert already_done.wanted_hires == 0
+    assert any(d["reason"] == "no_added_feasible_work"
+               for d in already_done.rejection_diagnostics)
+    assert cheap.wanted_hires == cheap.submittable_hires == 1
+    candidate = next(d for d in economic_candidates(cheap)
+                     if d["candidate_hires"] == 1)
+    assert candidate["newly_completed_task_keys"] == ["CHEAP"]
+    assert candidate["marginal_cost"] == 1
+    assert candidate["benefit"] > candidate["marginal_cost"]
+
+
+def test_economic_repair_rejects_expensive_low_benefit_manager_work():
+    result = recommend_hires(
+        make_obs(hour=22, step=94), 0,
+        [task("MANAGER_REQUEST", tile=(4, 4))],
+        available_cash=100,
+        hire_cost_mult=10,
+        economic_repair=True,
+    )
+
+    assert result.wanted_hires == result.submittable_hires == 0
+    outcome = next(d for d in economic_candidates(result)
+                   if d["candidate_hires"] == 1)
+    assert outcome["rejected_reason"] == "marginal_benefit_below_cost"
+    assert any(d["reason"] == "marginal_benefit_below_cost"
+               for d in result.rejection_diagnostics)
+
+
+def test_economic_repair_plant_cost_includes_water_follow_up():
+    result = recommend_hires(
+        make_obs(hour=21, step=93, seeds={"WHEAT": 1}), 0,
+        [task("PLANT_NOW", "PLANT", tile=(4, 4), crop="WHEAT")],
+        available_cash=100,
+        economic_repair=True,
+    )
+
+    detail = next(d for d in result.diagnostics
+                  if d.get("task_key") == "PLANT_NOW")
+    assert result.submittable_hires == 1
+    assert detail["cost"] == 2
+    assert detail["included_follow_up"]["kind"] == "WATER"
+
+
+def test_economic_repair_respects_market_cap_and_authoritative_prices():
+    tasks = [task("M0", tile=(4, 4)), task("M1", tile=(5, 4)),
+             task("M2", tile=(4, 5))]
+    result = recommend_hires(
+        make_obs(hour=22, step=94), 0, tasks,
+        available_cash=6, hires_today=1, hire_cost_mult=1,
+        market_order_limit=1,
+        policy=ScheduleHiringPolicy(manager_benefit=4),
+        economic_repair=True,
+    )
+
+    assert result.wanted_hires == 3
+    assert result.affordable_hires == 3
+    assert result.submittable_hires == 1
+    assert result.hire_costs == (1, 2, 3)
+    assert any(d["reason"] == "market_order_limit"
+               for d in result.rejection_diagnostics)
+
+
+def test_economic_repair_affordability_cannot_create_manager_demand():
+    result = recommend_hires(
+        make_obs(hour=22, step=94), 0,
+        [task("CASHLESS", tile=(4, 4))],
+        available_cash=0,
+        economic_repair=True,
+    )
+
+    assert result.submittable_hires == 0
+    assert result.affordable_hires == 0
+    assert any(d["reason"] == "insufficient_cash_for_marginal_hire"
+               for d in result.rejection_diagnostics)
+
+
+def test_economic_repair_honors_final_and_terminal_horizons():
+    work = [task("LAST", tile=(4, 4))]
+    at_23 = recommend_hires(
+        make_obs(hour=23, step=95), 0, work,
+        available_cash=100, economic_repair=True)
+    terminal = recommend_hires(
+        make_obs(day=29, hour=22, step=718), 0, work,
+        available_cash=100, economic_repair=True)
+
+    assert at_23.submittable_hires == terminal.submittable_hires == 0
+    assert all(item["remaining_capacity"] == 0
+               for item in economic_candidates(at_23))
+    assert any(d["reason"] == "no_future_worker_action_before_reset_or_terminal"
+               for d in terminal.rejection_diagnostics)
+
+
+def test_economic_repair_compares_all_candidates_against_one_baseline():
+    result = recommend_hires(
+        make_obs(hour=22, step=94), 0,
+        [task(f"M{i}", tile=(4, 4)) for i in range(3)],
+        available_cash=100,
+        policy=ScheduleHiringPolicy(manager_benefit=4),
+        economic_repair=True,
+    )
+
+    candidates = economic_candidates(result)
+    assert [item["candidate_hires"] for item in candidates] == [0, 1, 2, 3]
+    baseline_keys = candidates[0]["completed_task_keys"]
+    assert all(item["baseline_completed_task_keys"] == baseline_keys
+               for item in candidates)
+    assert any(item["rejected_reason"] == "not_best_net_benefit"
+               for item in candidates[1:])
+
+
+def test_economic_repair_false_is_legacy_output_equivalent():
+    values = [
+        task("A", tile=(6, 6), priority=Priority.MAINTENANCE),
+        task("B", tile=(7, 7), priority=Priority.PRODUCTIVE),
+        task("SELL", "SELL", tile=None),
+    ]
+    implicit = recommend_hires(make_obs(), 0, values, available_cash=100)
+    explicit = recommend_hires(make_obs(), 0, values, available_cash=100,
+                               economic_repair=False)
+
+    assert implicit.to_json_dict() == explicit.to_json_dict()
+    assert json.dumps(implicit.to_json_dict(), sort_keys=True) \
+        == json.dumps(explicit.to_json_dict(), sort_keys=True)

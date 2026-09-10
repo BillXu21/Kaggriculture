@@ -65,6 +65,7 @@ def test_identity_formula_and_full_seed_list_preflight(tmp_path: Path):
     assert payload["ordered_seeds"] == SEEDS
     assert payload["coverage"]["expected_identities"] == 16 * 2 * 6
     assert result["config"]["starvation_workload_visibility_repair"] is False
+    assert result["config"]["schedule_hiring_economic_repair"] is False
     assert result["planned_games"] == 32
     assert payload["expected_episode_ids"][0] == sharded.episode_id_for(25, 16, 0, 0)
     assert payload["expected_episode_ids"][-1] == sharded.episode_id_for(25, 16, 15, 1)
@@ -92,12 +93,14 @@ def test_child_command_propagates_executor_controls():
         deadline_safe_hiring=True, persistent_worker_queues=True,
         queue_ownership_repair=True,
         schedule_informed_hiring=True,
+        schedule_hiring_economic_repair=True,
         starvation_workload_visibility_repair=True)
     for flag in (
             "--underfoot-first", "--deadline-safe-planting",
             "--deadline-safe-hiring", "--persistent-worker-queues",
             "--queue-ownership-repair",
             "--schedule-informed-hiring",
+            "--schedule-hiring-economic-repair",
             "--starvation-workload-visibility-repair"):
         assert flag in command
 
@@ -119,11 +122,14 @@ def test_preflight_manifest_records_normalized_starvation_visibility(tmp_path: P
         checkpoint=None, e_checkpoint=None, seeds=SEEDS, output_dir=output,
         backend="fast", preflight_only=True,
         starvation_workload_visibility_repair=True,
+        schedule_hiring_economic_repair=True,
     )
     assert result["config"]["starvation_workload_visibility_repair"] is True
     assert result["config"]["schedule_informed_hiring"] is False
+    assert result["config"]["schedule_hiring_economic_repair"] is True
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["config"]["starvation_workload_visibility_repair"] is True
+    assert manifest["config"]["schedule_hiring_economic_repair"] is True
 
 
 def test_fake_children_merge_canonically_and_emit_pair_bootstrap(tmp_path: Path):
@@ -160,6 +166,42 @@ def test_fake_children_merge_canonically_and_emit_pair_bootstrap(tmp_path: Path)
         shard_manifest = json.loads(path.read_text())
         assert shard_manifest["ordered_seeds"] == SEEDS
         assert set(("config", "source", "patch", "checkpoints", "engine")) <= set(shard_manifest)
+
+
+def test_fake_child_launch_receives_schedule_hiring_repair_flag(tmp_path: Path):
+    checkpoint = tmp_path / "ppo.ckpt"
+    e_checkpoint = tmp_path / "e.ckpt"
+    checkpoint.write_bytes(b"ppo")
+    e_checkpoint.write_bytes(b"e")
+    output = tmp_path / "run-repair"
+    commands = []
+
+    def popen(command, **kwargs):
+        del kwargs
+        commands.append(command)
+        child_output = Path(command[command.index("--output-dir") + 1])
+        # The fixture's row synthesizer expects --game-filter to be the final
+        # argument; the production command intentionally appends feature flags
+        # after it.  Preserve the real command for the assertion and give the
+        # fake process only the identity-bearing prefix.
+        feature_start = next(
+            (index for index, value in enumerate(command)
+             if value == "--schedule-informed-hiring"),
+            len(command),
+        )
+        return _FakeProcess(child_output, command[:feature_start])
+
+    sharded.run_sharded(
+        checkpoint=checkpoint, e_checkpoint=e_checkpoint, seeds=SEEDS,
+        variants=["baseline"], output_dir=output, backend="fast",
+        schedule_informed_hiring=True,
+        schedule_hiring_economic_repair=True,
+        popen_factory=popen,
+    )
+
+    assert commands
+    assert "--schedule-informed-hiring" in commands[0]
+    assert "--schedule-hiring-economic-repair" in commands[0]
 
 
 def test_child_failure_preserves_partial_outputs(tmp_path: Path):
@@ -216,6 +258,32 @@ def test_resume_reuses_validated_completed_shards(tmp_path: Path):
     )
     assert resumed["status"] == "complete"
     assert resumed["reused_shards"] == [0, 1, 2, 3]
+
+
+def test_resume_rejects_schedule_hiring_economic_repair_mismatch(tmp_path: Path):
+    checkpoint = tmp_path / "ppo.ckpt"
+    e_checkpoint = tmp_path / "e.ckpt"
+    checkpoint.write_bytes(b"ppo")
+    e_checkpoint.write_bytes(b"e")
+    output = tmp_path / "resume-mismatch"
+
+    def popen(command, **kwargs):
+        del kwargs
+        child_output = Path(command[command.index("--output-dir") + 1])
+        return _FakeProcess(child_output, command)
+
+    sharded.run_sharded(
+        checkpoint=checkpoint, e_checkpoint=e_checkpoint, seeds=SEEDS,
+        variants=["baseline"], output_dir=output, backend="fast",
+        popen_factory=popen,
+    )
+    with pytest.raises(ValueError, match="resume configuration mismatch"):
+        sharded.run_sharded(
+            checkpoint=checkpoint, e_checkpoint=e_checkpoint, seeds=SEEDS,
+            variants=["baseline"], output_dir=output, backend="fast",
+            schedule_hiring_economic_repair=True, resume=True,
+            popen_factory=popen,
+        )
 
 
 def test_merge_rejects_duplicate_and_omitted_rows():

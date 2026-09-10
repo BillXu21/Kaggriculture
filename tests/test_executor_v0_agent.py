@@ -445,6 +445,33 @@ def test_starvation_visibility_feeds_complete_workload_to_opt_in_schedule_hiring
     assert "WATER:4,5" in diagnostic_keys
 
 
+def test_schedule_hiring_retains_each_turn_decision():
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(
+            schedule_informed_hiring=True,
+            schedule_hiring_economic_repair=True))
+
+    agent(make_obs(day=3, hour=2, farmer=(4, 4), money=100.0))
+    agent(make_obs(day=3, hour=3, farmer=(4, 4), money=100.0))
+
+    day = agent.diagnostics_json()["days"]["3"]
+    assert len(day["hiring_decisions"]) == 2
+    assert [item["hour"] for item in day["hiring_decisions"]] == [2, 3]
+    assert all({"requested_hires", "orders_submitted",
+                "observed_hires_today", "recommendation"} <= set(item)
+               for item in day["hiring_decisions"])
+
+
+def test_schedule_hiring_economic_repair_off_keeps_legacy_capture_shape():
+    agent = ExecutorAgent(
+        recording_provider(simple_plan()), seat=0,
+        config=AgentConfig(schedule_informed_hiring=True))
+    agent(make_obs(day=3, hour=2, farmer=(4, 4), money=100.0))
+    day = agent.diagnostics_json()["days"]["3"]
+    assert "hiring_decisions" not in day
+
+
 def test_deadline_flags_off_match_default_action_parity():
     plan = simple_plan(crop_targets={
         "WHEAT": 1, "CARROT": 0, "TOMATO": 0,

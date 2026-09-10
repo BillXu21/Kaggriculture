@@ -198,6 +198,7 @@ def test_new_executor_controls_are_candidate_only():
         deadline_safe_planting=True, deadline_safe_hiring=True,
         persistent_worker_queues=True, queue_ownership_repair=True,
         schedule_informed_hiring=True,
+        schedule_hiring_economic_repair=True,
         starvation_workload_visibility_repair=True)
     candidate = factory.create(backend_name="fast", seat=0,
                                configuration={}, provider=Provider())
@@ -209,6 +210,7 @@ def test_new_executor_controls_are_candidate_only():
     assert candidate.config.persistent_worker_queues is True
     assert candidate.config.queue_ownership_repair is True
     assert candidate.config.schedule_informed_hiring is True
+    assert candidate.config.schedule_hiring_economic_repair is True
     assert candidate.config.starvation_workload_visibility_repair is True
     assert opponent.config.foreman.underfoot_first is False
     assert opponent.config.deadline_safe_planting is False
@@ -216,7 +218,14 @@ def test_new_executor_controls_are_candidate_only():
     assert opponent.config.persistent_worker_queues is False
     assert opponent.config.queue_ownership_repair is False
     assert opponent.config.schedule_informed_hiring is False
+    assert opponent.config.schedule_hiring_economic_repair is False
     assert opponent.config.starvation_workload_visibility_repair is False
+
+    economic_repair_only = UpkeepFactory(
+        0, "baseline", schedule_hiring_economic_repair=True)
+    assert economic_repair_only.create(
+        backend_name="fast", seat=0, configuration={}, provider=Provider()
+    ).config.schedule_hiring_economic_repair is True
 
     repair_without_queues = UpkeepFactory(
         0, "combined", queue_ownership_repair=True)
@@ -230,9 +239,13 @@ def test_starvation_visibility_cli_is_default_off_and_parseable():
     common = ["--checkpoint", "ppo", "--e-checkpoint", "e",
               "--output-dir", "out", "--seeds", "0"]
     assert parser.parse_args(common).starvation_workload_visibility_repair is False
+    assert parser.parse_args(common).schedule_hiring_economic_repair is False
     assert parser.parse_args(
         common + ["--starvation-workload-visibility-repair"]
     ).starvation_workload_visibility_repair is True
+    assert parser.parse_args(
+        common + ["--schedule-hiring-economic-repair"]
+    ).schedule_hiring_economic_repair is True
 
 
 # ------------------------------------------------------- capture writer

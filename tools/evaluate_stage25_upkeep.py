@@ -134,6 +134,7 @@ class UpkeepFactory:
     persistent_worker_queues: bool = False
     queue_ownership_repair: bool = False
     schedule_informed_hiring: bool = False
+    schedule_hiring_economic_repair: bool = False
     starvation_workload_visibility_repair: bool = False
 
     @property
@@ -143,6 +144,10 @@ class UpkeepFactory:
             base += ':persistent-worker-queues'
             if self.queue_ownership_repair:
                 base += ':queue-ownership-repair'
+        if self.schedule_informed_hiring:
+            base += ':schedule-informed-hiring'
+            if self.schedule_hiring_economic_repair:
+                base += ':economic-repair'
         return base + ':capture' if self.capture else base
 
     def create(self, *, backend_name, seat, configuration, provider):
@@ -167,6 +172,8 @@ class UpkeepFactory:
                 and self.persistent_worker_queues
                 and candidate),
             schedule_informed_hiring=(self.schedule_informed_hiring and candidate),
+            schedule_hiring_economic_repair=(
+                self.schedule_hiring_economic_repair and candidate),
             starvation_workload_visibility_repair=(
                 self.starvation_workload_visibility_repair and candidate),
             heuristic_care=care, heuristic_fertilizer=fert,
@@ -192,6 +199,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--queue-ownership-repair', action='store_true',
                    help='candidate-only repair; effective only with persistent worker queues')
     p.add_argument('--schedule-informed-hiring', action='store_true')
+    p.add_argument('--schedule-hiring-economic-repair', action='store_true',
+                   help='candidate-only repair; meaningful with schedule-informed hiring')
     p.add_argument('--starvation-workload-visibility-repair', action='store_true',
                    help='candidate-only repair')
     p.add_argument('--game-filter', nargs='*', default=None, metavar='SEED:SEAT',
@@ -283,6 +292,8 @@ def main(argv=None) -> None:
                                           persistent_worker_queues=args.persistent_worker_queues,
                                           queue_ownership_repair=args.queue_ownership_repair,
                                           schedule_informed_hiring=args.schedule_informed_hiring,
+                                          schedule_hiring_economic_repair=(
+                                              args.schedule_hiring_economic_repair),
                                           starvation_workload_visibility_repair=(
                                               args.starvation_workload_visibility_repair)),
                                       master_seed=args.master_seed)

@@ -213,6 +213,7 @@ def _config_manifest(
     underfoot_first: bool, deadline_safe_planting: bool,
     deadline_safe_hiring: bool, persistent_worker_queues: bool,
     queue_ownership_repair: bool, schedule_informed_hiring: bool,
+    schedule_hiring_economic_repair: bool,
     starvation_workload_visibility_repair: bool,
 ) -> dict[str, Any]:
     diff = _git(repo_root, "diff", "HEAD")
@@ -238,6 +239,7 @@ def _config_manifest(
             "persistent_worker_queues": persistent_worker_queues,
             "queue_ownership_repair": queue_ownership_repair,
             "schedule_informed_hiring": schedule_informed_hiring,
+            "schedule_hiring_economic_repair": schedule_hiring_economic_repair,
             "starvation_workload_visibility_repair": (
                 starvation_workload_visibility_repair),
         },
@@ -493,6 +495,7 @@ def _child_command(
     deadline_safe_hiring: bool = False, persistent_worker_queues: bool = False,
     queue_ownership_repair: bool = False,
     schedule_informed_hiring: bool = False,
+    schedule_hiring_economic_repair: bool = False,
     starvation_workload_visibility_repair: bool = False,
 ) -> list[str]:
     filters = [f"{seeds[index]}:{seat}" for index, seat in game_pairs]
@@ -514,6 +517,8 @@ def _child_command(
         (queue_ownership_repair and persistent_worker_queues,
          "--queue-ownership-repair"),
         (schedule_informed_hiring, "--schedule-informed-hiring"),
+        (schedule_hiring_economic_repair,
+         "--schedule-hiring-economic-repair"),
         (starvation_workload_visibility_repair,
          "--starvation-workload-visibility-repair"),
     ):
@@ -532,6 +537,7 @@ def run_sharded(
     deadline_safe_hiring: bool = False, persistent_worker_queues: bool = False,
     queue_ownership_repair: bool = False,
     schedule_informed_hiring: bool = False,
+    schedule_hiring_economic_repair: bool = False,
     starvation_workload_visibility_repair: bool = False,
     resume: bool = False,
     popen_factory: Callable[..., Any] | None = None,
@@ -543,6 +549,7 @@ def run_sharded(
         queue_ownership_repair and persistent_worker_queues)
     starvation_workload_visibility_repair = bool(
         starvation_workload_visibility_repair)
+    schedule_hiring_economic_repair = bool(schedule_hiring_economic_repair)
     _validate_config(seeds, variants, master_seed, processes)
     if backend not in ("fast", "official"):
         raise ValueError("backend must be fast or official")
@@ -585,6 +592,7 @@ def run_sharded(
             "persistent_worker_queues": persistent_worker_queues,
             "queue_ownership_repair": queue_ownership_repair,
             "schedule_informed_hiring": schedule_informed_hiring,
+            "schedule_hiring_economic_repair": schedule_hiring_economic_repair,
             "starvation_workload_visibility_repair": (
                 starvation_workload_visibility_repair),
         }
@@ -629,6 +637,8 @@ def run_sharded(
         persistent_worker_queues=persistent_worker_queues,
         queue_ownership_repair=queue_ownership_repair,
         schedule_informed_hiring=schedule_informed_hiring,
+        schedule_hiring_economic_repair=(
+            schedule_hiring_economic_repair),
         starvation_workload_visibility_repair=(
             starvation_workload_visibility_repair),
     )
@@ -697,6 +707,8 @@ def run_sharded(
                 persistent_worker_queues=persistent_worker_queues,
                 queue_ownership_repair=queue_ownership_repair,
                 schedule_informed_hiring=schedule_informed_hiring,
+                schedule_hiring_economic_repair=(
+                    schedule_hiring_economic_repair),
                 starvation_workload_visibility_repair=(
                     starvation_workload_visibility_repair),
             )
@@ -822,6 +834,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--queue-ownership-repair", action="store_true",
                         help="candidate-only repair; effective only with persistent worker queues")
     parser.add_argument("--schedule-informed-hiring", action="store_true")
+    parser.add_argument("--schedule-hiring-economic-repair", action="store_true",
+                        help="candidate-only repair; meaningful with schedule-informed hiring")
     parser.add_argument("--starvation-workload-visibility-repair", action="store_true",
                         help="candidate-only repair")
     parser.add_argument("--resume", action="store_true")
@@ -846,6 +860,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             persistent_worker_queues=args.persistent_worker_queues,
             queue_ownership_repair=args.queue_ownership_repair,
             schedule_informed_hiring=args.schedule_informed_hiring,
+            schedule_hiring_economic_repair=(
+                args.schedule_hiring_economic_repair),
             starvation_workload_visibility_repair=(
                 args.starvation_workload_visibility_repair),
             resume=args.resume,

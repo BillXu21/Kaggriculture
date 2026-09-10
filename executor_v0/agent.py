@@ -104,6 +104,7 @@ class AgentConfig:
     persistent_worker_queues: bool = False
     queue_ownership_repair: bool = False
     schedule_informed_hiring: bool = False
+    schedule_hiring_economic_repair: bool = False
     starvation_workload_visibility_repair: bool = False
     record_turn_snapshot: bool = True
     heuristic_care: bool = False
@@ -789,6 +790,10 @@ class ExecutorAgent:
             },
             "errors": [],
         }
+        if (self.config.schedule_informed_hiring
+                and self.config.schedule_hiring_economic_repair):
+            day_record = self._day_records[int(obs["day"])]
+            day_record["hiring_decisions"] = []
         self._day = int(obs["day"])
 
     def _refresh_sell_ledger(self, obs: Mapping, bin_anchor: int) -> None:
@@ -896,6 +901,7 @@ class ExecutorAgent:
         available_cash: float,
         *,
         visibility: _StarvationVisibility | None = None,
+        market_order_limit: int | None = None,
     ) -> tuple[list[list], int]:
         self._last_hiring_recommendation = None
         if visibility is not None and self.config.starvation_workload_visibility_repair:
@@ -908,7 +914,10 @@ class ExecutorAgent:
                                   if self.config.persistent_worker_queues else None),
                 available_cash=available_cash,
                 hire_cost_mult=self.config.hire_cost_mult,
-                market_order_limit=self.config.max_market_orders,
+                market_order_limit=(
+                    self.config.max_market_orders
+                    if market_order_limit is None else max(0, market_order_limit)),
+                economic_repair=self.config.schedule_hiring_economic_repair,
             )
             self._last_hiring_recommendation = recommendation
             self._last_hire_rejections = [
@@ -1673,6 +1682,7 @@ class ExecutorAgent:
              if t.tile is not None and t.kind in _foreman_mod._TILE_TASK_KINDS],
             running_cash,
             visibility=visibility,
+            market_order_limit=max(0, self.config.max_market_orders - len(candidates)),
         )
         already_today = int(obs["farms"][seat].get("hires_today", 0))
         for k, order in enumerate(hire_orders):
@@ -1753,6 +1763,23 @@ class ExecutorAgent:
         if self._last_hiring_recommendation is not None:
             record["hiring_recommendation"] = (
                 self._last_hiring_recommendation.to_json_dict())
+            if (self.config.schedule_informed_hiring
+                    and self.config.schedule_hiring_economic_repair):
+                farm = obs["farms"][seat]
+                raw_observed_hires = farm.get("hires_today", 0)
+                observed_hires = (
+                    int(raw_observed_hires)
+                    if isinstance(raw_observed_hires, int)
+                    and not isinstance(raw_observed_hires, bool) else 0)
+                record["hiring_decisions"].append({
+                    "day": day,
+                    "hour": hour,
+                    "requested_hires": int(hires_requested),
+                    "orders_submitted": int(submitted_hires),
+                    "observed_hires_today": observed_hires,
+                    "recommendation": (
+                        self._last_hiring_recommendation.to_json_dict()),
+                })
         if self._last_hire_rejections:
             record.setdefault("hire_rejections", []).extend(
                 self._last_hire_rejections)
@@ -1885,6 +1912,8 @@ class ExecutorAgent:
                 "persistent_worker_queues": self.config.persistent_worker_queues,
                 "queue_ownership_repair": self.config.queue_ownership_repair,
                 "schedule_informed_hiring": self.config.schedule_informed_hiring,
+                "schedule_hiring_economic_repair": (
+                    self.config.schedule_hiring_economic_repair),
                 "record_turn_snapshot": self.config.record_turn_snapshot,
             },
             "cleanup_metrics": self._cleanup_diagnostics(),
