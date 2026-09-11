@@ -24,6 +24,7 @@ from rl_manager.stage25_mechanics import (
     animal_target_support_mask,
     crop_delta_support_mask,
     physical_context_from_board,
+    physical_crop_capacity,
     land_target_support_mask,
 )
 from rl_manager.stage25_policy import (
@@ -258,6 +259,41 @@ def test_jax_support_matches_packet1_python_helpers(index):
         assert np.array_equal(masks[index, step + 4, :201], expected)
         cls = int(np.asarray(result["classes"])[index, step + 4])
         goals[step] += cls - 100
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Packet 2 crop support uses sum(crop_capacity) as the residual budget "
+        "and ignores the Packet 1A physical C reachable from the supplied "
+        "physical_contexts. A caller that reproduces the scalar Packet 1A C "
+        "across the five capacity slots may decode a crop-goal sum up to 5*C."
+    ),
+)
+def test_jax_crop_goal_sum_is_bounded_by_packet1_physical_capacity():
+    config = _config()
+    params = init_stage25_params(config, seed=101)
+    # Two footprints with different physical crop capacity: B=25 vs B=0.
+    full = [[None] * 5 + ["LOCKED"] * 5 for _ in range(5)] + [
+        ["LOCKED"] * 10 for _ in range(5)]
+    blocked = [["LOCKED"] * 10 for _ in range(10)]
+    for y in range(5):
+        for x in range(5):
+            blocked[y][x] = {"kind": "COOP"}
+    ctx_full = physical_context_from_board(full, ("NW",))
+    ctx_blocked = physical_context_from_board(blocked, ("NW",))
+    capacity_full = physical_crop_capacity(ctx_full, 1, (0, 0, 0))
+    capacity_blocked = physical_crop_capacity(ctx_blocked, 1, (0, 0, 0))
+    assert capacity_full == 25 and capacity_blocked == 0
+    # Reproduce the scalar Packet 1A C in each of the five supplied slots.
+    inputs = _encoded(1, capacity=np.full((1, 5), capacity_full, dtype=np.int16),
+                      goals=np.zeros((1, 5), dtype=np.int16))
+    # Wheat goal 40 exceeds the physical C=25 but not sum(crop_capacity)=125.
+    classes = np.array([[0, 0, 0, 0, 140, 100, 100, 100, 100]], dtype=np.int16)
+    out = evaluate_actions(
+        params, inputs, config, classes=classes, reject_invalid=False,
+        physical_contexts=(ctx_full,))
+    assert not bool(np.asarray(out["valid"])[0])
 
 
 def test_encoded_observation_physical_seam_is_economic_support_invariant():
