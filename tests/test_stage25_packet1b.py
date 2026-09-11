@@ -12,6 +12,7 @@ from dataclasses import asdict, is_dataclass
 import importlib
 import inspect
 import math
+from pathlib import Path
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -341,13 +342,26 @@ def test_outcome_proxy_uses_observed_animal_loss_without_fabricating_transaction
         _logical_row(1, start_sheep=True, end_sheep=False),
     ]
     result = _build_labels(module, rows, first_k=1)
-    labels = _result_field(result, ("labels", "proxy_labels", "outcomes", "rows"))
-    assert labels[-1].animal_labels == (0, 0, None)
-    assert "purchase" not in repr(labels[-1]).lower()
+    # The sheep loss leaves the observed nine-action chain incomplete, so the
+    # row must not be emitted as a complete trainable example.
+    assert [label.row_index for label in result.labels] == [0]
+    partial = result.partial_rows
+    assert [label.row_index for label in partial] == [1]
+    lost = partial[0]
+    assert lost.animal_labels == (0, 0, None)
+    assert "purchase" not in repr(lost).lower()
+    assert lost.complete_ar_chain is False
+    # No component is marked valid without a populated class.  The loss is the
+    # last animal step, so the earlier land/goose/cow steps stay usable, but the
+    # sheep axis is withheld.
+    assert lost.valid_components == ("land", "goose", "cow")
+    assert lost.animal_classes == (0, 0, None)
     invalid = _invalid_mapping(
         _result_field(result, ("invalid_counts", "invalid_count", "counts", "counters"))
     )
     assert invalid["animal_loss_ambiguity_components"] == 1
+    assert invalid["incomplete_ar_chain_rows"] == 1
+    assert invalid["excluded_rows"] == 0
 
 
 def test_outcome_proxy_preserves_class_delta_and_does_not_clip_raw_change():
@@ -380,17 +394,92 @@ def test_outcome_proxy_preserves_class_delta_and_does_not_clip_raw_change():
         constrained,
     ]
     result = _build_labels(module, rows, first_k=1)
-    labels = _result_field(result, ("labels", "proxy_labels", "outcomes", "rows"))
     # The end board asks for 50 crops, but the start physical context has
     # only 27 recoverable cells at the requested land target.  The component
-    # is invalid; it must not be repaired or clipped to the capacity.
+    # is invalid; it must not be repaired or clipped to the capacity, and the
+    # incomplete row is not a complete trainable example.
     invalid = _invalid_mapping(
         _result_field(result, ("invalid_counts", "invalid_count", "counts", "counters"))
     )
     assert (invalid["crop_physical_incompatibility_components"] >= 1 or
             invalid["crop_delta_outside_vocabulary_components"] >= 1)
-    assert labels[-1].crop_deltas[0] is None
-    assert labels[-1].crop_classes[0] is None
+    assert [label.row_index for label in result.labels] == [0]
+    partial = result.partial_rows
+    assert [label.row_index for label in partial] == [1]
+    assert partial[-1].crop_deltas[0] is None
+    assert partial[-1].crop_classes[0] is None
+    assert partial[-1].complete_ar_chain is False
+    assert invalid["incomplete_ar_chain_rows"] == 1
+
+
+def _goose_loss_row(day: int) -> dict:
+    """A row whose first animal (goose) is present at start and lost at end."""
+    row = _logical_row(day, start_sheep=False, end_sheep=False)
+    row["start"]["self"]["board"][0][0] = {"kind": "COOP", "animal": "GOOSE"}
+    row["end"]["self"]["board"][0][0] = {"kind": "COOP"}
+    return row
+
+
+def test_outcome_proxy_does_not_validate_later_actions_after_invalid_earlier_animal():
+    module = _data_module()
+    rows = [
+        _logical_row(0, start_sheep=False, end_sheep=False),
+        _goose_loss_row(1),
+    ]
+    result = _build_labels(module, rows, first_k=1)
+    # Goose is the first animal step; losing it means the observed prefix
+    # cannot continue, so cow/sheep and the later crops are not trainable and
+    # must not be validated against a fabricated prefix.
+    assert [label.row_index for label in result.labels] == [0]
+    partial = result.partial_rows
+    assert [label.row_index for label in partial] == [1]
+    broken = partial[-1]
+    assert broken.valid_components == ("land",)
+    assert broken.animal_classes == (None, None, None)
+    assert broken.complete_ar_chain is False
+    for component in ("cow", "sheep", "wheat", "carrot", "tomato",
+                      "strawberry", "melon"):
+        assert component not in broken.valid_components
+    invalid = _invalid_mapping(result.counters)
+    assert invalid["animal_loss_ambiguity_components"] == 1
+    assert invalid["incomplete_ar_chain_rows"] == 1
+
+
+def test_outcome_proxy_invalid_land_excludes_entire_downstream_chain():
+    module = _data_module()
+    # Land is action 1.  Ending on fewer unlocked quadrants than observed is
+    # physically impossible, so no later animal or crop step can be a complete
+    # observed training sequence.
+    row = _logical_row(1, unlocked=("NW", "NE"), end_unlocked=("NW",))
+    result = _build_labels(module, [row], first_k=1)
+    assert result.labels == ()
+    assert result.partial_rows == ()
+    invalid = _invalid_mapping(result.counters)
+    assert invalid["land_invalidity_rows"] == 1
+    assert invalid["excluded_rows"] == 1
+    assert invalid["incomplete_ar_chain_rows"] == 0
+
+
+def test_outcome_proxy_complete_valid_row_is_a_complete_trainable_example():
+    module = _data_module()
+    row = _logical_row(1, crop_counts=(2, 0, 0, 0, 0), start_wheat=1)
+    result = _build_labels(module, [row], first_k=1)
+    assert len(result.labels) == 1
+    assert result.partial_rows == ()
+    label = result.labels[0]
+    assert label.complete_ar_chain is True
+    assert label.valid_components == (
+        "land", "goose", "cow", "sheep", "wheat", "carrot", "tomato",
+        "strawberry", "melon",
+    )
+    assert label.land_class == 0
+    assert label.animal_classes == (0, 0, 1)
+    assert label.crop_deltas == (1, 0, 0, 0, 0)
+    assert label.crop_classes == (101, 100, 100, 100, 100)
+    invalid = _invalid_mapping(result.counters)
+    assert invalid["invalid_rows"] == 0
+    assert invalid["incomplete_ar_chain_rows"] == 0
+    assert invalid["excluded_rows"] == 0
 
 
 def test_data_module_exports_invalid_count_surface_and_is_framework_free():
@@ -407,6 +496,7 @@ def test_data_module_exports_invalid_count_surface_and_is_framework_free():
         "animal_loss_ambiguity_components",
         "invalid_rows",
         "component_excluded_rows",
+        "incomplete_ar_chain_rows",
     } <= fields
 
     result = subprocess.run(
@@ -420,6 +510,17 @@ def test_data_module_exports_invalid_count_surface_and_is_framework_free():
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_packet1b_document_describes_autoregressive_exclusion():
+    document = (Path(__file__).resolve().parents[1]
+                / "docs" / "STAGE25_PACKET1B_CONTRACT.md")
+    lowered = document.read_text(encoding="utf-8").lower()
+    assert "incomplete_ar_chain_rows" in lowered
+    assert "complete nine-action" in lowered or "complete valid observed prefix" in lowered
+    assert "partial diagnostics do not imply trainability" in lowered
+    assert "never replaced with" in lowered
+    assert "imputation" in lowered
 
 
 def test_stage25_framework_free_imports_do_not_load_heavy_frameworks():

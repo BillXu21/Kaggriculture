@@ -58,9 +58,17 @@ def test_packet1a_and_1b_versions_and_action_schema_agree():
         "strawberry", "melon",
     )
     assert ACTION_CLASS_COUNTS == (4, 101, 101, 101, 201, 201, 201, 201, 201)
-    assert "4 + 8*101 = 812" in AUTHORITY.read_text(encoding="utf-8")
-    assert 812 * (2 * 128 + 1) == 208_684
-    assert 812 * (2 * 256 + 1) == 416_556
+    # The decoder output/embedding accounting is derived from the actual class
+    # tuple, not a separately pinned constant.  Each of the nine step-specific
+    # heads contributes one output projection, one bias, and one action
+    # embedding per class, so the aggregate is sum(counts) * (2D + 1).
+    action_class_total = sum(ACTION_CLASS_COUNTS)
+    assert action_class_total == 4 + 3 * 101 + 5 * 201 == 1312
+    text = AUTHORITY.read_text(encoding="utf-8")
+    assert "4 + 3*101 + 5*201 = 1312" in text
+    assert "812" not in text
+    assert action_class_total * (2 * 128 + 1) == 337_184
+    assert action_class_total * (2 * 256 + 1) == 673_056
     assert CROP_HOLD_CLASS == 100
     assert crop_class_to_delta(CROP_HOLD_CLASS) == 0
 

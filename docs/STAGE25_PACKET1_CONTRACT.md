@@ -70,14 +70,13 @@ animal steps, and five crop steps. The semantic shapes at hidden width `D` are:
 | each crop | `[D, 201]` | `[201]` | `[201, D]` |
 
 Projections are step-specific; sharing one projection across same-sized heads
-is not equivalent. For this contract's output/embedding parameter accounting,
-the specified class aggregate is the normative constant `4 + 8*101 = 812`, not
-the earlier incorrect 1312 total. This accounting constant is intentionally
-pinned separately from the per-step class-count tuple above and must not be
-re-derived from that tuple. Output weights, biases, and action embeddings together contain
-`812 * (2D + 1)` parameters: `208,684` at `D=128` and `416,556` at `D=256`.
-These are semantic shapes; a repository storage convention may transpose a
-kernel.
+is not equivalent. The output/embedding parameter accounting is derived from
+the action class-count tuple above. Its aggregate is
+`sum(ACTION_CLASS_COUNTS) = 4 + 3*101 + 5*201 = 1312` (one land class group,
+three 101-class animal groups, and five 201-class crop groups). Output weights,
+biases, and action embeddings together contain `1312 * (2D + 1)` parameters:
+`337,184` at `D=128` and `673,056` at `D=256`. These are semantic shapes; a
+repository storage convention may transpose a kernel.
 
 One compiled JAX call must perform encoding, autoregressive action generation,
 Packet 1A physical support masking, conditional logprob evaluation, and value
@@ -133,6 +132,17 @@ identity/fingerprint. Checkpoint metadata pins the curriculum version/settings.
 The curriculum is fixed for a complete rollout/update cycle and can change
 only between cycles; silent mid-batch or mid-update changes are invalid. The
 disabled path must preserve physical support and checkpoint identity.
+
+## Outcome-proxy autoregressive eligibility
+
+Packet 1B's `build_outcome_proxy_labels` emits only complete nine-action
+teacher-forcing examples in its trainable output (`rows`/`labels`). A complete
+example requires a populated, physically supported class at every ordered step
+under the exact preceding observed class prefix. A row whose chain is
+incomplete is counted in `incomplete_ar_chain_rows`, retained only as a partial
+diagnostic in `partial_rows` when it still has observed outcomes, and is never
+a trainable example. Missing or invalid earlier actions are never repaired,
+imputed, replaced with HOLD/zero/current counts, or marginalized over.
 
 ## Future trajectory and provider contract
 

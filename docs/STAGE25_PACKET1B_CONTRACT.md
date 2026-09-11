@@ -64,6 +64,7 @@ history_reset_gap_rows
 animal_loss_ambiguity_components
 animal_loss_ambiguity_rows
 target_invalidity_components, target_invalidity_rows
+incomplete_ar_chain_rows
 excluded_rows, invalid_rows, selection_excluded_rows, component_excluded_rows
 ```
 
@@ -74,6 +75,12 @@ is the aggregate number of returned rows excluded by selection or by having
 no valid component. Date and minimum-score filtering are reported separately
 and happen only after history construction and invalid accounting.
 
+`incomplete_ar_chain_rows` counts selected rows that retain at least one valid
+diagnostic component but do not form a complete nine-action autoregressive
+chain. Such rows are retained separately as partial diagnostics and are never
+emitted as complete trainable examples. It is distinct from `excluded_rows`,
+which covers rows with no usable component at all.
+
 ## Physical validation and exclusions
 
 Every land, animal, and crop action/proxy is validated through the public
@@ -81,6 +88,24 @@ Packet 1A helpers and constants. In particular, land uses absolute-target
 support; animal prefixes use the sequential Packet 1A housing/reuse rules;
 crop deltas use the persistent-goal and residual-capacity support. The
 physical context contains no economic state.
+
+Validity is autoregressive. A component is usable only when its own class is
+populated, that class is physically supported under the exact preceding
+observed class prefix, and every earlier action in the nine-step order
+(`land, goose, cow, sheep, wheat, carrot, tomato, strawberry, melon`) is
+itself valid. Once a step is invalid, no later step may be treated as
+trainable, because doing so would require reconstructing a prefix that was
+never observed. A missing or invalid earlier action is never replaced with
+current observed counts, HOLD, zero, a clipped action, or any other repair.
+
+A complete nine-action teacher-forcing example therefore requires a complete
+valid observed prefix/action sequence. Rows with an incomplete chain are
+excluded from the complete trainable output, counted in
+`incomplete_ar_chain_rows`, and, when they retain partial observed outcomes,
+kept only as diagnostics. Partial diagnostics do not imply trainability.
+There is no latent-intent reconstruction, marginalization over missing
+prefixes, weak-label learning, missing-action imputation, or probabilistic
+repair of the observed sequence.
 
 An unsupported class, invalid transition, impossible end observation, or
 missing required component is excluded and counted. It is never clipped,

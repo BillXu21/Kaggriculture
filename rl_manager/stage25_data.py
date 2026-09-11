@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import Any
 
 from .stage25_mechanics import (
+    ACTION_ORDER,
     ANIMAL_ORDER,
     CROP_ORDER,
     PhysicalContext,
@@ -78,6 +79,11 @@ class OutcomeProxyLabel:
     provenance: OutcomeProxyProvenance
     valid_components: tuple[str, ...]
     invalid_components: tuple[str, ...]
+    # A complete nine-action teacher-forcing example requires every one of the
+    # nine ordered steps to have a populated class that is physically supported
+    # under the exact preceding observed class prefix.  A partial chain may be
+    # retained for diagnostics, but it is never a complete trainable example.
+    complete_ar_chain: bool = False
 
     @property
     def labels(self) -> Mapping[str, Any]:
@@ -112,6 +118,12 @@ class InvalidCounters:
     component_excluded_rows: int = 0
     target_invalidity_components: int = 0
     target_invalidity_rows: int = 0
+    # Rows with at least one valid component but an incomplete nine-action
+    # autoregressive chain.  They are retained only as partial diagnostics and
+    # are excluded from the complete trainable output.  This is distinct from
+    # ``component_excluded_rows``/``excluded_rows``, which cover rows with no
+    # usable component at all.
+    incomplete_ar_chain_rows: int = 0
 
     # Compact aliases retain the same values while keeping the canonical
     # fields above suitable for JSON/dataclass serialization.
@@ -198,15 +210,35 @@ class InvalidCounters:
 
 @dataclass(frozen=True)
 class OutcomeProxyBuild:
-    """Immutable builder output, preserving selected input order."""
+    """Immutable builder output, preserving selected input order.
+
+    ``rows`` (aliased by ``labels``) contains only complete nine-action
+    teacher-forcing examples: every step has a populated class supported under
+    the exact preceding observed prefix.  ``partial_rows`` retains selected
+    rows with an incomplete chain for diagnostics/accounting only; those rows
+    are never trainable examples.
+    """
 
     schema_version: str
     rows: tuple[OutcomeProxyLabel, ...]
     counters: InvalidCounters
+    partial_rows: tuple[OutcomeProxyLabel, ...] = ()
 
     @property
     def labels(self) -> tuple[OutcomeProxyLabel, ...]:
         return self.rows
+
+    @property
+    def complete_rows(self) -> tuple[OutcomeProxyLabel, ...]:
+        return self.rows
+
+    @property
+    def trainable_rows(self) -> tuple[OutcomeProxyLabel, ...]:
+        return self.rows
+
+    @property
+    def partial_labels(self) -> tuple[OutcomeProxyLabel, ...]:
+        return self.partial_rows
 
     @property
     def report(self) -> InvalidCounters:
@@ -639,38 +671,41 @@ def _make_label(row: _HistoryRow, prior: OutcomeProxyProvenance,
     if target_invalid:
         counters["target_invalidity_components"] += len(target_invalid)
         counters["target_invalidity_rows"] += 1
+
+    # Step 1 -- land.  This is the first action of the nine-step autoregressive
+    # chain, so an invalid land outcome truncates every later step.
     land_label: int | None = row.end_land
     land_class: int | None = None
+    land_valid = False
     try:
+        if _LAND_COMPONENT in target_invalid:
+            raise ValueError
         land_mask = land_target_support_mask(row.start_land)
         if not 1 <= row.end_land <= len(land_mask) or not land_mask[row.end_land - 1]:
             raise ValueError
-        if _LAND_COMPONENT not in target_invalid:
-            land_class = row.end_land - 1
-            valid.append(_LAND_COMPONENT)
+        land_class = row.end_land - 1
+        land_valid = True
+        valid.append(_LAND_COMPONENT)
     except (ValueError, IndexError):
         counters["land_invalidity_rows"] += 1
         land_label = None
         invalid.append(_LAND_COMPONENT)
 
+    # Steps 2-4 -- animals.  A component is only usable when its own class is
+    # populated and every earlier action is itself valid.  Once a step is
+    # invalid, later steps are not reconstructed from a fabricated prefix.
     animal_labels: list[int | None] = list(row.end_animals)
     animal_classes: list[int | None] = [None] * len(ANIMAL_ORDER)
-    animal_valid = True
     context: PhysicalContext | None = None
     try:
         context = _physical_context(row)
     except (ValueError, KeyError, TypeError):
-        animal_valid = False
+        context = None
 
     loss_indices = {
         index for index, (start, end) in enumerate(
             zip(row.start_animals, row.end_animals)) if end < start
     }
-    for index, component in enumerate(_ANIMAL_COMPONENTS):
-        if component in target_invalid:
-            # The count remains the observed end-board count; only the
-            # target-derived class is withheld.
-            animal_classes[index] = None
     for index in loss_indices:
         component = _component_name("animal", index)
         counters["animal_loss_ambiguity_components"] += 1
@@ -680,117 +715,120 @@ def _make_label(row: _HistoryRow, prior: OutcomeProxyProvenance,
             invalid.append(component)
     if loss_indices:
         counters["animal_loss_ambiguity_rows"] += 1
-        animal_valid = False
-        # A loss makes the full acquisition vector unusable for crop support,
-        # but unaffected observed outcomes still require physical validation.
-        # Use the observed placement as the neutral baseline for the excluded
-        # loss species; this is not an inferred sell action or repaired label.
-        safe_prefix: list[int] = []
-        for index, (start, target) in enumerate(
-                zip(row.start_animals, row.end_animals)):
-            component = _component_name("animal", index)
-            if index in loss_indices or component in target_invalid:
-                safe_prefix.append(context.placed_animals[index]
-                                   if context is not None else start)
-                continue
-            try:
-                if (context is None or land_label is None
-                        or not 0 <= target <= 100 or target < start):
-                    raise ValueError
-                mask = animal_target_support_mask(
-                    context, land_label, index, tuple(safe_prefix))
-                if not mask[target]:
-                    raise ValueError
-                valid.append(component)
-                safe_prefix.append(target)
-            except (ValueError, IndexError):
-                counters["animal_acquisition_invalidity_components"] += 1
-                animal_labels[index] = None
-                invalid.append(_component_name("animal", index))
-                safe_prefix.append(context.placed_animals[index]
-                                   if context is not None else start)
 
-    if context is not None and land_label is not None and not loss_indices:
-        prefix: list[int] = []
-        for index, target in enumerate(row.end_animals):
-            component = _component_name("animal", index)
-            if component in target_invalid:
-                prefix.append(context.placed_animals[index])
-                continue
-            try:
-                # This validates the observed-placement/acquisition boundary;
-                # positive deficits are legitimate purchases, while a target
-                # below observed placement is never repaired.
-                if (isinstance(target, bool) or not isinstance(target, int)
-                        or not 0 <= target <= 100
-                        or target < context.placed_animals[index]):
-                    raise ValueError
-                mask = animal_target_support_mask(
-                    context, land_label, index, tuple(prefix))
-                if not mask[target]:
-                    raise ValueError
-                animal_classes[index] = target
-                valid.append(component)
-                prefix.append(target)
-            except (ValueError, IndexError):
-                counters["animal_acquisition_invalidity_components"] += 1
-                animal_labels[index] = None
+    animal_prefix: list[int] = []
+    prefix_ok = land_valid
+    for index, component in enumerate(_ANIMAL_COMPONENTS):
+        target = row.end_animals[index]
+        if component in target_invalid:
+            # The count remains the observed end-board count; only the
+            # target-derived class is withheld.  The observed prefix breaks
+            # here because this step has no populated class.
+            prefix_ok = False
+            if component not in invalid:
                 invalid.append(component)
-                animal_valid = False
-                prefix.append(context.placed_animals[index])
-    elif context is None or land_label is None:
-        for index in range(len(ANIMAL_ORDER)):
-            component = _component_name("animal", index)
-            if index not in loss_indices and component not in target_invalid:
-                counters["animal_acquisition_invalidity_components"] += 1
-                animal_labels[index] = None
+            continue
+        if index in loss_indices:
+            # A loss is an ambiguous outcome, never a purchase target, so the
+            # observed autoregressive prefix cannot continue through it.
+            prefix_ok = False
+            continue
+        if not prefix_ok:
+            counters["animal_acquisition_invalidity_components"] += 1
+            animal_labels[index] = None
+            if component not in invalid:
                 invalid.append(component)
-        animal_valid = False
+            continue
+        try:
+            # Positive deficits are legitimate purchases; a target below
+            # observed placement is never repaired.
+            if (context is None or land_label is None
+                    or isinstance(target, bool) or not isinstance(target, int)
+                    or not 0 <= target <= 100
+                    or target < context.placed_animals[index]):
+                raise ValueError
+            mask = animal_target_support_mask(
+                context, land_label, index, tuple(animal_prefix))
+            if not mask[target]:
+                raise ValueError
+        except (ValueError, IndexError):
+            counters["animal_acquisition_invalidity_components"] += 1
+            animal_labels[index] = None
+            prefix_ok = False
+            if component not in invalid:
+                invalid.append(component)
+            continue
+        animal_classes[index] = target
+        valid.append(component)
+        animal_prefix.append(target)
+    animal_valid = prefix_ok
 
+    # Steps 5-9 -- crops.  Crops depend on the complete land+animal prefix and
+    # only on the decoded goals of earlier crops; capacity is never reserved
+    # for later crop heads.
     crop_deltas: list[int | None] = [None] * len(CROP_ORDER)
     crop_classes: list[int | None] = [None] * len(CROP_ORDER)
     if context is not None and land_label is not None and animal_valid:
         try:
-            capacity = physical_crop_capacity(context, land_label, row.end_animals)
+            capacity = physical_crop_capacity(
+                context, land_label, tuple(animal_classes))
         except (ValueError, TypeError):
             capacity = -1
         if capacity >= 0:
+            decoded_goals: list[int] = []
+            crop_ok = True
             for index, (prior_goal, desired) in enumerate(
                      zip(prior.prior_crop_goals, row.end_crops)):
                 component = _component_name("crop", index)
                 if component in target_invalid:
+                    crop_ok = False
+                    if component not in invalid:
+                        invalid.append(component)
+                    continue
+                if not crop_ok:
+                    if component not in invalid:
+                        invalid.append(component)
                     continue
                 delta = desired - prior_goal
                 if not _CROP_DELTA_MIN <= delta <= _CROP_DELTA_MAX:
                     counters["crop_delta_outside_vocabulary_components"] += 1
-                    invalid.append(component)
+                    crop_ok = False
+                    if component not in invalid:
+                        invalid.append(component)
                     continue
                 if not 0 <= prior_goal <= 100 or not 0 <= desired <= 100:
                     counters["crop_physical_incompatibility_components"] += 1
-                    invalid.append(component)
+                    crop_ok = False
+                    if component not in invalid:
+                        invalid.append(component)
                     continue
-                residual = capacity - sum(row.end_crops[:index])
+                residual = capacity - sum(decoded_goals)
                 try:
                     class_index = crop_delta_to_class(delta)
                     if not crop_delta_support_mask(prior_goal, residual)[class_index]:
                         raise ValueError
                 except (ValueError, IndexError):
                     counters["crop_physical_incompatibility_components"] += 1
-                    invalid.append(component)
+                    crop_ok = False
+                    if component not in invalid:
+                        invalid.append(component)
                     continue
                 crop_deltas[index] = delta
                 crop_classes[index] = class_index
+                decoded_goals.append(prior_goal + delta)
                 valid.append(component)
         else:
             # Capacity is a shared prerequisite, so it invalidates all crop
             # proxies.  It still never changes the observed end counts.
             for index in range(len(CROP_ORDER)):
                 component = _component_name("crop", index)
-                invalid.append(component)
+                if component not in invalid:
+                    invalid.append(component)
     else:
         for index in range(len(CROP_ORDER)):
             component = _component_name("crop", index)
-            invalid.append(component)
+            if component not in invalid:
+                invalid.append(component)
 
     # Remove duplicate component names while retaining canonical order.
     valid = list(dict.fromkeys(valid))
@@ -798,6 +836,9 @@ def _make_label(row: _HistoryRow, prior: OutcomeProxyProvenance,
     if invalid:
         counters["invalid_rows"] += 1
         counters["component_excluded_rows"] += 1
+    # A complete teacher-forcing example requires all nine ordered steps to be
+    # present, populated, and physically supported under the exact prefix.
+    complete_ar_chain = len(valid) == len(ACTION_ORDER)
 
     return OutcomeProxyLabel(
         row_index=row.index,
@@ -815,6 +856,7 @@ def _make_label(row: _HistoryRow, prior: OutcomeProxyProvenance,
         provenance=prior,
         valid_components=tuple(valid),
         invalid_components=tuple(invalid),
+        complete_ar_chain=complete_ar_chain,
     )
 
 
@@ -881,8 +923,10 @@ def build_outcome_proxy_labels(
         "selection_excluded_rows": 0,
         "target_invalidity_components": 0,
         "target_invalidity_rows": 0,
+        "incomplete_ar_chain_rows": 0,
     }
     built: list[OutcomeProxyLabel] = []
+    partial: list[OutcomeProxyLabel] = []
     for history in groups.values():
         previous_goals: tuple[int, ...] | None = None
         previous_row: _HistoryRow | None = None
@@ -927,12 +971,20 @@ def build_outcome_proxy_labels(
             previous_goals = row.end_crops
             previous_row = row
             if _selected(row.record, row.metadata, dates, threshold):
-                if label.valid_components:
+                if label.complete_ar_chain:
                     built.append(label)
+                elif label.valid_components:
+                    # Retained only as a partial diagnostic; never a complete
+                    # teacher-forcing training example.
+                    partial.append(label)
+                    counters["incomplete_ar_chain_rows"] += 1
             else:
                 counters["selection_excluded_rows"] += 1
 
-    excluded_rows = len(parsed) - len(built)
+    # Preserves the original exclusion meaning: rows excluded by selection or
+    # by having no usable component.  Partial diagnostic rows are neither
+    # trainable nor counted as fully excluded here.
+    excluded_rows = len(parsed) - len(built) - len(partial)
     final_counters = InvalidCounters(
         crop_delta_outside_vocabulary_components=counters[
             "crop_delta_outside_vocabulary_components"],
@@ -952,9 +1004,11 @@ def build_outcome_proxy_labels(
         target_invalidity_components=counters[
             "target_invalidity_components"],
         target_invalidity_rows=counters["target_invalidity_rows"],
+        incomplete_ar_chain_rows=counters["incomplete_ar_chain_rows"],
     )
     return OutcomeProxyBuild(
         schema_version=OUTCOME_PROXY_SCHEMA_VERSION,
         rows=tuple(sorted(built, key=lambda label: label.row_index)),
         counters=final_counters,
+        partial_rows=tuple(sorted(partial, key=lambda label: label.row_index)),
     )
