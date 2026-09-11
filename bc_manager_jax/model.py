@@ -42,24 +42,19 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from bc_manager.constants import (
-    BOARD_BOOL_FIELDS,
-    BOARD_NUMERIC_FIELDS,
-    BOARD_SIZE,
-    MAX_HANDS,
-    RESOURCE_ORDER,
-    SHOP_VOCAB,
-    TOTAL_DAYS,
-)
+from bc_manager.constants import MAX_HANDS
 from bc_manager.economics import (
     ECONOMIC_CONTEXT_KEY,
     ECONOMIC_DIM,
     normalize_model_variant,
 )
-from bc_manager.model import (
+from bc_manager.model_spec import (
     BOARD_NUMERIC_SCALES,
     BOARD_SIDE,
+    BOARD_SIZE,
     GLOBAL_TOKEN_NAMES,
+    LABOR_DIM,
+    MARKET_DIM,
     NULLABLE_TIMING_CHANNELS,
     NUM_ANIMALS,
     NUM_ANIMAL_IDS,
@@ -73,9 +68,9 @@ from bc_manager.model import (
     SELF_RESOURCE_DIM,
     SELL_BIN_COUNT,
     SELL_PRESENCE_CELLS,
-    MARKET_DIM,
     TOWN_DIM,
-    LABOR_DIM,
+    TOTAL_DAYS,
+    tile_feature_dim,
 )
 
 _LAYER_NORM_EPS = 1e-5  # torch.nn.LayerNorm default; must match source
@@ -145,6 +140,14 @@ def tiny_manager_config(**overrides) -> ManagerConfig:
     return ManagerConfig(**params)
 
 
+def large_manager_config(**overrides) -> ManagerConfig:
+    """Explicit default-size configuration, with optional overrides."""
+    params = dict(d_model=128, num_layers=4, num_heads=4, ffn_dim=384,
+                  dropout=0.1, include_opponent_board=False)
+    params.update(overrides)
+    return ManagerConfig(**params)
+
+
 # --------------------------------------------------------------- params
 
 
@@ -162,12 +165,7 @@ def empty_params(config: ManagerConfig,
     """
     variant = resolve_model_variant(model_variant)
     d = config.d_model
-    feature_dim = (
-        5 * d  # kind + crop + animal + row + col embeddings
-        + len(BOARD_NUMERIC_FIELDS) + len(NULLABLE_TIMING_CHANNELS)
-        + len(BOARD_BOOL_FIELDS)
-        + 4  # presence mask channels
-    )
+    feature_dim = tile_feature_dim(d)
     self_resource_dim = SELF_RESOURCE_DIM + (
         ECONOMIC_DIM if variant == "E" else 0)
 

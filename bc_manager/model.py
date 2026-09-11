@@ -21,81 +21,38 @@ from typing import Mapping
 import torch
 from torch import Tensor, nn
 
-from .constants import (
-    ANIMAL_ORDER,
-    BOARD_BOOL_FIELDS,
-    BOARD_NUMERIC_FIELDS,
-    BOARD_SIZE,
-    CROP_ORDER,
-    MAX_HANDS,
-    PRODUCT_ORDER,
-    QUADRANT_ORDER,
-    RESOURCE_ORDER,
-    SELL_BIN_COUNT,
-    SHOP_VOCAB,
-    TILE_KIND_IDS,
-    TOTAL_DAYS,
-)
+from .constants import MAX_HANDS
 from .economics import (
     ECONOMIC_CONTEXT_KEY,
     ECONOMIC_DIM,
     normalize_model_variant,
 )
-
-NUM_CROPS = len(CROP_ORDER)                      # 5
-NUM_ANIMALS = len(ANIMAL_ORDER)                  # 3
-NUM_PRODUCTS = len(PRODUCT_ORDER)                # 9
-NUM_LAND_CLASSES = len(QUADRANT_ORDER)           # 4 -> counts 1..4
-SELL_PRESENCE_CELLS = NUM_PRODUCTS * SELL_BIN_COUNT  # 54
-
-NUM_TILE_KINDS = max(TILE_KIND_IDS.values()) + 1     # 8
-NUM_CROP_IDS = len(CROP_ORDER) + 2                   # absent + vocab + UNKNOWN
-NUM_ANIMAL_IDS = len(ANIMAL_ORDER) + 2               # absent + vocab + UNKNOWN
-
-BOARD_SIDE = 10
-assert BOARD_SIDE * BOARD_SIDE == BOARD_SIZE
-
-# Fixed stable scaling for board numeric channels (order =
-# BOARD_NUMERIC_FIELDS). Days are divided by episode length; small counters
-# by small constants. Nullable timing NaNs get explicit indicator channels.
-BOARD_NUMERIC_SCALES = (
-    float(TOTAL_DAYS),   # planted_day
-    float(TOTAL_DAYS),   # placed_day
-    10.0,                # yield_units
-    200.0,               # max_lifespan_step
-    float(TOTAL_DAYS),   # fertilized_until_day
-    7.0,                 # consecutive_unwatered
-    7.0,                 # consecutive_unfed
-    5.0,                 # pending_care_bonus
-    float(TOTAL_DAYS),   # age_days
-    float(TOTAL_DAYS),   # days_until_next_harvest
-    float(TOTAL_DAYS),   # days_until_next_product
+from .model_spec import (
+    BOARD_NUMERIC_SCALES,
+    BOARD_SIDE,
+    DECISION_SELL_INDEX,
+    DECISION_TOKEN_NAMES,
+    GLOBAL_TOKEN_NAMES,
+    LABOR_DIM,
+    MARKET_DIM,
+    NULLABLE_TIMING_CHANNELS,
+    NUM_ANIMALS,
+    NUM_ANIMAL_IDS,
+    NUM_CROPS,
+    NUM_CROP_IDS,
+    NUM_LAND_CLASSES,
+    NUM_PRODUCTS,
+    NUM_TILE_KINDS,
+    OPPONENT_PUBLIC_INPUT_KEYS,
+    OWN_INPUT_KEYS,
+    SELL_PRESENCE_CELLS,
+    SELF_RESOURCE_DIM,
+    SELL_BIN_COUNT,
+    TOTAL_DAYS,
+    TOWN_DIM,
+    BOARD_SIZE,
+    tile_feature_dim,
 )
-NULLABLE_TIMING_CHANNELS = (
-    BOARD_NUMERIC_FIELDS.index("days_until_next_harvest"),
-    BOARD_NUMERIC_FIELDS.index("days_until_next_product"),
-)
-
-OWN_INPUT_KEYS = frozenset({
-    "board_kind", "board_crop", "board_animal", "board_numeric",
-    "board_bool", "board_mask", "scalars", "shed_counts", "seed_counts",
-    "carried_counts", "unlocked", "market_inventory", "market_prices",
-    "shop_counts", "day", "days_remaining",
-})
-OPPONENT_PUBLIC_INPUT_KEYS = frozenset({
-    "opp_board_kind", "opp_board_crop", "opp_board_animal",
-    "opp_board_numeric", "opp_board_bool", "opp_board_mask",
-    "opp_scalars", "opp_unlocked",
-})
-
-GLOBAL_TOKEN_NAMES = ("self_resource", "market", "town", "labor", "day")
-
-# Fixed-semantic joint-decoder decision tokens (issue #6 experiment J).
-# Index order is part of the forward contract; the sell token is shared by
-# both sell heads.
-DECISION_TOKEN_NAMES = ("crop", "animal", "land", "fertilizer", "care",
-                        "sell")
-DECISION_SELL_INDEX = DECISION_TOKEN_NAMES.index("sell")
 
 
 @dataclass
@@ -159,6 +116,14 @@ def tiny_manager_config(**overrides) -> ManagerConfig:
     return ManagerConfig(**params)
 
 
+def large_manager_config(**overrides) -> ManagerConfig:
+    """Explicit default-size configuration, with optional overrides."""
+    params = dict(d_model=128, num_layers=4, num_heads=4, ffn_dim=384,
+                  dropout=0.1, include_opponent_board=False)
+    params.update(overrides)
+    return ManagerConfig(**params)
+
+
 def _sign_log1p(x: Tensor) -> Tensor:
     return torch.sign(x) * torch.log1p(x.abs())
 
@@ -173,17 +138,7 @@ class TileEncoder(nn.Module):
         self.animal_embedding = nn.Embedding(NUM_ANIMAL_IDS, d_model)
         self.row_embedding = nn.Embedding(BOARD_SIDE, d_model)
         self.col_embedding = nn.Embedding(BOARD_SIDE, d_model)
-        numeric_dim = len(BOARD_NUMERIC_FIELDS) + len(NULLABLE_TIMING_CHANNELS)
-        feature_dim = (
-            d_model  # kind
-            + d_model  # crop
-            + d_model  # animal
-            + d_model  # row
-            + d_model  # col
-            + numeric_dim
-            + len(BOARD_BOOL_FIELDS)
-            + 4  # presence mask channels
-        )
+        feature_dim = tile_feature_dim(d_model)
         self.register_buffer(
             "numeric_scales",
             torch.tensor(BOARD_NUMERIC_SCALES, dtype=torch.float32),
@@ -229,13 +184,6 @@ def _global_mlp(in_dim: int, d_model: int, dropout: float) -> nn.Module:
         nn.Dropout(dropout),
         nn.Linear(d_model, d_model),
     )
-
-
-SELF_RESOURCE_DIM = 1 + len(RESOURCE_ORDER) + len(CROP_ORDER) \
-    + len(RESOURCE_ORDER) + len(QUADRANT_ORDER) + 1
-MARKET_DIM = 2 * NUM_PRODUCTS
-TOWN_DIM = len(SHOP_VOCAB)
-LABOR_DIM = 3
 
 
 class GlobalEncoders(nn.Module):
