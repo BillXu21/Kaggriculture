@@ -89,6 +89,14 @@ class PPOBatchedPolicy:
         self.exploration = (TargetedExplorationConfig()
                             if self._deterministic else requested_exploration)
         self.e_history_version = normalize_e_history_version(e_history_version)
+        # Row-aware rollout sampling historically seeds from the raw parameter
+        # fingerprint, not the behavior/provenance fingerprint.  Materializing
+        # every JAX parameter leaf to NumPy inside plan_batch_with_row_ids()
+        # can force a device->host sync and hash the full model once per
+        # physical inference batch.  Params are immutable for the lifetime of
+        # one adapter snapshot, so cache that exact same fingerprint here and
+        # refresh it only when the snapshot identity is explicitly refreshed.
+        self._params_fingerprint = params_fingerprint(policy.params)
         self.identity = PolicyIdentity(
             name=name,
             version=version,
@@ -106,6 +114,7 @@ class PPOBatchedPolicy:
 
     def refresh_identity(self) -> None:
         """Re-derive the fingerprint after the underlying params changed."""
+        self._params_fingerprint = params_fingerprint(self._policy.params)
         self.identity = PolicyIdentity(
             name=self.identity.name,
             version=self.identity.version,
@@ -160,7 +169,7 @@ class PPOBatchedPolicy:
             # changes the resulting distribution.
             rng=prng_key_from_id(
                 f"policy={self.identity.name}@{self.identity.version}:"
-                f"{params_fingerprint(self._policy.params)}"),
+                f"{self._params_fingerprint}"),
             decision_seeds=seeds)
         self.call_count += 1
         self.batch_size_history.append(int(result["batch_size"]))
