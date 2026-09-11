@@ -42,7 +42,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from bc_manager.constants import MAX_HANDS
+from bc_manager.constants import (  # noqa: F401 - compatibility re-exports
+    BOARD_BOOL_FIELDS,
+    BOARD_NUMERIC_FIELDS,
+    MAX_HANDS,
+    RESOURCE_ORDER,
+    SHOP_VOCAB,
+)
 from bc_manager.economics import (
     ECONOMIC_CONTEXT_KEY,
     ECONOMIC_DIM,

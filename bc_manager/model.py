@@ -21,7 +21,18 @@ from typing import Mapping
 import torch
 from torch import Tensor, nn
 
-from .constants import MAX_HANDS
+from .constants import (  # noqa: F401 - compatibility re-exports
+    ANIMAL_ORDER,
+    BOARD_BOOL_FIELDS,
+    BOARD_NUMERIC_FIELDS,
+    CROP_ORDER,
+    MAX_HANDS,
+    PRODUCT_ORDER,
+    QUADRANT_ORDER,
+    RESOURCE_ORDER,
+    SHOP_VOCAB,
+    TILE_KIND_IDS,
+)
 from .economics import (
     ECONOMIC_CONTEXT_KEY,
     ECONOMIC_DIM,

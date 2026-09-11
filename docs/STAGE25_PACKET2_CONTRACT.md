@@ -29,10 +29,32 @@ mechanics and vocabularies remain authoritative.
 - `evaluate_actions(params, inputs, config, actions=None, classes=None, *,
   reject_invalid=True, physical_contexts=None, crop_capacity=None,
   row_ids=None)` teacher-forces stored classes and never resamples or repairs.
+  Invalid/out-of-vocabulary classes fail loudly by default. The diagnostics
+  mode (`reject_invalid=False`) preserves the exact supplied sequence, returns
+  explicit validity, and marks the affected and downstream likelihoods and
+  entropies invalid instead of substituting a repaired class.
 
-`inputs` contain the own-only corrected-E arrays plus pre-decision
-`crop_capacity` and optional `crop_goals`. A caller may instead pass
-`crop_capacity` and `physical_contexts` through the explicit keyword seams.
+`inputs` contain the own-only corrected-E arrays plus the pre-decision
+persistent goal ledger `crop_capacity` (`K`, integer `[B, 5]`, entries in
+`[0, 100]`). The ledger is required and unambiguous: a scalar `[B]` ledger or
+an omitted ledger is rejected, there is no separate caller-supplied
+`crop_goals`, and there is no occupancy-derived default. If the ledger is not
+embedded in `inputs`, a caller may pass `crop_capacity` through the explicit
+keyword seam; `physical_contexts` may likewise be passed explicitly.
+First-boundary ledger construction from observed occupancy belongs outside
+policy inference.
+
+`K` conditions the encoder/decoder and supplies each crop head's delta base
+(`goal_i = K_i + class_i - 100`). It does not define available space and need
+not fit the footprint: a ledger with `sum(K) > C` is valid and the
+autoregressive masks force contraction. The physical capacity
+`C = B(requested_land) - required_new_housing_cells` is always derived by the
+policy from the decoded Packet 1A context (observed placed animals, reusable
+empty coops, shared empty pastures, requested land footprint) after the land
+and animal actions; it is never supplied by the caller, never taken from
+`sum(K)`, never reserved for future crops, and never clamped to zero. A
+negative `C` yields empty crop support.
+
 `physical_contexts` are Packet 1A `PhysicalContext` values, one per row;
 without them, the physical subset is decoded from the encoded board,
 unlocked-prefix, and inventory arrays. `row_ids` are immutable decision
@@ -75,14 +97,15 @@ bias/step embeddings/state-relative scale, and a `D -> 1` value head. For
 The corrected-E encoder/trunk is
 `10D^2 + 192D + L*(4D^2 + 2DF + 9D + F)`; the remaining
 `2D^2 + 16D + 5` is the capacity conditioning, recurrent decoder state,
-nine-step embeddings/scales, and value head. The normal `L=4, F=384, H=4`
-counts are:
+nine-step embeddings/scales, and value head. Counts for the `tiny`, `small`,
+and `large` convenience constructors (`(D,L,H,F)` of `(16,1,1,32)`,
+`(128,4,4,384)`, and `(256,7,8,1024)`):
 
-| D | decoder | non-decoder | total |
-|---:|---:|---:|---:|
-| 16 | 43,296 | 8,629 | 51,925 |
-| 128 | 337,184 | 884,741 | 1,221,925 |
-| 256 | 673,056 | 6,368,005 | 7,041,061 |
+| config | D | decoder | non-decoder | total |
+|---|---:|---:|---:|---:|
+| tiny | 16 | 43,296 | 8,629 | 51,925 |
+| small | 128 | 337,184 | 884,741 | 1,221,925 |
+| large | 256 | 673,056 | 6,368,005 | 7,041,061 |
 
 `parameter_spec` and `stage25_parameter_count` are executable authority; a
 transposed-kernel storage convention does not change counts.
@@ -117,9 +140,8 @@ from tests.test_stage25_policy import _encoded, _contexts
 c = Stage25ModelConfig.tiny()
 p = init_stage25_params(c, seed=7)
 out = greedy_act(
-    p, _encoded(1), c, physical_contexts=(_contexts()[0],),
-    crop_capacity=jnp.full((1, 5), 20, dtype=jnp.int16),
-    row_ids=jnp.array([7]),
+    p, _encoded(1, ledger=jnp.full((1, 5), 20, dtype=jnp.int16)), c,
+    physical_contexts=(_contexts()[0],), row_ids=jnp.array([7]),
 )
 print(out["classes"], out["joint_logprob"], out["value"])
 print(sum(x.size for x in jax.tree_util.tree_leaves(p)))

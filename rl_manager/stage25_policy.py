@@ -334,27 +334,27 @@ def init_stage25_params(
     return params
 
 
-def _lookup_extra(inputs: Mapping[str, Any], *names: str) -> Any:
-    for name in names:
-        if name in inputs:
-            return inputs[name]
-    return None
-
-
 def _host_inputs(
         inputs: Mapping[str, Any], config: Stage25ModelConfig,
         crop_capacity: Any = None,
-) -> tuple[dict[str, jax.Array], jax.Array, jax.Array, int]:
+) -> tuple[dict[str, jax.Array], jax.Array, int]:
+    """Prepare encoder inputs and the persistent crop-goal ledger ``K``.
+
+    ``crop_capacity`` is the pre-decision persistent goal ledger ``K`` of
+    shape ``[B, 5]`` with integer entries in ``[0, 100]``.  It conditions the
+    encoder/decoder and supplies each crop head's delta base; it never supplies
+    the physical capacity ``C``, which is derived from the decoded physical
+    context after the land and animal decisions.
+    """
     if not isinstance(inputs, Mapping):
         raise ValueError("inputs must be a mapping")
-    capacity = (crop_capacity if crop_capacity is not None else
-                _lookup_extra(inputs, "crop_capacity", "capacity"))
-    if capacity is None:
-        raise ValueError("inputs must contain crop_capacity")
+    ledger = (crop_capacity if crop_capacity is not None
+              else inputs.get("crop_capacity"))
+    if ledger is None:
+        raise ValueError(
+            "inputs must contain crop_capacity (persistent goal ledger K [B,5])")
     base = {key: value for key, value in inputs.items()
-            if key not in ("crop_capacity", "capacity", "crop_goals",
-                           "previous_crop_goals", "prior_crop_goals",
-                           "row_ids")}
+            if key not in ("crop_capacity", "row_ids")}
     _validate_encoder_inputs(base, config.manager_config, model_variant="E")
     prepared = {
         key: (jnp.asarray(value, dtype=jnp.int32)
@@ -382,32 +382,27 @@ def _host_inputs(
     prefix = np.asarray(unlocked, dtype=np.int32)
     if np.any(prefix[:, 1:] > prefix[:, :-1]):
         raise ValueError("unlocked must be a canonical land prefix")
+    if np.any(prefix.sum(axis=1) < 1):
+        raise ValueError("unlocked must contain at least the NW quadrant")
 
-    capacity_array = np.asarray(capacity, dtype=np.float32)
-    if capacity_array.ndim == 1:
-        if capacity_array.shape != (b,):
-            raise ValueError("crop_capacity must have shape [B] or [B, 5]")
-        capacity_array = np.repeat(capacity_array[:, None], _N_CROPS, axis=1)
-    if capacity_array.shape != (b, _N_CROPS) \
-            or not np.all(np.isfinite(capacity_array)):
-        raise ValueError("crop_capacity must have finite shape [B, 5]")
-
-    goals = _lookup_extra(inputs, "crop_goals", "previous_crop_goals",
-                          "prior_crop_goals")
-    if goals is None:
-        # A useful boundary default for live encoded boards; callers training
-        # persistent goals should pass them explicitly.
-        crop = np.asarray(prepared["board_crop"])
-        goals_array = np.stack([
-            np.sum((crop == index + 1).astype(np.int32), axis=1)
-            for index in range(_N_CROPS)
-        ], axis=1)
-    else:
-        goals_array = np.asarray(goals, dtype=np.int32)
-    if goals_array.shape != (b, _N_CROPS) \
-            or np.any(goals_array < 0) or np.any(goals_array > 100):
-        raise ValueError("crop_goals must have shape [B, 5] and lie in [0, 100]")
-    return prepared, jnp.asarray(capacity_array), jnp.asarray(goals_array), b
+    ledger_array = np.asarray(ledger)
+    if ledger_array.shape != (b, _N_CROPS):
+        raise ValueError(
+            "crop_capacity (persistent goal ledger K) must have shape [B, 5]; "
+            "a scalar or omitted ledger is not accepted")
+    if not np.issubdtype(ledger_array.dtype, np.integer):
+        integral_float = (
+            np.issubdtype(ledger_array.dtype, np.floating)
+            and np.all(np.isfinite(ledger_array))
+            and np.all(ledger_array == np.floor(ledger_array)))
+        if not integral_float:
+            raise ValueError(
+                "crop_capacity (persistent goal ledger K) must be integers")
+    if np.any(ledger_array < 0) or np.any(ledger_array > 100):
+        raise ValueError(
+            "crop_capacity (persistent goal ledger K) entries must lie in "
+            "[0, 100]")
+    return prepared, jnp.asarray(ledger_array.astype(np.int32)), b
 
 
 def _host_contexts(contexts: Any, batch: int) -> tuple[jax.Array, ...] | None:
@@ -418,10 +413,19 @@ def _host_contexts(contexts: Any, batch: int) -> tuple[jax.Array, ...] | None:
     fields = ("observed_land", "crop_build_cells_by_land", "placed_animals",
               "reusable_empty_coops", "reusable_empty_pastures",
               "unplaced_animals")
-    values = []
-    for field_name in fields:
-        values.append(np.asarray([getattr(context, field_name)
-                                  for context in contexts], dtype=np.int32))
+    values = [
+        np.asarray([getattr(context, field_name) for context in contexts],
+                   dtype=np.int32)
+        for field_name in fields
+    ]
+    observed_land = values[0]
+    cells = values[1]
+    if np.any(observed_land < 1) or np.any(observed_land > _N_LAND):
+        raise ValueError("physical_contexts observed_land must lie in [1, 4]")
+    if cells.shape != (batch, _N_LAND) or np.any(cells < 0):
+        raise ValueError(
+            "physical_contexts crop_build_cells_by_land must be nonnegative "
+            "[B, 4]")
     return tuple(jnp.asarray(value) for value in values)
 
 
@@ -478,6 +482,44 @@ def _physical_context_jax(inputs: Mapping[str, jax.Array]) -> tuple[jax.Array, .
             unplaced)
 
 
+def _new_housing_cells(placed: jax.Array, empty_coops: jax.Array,
+                       empty_pastures: jax.Array, goose_target: jax.Array,
+                       cow_target: jax.Array, sheep_target: jax.Array) \
+        -> jax.Array:
+    """Shared Packet 1A ``new_housing_cells`` for one animal target vector.
+
+    ``placed`` has trailing animal axis; the target arguments may carry a
+    leading candidate axis so the same helper serves autoregressive animal
+    feasibility and the post-animal crop capacity.
+    """
+    packed = placed[..., None, :]
+    goose_need = jnp.maximum(
+        0, goose_target - packed[..., 0] - empty_coops[..., None])
+    pasture_need = jnp.maximum(
+        0, cow_target - packed[..., 1] + sheep_target - packed[..., 2]
+        - empty_pastures[..., None])
+    return goose_need + pasture_need
+
+
+def _physical_crop_capacity(
+        cells: jax.Array, land_target: jax.Array, placed: jax.Array,
+        empty_coops: jax.Array, empty_pastures: jax.Array,
+        goose_target: jax.Array, cow_target: jax.Array,
+        sheep_target: jax.Array) -> jax.Array:
+    """Shared Packet 1A physical capacity ``C = B(land) - new_housing``.
+
+    ``B`` is the recoverable crop/build footprint for the requested absolute
+    land target.  The result is never clamped: an infeasible animal prefix
+    yields a negative ``C`` and therefore empty crop support.
+    """
+    index = jnp.clip(land_target - 1, 0, _N_LAND - 1)[:, None]
+    build = jnp.take_along_axis(cells, index, axis=1)[:, 0]
+    housing = _new_housing_cells(
+        placed, empty_coops, empty_pastures,
+        goose_target[:, None], cow_target[:, None], sheep_target[:, None])[:, 0]
+    return build - housing
+
+
 def _curriculum_masks(
         config: Stage25ModelConfig, observed_land: jax.Array,
         placed: jax.Array, land_mask: jax.Array,
@@ -505,12 +547,17 @@ def _curriculum_masks(
 
 def _policy_core(
         params: Mapping[str, Any], inputs: Mapping[str, jax.Array],
-        crop_capacity: jax.Array, crop_goals: jax.Array,
+        crop_capacity: jax.Array,
         rng_keys: jax.Array, supplied_actions: jax.Array,
         context_values: tuple[jax.Array, ...], row_ids: jax.Array,
         config: Stage25ModelConfig, mode: str, use_explicit_context: bool,
 ) -> dict[str, jax.Array | dict[str, jax.Array]]:
-    """One jitted core shared by stochastic, greedy, and evaluation paths."""
+    """One jitted core shared by stochastic, greedy, and evaluation paths.
+
+    ``crop_capacity`` is the persistent goal ledger ``K``.  The physical
+    capacity ``C`` is derived here from the decoded context after the land and
+    animal steps; it is never supplied by the caller.
+    """
     z = _manager_representation(params["encoder"], inputs,
                                 config.manager_config, _Dropout(0.0, None), "E")
     z = z + (crop_capacity / 100.0) @ params["capacity_conditioning"]
@@ -557,7 +604,6 @@ def _policy_core(
             species = step - 1
             land_class_valid = (classes[0] >= 0) & (classes[0] < _N_LAND)
             land_target = jnp.where(land_class_valid, classes[0] + 1, 1)
-            batch_index = jnp.arange(b)
             base = animal_targets
             candidate = jnp.broadcast_to(base[:, None, :],
                                          (b, _N_ANIMAL_CLASSES, _N_ANIMALS))
@@ -566,16 +612,14 @@ def _policy_core(
                     classes[1 + prior][:, None])
             candidate = candidate.at[:, :, species].set(
                 jnp.arange(_N_ANIMAL_CLASSES)[None, :])
-            land_cells = cells[batch_index, land_target - 1]
-            goose_need = jnp.maximum(
-                0, candidate[:, :, 0] - placed[:, 0, None] -
-                empty_coops[:, None])
-            pasture_need = jnp.maximum(
-                0, candidate[:, :, 1] - placed[:, 1, None] +
-                candidate[:, :, 2] - placed[:, 2, None] -
-                empty_pastures[:, None])
+            land_cells = jnp.take_along_axis(
+                cells, jnp.clip(land_target - 1, 0, _N_LAND - 1)[:, None],
+                axis=1)[:, 0]
+            housing = _new_housing_cells(
+                placed, empty_coops, empty_pastures, candidate[:, :, 0],
+                candidate[:, :, 1], candidate[:, :, 2])
             feasible = (jnp.all(candidate >= placed[:, None, :], axis=-1) &
-                        (land_cells[:, None] - goose_need - pasture_need >= 0))
+                        (land_cells[:, None] - housing >= 0))
             support = feasible
             _, animal_support, _ = _curriculum_masks(
                 config, observed_land, placed,
@@ -590,24 +634,21 @@ def _policy_core(
             crop_index = step - 4
             land_class_valid = (classes[0] >= 0) & (classes[0] < _N_LAND)
             land_target = jnp.where(land_class_valid, classes[0] + 1, 1)
-            batch_index = jnp.arange(b)
             selected_animals = jnp.stack(classes[1:4], axis=1)
-            goose_need = jnp.maximum(
-                0, selected_animals[:, 0] - placed[:, 0] - empty_coops)
-            pasture_need = jnp.maximum(
-                0, selected_animals[:, 1] - placed[:, 1] +
-                selected_animals[:, 2] - placed[:, 2] - empty_pastures)
-            # The five supplied values are the pre-decision crop capacities;
-            # crop support consumes their shared total without reserving
-            # capacity for future crop heads.
-            total_capacity = jnp.sum(crop_capacity, axis=1).astype(jnp.int32)
+            # Derive the physical capacity from the decoded context and the
+            # sampled/teacher-forced land+animal prefix.  It is never taken
+            # from the caller, reserved for future crops, or clamped to zero.
+            total_capacity = _physical_crop_capacity(
+                cells, land_target, placed, empty_coops, empty_pastures,
+                selected_animals[:, 0], selected_animals[:, 1],
+                selected_animals[:, 2]).astype(jnp.int32)
             residual = total_capacity - jnp.sum(decoded_goals, axis=1)
-            goals = crop_goals[:, crop_index]
+            goals = crop_capacity[:, crop_index]
             deltas = jnp.arange(-100, 101)
-            lower = jnp.maximum(-100, -goals)
-            upper = jnp.minimum(100, residual) - goals
-            support = (deltas[None, :] >= lower[:, None]) & \
-                (deltas[None, :] <= upper[:, None])
+            candidate_goals = goals[:, None] + deltas[None, :]
+            # Equivalent to max(-100, -K_i) <= delta <= min(100, R_i) - K_i.
+            upper_goal = jnp.minimum(100, residual)[:, None]
+            support = (candidate_goals >= 0) & (candidate_goals <= upper_goal)
             _, _, crop_support = _curriculum_masks(
                 config, observed_land, placed,
                 jnp.ones((b, _N_LAND), bool),
@@ -632,16 +673,20 @@ def _policy_core(
             selected = supplied_actions[:, step]
         class_count = ACTION_CLASS_COUNTS[step]
         chosen_valid = (selected >= 0) & (selected < class_count)
-        # Safe indexing for an invalid teacher-forced class is only a
-        # diagnostic sentinel; validity remains false and the host wrapper
-        # rejects it. Sampled/greedy classes are already in range.
+        # ``selected`` is the authoritative action: sampled/greedy classes are
+        # in range, and a teacher-forced class is preserved exactly, even when
+        # out of vocabulary.  ``selected_safe`` is only an internal index guard
+        # and is never exposed as a repaired action.
         selected_safe = jnp.where(chosen_valid, selected, 0).astype(jnp.int32)
-        chosen_valid = chosen_valid & any_valid & jnp.take_along_axis(
+        step_valid = chosen_valid & any_valid & jnp.take_along_axis(
             support, selected_safe[:, None], axis=1)[:, 0]
+        validity = validity & step_valid
         selected_logprob = jnp.take_along_axis(
             log_probs, selected_safe[:, None], axis=1)[:, 0]
-        selected_logprob = jnp.where(chosen_valid, selected_logprob, 0.0)
-        classes.append(selected_safe)
+        # Invalid and all downstream likelihoods/entropies are marked invalid.
+        selected_logprob = jnp.where(validity, selected_logprob, 0.0)
+        entropy = jnp.where(validity, entropy, 0.0)
+        classes.append(jnp.asarray(selected, dtype=jnp.int32))
         component_logprobs.append(selected_logprob)
         entropies.append(entropy)
         support_counts.append(jnp.sum(support, axis=1))
@@ -649,15 +694,14 @@ def _policy_core(
                                            (0, 201 - class_count))))
         all_masks.append(jnp.pad(support, ((0, 0),
                                            (0, 201 - class_count))))
-        validity = validity & chosen_valid & any_valid
-        if step < 4:
-            if step == 0:
-                animal_targets = animal_targets
-            elif step < 4:
-                animal_targets = animal_targets.at[:, step - 1].set(selected_safe)
+        if step == 0:
+            animal_targets = animal_targets
+        elif step < 4:
+            animal_targets = animal_targets.at[:, step - 1].set(selected_safe)
         else:
             crop_index = step - 4
-            updated = crop_goals[:, crop_index] + selected_safe - _CROP_DELTA_OFFSET
+            updated = crop_capacity[:, crop_index] + selected_safe \
+                - _CROP_DELTA_OFFSET
             decoded_goals = decoded_goals.at[:, crop_index].set(updated)
         embedding = params["action_embeddings"][step]
         h = h + embedding[selected_safe]
@@ -702,7 +746,7 @@ def _call_policy(
         row_ids: Any = None,
         reject_invalid: bool = True,
 ) -> dict[str, Any]:
-    prepared, capacity, goals, batch = _host_inputs(
+    prepared, capacity, batch = _host_inputs(
         inputs, config, crop_capacity=crop_capacity)
     if rng_keys is None:
         keys = jnp.zeros((batch, 2), dtype=jnp.uint32)
@@ -739,12 +783,13 @@ def _call_policy(
                                np.any(supplied_array >=
                                       np.asarray(ACTION_CLASS_COUNTS))):
             raise ValueError("actions contain a class outside its vocabulary")
-    result = _stage25_jit(params, prepared, capacity, goals, keys, supplied,
+    result = _stage25_jit(params, prepared, capacity, keys, supplied,
                           context_values, row_id_array, config, mode,
                           use_explicit_context)
     if actions is not None and reject_invalid:
         if not bool(np.all(np.asarray(result["validity"]))):
-            raise ValueError("actions contain a physically unsupported class")
+            raise ValueError(
+                "actions contain a physically unsupported or invalid class")
     return result
 
 
@@ -783,7 +828,16 @@ def evaluate_actions(
         *, reject_invalid: bool = True, physical_contexts: Any = None,
         crop_capacity: Any = None, row_ids: Any = None,
 ) -> dict[str, Any]:
-    """Evaluate supplied classes with shared teacher-forced recurrence."""
+    """Evaluate supplied classes with shared teacher-forced recurrence.
+
+    The supplied class sequence is authoritative and is returned unchanged.
+    With the default ``reject_invalid=True`` any out-of-vocabulary, physically
+    unsupported, or otherwise invalid class raises loudly.  With
+    ``reject_invalid=False`` (diagnostics only) the sequence is still returned
+    unchanged, ``valid`` is False from the first invalid step onward, and the
+    affected and downstream ``component_logprobs``/``conditional_entropies``
+    are zeroed; no repaired action is ever exposed.
+    """
     # Accept both ``(params, inputs, config, actions)`` and the natural
     # ``(params, inputs, actions, config)`` positional spelling.
     if not isinstance(config, Stage25ModelConfig):
