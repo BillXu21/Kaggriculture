@@ -29,7 +29,7 @@ from executor_v0.agent import AgentConfig, ExecutorAgent
 from executor_v0.manager import CheckpointPlanProvider, PlanProvider
 from executor_v0.plan import DailyPlan
 from opening_book.trace import validate_action
-from oracle.backend import EngineBackend, make_backend
+from oracle.backend import EngineBackend, canonical_observations, make_backend
 from replay_daily.constants import ENGINE_VERSION
 from rl_manager.provenance import (
     backend_provenance,
@@ -121,14 +121,10 @@ def _canonical_observations(
         raise FixedPlanTapeRecordingError(
             "backend canonical_state must contain two farms"
         )
-    adapted: list[dict[str, Any]] = []
-    for obs in observations:
-        view = copy.deepcopy(dict(obs))
-        view["farms"] = copy.deepcopy(farms)
-        if "step" not in view:
-            view["step"] = int(view["day"]) * 24 + int(view.get("hour", 0))
-        adapted.append(view)
-    return adapted
+    # Reuse the one public observation-canonicalization seam (resolved step +
+    # backend-canonical farms) so this recorder cannot drift from the runner.
+    return canonical_observations(
+        backend, observations, canonical_state=canonical)
 
 
 def _step_entry(replay: Mapping[str, Any], index: int, seat: int) -> Mapping[str, Any]:

@@ -13,7 +13,7 @@ from pathlib import Path
 import tempfile
 
 from executor_v0.agent import ExecutorAgent
-from oracle.backend import make_backend
+from oracle.backend import canonical_observations, make_backend
 from rl_manager.executor_factory import make_stage25_executor_factory
 from rl_manager.stage25_checkpoint import save_stage25_inference_checkpoint
 from rl_manager.stage25_policy import init_stage25_params, tiny_stage25_config
@@ -48,17 +48,37 @@ def run_smoke(*, engine: str, seed: int, days: int, mode: str) -> dict:
             for seat in (0, 1)
         ]
         backend = make_backend(engine, {"seed": seed})
-        observations = backend.reset()
+        # Route every observation through the same public canonicalization seam
+        # the runner uses: canonical farms (no fast-engine `age` alias) and a
+        # resolved absolute step for both seats.
+        def seat_animals(views: list[dict]) -> int:
+            return sum(
+                1
+                for seat in (0, 1)
+                for row in views[seat]["farms"][seat]["tiles"]
+                for tile in row
+                if isinstance(tile, dict) and "animal" in tile
+            )
+
+        observations = canonical_observations(backend, backend.reset())
         boundaries: list[int] = []
         max_steps = days * 24
         steps_run = 0
+        buy_animal_orders = 0
+        max_seat_animals = seat_animals(observations)
         for _ in range(max_steps):
             if int(observations[0]["hour"]) == 0:
                 boundaries.append(int(observations[0]["day"]))
             actions = [
                 agents[seat](observations[seat]) for seat in (0, 1)
             ]
-            observations, _, statuses = backend.step(actions)
+            for action in actions:
+                for order in (action.get("market") or []):
+                    if order and order[0] == "BUY_ANIMAL":
+                        buy_animal_orders += 1
+            raw_observations, _, statuses = backend.step(actions)
+            observations = canonical_observations(backend, raw_observations)
+            max_seat_animals = max(max_seat_animals, seat_animals(observations))
             steps_run += 1
             if len(boundaries) >= days:
                 break
@@ -73,17 +93,23 @@ def run_smoke(*, engine: str, seed: int, days: int, mode: str) -> dict:
                 "fast_env" if engine == "fast" else "kaggle_environments"
             ),
         }
+        final_seat_animals = seat_animals(observations)
         return {
             "engine": engine_identity,
             "seed": seed,
             "mode": mode,
+            "seats": [0, 1],
             "boundaries": boundaries,
+            "boundary_count": len(boundaries),
             "steps": steps_run,
             "provider_days": [provider.last_accepted_day for provider in providers],
             "executor_profiles": [
                 agent.effective_profile["version"] for agent in agents
             ],
             "statuses": list(statuses),
+            "buy_animal_orders": buy_animal_orders,
+            "final_seat_animals": final_seat_animals,
+            "max_seat_animals": max_seat_animals,
             "plumbing_only": True,
         }
 

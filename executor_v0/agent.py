@@ -50,7 +50,7 @@ from replay_daily.constants import (
     hire_cost,
     total_hire_cost,
 )
-from replay_daily.lifecycle import canonical_board
+from replay_daily.lifecycle import canonical_board, resolve_observation_step
 
 from .foreman import ForemanConfig, apply_idle_cleanup, run_foreman
 from .hiring import HiringRecommendation, recommend_hires
@@ -724,7 +724,7 @@ class ExecutorAgent:
         farm = obs["farms"][seat]
         if board is None:
             board = canonical_board(
-                farm["tiles"], int(obs["day"]), int(obs.get("step", 0)))
+                farm["tiles"], int(obs["day"]), resolve_observation_step(obs))
         crops, animals, care_done, fert_done = _board_counts(board)
         prior_debt = False
         if self._day is not None:
@@ -1438,7 +1438,7 @@ class ExecutorAgent:
         seat = self._resolve_seat(obs)
         day, hour = int(obs["day"]), int(obs["hour"])
         board = canonical_board(
-            obs["farms"][seat]["tiles"], day, int(obs.get("step", 0)))
+            obs["farms"][seat]["tiles"], day, resolve_observation_step(obs))
         self._refresh_plant_water_continuations(obs, seat, board)
         if self._day != day:
             self._new_day(obs, seat, board=board)

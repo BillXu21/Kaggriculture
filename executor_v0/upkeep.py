@@ -5,6 +5,7 @@ executor's first-available harvest behavior, not an optimized harvest policy.
 """
 from collections.abc import Mapping
 from replay_daily.constants import ANIMALS, CROPS
+from replay_daily.lifecycle import animal_placed_day
 
 WHEAT_HARVEST_THRESHOLD = 3
 FINAL_ACTIONABLE_STEP = 718
@@ -47,7 +48,9 @@ def care_has_payoff(tile: Mapping, day: int) -> bool:
     if not tile.get("fed_today") or tile.get("cared_today"):
         return False
     data = ANIMALS[tile["animal"]]
-    first = int(tile["placed_day"]) + data["first_yield_day"]
+    # Reuse the authoritative lifecycle helper so canonical `placed_day` and
+    # fast-engine `age` tiles decide identically (never a second formula).
+    first = animal_placed_day(tile, day) + data["first_yield_day"]
     earliest = max(first, day + 2)  # production precedes banking tonight
     production = first + max(0, (earliest - first + data["interval"] - 1)
                              // data["interval"]) * data["interval"]

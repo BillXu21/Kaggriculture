@@ -44,7 +44,7 @@ from bc_manager.economics import (
 from bc_manager.live import encode_live_inputs
 from executor_v0.plan import DailyPlan
 from opening_book.agent import make_opening_agent
-from oracle.backend import EngineBackend, make_backend
+from oracle.backend import EngineBackend, canonical_observations, make_backend
 from oracle.batched_backend import BatchedEngineBackend, make_batched_backend
 from oracle.canonical import canonical_state_fast
 from replay_daily.constants import total_hire_cost
@@ -520,15 +520,8 @@ class _EpisodeState:
         canonical = self.backend.canonical_state()
         if self.trace_recorder is not None:
             self.current_canonical_state = canonical
-        canonical_farms = canonical["farms"]
-        adapted = []
-        for obs in observations:
-            view = dict(obs)
-            day = int(obs["day"])
-            hour = int(obs.get("hour", 0))
-            view.setdefault("step", day * 24 + hour)
-            view["farms"] = [copy.deepcopy(farm) for farm in canonical_farms]
-            adapted.append(view)
+        adapted = canonical_observations(
+            self.backend, observations, canonical_state=canonical)
         if self.config.read_only_agent_observations:
             self.agent_obs = [_readonly_observation(view) for view in adapted]
         return adapted

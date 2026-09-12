@@ -169,14 +169,6 @@ def test_export_import_is_strict_and_preserves_cached_plan() -> None:
         restored.import_state(bad)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "official 1.32.7 observations omit 'step' for the non-acting seat; the "
-        "provider must derive step from day/hour instead of failing the live "
-        "observation contract."
-    ),
-)
 def test_provider_derives_step_when_observation_omits_it() -> None:
     provider = Stage25PlanProvider(7, 0, 3)
     obs = _obs(day=3)
@@ -185,14 +177,6 @@ def test_provider_derives_step_when_observation_omits_it() -> None:
     assert provider.crop_capacity == (1, 0, 0, 0, 0)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "fast-engine animal tiles carry 'age' (days since placement) rather "
-        "than 'placed_day'; the live corrected-E normalizer rejects the 'age' "
-        "key, so stochastic native rollouts cannot encode the observation."
-    ),
-)
 def test_provider_accepts_fast_engine_age_animal_tiles() -> None:
     provider = Stage25PlanProvider(7, 0, 3)
     obs = _obs(day=3)
@@ -201,6 +185,105 @@ def test_provider_accepts_fast_engine_age_animal_tiles() -> None:
     goose["age"] = 3
     provider.accept_classes(obs, HOLD)
     assert provider.crop_capacity == (1, 0, 0, 0, 0)
+
+
+def test_age_and_placed_day_observations_encode_identically() -> None:
+    canonical = Stage25PlanProvider(7, 0, 3)
+    fast = Stage25PlanProvider(7, 0, 3)
+    canonical.accept_classes(_obs(day=3, money=1000.0), HOLD)
+
+    fast_obs = _obs(day=3, money=1000.0)
+    goose = fast_obs["farms"][0]["tiles"][0][1]
+    del goose["placed_day"]
+    goose["age"] = 3
+    sheep = fast_obs["farms"][0]["tiles"][0][2]
+    del sheep["placed_day"]
+    sheep["age"] = 3
+    fast.accept_classes(fast_obs, HOLD)
+
+    assert fast.diagnostics["requested_crop_goals"] == \
+        canonical.diagnostics["requested_crop_goals"]
+    canonical_inputs = canonical.encoded_inputs
+    fast_inputs = fast.encoded_inputs
+    assert canonical_inputs is not None and fast_inputs is not None
+    for key in sorted(canonical_inputs):
+        np.testing.assert_array_equal(canonical_inputs[key], fast_inputs[key], err_msg=key)
+    # The caller-owned observation still carries the fast alias untouched.
+    assert goose["age"] == 3 and "placed_day" not in goose
+
+
+def test_external_provider_retains_explicit_curriculum() -> None:
+    from rl_manager.stage25_config import Stage25CurriculumConfig
+
+    enabled = Stage25CurriculumConfig(enabled=True, max_positive_crop_delta=1)
+    provider = Stage25PlanProvider(7, 0, 3, curriculum=enabled)
+    assert provider.effective_curriculum() == enabled
+    provider.accept_classes(_obs(), HOLD)
+    assert provider.provenance["curriculum_version"] == enabled.version
+    assert provider.export_state()["curriculum"]["enabled"] is True
+
+
+def test_native_checkpoint_curriculum_binds_and_rejects_mismatch(tmp_path) -> None:
+    from rl_manager.stage25_checkpoint import save_stage25_inference_checkpoint
+    from rl_manager.stage25_config import Stage25CurriculumConfig
+    from rl_manager.stage25_policy import init_stage25_params, tiny_stage25_config
+    from rl_manager.stage25_provider import Stage25NativePolicy
+
+    enabled = Stage25CurriculumConfig(enabled=True, max_positive_crop_delta=1)
+    config = tiny_stage25_config(curriculum=enabled)
+    params = init_stage25_params(config, seed=17)
+    checkpoint = tmp_path / "enabled.npz"
+    save_stage25_inference_checkpoint(checkpoint, params, config, seed=17)
+
+    # An unspecified provider curriculum adopts the checkpoint curriculum and
+    # uses exactly that support for sampling and validation.
+    policy = Stage25NativePolicy(checkpoint, seed=17, mode="deterministic")
+    provider = Stage25PlanProvider(7, 0, 3, native_policy=policy)
+    assert provider.effective_curriculum() == enabled
+    provider.daily_plan(_obs(), 0)
+    assert provider.diagnostics["curriculum_version"] == enabled.version
+    assert provider.provenance["curriculum"] == {
+        "version": enabled.version, "enabled": True,
+        "max_positive_crop_delta": 1,
+        "max_land_expansion_per_decision": None,
+        "max_animal_additions_per_species_per_decision": None,
+    }
+
+    # Explicit disagreement fails before sampling or state mutation.
+    policy2 = Stage25NativePolicy(checkpoint, seed=17, mode="deterministic")
+    policy2.act = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("native policy sampled despite curriculum mismatch"))
+    mismatch = Stage25PlanProvider(
+        7, 0, 3, native_policy=policy2,
+        curriculum=Stage25CurriculumConfig())
+    before = (mismatch.crop_capacity, mismatch.last_accepted_decision,
+              mismatch.cached_plan, mismatch.e_history)
+    with pytest.raises(Stage25ProviderError, match="curriculum"):
+        mismatch.daily_plan(_obs(), 0)
+    assert (mismatch.crop_capacity, mismatch.last_accepted_decision,
+            mismatch.cached_plan, mismatch.e_history) == before
+
+    # Explicit agreement is accepted.
+    policy3 = Stage25NativePolicy(checkpoint, seed=17, mode="deterministic")
+    agreed = Stage25PlanProvider(
+        7, 0, 3, native_policy=policy3, curriculum=enabled)
+    assert agreed.effective_curriculum() == enabled
+
+
+def test_lightweight_provider_import_precedes_real_executor_import() -> None:
+    script = """
+import sys
+import rl_manager.stage25_provider  # lightweight worker-side import first
+assert 'torch' not in sys.modules, 'provider import pulled torch'
+assert 'jax' not in sys.modules, 'provider import pulled jax'
+import executor_v0
+from executor_v0 import ExecutorAgent, PlanProvider, DailyPlan, generate_tasks
+assert ExecutorAgent and PlanProvider and DailyPlan and generate_tasks
+assert 'torch' in sys.modules, 'executor_v0 manager import did not run normally'
+"""
+    result = subprocess.run([sys.executable, "-c", script], cwd=ROOT,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_external_import_and_acceptance_can_run_with_torch_and_jax_blocked() -> None:

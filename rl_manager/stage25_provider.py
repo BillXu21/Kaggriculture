@@ -14,14 +14,11 @@ import copy
 from dataclasses import dataclass
 import hashlib
 import importlib
-import importlib.util
 import json
 import math
 from numbers import Integral
 from pathlib import Path
-import sys
-import types
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import numpy as np
 
@@ -31,8 +28,9 @@ from bc_manager.economics import (
     normalize_e_history_version,
 )
 from bc_manager.live import encode_live_inputs, validate_previous_execution
+from executor_v0.plan import DailyPlan, SELL_BIN_ANCHORS
 from replay_daily.constants import PRODUCTS
-from replay_daily.lifecycle import canonical_board
+from replay_daily.lifecycle import canonical_board, resolve_observation_step
 
 from .stage25_config import (
     Stage25CurriculumConfig,
@@ -58,55 +56,13 @@ from .stage25_mechanics import (
     unplaced_animal_counts,
 )
 
-if TYPE_CHECKING:
-    from executor_v0.plan import DailyPlan
-
-
-STATE_VERSION = "stage25_provider_state_v1"
+STATE_VERSION = "stage25_provider_state_v2"
 SOURCE_TRANSFER = "encoder_only"
 DecisionMode = Literal["deterministic", "stochastic"]
 
 
-def _executor_plan_module() -> Any:
-    """Load ``executor_v0.plan`` without executing its Torch-owning package.
-
-    The normal executor package initializer imports the legacy manager and
-    therefore Torch.  Stage 2.5's external process needs only the immutable
-    plan type.  Once the root package has already been imported, normal import
-    semantics are retained.
-    """
-    if "executor_v0.plan" in sys.modules:
-        return sys.modules["executor_v0.plan"]
-    # Never import executor_v0 as a package here: its initializer imports the
-    # Torch-owning legacy manager.  Install a package shell only when needed
-    # and load the immutable plan source directly.
-    package = sys.modules.get("executor_v0")
-    if package is None:
-        package = types.ModuleType("executor_v0")
-        package.__path__ = [str(Path(__file__).resolve().parents[1] / "executor_v0")]
-        sys.modules["executor_v0"] = package
-    plan_path = Path(__file__).resolve().parents[1] / "executor_v0" / "plan.py"
-    spec = importlib.util.spec_from_file_location("executor_v0.plan", plan_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load executor plan from {plan_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["executor_v0.plan"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _daily_plan_class() -> Any:
-    return _executor_plan_module().DailyPlan
-
-
-def _plan_constants() -> tuple[tuple[int, ...], tuple[str, ...]]:
-    module = _executor_plan_module()
-    return module.SELL_BIN_ANCHORS, PRODUCTS
-
-
-def _lower_plan(action_classes: Sequence[int], crop_goals: Sequence[int]) -> Any:
+def _lower_plan(action_classes: Sequence[int], crop_goals: Sequence[int]) -> DailyPlan:
     # Import the root-owned lowering adapter only at the transport boundary.
-    _executor_plan_module()
     module = importlib.import_module("rl_manager.stage25_plan")
     return module.lower_stage25_daily_plan(action_classes, crop_goals)
 
@@ -222,6 +178,30 @@ class Stage25DecisionKey:
                    value["row_id"])
 
 
+def _curriculum_json(config: Stage25CurriculumConfig) -> dict[str, Any]:
+    return {
+        "version": config.version,
+        "enabled": config.enabled,
+        "max_positive_crop_delta": config.max_positive_crop_delta,
+        "max_land_expansion_per_decision":
+            config.max_land_expansion_per_decision,
+        "max_animal_additions_per_species_per_decision":
+            config.max_animal_additions_per_species_per_decision,
+    }
+
+
+def _curriculum_from_json(value: object) -> Stage25CurriculumConfig:
+    if not isinstance(value, Mapping) or set(value) != {
+            "version", "enabled", "max_positive_crop_delta",
+            "max_land_expansion_per_decision",
+            "max_animal_additions_per_species_per_decision"}:
+        raise Stage25ProviderError("curriculum has an unexpected schema")
+    try:
+        return Stage25CurriculumConfig(**dict(value))
+    except (TypeError, ValueError) as exc:
+        raise Stage25ProviderError(f"curriculum is invalid: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class Stage25LifecycleState:
     """Serializable snapshot of lifecycle state, excluding executor queues."""
@@ -237,6 +217,7 @@ class Stage25LifecycleState:
     e_history: tuple[int, float] | None = None
     e_history_version: str = E_HISTORY_CORRECTED_V1
     source_history_version: str | None = None
+    curriculum: Stage25CurriculumConfig | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -258,6 +239,8 @@ class Stage25LifecycleState:
             },
             "e_history_version": self.e_history_version,
             "source_history_version": self.source_history_version,
+            "curriculum": None if self.curriculum is None
+            else _curriculum_json(self.curriculum),
         }
 
     @classmethod
@@ -266,7 +249,7 @@ class Stage25LifecycleState:
             "version", "episode_id", "seat", "manager_start_day",
             "crop_capacity", "accepted_decision", "accepted_classes",
             "crop_goals", "cached_plan", "e_history", "e_history_version",
-            "source_history_version",
+            "source_history_version", "curriculum",
         }
         if not isinstance(value, Mapping) or set(value) != expected:
             raise Stage25ProviderError(
@@ -299,8 +282,7 @@ class Stage25LifecycleState:
                     "crop_targets", "animal_targets", "land_count",
                     "fertilizer_by_crop", "care_by_animal", "sell_quantities"}:
                 raise Stage25ProviderError("cached_plan has unexpected fields")
-            plan_class = _daily_plan_class()
-            sell_anchors, products = _plan_constants()
+            sell_anchors, products = SELL_BIN_ANCHORS, PRODUCTS
             sell_rows = plan_value["sell_quantities"]
             if (not isinstance(sell_rows, Mapping)
                     or set(sell_rows) != {str(anchor) for anchor in sell_anchors}
@@ -315,7 +297,7 @@ class Stage25LifecycleState:
                 }
                 for product in products
             }
-            plan = plan_class.create(
+            plan = DailyPlan.create(
                 crop_targets=plan_value["crop_targets"],
                 animal_targets=plan_value["animal_targets"],
                 land_count=plan_value["land_count"],
@@ -338,13 +320,16 @@ class Stage25LifecycleState:
         source = value["source_history_version"]
         if source is not None:
             source = normalize_e_history_version(source)
+        curriculum_value = value["curriculum"]
+        curriculum = None if curriculum_value is None else \
+            _curriculum_from_json(curriculum_value)
         return cls(
             episode_id=_json_scalar(value["episode_id"], "episode_id"),
             seat=value["seat"], manager_start_day=value["manager_start_day"],
             crop_capacity=crop_capacity, accepted_decision=key,
             accepted_classes=classes, crop_goals=goals, cached_plan=plan,
             e_history=history, e_history_version=operating,
-            source_history_version=source,
+            source_history_version=source, curriculum=curriculum,
         )
 
 
@@ -456,6 +441,15 @@ class Stage25NativePolicy:
         from rl_manager.stage25_policy import greedy_act, stochastic_act
         return self._params, self._config, greedy_act, stochastic_act
 
+    def load_config(self) -> Any:
+        """Return the effective static config, loading the checkpoint once.
+
+        The provider uses this to bind its validation curriculum to the exact
+        checkpoint curriculum before sampling or mutating lifecycle state.
+        """
+        self._ensure_loaded()
+        return self._config
+
     def act(
         self, inputs: Mapping[str, np.ndarray], physical_context: PhysicalContext,
         *, row_id: str, mode: DecisionMode | None = None,
@@ -504,9 +498,14 @@ class Stage25PlanProvider:
             manager_start_day, "manager_start_day")
         self.mode = _mode(mode)
         self.seed = _scalar_int(seed, "seed")
-        self.curriculum = curriculum or Stage25CurriculumConfig()
-        if not isinstance(self.curriculum, Stage25CurriculumConfig):
+        if curriculum is not None and not isinstance(
+                curriculum, Stage25CurriculumConfig):
             raise TypeError("curriculum must be Stage25CurriculumConfig")
+        # ``None`` means "adopt the native checkpoint's curriculum"; an explicit
+        # value must agree with it before inference or state mutation.
+        self._curriculum_explicit = curriculum is not None
+        self.curriculum = curriculum or Stage25CurriculumConfig()
+        self._bound_curriculum: Stage25CurriculumConfig | None = None
         self.e_history_version = E_HISTORY_CORRECTED_V1
         self.source_history_version = None if source_history_version is None else \
             normalize_e_history_version(source_history_version)
@@ -573,6 +572,33 @@ class Stage25PlanProvider:
         return {key: np.array(value, copy=True)
                 for key, value in self._last_inputs.items()}
 
+    def effective_curriculum(self) -> Stage25CurriculumConfig:
+        """Return the one effective curriculum, binding before first use.
+
+        With a native checkpoint and no explicit curriculum, adopt the
+        checkpoint's curriculum. An explicitly supplied curriculum must match
+        it exactly; otherwise sampling would use one support while validation
+        used another.
+        """
+        if self._bound_curriculum is None:
+            checkpoint_curriculum = None
+            loader = getattr(self._native_policy, "load_config", None)
+            if callable(loader):
+                checkpoint_curriculum = getattr(
+                    loader(), "curriculum", None)
+            if checkpoint_curriculum is None:
+                self._bound_curriculum = self.curriculum
+            elif self._curriculum_explicit:
+                if self.curriculum != checkpoint_curriculum:
+                    raise Stage25ProviderError(
+                        "explicit provider curriculum does not match the native "
+                        "checkpoint curriculum; refusing to sample or mutate state")
+                self._bound_curriculum = self.curriculum
+            else:
+                self.curriculum = checkpoint_curriculum
+                self._bound_curriculum = checkpoint_curriculum
+        return self._bound_curriculum
+
     @property
     def state(self) -> Stage25LifecycleState:
         return Stage25LifecycleState(
@@ -586,13 +612,17 @@ class Stage25PlanProvider:
             e_history=self._e_history,
             e_history_version=self.e_history_version,
             source_history_version=self.source_history_version,
+            curriculum=self.effective_curriculum(),
         )
 
     @property
     def provenance(self) -> dict[str, Any]:
+        curriculum = self.effective_curriculum()
         result = {
             "e_history_version": self.e_history_version,
             "e_identity": {"variant": "E", "history_version": self.e_history_version},
+            "curriculum_version": curriculum.version,
+            "curriculum": _curriculum_json(curriculum),
         }
         if self.source_history_version is not None:
             result["source_history_version"] = self.source_history_version
@@ -639,9 +669,13 @@ class Stage25PlanProvider:
             raise Stage25ProviderError("obs must be a mapping")
         if "day" not in obs:
             raise Stage25ProviderError("obs is missing day")
+        # One resolved absolute step feeds the live encoder and the physical
+        # context, so both consumers share lifecycle timing. The caller's
+        # observation is not mutated.
+        step = resolve_observation_step(obs)
         previous = validate_previous_execution(previous_execution)
         inputs = encode_live_inputs(
-            obs, self.seat, previous, step=obs.get("step"),
+            obs, self.seat, previous, step=step,
             economic_prev_start=self._e_history,
             e_history_version=self.e_history_version,
         )
@@ -654,8 +688,7 @@ class Stage25PlanProvider:
         private = obs.get("private") or {}
         unplaced = unplaced_animal_counts(
             private.get("shed") or {}, private.get("inventories") or ())
-        board = canonical_board(
-            farm["tiles"], int(obs["day"]), int(obs.get("step", 0)))
+        board = canonical_board(farm["tiles"], int(obs["day"]), step)
         context = physical_context_from_board(
             board, farm["unlocked_quadrants"],
             unplaced_animals=unplaced,
@@ -667,23 +700,30 @@ class Stage25PlanProvider:
         goals: tuple[int, ...], plan: DailyPlan, inputs: dict[str, np.ndarray],
         obs: Mapping[str, Any],
     ) -> DailyPlan:
+        # Compute every fallible value before mutating lifecycle fields so a
+        # malformed observation (e.g. missing daily-start money) can never
+        # leave a partially-applied decision.
+        e_history = (int(obs["day"]), float(obs["farms"][self.seat]["money"]))
+        last_inputs = {name: np.array(value, copy=True)
+                       for name, value in inputs.items()}
+        curriculum = self.effective_curriculum()
+        diagnostics = {
+            "decision_identity": key.identity,
+            "requested_classes": classes,
+            "requested_crop_goals": goals,
+            "plan": plan.to_json_dict(),
+            "curriculum_version": curriculum.version,
+            "e_history_version": self.e_history_version,
+        }
         # All validation and policy work has completed before this point.
         self._crop_capacity = goals
         self._accepted_key = key
         self._accepted_classes = classes
         self._crop_goals = goals
         self._cached_plan = plan
-        self._e_history = (int(obs["day"]), float(obs["farms"][self.seat]["money"]))
-        self._last_inputs = {name: np.array(value, copy=True)
-                             for name, value in inputs.items()}
-        self._diagnostics = {
-            "decision_identity": key.identity,
-            "requested_classes": classes,
-            "requested_crop_goals": goals,
-            "plan": plan.to_json_dict(),
-            "curriculum_version": self.curriculum.version,
-            "e_history_version": self.e_history_version,
-        }
+        self._e_history = e_history
+        self._last_inputs = last_inputs
+        self._diagnostics = diagnostics
         return plan
 
     def accept_classes(
@@ -701,8 +741,9 @@ class Stage25PlanProvider:
         key = self._key(day, decision_key, decision_id)
         self._check_delivery(key)
         classes = _class_tuple(action_classes)
+        curriculum = self.effective_curriculum()
         inputs, context, initial = self._stage_observation(obs, previous_execution)
-        goals = _validate_action(classes, initial, context, self.curriculum)
+        goals = _validate_action(classes, initial, context, curriculum)
         plan = _lower_plan(classes, goals)
         return self._commit(key, classes, goals, plan, inputs, obs)
 
@@ -746,6 +787,9 @@ class Stage25PlanProvider:
                 "external provider requires accept_classes before daily_plan")
         key = self._key(day, decision_key, decision_id)
         self._check_delivery(key)
+        # Bind the effective curriculum before sampling so a checkpoint/config
+        # mismatch fails before inference or state mutation.
+        curriculum = self.effective_curriculum()
         inputs, context, initial = self._stage_observation(obs, previous_execution)
         native = self._native_policy
         if hasattr(native, "act"):
@@ -756,7 +800,7 @@ class Stage25PlanProvider:
         else:
             raise TypeError("native_policy must provide act() or be callable")
         classes_tuple = _class_tuple(sampled)
-        goals = _validate_action(classes_tuple, initial, context, self.curriculum)
+        goals = _validate_action(classes_tuple, initial, context, curriculum)
         plan = _lower_plan(classes_tuple, goals)
         return self._commit(key, classes_tuple, goals, plan, inputs, obs)
 
@@ -781,6 +825,10 @@ class Stage25PlanProvider:
                 "provider state identity/configuration does not match owner")
         if snapshot.e_history_version != self.e_history_version:
             raise Stage25ProviderError("only corrected-E operating history is supported")
+        if snapshot.curriculum is None \
+                or snapshot.curriculum != self.effective_curriculum():
+            raise Stage25ProviderError(
+                "provider state curriculum does not match the effective curriculum")
         # Validate cross-field invariants before mutating this provider.
         if (snapshot.accepted_decision is None) != (snapshot.cached_plan is None):
             raise Stage25ProviderError("accepted decision and cached plan must agree")

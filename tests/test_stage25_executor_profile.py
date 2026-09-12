@@ -175,14 +175,6 @@ def test_failed_expansion_keeps_requested_and_feasible_plans_distinct():
     assert record["land_purchase"]["submitted"] is False
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the required Stage 2.5 heuristic_care profile crashes on the "
-        "fast-engine animal tile shape, which carries 'age' instead of "
-        "'placed_day', so the native-provider smoke fails in stochastic mode."
-    ),
-)
 def test_heuristic_care_accepts_fast_engine_age_tiles():
     from executor_v0.upkeep import care_has_payoff
 
@@ -190,6 +182,23 @@ def test_heuristic_care_accepts_fast_engine_age_tiles():
             "fed_today": True, "cared_today": False}
     # Must decide using 'age' (current_day - age) rather than raising KeyError.
     assert care_has_payoff(tile, 3) in (True, False)
+
+
+def test_heuristic_care_canonical_and_age_tiles_decide_identically():
+    from executor_v0.upkeep import care_has_payoff
+
+    for animal, age in (("GOOSE", 0), ("COW", 2), ("SHEEP", 3)):
+        canonical = {"kind": "PASTURE", "animal": animal, "placed_day": 3 - age,
+                     "fed_today": True, "cared_today": False}
+        fast = {"kind": "PASTURE", "animal": animal, "age": age,
+                "fed_today": True, "cared_today": False}
+        assert care_has_payoff(fast, 3) == care_has_payoff(canonical, 3)
+    # Same-day placement (age 0) is the boundary case: placed today.
+    assert care_has_payoff(
+        {"kind": "COOP", "animal": "GOOSE", "age": 0,
+         "fed_today": True, "cared_today": False}, 3) == care_has_payoff(
+        {"kind": "COOP", "animal": "GOOSE", "placed_day": 3,
+         "fed_today": True, "cared_today": False}, 3)
 
 
 def test_goal_change_releases_obsolete_plant_and_conversion_queue_work():
@@ -225,3 +234,45 @@ def test_goal_change_releases_obsolete_plant_and_conversion_queue_work():
     )
     assert dispatch.assignments[0].task_key == new_plant.key
     assert dispatch.assignments[0].action != ("PLANT", "WHEAT")
+
+
+def test_provider_executor_lowers_persistent_goals_and_releases_stale_work():
+    from rl_manager.stage25_provider import Stage25PlanProvider
+
+    # Real path: external provider -> Stage 2.5 factory -> ExecutorAgent.
+    provider = Stage25PlanProvider("packet4-reduction", seat=0, manager_start_day=3)
+    agent = make_stage25_executor_factory().create(
+        backend_name="fixture", seat=0, configuration={}, provider=provider)
+
+    flat_land_animals = (0, 0, 0, 0)
+    day3 = agent_obs(day=3, hour=0, farmer=(0, 0), seeds={"WHEAT": 2},
+                     unlocked=("NW",))
+    # First boundary: observed WHEAT=0, +2 => persistent goal 2.
+    provider.accept_classes(day3, (*flat_land_animals, 102, 100, 100, 100, 100))
+    agent(day3)
+    day3_record = agent.diagnostics_json()["days"]["3"]
+    assert day3_record["requested"]["crop_targets"]["WHEAT"] == 2
+    stale_plants = [task["key"] for task in agent.debug_trace_turn["tasks"]
+                    if task["kind"] == "PLANT"]
+    assert stale_plants
+
+    day4 = agent_obs(day=4, hour=0, farmer=(0, 0), seeds={"WHEAT": 2},
+                     unlocked=("NW",))
+    # A new decision lowers the same persistent goal back to 0. The obsolete
+    # PLANT work must be invalidated, not executed or replaced by destruction.
+    provider.accept_classes(day4, (*flat_land_animals, 98, 100, 100, 100, 100))
+    day4_action = agent(day4)
+    day4_record = agent.diagnostics_json()["days"]["4"]
+    assert day4_record["requested"]["crop_targets"]["WHEAT"] == 0
+    assert day4_record["feasible"]["crop_targets"]["WHEAT"] == 0
+    assert not any(task["kind"] == "PLANT"
+                   for task in agent.debug_trace_turn["tasks"])
+    # The reduction is a maintenance-goal change, not unconditional destruction.
+    assert not any(task["kind"] in ("DIG", "BUILD_COOP", "BUILD_PASTURE")
+                   for task in agent.debug_trace_turn["tasks"])
+    # No stale plant survives in the persistent queue and no PLANT is executed.
+    assert day4_record["scheduler"]["queue_lengths"].get("0", 0) == 0
+    submitted_ops = [op for action in (day4_action["farmer"], *day4_action["hands"])
+                     for op in (action[:1] if action else [])]
+    assert "PLANT" not in submitted_ops
+    assert stale_plants  # the day-3 baseline really queued obsolete PLANT work

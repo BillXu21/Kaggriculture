@@ -37,6 +37,8 @@ from replay_daily.storage import (
     normalize_shared_state,
 )
 
+from replay_daily.lifecycle import resolve_observation_step
+
 from .adapter import _input_arrays_from_starts
 from .economics import (
     E_HISTORY_CORRECTED_V1,
@@ -101,10 +103,11 @@ def encode_live_inputs(
 ) -> dict[str, np.ndarray]:
     """Encode one raw live 1.32.7 observation into one-row BC input arrays.
 
-    `step` resolution order: explicit argument, then `obs["step"]`. Compiled
-    replays may omit per-seat `step`; live engine observations carry it. There
-    is no silent default because lifecycle timing (`past_lifespan`) depends on
-    it.
+    `step` resolution order: explicit argument, then `obs["step"]`, then the
+    pinned engine convention ``day*24 + hour``. Official 1.32.7 observations
+    omit per-seat `step` for the non-acting seat, so the derived form is
+    required; it is validated against `obs["day"]`/`obs["hour"]` rather than
+    silently defaulted.
 
     Economic context (issue #6 variant E) is emitted only when explicitly
     requested via exactly one of:
@@ -150,15 +153,9 @@ def encode_live_inputs(
 
     day = _require_int(obs["day"], "obs['day']")
     hour = _require_int(obs["hour"], "obs['hour']")
-    resolved_step: int | None
-    if step is not None:
-        resolved_step = _require_int(step, "step")
-    elif obs.get("step") is not None:
-        resolved_step = _require_int(obs["step"], "obs['step']")
-    else:
-        raise ValueError(
-            "live observation has no 'step' field; pass step= explicitly "
-            "(lifecycle timing depends on it)")
+    # Preserve an explicit valid step; otherwise resolve the pinned
+    # day*24 + hour convention with day/hour validation.
+    resolved_step = resolve_observation_step(obs, step=step)
     prev = validate_previous_execution(previous_execution)
 
     start: dict[str, Any] = {

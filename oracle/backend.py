@@ -17,7 +17,10 @@ agent logic — callers submit explicit action pairs.
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Mapping, Protocol, Sequence
+
+from replay_daily.lifecycle import resolve_observation_step
 
 SUPPORTED_BACKENDS = ("official", "fast")
 
@@ -38,6 +41,31 @@ class EngineBackend(Protocol):
 
     @property
     def statuses(self) -> list[str]: ...
+
+
+def canonical_observations(
+    backend: EngineBackend,
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    canonical_state: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Return live observations with canonical farms and a resolved step.
+
+    Reuses the public ``EngineBackend.canonical_state`` seam (the established
+    runner/backend canonicalization path) so fast-engine tile aliases (``age``)
+    and missing per-seat ``step`` values never reach the executor or the live
+    encoder. Caller-owned observations are never mutated.
+    """
+    state = backend.canonical_state() if canonical_state is None else canonical_state
+    canonical_farms = state["farms"]
+    adapted: list[dict[str, Any]] = []
+    for obs in observations:
+        view = dict(obs)
+        # Preserve an explicit step; validate/derive otherwise.
+        view["step"] = resolve_observation_step(obs)
+        view["farms"] = [copy.deepcopy(farm) for farm in canonical_farms]
+        adapted.append(view)
+    return adapted
 
 
 class FastBackendAdapter:

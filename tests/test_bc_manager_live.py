@@ -237,12 +237,17 @@ def test_missing_required_obs_fields_fail_clearly(missing):
         encode_live_inputs(obs, 0)
 
 
-def test_missing_step_fails_without_explicit_override():
+def test_missing_step_derives_pinned_day_hour_convention():
     obs = make_obs10(0)
     del obs["step"]
-    with pytest.raises(ValueError, match="step"):
-        encode_live_inputs(obs, 0)
-    # Explicit override resolves the same lifecycle timing as obs["step"].
+    derived = encode_live_inputs(obs, 0, NONZERO_PREV)
+
+    explicit_obs = make_obs10(0)
+    explicit_obs["step"] = explicit_obs["day"] * 24 + explicit_obs["hour"]
+    explicit = encode_live_inputs(explicit_obs, 0, NONZERO_PREV)
+    assert_parity(derived, explicit)
+
+    # An explicit valid step is still preserved (here the fixture's step=100).
     assert_parity(encode_live_inputs(make_obs10(0), 0, NONZERO_PREV, step=100),
                   reference_inputs(make_obs10(0), 0, NONZERO_PREV, False))
 
