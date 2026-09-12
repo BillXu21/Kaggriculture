@@ -36,6 +36,8 @@ from replay_daily.storage import (
 from .stage25_data import (
     OutcomeProxyBuild,
     OutcomeProxyLabel,
+    _date as _data_date,
+    _score as _data_score,
     build_outcome_proxy_labels,
 )
 
@@ -209,11 +211,12 @@ def _identity(source: _SourceRow, record: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _selected(record: Mapping[str, Any], dates: set[str], min_score: float) -> tuple[bool, str | None]:
+    # Share the Packet 1B selection semantics so the adapter can never filter a
+    # row differently from the authoritative outcome-proxy builder.
     metadata = record["metadata"]
-    date = metadata.get("partition_date", metadata.get("date"))
-    if str(date) not in dates:
+    if str(_data_date(record, metadata)) not in dates:
         return False, "date"
-    score = metadata.get("min_score", metadata.get("score"))
+    score = _data_score(record, metadata)
     if score is None or float(score) < float(min_score):
         return False, "score"
     return True, None

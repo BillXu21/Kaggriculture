@@ -73,6 +73,15 @@ _REQUIRED_META = frozenset({
     "executor", "leaf_manifest",
 })
 
+# Metadata fields written by ``_metadata`` itself (required plus optional).
+# Generic ``metadata`` must never collide with these; callers must use the
+# explicit arguments so history/source identity can never be silently dropped.
+_OWNED_META = _REQUIRED_META | frozenset({
+    "source_e_identity", "step", "epoch", "optimizer_config",
+    "optimizer_leaf_count", "optimizer_leaf_manifest", "optimizer_tree",
+    "data_order_position", "resume_boundary",
+})
+
 
 def _flatten_arrays(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
     """Flatten a parameter/state pytree without accepting arbitrary objects."""
@@ -199,7 +208,8 @@ def _metadata(*, payload_kind: str, config: Stage25ModelConfig, seed: int,
               source_identity: Mapping[str, Any] | None,
               provenance: Mapping[str, Any] | None,
               executor: Mapping[str, Any] | None,
-              e_history_version: str, step: int | None = None,
+              e_history_version: str, source_history_version: str | None = None,
+              step: int | None = None,
               epoch: int | None = None, optimizer_config: Any = None,
               data_order_position: Any = None) -> dict[str, Any]:
     history = normalize_e_history_version(e_history_version)
@@ -232,6 +242,12 @@ def _metadata(*, payload_kind: str, config: Stage25ModelConfig, seed: int,
         "executor": _jsonable(executor or {}),
         "leaf_manifest": _leaf_manifest(flat),
     }
+    if source_history_version is not None:
+        required["source_e_identity"] = {
+            "variant": "E",
+            "history_version": normalize_e_history_version(source_history_version),
+            "transfer": "encoder_only",
+        }
     if step is not None:
         required["step"] = int(step)
     if epoch is not None:
@@ -246,9 +262,13 @@ def _metadata(*, payload_kind: str, config: Stage25ModelConfig, seed: int,
         extras = _jsonable(metadata)
         if not isinstance(extras, Mapping):
             raise Stage25CheckpointError("metadata must be a mapping")
-        for key, value in extras.items():
-            if key not in _REQUIRED_META:
-                required[key] = value
+        collisions = sorted(set(extras) & _OWNED_META)
+        if collisions:
+            raise Stage25CheckpointError(
+                f"metadata contains reserved checkpoint keys {collisions}; pass "
+                f"them through the explicit operating/source-history, "
+                f"source_identity, provenance, or executor arguments instead")
+        required.update(extras)
     return required
 
 
@@ -339,6 +359,18 @@ def _validate_meta(meta: Mapping[str, Any], path: Path, expected_kind: str) -> N
     if not isinstance(identity, Mapping) or identity.get("variant") != "E" \
             or identity.get("history_version") != history:
         raise Stage25CheckpointError(f"{path}: corrected E identity is inconsistent")
+    source_identity_meta = meta.get("source_e_identity")
+    if source_identity_meta is not None:
+        if (not isinstance(source_identity_meta, Mapping)
+                or source_identity_meta.get("variant") != "E"
+                or source_identity_meta.get("transfer") != "encoder_only"):
+            raise Stage25CheckpointError(
+                f"{path}: source E identity is inconsistent")
+        try:
+            normalize_e_history_version(source_identity_meta.get("history_version"))
+        except Exception as exc:
+            raise Stage25CheckpointError(
+                f"{path}: invalid source E history version") from exc
     if meta.get("resume_boundary") not in (None, RESUME_BOUNDARY):
         raise Stage25CheckpointError(f"{path}: unsupported resume boundary")
     if expected_kind == BC_TRAINING_PAYLOAD_KIND:
@@ -452,6 +484,7 @@ def save_stage25_inference_checkpoint(
     provenance: Mapping[str, Any] | None = None,
     executor: Mapping[str, Any] | None = None,
     e_history_version: str = E_HISTORY_CORRECTED_V1,
+    source_history_version: str | None = None,
 ) -> Path:
     """Save inference parameters with an atomic replace."""
     template = init_stage25_params(config, seed=int(seed))
@@ -460,7 +493,8 @@ def save_stage25_inference_checkpoint(
     meta = _metadata(payload_kind=INFERENCE_PAYLOAD_KIND, config=config,
                      seed=int(seed), flat=flat, metadata=metadata,
                      source_identity=source_identity, provenance=provenance,
-                     executor=executor, e_history_version=e_history_version)
+                     executor=executor, e_history_version=e_history_version,
+                     source_history_version=source_history_version)
     return _write_archive(path, flat, meta)
 
 
@@ -494,6 +528,7 @@ def save_stage25_bc_checkpoint(
     provenance: Mapping[str, Any] | None = None,
     executor: Mapping[str, Any] | None = None,
     e_history_version: str = E_HISTORY_CORRECTED_V1,
+    source_history_version: str | None = None,
 ) -> Path:
     """Save resumable BC state at the post-update/pre-next-batch boundary."""
     if optimizer_config is None:
@@ -532,6 +567,7 @@ def save_stage25_bc_checkpoint(
                      seed=int(seed), flat=arrays, metadata=metadata,
                      source_identity=source_identity, provenance=provenance,
                      executor=executor, e_history_version=e_history_version,
+                     source_history_version=source_history_version,
                      step=int(step), epoch=int(epoch), optimizer_config=optimizer_config,
                      data_order_position=data_order_position)
     meta["optimizer_leaf_count"] = len(opt_arrays)

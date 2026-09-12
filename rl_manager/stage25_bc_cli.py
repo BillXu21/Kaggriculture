@@ -8,6 +8,10 @@ from pathlib import Path
 import jax
 import numpy as np
 
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    normalize_e_history_version,
+)
 from rl_manager.stage25_bc import (
     Stage25BCConfig,
     import_encoder_checkpoint,
@@ -18,6 +22,7 @@ from rl_manager.stage25_bc import (
     save_checkpoint,
     train_step,
 )
+from rl_manager.stage25_checkpoint import Stage25CheckpointError
 from rl_manager.stage25_policy import Stage25ModelConfig, init_stage25_params
 
 
@@ -36,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=Path("stage25_bc.npz"))
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--import", dest="import_path", type=Path)
+    parser.add_argument(
+        "--allow-legacy-e", action="store_true",
+        help="allow a legacy E-history source encoder import (source only; "
+             "Stage 2.5 operating history stays corrected)")
     parser.add_argument("--date", dest="dates", action="append")
     parser.add_argument("--min-score", type=float, default=2950.0)
     return parser
@@ -77,10 +86,21 @@ def main(argv: list[str] | None = None) -> int:
     model = _model(args.model_size)
     config = Stage25BCConfig(model=model, batch_size=args.batch_size,
                              lr=args.lr, weight_decay=args.weight_decay)
-    import_meta = {}
+    operating_history = E_HISTORY_CORRECTED_V1
+    source_history = None
+    source_identity = None
+    provenance = None
+    executor = None
     if args.import_path:
         params, import_meta = import_encoder_checkpoint(
-            args.import_path, model, seed=args.seed, return_metadata=True)
+            args.import_path, model, seed=args.seed,
+            allow_legacy_e=args.allow_legacy_e, return_metadata=True)
+        source_history = import_meta.get("e_history_version")
+        source_identity = dict(import_meta.get("source_identity") or {})
+        source_identity["e_identity"] = import_meta.get("e_identity")
+        source_identity["transfer"] = import_meta.get("imported")
+        provenance = {"historical_import": import_meta.get("imported"),
+                      "source_e_history_version": source_history}
     else:
         params = init_stage25_params(model, seed=args.seed)
     rng = jax.random.PRNGKey(args.seed)
@@ -89,14 +109,35 @@ def main(argv: list[str] | None = None) -> int:
     epoch = 0
     resume_batch = 0
     if args.resume:
-        params, opt_state, rng, meta = load_checkpoint(args.resume, config=config,
-                                                        params=params, seed=args.seed)
+        try:
+            params, opt_state, rng, meta = load_checkpoint(
+                args.resume, config=config, params=params, seed=args.seed,
+                expected_e_history_version=E_HISTORY_CORRECTED_V1,
+                allow_legacy_e=False)
+        except Stage25CheckpointError as exc:
+            raise ValueError(
+                "the BC CLI supports corrected-E operating history only; "
+                f"cannot resume {args.resume}: {exc}") from exc
         step = int(meta.get("step", 0))
         epoch = int(meta.get("epoch", 0))
-        position = meta.get("data_order_position", {})
-        if isinstance(position, dict):
-            epoch = int(position.get("epoch", epoch))
-            resume_batch = int(position.get("batch", 0))
+        cursor = meta.get("data_order_position", {})
+        if isinstance(cursor, dict):
+            epoch = int(cursor.get("epoch", epoch))
+            resume_batch = int(cursor.get("batch", 0))
+        operating_history = normalize_e_history_version(
+            meta.get("e_history_version", E_HISTORY_CORRECTED_V1))
+        if operating_history != E_HISTORY_CORRECTED_V1:
+            raise ValueError(
+                "the BC CLI supports corrected-E operating history only; "
+                f"checkpoint operating history is {operating_history!r}")
+        stored_source = meta.get("source_e_identity") or {}
+        if source_history is None:
+            source_history = stored_source.get("history_version")
+        if source_identity is None:
+            source_identity = dict(meta.get("source_identity") or {})
+        if provenance is None:
+            provenance = dict(meta.get("provenance") or {})
+        executor = dict(meta.get("executor") or {})
     remaining = args.steps
     position = {"epoch": epoch, "batch": resume_batch}
     for epoch_offset in range(args.epochs):
@@ -119,17 +160,14 @@ def main(argv: list[str] | None = None) -> int:
                   f"valid_rows={int(metrics['valid_rows'])}", flush=True)
         if remaining == 0:
             break
-    checkpoint_metadata = {}
-    if import_meta:
-        checkpoint_metadata = {
-            "source_identity": import_meta.get("source_identity", {}),
-            "e_history_version": import_meta.get("e_history_version"),
-            "e_identity": import_meta.get("e_identity", {}),
-            "historical_import": "encoder_only",
-        }
     save_checkpoint(args.output, params, opt_state, rng, config=config,
                     step=step, epoch=epoch, seed=args.seed,
-                    shuffle_state=position, metadata=checkpoint_metadata)
+                    shuffle_state=position,
+                    e_history_version=operating_history,
+                    source_history_version=source_history,
+                    source_identity=source_identity,
+                    provenance=provenance,
+                    executor=executor)
     return 0
 
 

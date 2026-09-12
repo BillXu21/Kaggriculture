@@ -18,13 +18,17 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from bc_manager.economics import (
+    E_HISTORY_CORRECTED_V1,
+    E_HISTORY_LEGACY,
+    normalize_e_history_version,
+)
 from rl_manager.stage25_policy import (
     ACTION_CLASS_COUNTS,
     Stage25ModelConfig,
     _host_contexts,
     _host_inputs,
     _stage25_jit,
-    evaluate_actions,
     init_stage25_params,
 )
 
@@ -244,18 +248,21 @@ def _core_inputs(batch: Stage25BCBatch, model: Stage25ModelConfig):
     return prepared, capacity, contexts, row_ids, explicit
 
 
-def _validated_output(params: Mapping[str, Any], batch: Stage25BCBatch,
-                     model: Stage25ModelConfig) -> Mapping[str, Any]:
-    # Keep this host call before optimizer work: invalid chains fail loudly.
-    return evaluate_actions(
-        params, batch.inputs, model, actions=batch.actions,
-        physical_contexts=batch.physical_contexts, row_ids=batch.row_ids,
-        reject_invalid=True)
+def _eval_output(params: Mapping[str, Any], batch: Stage25BCBatch,
+                 model: Stage25ModelConfig) -> Mapping[str, Any]:
+    """One encoder pass in the shared eval mode (no dropout)."""
+    prepared, capacity, contexts, row_ids, explicit = _core_inputs(batch, model)
+    keys = jnp.zeros((batch.actions.shape[0], 2), dtype=jnp.uint32)
+    return _stage25_jit(
+        params, prepared, capacity, keys, jnp.asarray(batch.actions, jnp.int32),
+        contexts, row_ids, model, "eval", explicit)
 
 
 def _training_output(params: Mapping[str, Any], batch: Stage25BCBatch,
                      model: Stage25ModelConfig, rng: Any) -> Mapping[str, Any]:
     """Run the shared policy core in its explicit training/dropout mode."""
+    if rng is None:
+        raise ValueError("training requires an explicit rng")
     prepared, capacity, contexts, row_ids, explicit = _core_inputs(batch, model)
     key = _normal_key(rng)
     keys = jnp.broadcast_to(key, (batch.actions.shape[0], 2))
@@ -265,24 +272,31 @@ def _training_output(params: Mapping[str, Any], batch: Stage25BCBatch,
 
 
 def _metrics_from_output(output: Mapping[str, Any], actions: jax.Array,
-                         real_mask: jax.Array, *, rng: jax.Array,
-                         dropout: float, training: bool) -> tuple[jax.Array, dict[str, jax.Array]]:
-    logits = jnp.asarray(output["logits"], dtype=jnp.float32)
+                         real_mask: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """Masked reduction of the policy's teacher-forced conditional likelihood.
+
+    The policy owns support masking and invalid-step zeroing, so BC consumes
+    its ``component_logprobs``/``joint_logprob`` directly and never recomputes
+    a second masked log-softmax or NLL.  Logits are used only for accuracy
+    diagnostics.
+    """
+    component_nll = -jnp.asarray(output["component_logprobs"], dtype=jnp.float32)
+    joint_nll = -jnp.asarray(output["joint_logprob"], dtype=jnp.float32)
     support = jnp.asarray(output["masks"], dtype=bool)
-    safe_logits = jnp.where(support, logits, -1.0e30)
-    log_norm = jax.nn.logsumexp(safe_logits, axis=-1)
-    selected = jnp.take_along_axis(safe_logits,
-                                   actions[..., None], axis=-1)[..., 0]
-    component_nll = log_norm - selected
-    predictions = jnp.argmax(safe_logits, axis=-1)
+    logits = jnp.asarray(output["logits"], dtype=jnp.float32)
+    predictions = jnp.argmax(jnp.where(support, logits, -1.0e30), axis=-1)
     row_mask = real_mask.astype(jnp.float32)
     denominator = jnp.maximum(jnp.sum(row_mask), 1.0)
-    joint_rows = jnp.sum(component_nll, axis=1)
-    loss = jnp.sum(joint_rows * row_mask) / denominator
+    loss = jnp.sum(joint_nll * row_mask) / denominator
     per_step_nll = jnp.sum(component_nll * row_mask[:, None], axis=0) / denominator
     per_step_accuracy = jnp.sum(
         (predictions == actions).astype(jnp.float32) * row_mask[:, None],
         axis=0) / denominator
+    counts = jnp.asarray(ACTION_CLASS_COUNTS)
+    in_range = (actions >= 0) & (actions < counts[None, :])
+    safe = jnp.where(in_range, actions, 0)
+    step_supported = jnp.take_along_axis(
+        support, safe[..., None], axis=-1)[..., 0] & in_range
     metrics = {
         "loss": loss,
         "joint_nll": loss,
@@ -293,8 +307,30 @@ def _metrics_from_output(output: Mapping[str, Any], actions: jax.Array,
         "step_accuracy": per_step_accuracy,
         "valid_rows": jnp.sum(row_mask),
         "validity": jnp.asarray(output["valid"]),
+        "step_supported": step_supported,
+        "step_in_range": in_range,
     }
     return loss, metrics
+
+
+def _ensure_supported(metrics: Mapping[str, Any], actions: Any,
+                      real_mask: Any) -> None:
+    """Fail before any optimizer update if a real row has an invalid action."""
+    supported = np.asarray(metrics["step_supported"], dtype=bool)
+    in_range = np.asarray(metrics["step_in_range"], dtype=bool)
+    mask = np.asarray(real_mask, dtype=bool)
+    invalid = (~supported) & mask[:, None]
+    if not invalid.any():
+        return
+    row, step = (int(value) for value in np.argwhere(invalid)[0])
+    action = int(np.asarray(actions)[row, step])
+    if bool(in_range[row, step]):
+        raise ValueError(
+            f"teacher-forced action at row {row} step {step} (class {action}) "
+            f"is physically unsupported")
+    raise ValueError(
+        f"teacher-forced action at row {row} step {step} (class {action}) "
+        f"is outside its vocabulary")
 
 
 def loss_and_metrics(
@@ -307,13 +343,14 @@ def loss_and_metrics(
     model = _model_config(config)
     if training and settings.train_dropout and rng is None:
         raise ValueError("training with nonzero dropout requires an explicit rng")
-    output = _validated_output(params, batch, model)
-    if training and settings.train_dropout:
+    if training:
         output = _training_output(params, batch, model, rng)
+    else:
+        output = _eval_output(params, batch, model)
+    labels = jnp.asarray(batch.actions, jnp.int32)
     loss, metrics = _metrics_from_output(
-        output, jnp.asarray(batch.actions, jnp.int32),
-        jnp.asarray(batch.real_row_mask), rng=_normal_key(rng),
-        dropout=settings.train_dropout, training=training)
+        output, labels, jnp.asarray(batch.real_row_mask))
+    _ensure_supported(metrics, batch.actions, batch.real_row_mask)
     del loss
     return {name: np.asarray(value) if name != "loss" else value
             for name, value in metrics.items()}
@@ -353,7 +390,6 @@ def train_step(
     if settings.train_dropout and rng is None:
         raise ValueError("training with nonzero dropout requires an explicit rng")
     key = _normal_key(rng)
-    _validated_output(params, batch, model)
     prepared, capacity, contexts, row_ids, explicit = _core_inputs(batch, model)
     labels = jnp.asarray(batch.actions, dtype=jnp.int32)
     real_mask = jnp.asarray(batch.real_row_mask)
@@ -365,11 +401,13 @@ def train_step(
             tree, prepared, capacity, train_keys, labels,
             contexts, row_ids, model,
             "train" if settings.train_dropout else "eval", explicit)
-        return _metrics_from_output(
-            output, labels, real_mask, rng=key,
-            dropout=settings.train_dropout, training=True)
+        return _metrics_from_output(output, labels, real_mask)
 
     (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(params)
+    # A single encoder pass produces both the objective and the exact policy
+    # support; invalid real actions fail here, before the optimizer or RNG are
+    # advanced, so diagnostic zero placeholders never enter an update.
+    _ensure_supported(metrics, batch.actions, batch.real_row_mask)
     updates, next_opt_state = optimizer.update(grads, opt_state, params)
     next_params = optax.apply_updates(params, updates)
     next_rng = jax.random.split(key)[1]
@@ -451,8 +489,20 @@ def save_checkpoint(
         step: int = 0, epoch: int = 0, seed: int = 0,
         shuffle_state: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        e_history_version: str = E_HISTORY_CORRECTED_V1,
+        source_history_version: str | None = None,
+        source_identity: Mapping[str, Any] | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        executor: Mapping[str, Any] | None = None,
 ) -> None:
-    """Write params, Optax state, explicit RNG, and resume metadata to NPZ."""
+    """Write params, Optax state, explicit RNG, and resume metadata to NPZ.
+
+    ``e_history_version`` is the *operating* history of this Stage 2.5 run.
+    The imported source encoder's history, when any, is recorded separately via
+    ``source_history_version`` plus ``source_identity``/``provenance`` so a
+    legacy transfer is never reported as corrected-source parity.  ``metadata``
+    carries non-reserved extras only.
+    """
     try:
         from rl_manager.stage25_checkpoint import save_stage25_bc_checkpoint
     except ImportError:  # pragma: no cover - compatibility with the base tree
@@ -464,7 +514,11 @@ def save_checkpoint(
             path, params, opt_state, _normal_key(rng), _model_config(config),
             seed=int(seed), step=int(step), epoch=int(epoch),
             optimizer_config=_settings(config),
-            data_order_position=order, metadata=metadata)
+            data_order_position=order, metadata=metadata,
+            e_history_version=e_history_version,
+            source_history_version=source_history_version,
+            source_identity=source_identity, provenance=provenance,
+            executor=executor)
         return
     param_items, _ = _flatten(params)
     opt_items, _ = _flatten(opt_state)
@@ -474,7 +528,12 @@ def save_checkpoint(
     meta = {"format": BC_CHECKPOINT_FORMAT, "config": _config_json(config),
             "step": int(step), "epoch": int(epoch),
             "shuffle_state": dict(shuffle_state or {}),
-            "metadata": dict(metadata or {})}
+            "metadata": dict(metadata or {}),
+            "e_history_version": normalize_e_history_version(e_history_version),
+            "source_history_version": source_history_version,
+            "source_identity": dict(source_identity or {}),
+            "provenance": dict(provenance or {}),
+            "executor": dict(executor or {})}
     items["__meta__"] = np.frombuffer(
         json.dumps(meta, sort_keys=True).encode("utf-8"), dtype=np.uint8)
     destination = Path(path)
@@ -490,8 +549,15 @@ def load_checkpoint(
         path: str | Path, *, config: Stage25BCConfig | Stage25ModelConfig,
         params: Mapping[str, Any] | None = None,
         seed: int | None = None,
+        expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
+        allow_legacy_e: bool = False,
 ) -> tuple[dict[str, Any], Any, jax.Array, dict[str, Any]]:
-    """Load and strictly validate a native BC training-state archive."""
+    """Load and strictly validate a native BC training-state archive.
+
+    ``expected_e_history_version``/``allow_legacy_e`` are forwarded to the
+    native loader so an explicitly legacy-operating checkpoint can only be
+    resumed through an explicit opt-in.
+    """
     settings = _settings(config)
     model = _model_config(config)
     try:
@@ -503,7 +569,9 @@ def load_checkpoint(
         optimizer_template = init_opt_state(template, settings)
         return load_stage25_bc_checkpoint(
             path, config=model, optimizer_state_template=optimizer_template,
-            optimizer_config=settings, expected_data_order_seed=seed)
+            optimizer_config=settings, expected_data_order_seed=seed,
+            expected_e_history_version=expected_e_history_version,
+            allow_legacy_e=allow_legacy_e)
     if params is None:
         params = init_stage25_params(model, seed=0)
     with np.load(Path(path), allow_pickle=False) as archive:
@@ -513,6 +581,13 @@ def load_checkpoint(
     meta = json.loads(items.pop("__meta__").tobytes().decode("utf-8"))
     if meta.get("format") != BC_CHECKPOINT_FORMAT:
         raise ValueError(f"unrecognized BC checkpoint format {meta.get('format')!r}")
+    history = normalize_e_history_version(meta.get("e_history_version", E_HISTORY_LEGACY))
+    if history == E_HISTORY_LEGACY and not allow_legacy_e:
+        raise ValueError("legacy E history requires explicit allow_legacy_e=True")
+    if expected_e_history_version is not None \
+            and history != normalize_e_history_version(expected_e_history_version) \
+            and not (allow_legacy_e and history == E_HISTORY_LEGACY):
+        raise ValueError("checkpoint e_history_version is incompatible")
     loaded_params = _unflatten(items, params, prefix="param")
     template_state = init_opt_state(params, settings)
     loaded_opt = _unflatten(items, template_state, prefix="opt")
@@ -522,25 +597,35 @@ def load_checkpoint(
 
 
 def import_encoder_checkpoint(path: str | Path, model: Stage25ModelConfig,
-                              *, seed: int = 0,
+                              *, seed: int = 0, allow_legacy_e: bool = False,
                               return_metadata: bool = False) -> dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]:
-    """Import an existing native/Torch E checkpoint without Torch at startup."""
+    """Import an existing native/Torch E checkpoint without Torch at startup.
+
+    A legacy source encoder requires ``allow_legacy_e=True``; the imported
+    source history is reported in the metadata and never becomes the operating
+    history of a corrected-E run.
+    """
     try:
         from rl_manager.stage25_checkpoint import import_historical_encoder
     except ImportError:  # pragma: no cover - compatibility with the base tree
         import_historical_encoder = None
     if import_historical_encoder is not None:
-        encoder, import_meta = import_historical_encoder(path, model)
+        encoder, import_meta = import_historical_encoder(
+            path, model, allow_legacy_e=allow_legacy_e)
         params = init_stage25_params(model, seed=seed, encoder_params=encoder)
         return (params, import_meta) if return_metadata else params
+    expected = None if allow_legacy_e else E_HISTORY_CORRECTED_V1
     source = Path(path)
     if source.suffix.lower() == ".npz":
         from bc_manager_jax.checkpoint import load_native
-        encoder, import_meta = load_native(source, model.manager_config, model_variant="E")
+        encoder, import_meta = load_native(
+            source, model.manager_config, model_variant="E",
+            expected_e_history_version=expected)
     else:
         from bc_manager_jax.checkpoint import load_torch_checkpoint
-        encoder, import_meta = load_torch_checkpoint(source, model.manager_config,
-                                                     model_variant="E")
+        encoder, import_meta = load_torch_checkpoint(
+            source, model.manager_config, model_variant="E",
+            expected_e_history_version=expected)
     params = init_stage25_params(model, seed=seed, encoder_params=encoder)
     return (params, import_meta) if return_metadata else params
 

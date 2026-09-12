@@ -183,3 +183,48 @@ def test_legacy_e_native_import_requires_explicit_opt_in(tmp_path: Path) -> None
     encoder, meta = import_historical_encoder(path, config, allow_legacy_e=True)
     assert meta["e_history_version"] == E_HISTORY_LEGACY
     assert encoder
+
+
+def test_source_history_recorded_without_corrected_source_parity(tmp_path: Path) -> None:
+    config = _config()
+    params = init_stage25_params(config, seed=51)
+    path = tmp_path / "source-history.npz"
+    save_stage25_inference_checkpoint(
+        path, params, config, seed=51,
+        e_history_version=E_HISTORY_CORRECTED_V1,
+        source_history_version=E_HISTORY_LEGACY,
+        source_identity={"checkpoint": "historical-e"},
+        provenance={"historical_import": "encoder_only"})
+    loaded, meta = load_stage25_inference_checkpoint(path, config=config)
+    assert _same_tree(params, loaded)
+    assert meta["e_history_version"] == E_HISTORY_CORRECTED_V1
+    assert meta["e_identity"]["history_version"] == E_HISTORY_CORRECTED_V1
+    assert meta["source_e_identity"]["history_version"] == E_HISTORY_LEGACY
+    assert meta["source_e_identity"]["transfer"] == "encoder_only"
+    assert meta["source_identity"] == {"checkpoint": "historical-e"}
+
+
+def test_reserved_metadata_collisions_are_rejected(tmp_path: Path) -> None:
+    config = _config()
+    params = init_stage25_params(config, seed=53)
+    for reserved in ("e_history_version", "e_identity", "source_identity",
+                     "provenance", "executor", "source_e_identity"):
+        with pytest.raises(Stage25CheckpointError, match="reserved checkpoint keys"):
+            save_stage25_inference_checkpoint(
+                tmp_path / f"{reserved}.npz", params, config, seed=53,
+                metadata={reserved: "x"})
+
+
+def test_legacy_operating_checkpoint_requires_explicit_opt_in(tmp_path: Path) -> None:
+    config = _config()
+    params = init_stage25_params(config, seed=55)
+    path = tmp_path / "legacy-operating.npz"
+    save_stage25_inference_checkpoint(
+        path, params, config, seed=55, e_history_version=E_HISTORY_LEGACY)
+    with pytest.raises(Stage25CheckpointError, match="legacy E history"):
+        load_stage25_inference_checkpoint(path, config=config)
+    loaded, meta = load_stage25_inference_checkpoint(
+        path, config=config, expected_e_history_version=E_HISTORY_LEGACY,
+        allow_legacy_e=True)
+    assert _same_tree(params, loaded)
+    assert meta["e_history_version"] == E_HISTORY_LEGACY

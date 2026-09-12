@@ -214,6 +214,22 @@ def test_configurable_paths_and_exact_projection(tmp_path, monkeypatch):
     assert "events" not in seen[0]
 
 
+def test_adapter_selection_shares_builder_score_semantics():
+    from rl_manager.stage25_adapter import _selected
+
+    # The Packet 1B builder prefers a present ``score`` over ``min_score``; the
+    # adapter must reuse that predicate instead of choosing its own precedence.
+    high = {"metadata": {"partition_date": "2026-08-17", "score": 3000.0,
+                         "min_score": 1000.0}}
+    assert _selected(high, {"2026-08-17"}, 2950.0) == (True, None)
+    low = {"metadata": {"partition_date": "2026-08-17", "score": 1000.0,
+                        "min_score": 3000.0}}
+    assert _selected(low, {"2026-08-17"}, 2950.0) == (False, "score")
+    wrong_date = {"metadata": {"partition_date": "2026-08-16",
+                               "min_score": 3000.0}}
+    assert _selected(wrong_date, {"2026-08-17"}, 2950.0) == (False, "date")
+
+
 def test_mixed_schema_version_is_rejected(tmp_path):
     path = tmp_path / "mixed.parquet"
     table = records_to_table([_record(0, "2026-08-17")])
