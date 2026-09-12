@@ -63,7 +63,8 @@ from rl_manager.stage25_provider import (
     Stage25InferenceContext,
     Stage25PlanProvider,
 )
-from rl_manager.stage25_types import Stage25BehaviorIdentity, Stage25PolicyOutputs
+from rl_manager.stage25_types import (
+    Stage25BehaviorIdentity, Stage25PolicyOutputs, stage25_rng_namespace)
 from rl_manager.reward import RewardConfig, TERMINAL_OWN_BANK, terminal_rewards
 from rl_manager.trajectory import TrajectoryBuffer, Transition, \
     TransitionMetadata
@@ -187,6 +188,10 @@ class RunnerConfig:
                 "inference_batch_wait_seconds must be finite and >= 0")
         if self.stage25:
             object.__setattr__(self, "stage25_enabled", True)
+        if self.stage25_enabled and self.manager_start_day != MANAGER_START_DAY:
+            raise ValueError(
+                "Stage 2.5 trajectory currently supports manager_start_day=4; "
+                "another day boundary is rejected at startup")
         if self.stage25_mode not in ("deterministic", "stochastic"):
             raise ValueError(
                 "stage25_mode must be 'deterministic' or 'stochastic'")
@@ -472,7 +477,6 @@ class _EpisodeState:
             if config.record_debug_trace else None)
         self.current_canonical_state: dict[str, Any] | None = None
         self.providers = [QueuedPlanProvider(), QueuedPlanProvider()]
-        self.stage25_contexts: dict[tuple[int, int], Stage25InferenceContext] = {}
         self.stage25_enabled = bool(config.stage25_enabled)
         if self.stage25_enabled:
             stage25_providers = []
@@ -491,6 +495,7 @@ class _EpisodeState:
                 stage25_providers.append(Stage25PlanProvider(
                     spec.episode_index, seat, config.manager_start_day,
                     mode=config.stage25_mode,
+                    seed=spec.seed,
                     curriculum=curriculum,
                     behavior_identity=identity))
             self.providers = stage25_providers
@@ -803,6 +808,13 @@ class SelfPlayRunner:
         self.timing_totals: dict[str, float] = {
             "manager_inference": 0.0, "agent_actions": 0.0,
             "env_step": 0.0, "orchestration": 0.0}
+        self.inference_metrics: dict[str, Any] = {
+            "requests": 0, "real_requests": 0, "logical_requests": 0,
+            "bootstrap_requests": 0, "batches": 0,
+            "physical_inference_calls": 0, "batch_sizes": [],
+            "real_batch_sizes": [], "physical_batch_sizes": [],
+            "physical_rows": 0, "padding_rows": 0, "occupancy": 0.0,
+        }
         self.provenance: dict[str, Any] = {
             "opening": _runner_opening_provenance(config),
             "backend": backend_provenance(
@@ -1107,7 +1119,6 @@ class SelfPlayRunner:
                         f"episode={state.spec.episode_index}/seat={seat}/"
                         f"day={day}"),
                     behavior_identity=provider.expected_behavior_identity)
-                state.stage25_contexts[(seat, day)] = context
                 requests.append((state, seat, day, context))
         if not requests:
             return
@@ -1136,7 +1147,19 @@ class SelfPlayRunner:
                 set_context([item[3] for item in group])
             outputs = self._stage25_policy_batch(
                 policy, inputs, capacities, contexts, supports, row_ids,
-                f"stage25/policy={identity_id}")
+                stage25_rng_namespace(
+                    group[0][3].behavior_identity, getattr(policy, "seed", 0)))
+            real_count = len(group)
+            self.inference_metrics["requests"] += real_count
+            self.inference_metrics["real_requests"] += real_count
+            self.inference_metrics["logical_requests"] += real_count
+            self.inference_metrics["batches"] += 1
+            self.inference_metrics["physical_inference_calls"] += 1
+            self.inference_metrics["batch_sizes"].append(real_count)
+            self.inference_metrics["real_batch_sizes"].append(real_count)
+            self.inference_metrics["physical_batch_sizes"].append(real_count)
+            self.inference_metrics["physical_rows"] += real_count
+            self.inference_metrics["occupancy"] = 1.0
             if outputs.policy_identity != group[0][3].behavior_identity:
                 raise ValueError(
                     "Stage 2.5 policy response behavior identity mismatch")
@@ -1188,14 +1211,10 @@ class SelfPlayRunner:
                  getattr(policy, "stage25_infer_batch", None) or
                  getattr(policy, "plan_batch_with_context", None))
         if callable(infer):
-            try:
-                raw = infer(
-                    inputs=inputs, crop_capacity=crop_capacity,
-                    physical_contexts=contexts, supports=supports,
-                    row_ids=row_ids, prng_id=prng_id)
-            except TypeError:
-                raw = infer(inputs, crop_capacity, contexts, supports,
-                            row_ids, prng_id)
+            raw = infer(
+                inputs=inputs, crop_capacity=crop_capacity,
+                physical_contexts=contexts, supports=supports,
+                row_ids=row_ids, prng_id=prng_id)
         else:
             raw = policy.plan_batch(inputs, prng_id)
         if isinstance(raw, Stage25PolicyOutputs):
@@ -1323,15 +1342,13 @@ class SelfPlayRunner:
             raise ValueError(
                 "Stage 2.5 truncation requires a value-only parent inference "
                 "method; sampling a replacement plan is forbidden")
-        try:
-            raw = value_fn(
-                inputs=context.inputs,
-                crop_capacity=np.asarray([context.crop_capacity], dtype=np.int16),
-                physical_contexts=(context.physical_context,),
-                row_ids=(context.request_id,),
-                prng_id="stage25/bootstrap")
-        except TypeError:
-            raw = value_fn(context.inputs, context.physical_context)
+        raw = value_fn(
+            inputs=context.inputs,
+            crop_capacity=np.asarray([context.crop_capacity], dtype=np.int16),
+            physical_contexts=(context.physical_context,),
+            row_ids=(context.request_id,),
+            prng_id=stage25_rng_namespace(
+                context.behavior_identity, getattr(policy, "seed", 0)))
         if isinstance(raw, Mapping):
             raw = raw.get("value", raw.get("values"))
         values = np.asarray(raw, dtype=np.float32)

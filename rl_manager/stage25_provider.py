@@ -37,6 +37,7 @@ from .stage25_config import (
     apply_animal_curriculum,
     apply_crop_curriculum,
     apply_land_curriculum,
+    curriculum_fingerprint,
 )
 from .stage25_mechanics import (
     ACTION_CLASS_COUNTS,
@@ -95,6 +96,7 @@ class Stage25InferenceContext:
     physical_context: PhysicalContext
     support: Mapping[str, Any]
     observation: Mapping[str, Any]
+    seed: int = 0
 
     @property
     def request_id(self) -> str:
@@ -617,16 +619,27 @@ class Stage25PlanProvider:
                 checkpoint_curriculum = getattr(
                     loader(), "curriculum", None)
             if checkpoint_curriculum is None:
-                self._bound_curriculum = self.curriculum
+                candidate = self.curriculum
             elif self._curriculum_explicit:
                 if self.curriculum != checkpoint_curriculum:
                     raise Stage25ProviderError(
                         "explicit provider curriculum does not match the native "
                         "checkpoint curriculum; refusing to sample or mutate state")
-                self._bound_curriculum = self.curriculum
+                candidate = self.curriculum
             else:
-                self.curriculum = checkpoint_curriculum
-                self._bound_curriculum = checkpoint_curriculum
+                candidate = checkpoint_curriculum
+            if self.behavior_identity is not None:
+                if (self.behavior_identity.curriculum_version !=
+                        candidate.version or
+                        self.behavior_identity.curriculum_fingerprint !=
+                        curriculum_fingerprint(candidate)):
+                    raise Stage25ProviderError(
+                        "effective curriculum does not match the advertised "
+                        "behavior identity; explicit configuration is required")
+            # Commit the binding only after every identity/configuration check
+            # has passed, so a rejected rollout leaves lifecycle state intact.
+            self.curriculum = candidate
+            self._bound_curriculum = candidate
         return self._bound_curriculum
 
     @property
@@ -785,6 +798,7 @@ class Stage25PlanProvider:
             physical_context=context,
             support=self._support_payload(context, initial),
             observation=copy.deepcopy(dict(obs)),
+            seed=self.seed,
         )
 
     def prepare_bootstrap_context(
@@ -821,6 +835,7 @@ class Stage25PlanProvider:
             physical_context=context,
             support=self._support_payload(context, initial),
             observation=copy.deepcopy(dict(obs)),
+            seed=self.seed,
         )
 
     def accept_inference_response(

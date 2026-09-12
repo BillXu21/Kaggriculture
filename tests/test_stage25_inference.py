@@ -106,15 +106,6 @@ def test_row_ids_make_sampling_stable_under_reorder_and_padding():
     np.testing.assert_array_equal(padded.joint_logprob[:2], first.joint_logprob)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the single-process runner samples with prng_id 'stage25/policy=...' "
-        "while the parallel parent dispatches with 'stage25/behavior=...'; the "
-        "same checkpoint/seed/row therefore yields different stochastic actions "
-        "depending on the execution topology"
-    ),
-)
 def test_row_action_is_stable_across_runner_and_parent_prng_namespaces():
     adapter = _adapter()
     row = "episode=0/seat=0/day=4/behavior=" + adapter.identity.identity_id()

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import hashlib
+import json
 import math
 from numbers import Real
 
@@ -15,6 +17,7 @@ __all__ = [
     "CURRICULUM_CONFIG_VERSION",
     "SHORTFALL_CONFIG_VERSION",
     "Stage25CurriculumConfig",
+    "curriculum_fingerprint",
     "CropShortfallConfig",
     "apply_land_curriculum",
     "apply_animal_curriculum",
@@ -87,6 +90,20 @@ class CropShortfallConfig:
                 f"crop_shortfall_coef must be a finite nonnegative number, "
                 f"got {coef!r}")
         object.__setattr__(self, "crop_shortfall_coef", parsed)
+
+
+def curriculum_fingerprint(config: Stage25CurriculumConfig) -> str:
+    """Fingerprint explicit framework-neutral curriculum configuration."""
+    if not isinstance(config, Stage25CurriculumConfig):
+        raise TypeError("config must be Stage25CurriculumConfig")
+    payload = json.dumps(
+        {"version": config.version, "enabled": config.enabled,
+         "max_positive_crop_delta": config.max_positive_crop_delta,
+         "max_land_expansion_per_decision": config.max_land_expansion_per_decision,
+         "max_animal_additions_per_species_per_decision": (
+             config.max_animal_additions_per_species_per_decision)},
+        sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _physical_mask(mask: Sequence[bool], size: int, what: str) -> tuple[bool, ...]:

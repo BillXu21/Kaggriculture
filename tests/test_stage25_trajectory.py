@@ -107,6 +107,9 @@ def test_episode_seat_day_identity_is_separate_and_opening_rows_are_rejected():
 def test_terminal_reward_is_applied_once_and_only_to_final_row():
     buffer = Stage25TrajectoryBuffer(3)
     buffer.append(_row(day=4))
+    buffer.close_outgoing(
+        episode_index=1, seat=0, next_day=5, next_inputs=_inputs(5),
+        next_crop_capacity=np.asarray([1, 2, 3, 4, 5], dtype=np.int16))
     buffer.append(_row(day=5))
     with pytest.raises(ValueError, match="final manager row"):
         buffer.patch_terminal(0, np.asarray(2.0, dtype=np.float32))
@@ -114,6 +117,17 @@ def test_terminal_reward_is_applied_once_and_only_to_final_row():
     with pytest.raises(ValueError, match="terminal/truncation"):
         buffer.patch_terminal(1, np.asarray(2.0, dtype=np.float32))
     assert buffer.finalize()["reward"].tolist() == [0.0, 2.0]
+
+
+def test_outgoing_transition_must_close_before_next_manager_row():
+    buffer = Stage25TrajectoryBuffer(2)
+    buffer.append(_row(day=4))
+    with pytest.raises(ValueError, match="outgoing manager transition"):
+        buffer.append(_row(day=5))
+    buffer.close_outgoing(
+        episode_index=1, seat=0, next_day=5, next_inputs=_inputs(5),
+        next_crop_capacity=np.asarray([1, 2, 3, 4, 5], dtype=np.int16))
+    assert buffer.append(_row(day=5)) == 1
 
 
 def test_truncation_requires_and_preserves_bootstrap_value(tmp_path: Path):
@@ -126,7 +140,7 @@ def test_truncation_requires_and_preserves_bootstrap_value(tmp_path: Path):
     assert float(buffer.finalize()["bootstrap_value"][0]) == pytest.approx(0.75)
 
 
-def test_invalid_shape_dtype_and_diagnostic_zero_likelihood_are_rejected():
+def test_invalid_shape_dtype_and_zero_likelihood_validity_are_checked():
     buffer = Stage25TrajectoryBuffer(2)
     bad_inputs = _inputs()
     bad_inputs["crop_capacity"] = np.zeros((2, 5), dtype=np.int16)
@@ -139,8 +153,11 @@ def test_invalid_shape_dtype_and_diagnostic_zero_likelihood_are_rejected():
         **zero.__dict__, "component_logprobs": np.zeros(9, dtype=np.float32),
         "joint_logprob": np.asarray(0.0, dtype=np.float32),
     })
-    with pytest.raises(ValueError, match="zero likelihood"):
-        buffer.append(zero)
+    assert buffer.append(zero) == 0
+    invalid = Stage25TrajectoryRow(**{
+        **_row(episode=2).__dict__, "valid": False})
+    with pytest.raises(ValueError, match="invalid Stage 2.5"):
+        buffer.append(invalid)
 
 
 def test_npz_and_sidecar_are_pickle_free(tmp_path: Path):

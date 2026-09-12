@@ -28,15 +28,29 @@ recorded with every persisted row.
 ## Fixed batching and randomness
 
 Stage 2.5 uses the existing physical input preparation and padding machinery.
-The launch default is physical batch size 16 and the selected size is included
-in runner provenance and inference metrics. Rows are grouped only by exact
-behavior identity, sorted by immutable request ID, and padded with distinct
-`padding/...` identities. Padding is discarded before worker delivery and can
-never create an environment decision or trajectory row.
+The launch default is physical batch size 16 (the bounded validation smoke
+selects 2 explicitly), and the selected size is included in runner provenance
+and inference metrics. Rows are grouped only by exact behavior identity and
+request kind (`decision` or value-only `bootstrap`), then sorted by immutable
+request ID. A pending queue is partitioned before dispatch, so either request
+kind may arrive first and a bootstrap can never be routed as a sampled plan.
+Padding repeats a valid row only with a distinct `padding/...` identity;
+padded outputs are discarded before worker delivery and can never create an
+environment decision or trajectory row.
 
-Sampling folds a stable row token into a request-level PRNG key. Consequently,
-reordering rows, changing neighboring rows, and changing physical padding do
-not change a real row's stochastic action.
+Sampling folds a stable row token into the authoritative
+`stage25/rollout/v1/seed=<seed>/behavior=<identity>` namespace. The local
+runner and parent dispatcher use the same seed-bearing namespace; recognized legacy topology aliases
+are normalized explicitly, while arbitrary direct adapter names remain
+distinct. Reordering rows, changing neighboring rows, worker count, or
+physical padding therefore does not change a real row's stochastic action.
+
+The native parent resolves the checkpoint curriculum and transports its
+framework-neutral dataclass fields in each worker episode assignment. An
+unspecified provider override adopts that explicit checkpoint payload. An
+explicit mismatch, or an advertised identity whose version/fingerprint does
+not match the effective payload, is rejected before sampling or lifecycle
+mutation. Workers remain accelerator-free.
 
 ## Trajectory schema
 
@@ -57,8 +71,12 @@ tensors, and any frozen quantity model are intentionally absent. Actions,
 ledger K, identities, and numeric values survive a save/load round trip.
 
 The provider is the sole K ledger owner. The outgoing manager transition is
-recorded before the next decision is accepted, and K is applied once by the
-provider. No manager row is created before the first opening/manager boundary.
+closed before the next decision is recorded, and K is applied once by the
+provider. The trajectory buffer enforces this ordering when appending rows.
+No manager row is created before the first opening/manager boundary. The
+current supported Stage 2.5 day contract is manager start day 4 through day
+29; another configured start day is rejected during `RunnerConfig` startup
+until the versioned trajectory bounds are made configurable.
 
 ## Terminal and truncation semantics
 
@@ -76,7 +94,10 @@ The parent adapter can teacher-force stored classes through the unchanged
 native policy using the recorded curriculum and physical context. The audit
 compares all component log probabilities, joint log probability, value, and
 optionally decoded goals/support without mutating rollout arrays or replacing
-stored values. Invalid rows and diagnostic zero placeholders are rejected.
+stored values. Fully forced actions may legitimately have zero component and
+joint log-probabilities. Rows are accepted when `valid`, in support, finite,
+and joint/component-consistent; invalid placeholders are rejected by those
+explicit checks rather than by a zero-value heuristic.
 
 This is the unchanged-weight rollout audit only. The PPO update-path audit is a
 Packet 5B seam.
@@ -97,16 +118,17 @@ trajectory round-trip, seat/episode separation, terminal closure, truncation
 bootstrap without another plan, no pre-opening rows, and checkpoint/provider
 curriculum agreement. The fast-engine spawned-worker smoke exercises both
 seats and multiple manager boundaries with stochastic parent inference and
-reports placement coverage; a bounded true-terminal run separately checks
-final-transition closure. Any full-game or competitive evaluation remains
-outside this packet.
+reports placement coverage; the bounded run uses 2 workers, 6 episodes,
+`max_turns=144`, and physical batch size 2. A bounded true-terminal run
+separately checks final-transition closure. Any full-game or competitive
+evaluation remains outside this packet.
 
-Latest results: the Packet 5A command completed with `23 passed` and the
-legacy/Packet 4 regression command completed with `67 passed` (each emitted
-only the repository's existing pytest-cache permission warning). A native
-spawned smoke run recorded 8 decision requests, 4 value-only bootstrap
-requests, 12 logical rows, 6 physical calls, logical batch sizes
-`[4, 2, 2, 1, 2, 1]`, physical batch size 16 for every call, 96 physical
-rows, 84 padding rows, occupancy `0.125`, 8 trajectory rows, and 20 nonzero
-animal-placement classes out of 24. Batch composition can vary with worker
-arrival timing; row identity and action RNG do not.
+Latest results: the focused correction command completed with `29 passed`
+(plus the repository's existing pytest-cache permission warning). The native
+spawned smoke recorded 24 decision requests, 12 value-only bootstrap requests,
+36 logical rows, 23 physical calls, real batch sizes
+`[2,2,2,2,1,2,1,2,2,2,2,1,1,1,1,2,2,2,2,1,1,1,1]`, physical batch size 2
+for every call, 46 physical rows, 10 padding rows, occupancy
+`0.782608695652174`, 24 trajectory rows, and 63 nonzero animal-placement
+classes. The legacy/Packet 4 command remains `67 passed`. Batch composition
+can vary with worker arrival timing; row identity and action RNG do not.

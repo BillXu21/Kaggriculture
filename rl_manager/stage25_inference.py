@@ -53,6 +53,7 @@ from rl_manager.stage25_types import (
     STAGE25_POLICY_SCHEMA_VERSION,
     Stage25BehaviorIdentity,
     Stage25PolicyOutputs,
+    stage25_rng_namespace,
 )
 
 
@@ -293,11 +294,26 @@ def _normalise_row_ids(row_ids: Sequence[Any], batch: int) -> np.ndarray:
     return tokens
 
 
-def _root_key(prng_id: str, identity: Stage25BehaviorIdentity) -> jax.Array:
+def _canonical_prng_id(prng_id: str, identity: Stage25BehaviorIdentity,
+                       seed: int = 0) -> str:
     if not isinstance(prng_id, str) or not prng_id:
         raise ValueError("prng_id must be a non-empty string")
+    canonical = stage25_rng_namespace(identity, seed)
+    accepted = (canonical,
+                f"stage25/policy={identity.identity_id()}",
+                f"stage25/behavior={identity.identity_id()}",
+                f"parallel/policy={identity.identity_id()}")
+    # Older direct adapter callers may provide an opaque rollout namespace;
+    # preserve it as supplied.  The runner and parent dispatch both use the
+    # canonical namespace above, while only known topology aliases normalize.
+    return canonical if prng_id in accepted else prng_id
+
+
+def _root_key(prng_id: str, identity: Stage25BehaviorIdentity,
+              seed: int = 0) -> jax.Array:
+    canonical = _canonical_prng_id(prng_id, identity, seed)
     digest = hashlib.sha256(
-        (identity.fingerprint + "|" + prng_id).encode("utf-8")).digest()
+        (identity.fingerprint + "|" + canonical).encode("utf-8")).digest()
     return jax.random.PRNGKey(int.from_bytes(digest[:4], "little"))
 
 
@@ -365,6 +381,7 @@ class Stage25InferenceAdapter:
         if not isinstance(config, Stage25ModelConfig):
             raise TypeError("config must be Stage25ModelConfig")
         self.config = config
+        self.seed = int(metadata.get("seed", 0 if seed is None else seed))
         self._mode = _normalise_mode(mode, deterministic)
         checkpoint_curriculum = _as_curriculum(
             metadata.get("curriculum", config.curriculum))
@@ -476,15 +493,13 @@ class Stage25InferenceAdapter:
     ) -> Stage25PolicyOutputs:
         batch, prepared, capacity, contexts = self._prepare(inputs, physical_contexts)
         ids = _normalise_row_ids(row_ids, batch)
-        if not isinstance(prng_id, str) or not prng_id:
-            raise ValueError("prng_id must be a non-empty string")
         if self.deterministic:
             result = greedy_act(
                 self.params, prepared, self.config,
                 physical_contexts=contexts, crop_capacity=capacity,
                 row_ids=ids)
         else:
-            root = _root_key(prng_id, self.identity)
+            root = _root_key(prng_id, self.identity, self.seed)
             keys = np.asarray(jnp.stack([
                 jax.random.fold_in(root, int(row_id)) for row_id in ids
             ]), dtype=np.uint32)

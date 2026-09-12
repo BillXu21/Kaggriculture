@@ -202,6 +202,9 @@ class Stage25TrajectoryRow:
     bootstrap_patched: bool = False
     row_id: str | None = None
     valid: bool = True
+    # Runtime-only provenance used when a worker shard is merged.  It is not
+    # persisted because closure is reconstructed from the append sequence.
+    predecessor_closed: bool = False
 
     @property
     def episode_index(self) -> int:
@@ -259,7 +262,16 @@ class Stage25TrajectoryBuffer:
                 reward_patched=bool(self._arrays["reward_patched"][index]),
                 bootstrap_patched=bool(self._arrays["bootstrap_patched"][index]),
                 row_id=self._row_ids[index],
+                predecessor_closed=self._predecessor_was_closed(index),
             )
+
+    def _predecessor_was_closed(self, index: int) -> bool:
+        key = (int(self._arrays["episode_id"][index]),
+               int(self._arrays["seat"][index]),
+               int(self._arrays["day"][index]))
+        previous = [candidate for candidate in self._keys
+                    if candidate[:2] == key[:2] and candidate[2] < key[2]]
+        return not previous or max(previous, key=lambda item: item[2]) in self._closed_outgoing
 
     def append(self, row: Stage25TrajectoryRow | None = None, **kwargs: Any) -> int:
         """Append a validated row and return its contiguous row index."""
@@ -297,6 +309,14 @@ class Stage25TrajectoryBuffer:
         key = (int(row.episode_id), int(row.seat), int(row.day))
         if key in self._keys:
             raise ValueError(f"duplicate episode/seat/day identity {key}")
+        previous = [candidate for candidate in self._keys
+                    if candidate[:2] == key[:2] and candidate[2] < key[2]]
+        if previous:
+            prior = max(previous, key=lambda item: item[2])
+            if not bool(row.predecessor_closed) and prior not in self._closed_outgoing:
+                raise ValueError(
+                    "outgoing manager transition must be closed before "
+                    "recording the next decision")
         if any(self._arrays["terminated"][i] or self._arrays["truncated"][i]
                for i in range(self._count)
                if (int(self._arrays["episode_id"][i]), int(self._arrays["seat"][i])) == key[:2]):
@@ -312,8 +332,6 @@ class Stage25TrajectoryBuffer:
         _finite(component, "component_logprobs")
         _finite(joint, "joint_logprob")
         _finite(value, "value")
-        if np.all(component == 0.0) and float(joint) == 0.0:
-            raise ValueError("diagnostic zero likelihood placeholder cannot enter a trajectory")
         if not np.isclose(float(joint), float(np.sum(component, dtype=np.float32)), atol=1e-5, rtol=1e-5):
             raise ValueError("joint_logprob must equal the sum of component_logprobs")
         if not isinstance(row.inputs, Mapping) or set(row.inputs) != set(INPUT_SPEC):
@@ -566,8 +584,6 @@ class Stage25TrajectoryBuffer:
                 joint = buffer._arrays["joint_logprob"][:count]
                 if not np.all(np.isfinite(component)) or not np.all(np.isfinite(joint)):
                     raise ValueError("persisted likelihoods contain NaN or Inf")
-                if np.any(np.all(component == 0.0, axis=1) & (joint == 0.0)):
-                    raise ValueError("persisted diagnostic zero likelihood placeholder")
                 if not np.allclose(joint, np.sum(component, axis=1, dtype=np.float32), atol=1e-5, rtol=1e-5):
                     raise ValueError("persisted joint_logprob does not equal component sum")
                 for name in ("value", "reward", "bootstrap_value"):
@@ -576,6 +592,8 @@ class Stage25TrajectoryBuffer:
                 for name in ("valid", "terminated", "truncated", "reward_patched", "bootstrap_patched", "trainable"):
                     if np.any(~np.isin(buffer._arrays[name][:count], (0, 1))):
                         raise ValueError(f"persisted {name} is not boolean-valued")
+                if np.any(buffer._arrays["valid"][:count] != 1):
+                    raise ValueError("persisted invalid Stage 2.5 policy row")
                 for name, (shape, dtype) in INPUT_SPEC.items():
                     if (name == "board_numeric" and
                             np.any(np.isinf(buffer._arrays[f"input_{name}"][:count]))):

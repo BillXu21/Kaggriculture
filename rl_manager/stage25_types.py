@@ -18,6 +18,17 @@ from bc_manager.economics import normalize_e_history_version
 
 STAGE25_POLICY_SCHEMA_VERSION = "stage25_policy_v1"
 STAGE25_PHYSICAL_SUPPORT_VERSION = "stage25_physical_v1"
+STAGE25_RNG_NAMESPACE = "stage25/rollout/v1"
+
+
+def stage25_rng_namespace(identity: "Stage25BehaviorIdentity", seed: int = 0) -> str:
+    """Return the one rollout RNG namespace shared by local and parallel paths."""
+    if not isinstance(identity, Stage25BehaviorIdentity):
+        raise TypeError("identity must be Stage25BehaviorIdentity")
+    if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
+        raise TypeError("seed must be an integer")
+    return (f"{STAGE25_RNG_NAMESPACE}/seed={int(seed)}"
+            f"/behavior={identity.identity_id()}")
 
 
 @dataclass(frozen=True)

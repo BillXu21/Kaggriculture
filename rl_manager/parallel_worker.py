@@ -32,6 +32,7 @@ from rl_manager.parallel_protocol import (
 )
 from rl_manager.runner import EpisodeSpec, SelfPlayRunner
 from rl_manager.stage25_provider import Stage25InferenceContext
+from rl_manager.stage25_config import Stage25CurriculumConfig
 from rl_manager.stage25_types import Stage25PolicyOutputs
 from rl_manager.types import PolicyIdentity, PolicyOutputs
 
@@ -58,8 +59,10 @@ class RemotePlanPolicy:
     """Worker-side synchronous proxy for one immutable policy identity."""
 
     def __init__(self, identity: PolicyIdentity, request_queue: Any,
-                 response_queue: Any, worker_id: int) -> None:
+                 response_queue: Any, worker_id: int,
+                 *, curriculum: Stage25CurriculumConfig | None = None) -> None:
         self.identity = identity
+        self.curriculum = curriculum
         self._request_queue = request_queue
         self._response_queue = response_queue
         self._worker_id = int(worker_id)
@@ -150,7 +153,8 @@ class RemotePlanPolicy:
                 prng_id=str(prng_id), inputs=row_inputs,
                 crop_capacity=np.asarray([context.crop_capacity], dtype=np.int16),
                 physical_context=context.physical_context,
-                support=context.support, queued_at=time.perf_counter()))
+                support=context.support, queued_at=time.perf_counter(),
+                seed=context.seed))
         for request in requests:
             self._request_queue.put(request)
         expected = {request.request_id for request in requests}
@@ -298,8 +302,13 @@ def _assignment_specs(
         for identity in assignment.seat_policy_identities:
             policy = policies.get(identity)
             if policy is None:
+                curriculum = assignment.stage25_curricula[
+                    len(seat_policies)]
+                if curriculum is not None:
+                    curriculum = Stage25CurriculumConfig(**dict(curriculum))
                 policy = RemotePlanPolicy(
-                    identity, request_queue, response_queue, worker_id)
+                    identity, request_queue, response_queue, worker_id,
+                    curriculum=curriculum)
                 policies[identity] = policy
             seat_policies.append(policy)
         specs.append(EpisodeSpec(

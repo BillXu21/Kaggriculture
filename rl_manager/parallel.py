@@ -10,6 +10,7 @@ policy/day; mixed-day policy scope and fixed physical padding are opt-ins.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import math
 import multiprocessing as mp
 import pickle
@@ -50,7 +51,8 @@ from rl_manager.runner import (
 )
 from rl_manager.trajectory import TrajectoryBuffer, Transition
 from rl_manager.types import BatchedPlanPolicy, PolicyIdentity, PolicyOutputs
-from rl_manager.stage25_types import Stage25BehaviorIdentity, Stage25PolicyOutputs
+from rl_manager.stage25_types import (
+    Stage25BehaviorIdentity, Stage25PolicyOutputs, stage25_rng_namespace)
 
 
 class ParallelRolloutError(RuntimeError):
@@ -124,6 +126,23 @@ def _factory_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
 
 
 def _assignment(spec: EpisodeSpec) -> EpisodeAssignment:
+    curricula = []
+    for policy in spec.policies:
+        curriculum = getattr(policy, "curriculum", None)
+        if curriculum is None:
+            curriculum = getattr(getattr(policy, "config", None),
+                                 "curriculum", None)
+        if curriculum is None:
+            curricula.append(None)
+        elif isinstance(curriculum, Mapping):
+            curricula.append(dict(curriculum))
+        else:
+            try:
+                curricula.append(dataclasses.asdict(curriculum))
+            except (TypeError, dataclasses.FrozenInstanceError) as exc:
+                raise ValueError(
+                    "Stage 2.5 curriculum must be an explicit dataclass or mapping"
+                ) from exc
     return EpisodeAssignment(
         episode_index=int(spec.episode_index), seed=int(spec.seed),
         composition=str(spec.composition),
@@ -131,7 +150,8 @@ def _assignment(spec: EpisodeSpec) -> EpisodeAssignment:
                                 spec.policies[1].identity),
         trainable_seats=tuple(int(seat) for seat in spec.trainable_seats),
         controlled_seat=(None if spec.controlled_seat is None
-                         else int(spec.controlled_seat)))
+                         else int(spec.controlled_seat)),
+        stage25_curricula=(curricula[0], curricula[1]))
 
 
 def _slice_outputs(outputs: PolicyOutputs, row: int) -> PolicyOutputs:
@@ -286,6 +306,7 @@ class ParallelSelfPlayRunner:
         self.inference_metrics: dict[str, Any] = {
             "requests": 0, "real_requests": 0, "logical_requests": 0,
             "bootstrap_requests": 0,
+            "mixed_request_batches": 0,
             "batches": 0, "physical_inference_calls": 0,
             "batch_sizes": [], "real_batch_sizes": [],
             "physical_batch_sizes": [], "physical_rows": 0,
@@ -308,9 +329,7 @@ class ParallelSelfPlayRunner:
                 stage25_trajectory=self.stage25_trajectory)
             self.provenance = runner.provenance
             results = runner.run(specs)
-            request_count = sum(result.transitions for result in results)
-            self.inference_metrics["requests"] = request_count
-            self.inference_metrics["real_requests"] = request_count
+            self.inference_metrics.update(runner.inference_metrics)
             return results
 
         if ((self.buffer is not None and len(self.buffer)) or
@@ -515,16 +534,33 @@ class ParallelSelfPlayRunner:
     ) -> None:
         if not requests:
             return
-        if isinstance(requests[0], Stage25InferenceRequest):
+        # A queue can contain a decision and its truncation bootstrap at the
+        # same boundary. Partition by request kind before dispatching; queue
+        # position must never determine the response type.
+        stage25_decisions = [
+            request for request in requests
+            if isinstance(request, Stage25InferenceRequest)]
+        stage25_bootstraps = [
+            request for request in requests
+            if isinstance(request, Stage25BootstrapRequest)]
+        legacy = [
+            request for request in requests
+            if isinstance(request, InferenceRequest)]
+        if len(stage25_decisions) + len(stage25_bootstraps) + len(legacy) != len(requests):
+            raise ParallelRolloutError("unknown inference request type")
+        if stage25_decisions and stage25_bootstraps:
+            self.inference_metrics["mixed_request_batches"] += 1
+        if stage25_decisions:
             self._dispatch_stage25(
-                key, requests, _first_queued, policy_by_identity,
+                key, stage25_decisions, _first_queued, policy_by_identity,
                 response_queues)
-            return
-        if isinstance(requests[0], Stage25BootstrapRequest):
+        if stage25_bootstraps:
             self._dispatch_stage25_bootstrap(
-                key, requests, _first_queued, policy_by_identity,
+                key, stage25_bootstraps, _first_queued, policy_by_identity,
                 response_queues)
+        if not legacy:
             return
+        requests = legacy
         # Sort before chunking. Queue arrival order is scheduler-dependent and
         # must never decide which rows share a physical policy call.
         requests = sorted(requests, key=lambda request: (
@@ -648,12 +684,15 @@ class ParallelSelfPlayRunner:
             for request in physical_requests], axis=0)
         contexts = [request.physical_context for request in physical_requests]
         supports = [request.support for request in physical_requests]
-        row_ids = [request.request_id for request in requests]
+        row_ids = [
+            f"{request.request_id}/rng-seed={request.seed}"
+            for request in requests]
         row_ids.extend(
             f"padding/behavior={first.identity.behavior_identity.identity_id()}"
             f"/batch={'|'.join(request.request_id for request in requests)}"
             f"/slot={slot}" for slot in range(padding_count))
-        prng_id = f"stage25/behavior={first.identity.behavior_identity.identity_id()}"
+        prng_id = stage25_rng_namespace(
+            first.identity.behavior_identity, getattr(policy, "seed", 0))
         t0 = time.perf_counter()
         outputs = SelfPlayRunner._stage25_policy_batch(
             policy, batch, capacities, contexts, supports, row_ids, prng_id)
@@ -749,12 +788,9 @@ class ParallelSelfPlayRunner:
             raise ParallelRolloutError(
                 "Stage 2.5 truncation requires parent value-only inference")
         t0 = time.perf_counter()
-        try:
-            raw = value_fn(
-                inputs=batch, crop_capacity=capacities,
-                physical_contexts=contexts, row_ids=row_ids)
-        except TypeError:
-            raw = value_fn(batch, contexts)
+        raw = value_fn(
+            inputs=batch, crop_capacity=capacities,
+            physical_contexts=contexts, row_ids=row_ids)
         values = np.asarray(raw, dtype=np.float32)
         if values.shape != (physical_count,) or not np.all(np.isfinite(values)):
             raise ParallelRolloutError(

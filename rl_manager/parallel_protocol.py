@@ -26,6 +26,11 @@ class EpisodeAssignment:
     seat_policy_identities: tuple[PolicyIdentity, PolicyIdentity]
     trainable_seats: tuple[int, ...]
     controlled_seat: int | None
+    # Explicit framework-neutral curriculum payload for each seat.  This is
+    # transported separately from the identity fingerprint; workers never
+    # infer curriculum contents from a hash.
+    stage25_curricula: tuple[Mapping[str, Any] | None,
+                             Mapping[str, Any] | None] = (None, None)
 
 
 @dataclass(frozen=True)
@@ -106,6 +111,7 @@ class Stage25InferenceRequest:
     physical_context: Any
     support: Any
     queued_at: float
+    seed: int = 0
 
     def __post_init__(self) -> None:
         capacity = np.asarray(self.crop_capacity)
