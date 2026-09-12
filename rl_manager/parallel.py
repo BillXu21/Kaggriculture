@@ -30,6 +30,10 @@ from rl_manager.parallel_protocol import (
     EpisodeAssignment,
     InferenceRequest,
     InferenceResponse,
+    Stage25InferenceRequest,
+    Stage25InferenceResponse,
+    Stage25BootstrapRequest,
+    Stage25BootstrapResponse,
     WorkerFailed,
     WorkerFinished,
     WorkerTask,
@@ -46,17 +50,19 @@ from rl_manager.runner import (
 )
 from rl_manager.trajectory import TrajectoryBuffer, Transition
 from rl_manager.types import BatchedPlanPolicy, PolicyIdentity, PolicyOutputs
+from rl_manager.stage25_types import Stage25BehaviorIdentity, Stage25PolicyOutputs
 
 
 class ParallelRolloutError(RuntimeError):
     """A worker or inference-owner protocol failure."""
 
 
-BatchKey = PolicyIdentity | tuple[PolicyIdentity, int]
+BatchKey = (PolicyIdentity | Stage25BehaviorIdentity |
+            tuple[PolicyIdentity, int])
 
 
 def _batch_key_sort_key(key: BatchKey) -> tuple[str, int]:
-    if isinstance(key, PolicyIdentity):
+    if hasattr(key, "identity_id"):
         return (key.identity_id(), -1)
     return (key[0].identity_id(), int(key[1]))
 
@@ -98,6 +104,8 @@ def pad_batch_to_physical(
 
 def _factory_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
     """Use a child-local default factory with its complete config."""
+    if (getattr(factory, "name", None) == "stage25_executor"):
+        return ("stage25_executor@config", factory.agent_config)
     if (getattr(factory, "name", None) == "executor_v0"
             and getattr(factory, "version", None) == EXECUTOR_FACTORY_VERSION):
         del low_telemetry
@@ -135,6 +143,18 @@ def _slice_outputs(outputs: PolicyOutputs, row: int) -> PolicyOutputs:
         logprob_total=np.asarray(outputs.logprob_total[row:row + 1]).copy(),
         value=np.asarray(outputs.value[row:row + 1]).copy(),
         batch_size=1)
+
+
+def _slice_stage25_outputs(
+        outputs: Stage25PolicyOutputs, row: int) -> Stage25PolicyOutputs:
+    return Stage25PolicyOutputs(
+        classes=outputs.classes[row:row + 1],
+        component_logprobs=outputs.component_logprobs[row:row + 1],
+        joint_logprob=outputs.joint_logprob[row:row + 1],
+        value=outputs.value[row:row + 1],
+        decoded_goals=outputs.decoded_goals[row:row + 1],
+        valid=outputs.valid[row:row + 1],
+        policy_identity=outputs.policy_identity, batch_size=1)
 
 
 def _merge_shard(destination: TrajectoryBuffer, shard: TrajectoryBuffer,
@@ -201,6 +221,7 @@ class ParallelSelfPlayRunner:
         request_queue_size: int | None = None,
         inference_batch_wait_seconds: float | None = None,
         max_inference_batch_size: int | None = None,
+        stage25_trajectory_buffer: Any | None = None,
     ) -> None:
         if isinstance(num_workers, bool) or not isinstance(num_workers, int) \
                 or num_workers < 1:
@@ -217,8 +238,13 @@ class ParallelSelfPlayRunner:
         self.config = config
         self.num_workers = int(num_workers)
         self.buffer = trajectory_buffer
+        self.stage25_trajectory = stage25_trajectory_buffer
         if executor_factory is None:
-            if config.low_telemetry:
+            if config.stage25_enabled:
+                from rl_manager.executor_factory import make_stage25_executor_factory
+
+                executor_factory = make_stage25_executor_factory()
+            elif config.low_telemetry:
                 from executor_v0.agent import AgentConfig
 
                 executor_factory = make_default_executor_factory(
@@ -229,7 +255,9 @@ class ParallelSelfPlayRunner:
         self.executor_factory = executor_factory
         self.master_seed = master_seed
         self.request_queue_size = int(request_queue_size or max(4, num_workers * 4))
-        fixed_batch = config.fixed_inference_batch_size
+        fixed_batch = (config.stage25_fixed_inference_batch_size
+                       if config.stage25_enabled
+                       else config.fixed_inference_batch_size)
         if (fixed_batch is not None and max_inference_batch_size is not None
                 and fixed_batch != max_inference_batch_size):
             raise ValueError(
@@ -256,11 +284,16 @@ class ParallelSelfPlayRunner:
             "inference_batch_wait_seconds": self.batch_wait,
         }
         self.inference_metrics: dict[str, Any] = {
-            "requests": 0, "real_requests": 0,
+            "requests": 0, "real_requests": 0, "logical_requests": 0,
+            "bootstrap_requests": 0,
             "batches": 0, "physical_inference_calls": 0,
             "batch_sizes": [], "real_batch_sizes": [],
             "physical_batch_sizes": [], "physical_rows": 0,
             "padding_rows": 0, "occupancy": 0.0,
+            "animal_placement_rows": 0,
+            "animal_placement_nonzero_rows": 0,
+            "animal_placement_classes": 0,
+            "animal_placement_nonzero_classes": 0,
             "queue_wait_seconds": 0.0, "inference_seconds": 0.0,
         }
 
@@ -271,7 +304,8 @@ class ParallelSelfPlayRunner:
             runner = SelfPlayRunner(
                 self.config, trajectory_buffer=self.buffer,
                 executor_factory=self.executor_factory,
-                master_seed=self.master_seed)
+                master_seed=self.master_seed,
+                stage25_trajectory=self.stage25_trajectory)
             self.provenance = runner.provenance
             results = runner.run(specs)
             request_count = sum(result.transitions for result in results)
@@ -279,7 +313,9 @@ class ParallelSelfPlayRunner:
             self.inference_metrics["real_requests"] = request_count
             return results
 
-        if self.buffer is not None and len(self.buffer):
+        if ((self.buffer is not None and len(self.buffer)) or
+                (self.stage25_trajectory is not None and
+                 len(self.stage25_trajectory))):
             raise ValueError("parallel trajectory destination must be empty")
         assignments = [_assignment(spec) for spec in specs]
         policy_by_identity: dict[PolicyIdentity, BatchedPlanPolicy] = {}
@@ -305,8 +341,14 @@ class ParallelSelfPlayRunner:
         for position, assignment in enumerate(assignments):
             groups[position % self.num_workers].append(assignment)
         shard_capacity = None
+        stage25_shard_capacity = None
         if self.buffer is not None:
             shard_capacity = max(1, max(
+                len(groups[worker]) * 2
+                * (TOTAL_DAYS - self.config.manager_start_day)
+                for worker in range(self.num_workers)))
+        if self.stage25_trajectory is not None:
+            stage25_shard_capacity = max(1, max(
                 len(groups[worker]) * 2
                 * (TOTAL_DAYS - self.config.manager_start_day)
                 for worker in range(self.num_workers)))
@@ -320,7 +362,10 @@ class ParallelSelfPlayRunner:
                 master_seed=self.master_seed,
                 trajectory_capacity=(shard_capacity
                                      if self.buffer is not None else None),
-                owner_pid=owner_pid)
+                owner_pid=owner_pid,
+                stage25_trajectory_capacity=(
+                    stage25_shard_capacity
+                    if self.stage25_trajectory is not None else None))
             process = ctx.Process(
                 target=worker_main,
                 args=(task_queues[worker_id], request_queue,
@@ -349,6 +394,25 @@ class ParallelSelfPlayRunner:
                         message.policy_identity
                         if self.batch_scope == "policy"
                         else (message.policy_identity, int(message.day)))
+                    pending[key].append(message)
+                    pending_since.setdefault(key, time.perf_counter())
+                elif isinstance(message, Stage25InferenceRequest):
+                    if message.request_id in request_ids_seen:
+                        raise ParallelRolloutError(
+                            f"duplicate Stage 2.5 request {message.request_id!r}")
+                    request_ids_seen.add(message.request_id)
+                    # Stage 2.5 batches are grouped by immutable behavior
+                    # identity; unlike legacy policy-day routing, day mixing
+                    # is safe because K/context travel with every row.
+                    key = message.identity.behavior_identity
+                    pending[key].append(message)
+                    pending_since.setdefault(key, time.perf_counter())
+                elif isinstance(message, Stage25BootstrapRequest):
+                    if message.request_id in request_ids_seen:
+                        raise ParallelRolloutError(
+                            f"duplicate Stage 2.5 bootstrap request {message.request_id!r}")
+                    request_ids_seen.add(message.request_id)
+                    key = message.identity.behavior_identity
                     pending[key].append(message)
                     pending_since.setdefault(key, time.perf_counter())
                 elif message is not None:
@@ -413,7 +477,14 @@ class ParallelSelfPlayRunner:
             request_queue.close()
             result_queue.close()
 
-        if self.buffer is not None:
+        if self.stage25_trajectory is not None:
+            for shard in shards:
+                if shard is None:
+                    raise ParallelRolloutError(
+                        "worker returned no Stage 2.5 trajectory shard")
+                for row in shard.rows:
+                    self.stage25_trajectory.append(row)
+        elif self.buffer is not None:
             seen: set[tuple[int, int, int]] = set()
             for shard in shards:
                 if shard is None:
@@ -443,6 +514,16 @@ class ParallelSelfPlayRunner:
         response_queues: Sequence[Any],
     ) -> None:
         if not requests:
+            return
+        if isinstance(requests[0], Stage25InferenceRequest):
+            self._dispatch_stage25(
+                key, requests, _first_queued, policy_by_identity,
+                response_queues)
+            return
+        if isinstance(requests[0], Stage25BootstrapRequest):
+            self._dispatch_stage25_bootstrap(
+                key, requests, _first_queued, policy_by_identity,
+                response_queues)
             return
         # Sort before chunking. Queue arrival order is scheduler-dependent and
         # must never decide which rows share a physical policy call.
@@ -516,6 +597,191 @@ class ParallelSelfPlayRunner:
         for row, request in enumerate(requests):
             response_queues[request.worker_id].put(
                 InferenceResponse(request.request_id, _slice_outputs(outputs, row)))
+
+    def _dispatch_stage25(
+        self,
+        key: BatchKey,
+        requests: list[Stage25InferenceRequest],
+        _first_queued: float,
+        policy_by_identity: Mapping[Any, Any],
+        response_queues: Sequence[Any],
+    ) -> None:
+        """Batch Stage 2.5 rows while preserving each row's K/support payload."""
+        requests = sorted(requests, key=lambda request: (
+            request.identity.episode_index, request.identity.seat,
+            request.identity.day, request.request_id))
+        if self.max_batch is not None and len(requests) > self.max_batch:
+            for start in range(0, len(requests), self.max_batch):
+                self._dispatch_stage25(
+                    key, requests[start:start + self.max_batch], _first_queued,
+                    policy_by_identity, response_queues)
+            return
+        policy = policy_by_identity.get(key)
+        if policy is None:
+            # A Stage 2.5 key may be represented by a PolicyIdentity while the
+            # request carries the stronger behavior identity.
+            policy = next((candidate for candidate in policy_by_identity.values()
+                           if getattr(candidate, "behavior_identity", None) ==
+                           requests[0].identity.behavior_identity or
+                           getattr(candidate, "identity", None) ==
+                           requests[0].identity.behavior_identity), None)
+        if policy is None:
+            raise ParallelRolloutError(
+                "no owner policy for Stage 2.5 behavior identity "
+                f"{requests[0].identity.behavior_identity.identity_id()}")
+        real_count = len(requests)
+        physical_count = self.fixed_batch or real_count
+        if physical_count < real_count:
+            raise ParallelRolloutError(
+                f"fixed inference batch size {physical_count} is smaller than "
+                f"real request batch {real_count}")
+        keys = sorted(requests[0].inputs)
+        batch = {name: np.concatenate(
+            [np.asarray(request.inputs[name]) for request in requests], axis=0)
+                 for name in keys}
+        batch, padding_count = pad_batch_to_physical(batch, physical_count)
+        first = requests[0]
+        padded = [first] * padding_count
+        physical_requests = requests + padded
+        capacities = np.concatenate([
+            np.asarray(request.crop_capacity, dtype=np.int16)
+            for request in physical_requests], axis=0)
+        contexts = [request.physical_context for request in physical_requests]
+        supports = [request.support for request in physical_requests]
+        row_ids = [request.request_id for request in requests]
+        row_ids.extend(
+            f"padding/behavior={first.identity.behavior_identity.identity_id()}"
+            f"/batch={'|'.join(request.request_id for request in requests)}"
+            f"/slot={slot}" for slot in range(padding_count))
+        prng_id = f"stage25/behavior={first.identity.behavior_identity.identity_id()}"
+        t0 = time.perf_counter()
+        outputs = SelfPlayRunner._stage25_policy_batch(
+            policy, batch, capacities, contexts, supports, row_ids, prng_id)
+        inference_seconds = time.perf_counter() - t0
+        if outputs.batch_size != physical_count:
+            raise ParallelRolloutError(
+                "Stage 2.5 owner returned an unexpected physical batch size")
+        expected_identity = first.identity.behavior_identity
+        if outputs.policy_identity != expected_identity:
+            raise ParallelRolloutError(
+                "Stage 2.5 owner returned the wrong behavior identity")
+        self.inference_metrics["requests"] += real_count
+        self.inference_metrics["real_requests"] += real_count
+        self.inference_metrics["logical_requests"] += real_count
+        self.inference_metrics["batches"] += 1
+        self.inference_metrics["physical_inference_calls"] += 1
+        self.inference_metrics["batch_sizes"].append(real_count)
+        self.inference_metrics["real_batch_sizes"].append(real_count)
+        self.inference_metrics["physical_batch_sizes"].append(physical_count)
+        self.inference_metrics["physical_rows"] += physical_count
+        self.inference_metrics["padding_rows"] += padding_count
+        real_classes = np.asarray(outputs.classes[:real_count])
+        self.inference_metrics["animal_placement_rows"] += real_count
+        self.inference_metrics["animal_placement_nonzero_rows"] += int(
+            np.count_nonzero(np.any(real_classes[:, 1:4] > 0, axis=1)))
+        self.inference_metrics["animal_placement_classes"] += real_count * 3
+        self.inference_metrics["animal_placement_nonzero_classes"] += int(
+            np.count_nonzero(real_classes[:, 1:4] > 0))
+        self.inference_metrics["inference_seconds"] += inference_seconds
+        physical_rows = self.inference_metrics["physical_rows"]
+        self.inference_metrics["occupancy"] = (
+            self.inference_metrics["logical_requests"] / physical_rows
+            if physical_rows else 0.0)
+        self.inference_metrics["queue_wait_seconds"] += sum(
+            max(0.0, time.perf_counter() - request.queued_at)
+            for request in requests)
+        for row, request in enumerate(requests):
+            response_queues[request.worker_id].put(
+                Stage25InferenceResponse(
+                    request.request_id, request.identity,
+                    _slice_stage25_outputs(outputs, row)))
+
+    def _dispatch_stage25_bootstrap(
+        self,
+        key: BatchKey,
+        requests: list[Stage25BootstrapRequest],
+        _first_queued: float,
+        policy_by_identity: Mapping[Any, Any],
+        response_queues: Sequence[Any],
+    ) -> None:
+        """Batch value-only truncation requests with fixed physical padding."""
+        requests = sorted(requests, key=lambda request: (
+            request.identity.episode_index, request.identity.seat,
+            request.identity.day, request.request_id))
+        if self.max_batch is not None and len(requests) > self.max_batch:
+            for start in range(0, len(requests), self.max_batch):
+                self._dispatch_stage25_bootstrap(
+                    key, requests[start:start + self.max_batch], _first_queued,
+                    policy_by_identity, response_queues)
+            return
+        policy = policy_by_identity.get(key)
+        if policy is None:
+            policy = next((candidate for candidate in policy_by_identity.values()
+                           if getattr(candidate, "behavior_identity", None) == key or
+                           getattr(candidate, "identity", None) == key), None)
+        if policy is None:
+            raise ParallelRolloutError(
+                "no owner policy for Stage 2.5 bootstrap identity "
+                f"{key.identity_id() if hasattr(key, 'identity_id') else key}")
+        real_count = len(requests)
+        physical_count = self.fixed_batch or real_count
+        if physical_count < real_count:
+            raise ParallelRolloutError(
+                f"fixed inference batch size {physical_count} is smaller than "
+                f"real bootstrap batch {real_count}")
+        keys = sorted(requests[0].inputs)
+        batch = {name: np.concatenate(
+            [np.asarray(request.inputs[name]) for request in requests], axis=0)
+                 for name in keys}
+        batch, padding_count = pad_batch_to_physical(batch, physical_count)
+        first = requests[0]
+        physical_requests = requests + [first] * padding_count
+        capacities = np.concatenate([
+            np.asarray(request.crop_capacity, dtype=np.int16)
+            for request in physical_requests], axis=0)
+        contexts = [request.physical_context for request in physical_requests]
+        row_ids = [request.request_id for request in requests]
+        row_ids.extend(
+            f"padding/bootstrap={key.identity_id()}/slot={slot}"
+            for slot in range(padding_count))
+        value_fn = getattr(policy, "bootstrap_value", None)
+        if not callable(value_fn):
+            raise ParallelRolloutError(
+                "Stage 2.5 truncation requires parent value-only inference")
+        t0 = time.perf_counter()
+        try:
+            raw = value_fn(
+                inputs=batch, crop_capacity=capacities,
+                physical_contexts=contexts, row_ids=row_ids)
+        except TypeError:
+            raw = value_fn(batch, contexts)
+        values = np.asarray(raw, dtype=np.float32)
+        if values.shape != (physical_count,) or not np.all(np.isfinite(values)):
+            raise ParallelRolloutError(
+                "Stage 2.5 parent bootstrap must return finite float32 [B]")
+        self.inference_metrics["batches"] += 1
+        self.inference_metrics["physical_inference_calls"] += 1
+        self.inference_metrics["logical_requests"] += real_count
+        self.inference_metrics["bootstrap_requests"] += real_count
+        self.inference_metrics["batch_sizes"].append(real_count)
+        self.inference_metrics["real_batch_sizes"].append(real_count)
+        self.inference_metrics["physical_batch_sizes"].append(physical_count)
+        self.inference_metrics["physical_rows"] += physical_count
+        self.inference_metrics["padding_rows"] += padding_count
+        physical_rows = self.inference_metrics["physical_rows"]
+        self.inference_metrics["occupancy"] = (
+            self.inference_metrics["logical_requests"] / physical_rows
+            if physical_rows else 0.0)
+        self.inference_metrics["queue_wait_seconds"] += sum(
+            max(0.0, time.perf_counter() - request.queued_at)
+            for request in requests)
+        self.inference_metrics["inference_seconds"] += (
+            time.perf_counter() - t0)
+        for row, request in enumerate(requests):
+            response_queues[request.worker_id].put(
+                Stage25BootstrapResponse(
+                    request.request_id, request.identity,
+                    np.asarray(values[row], dtype=np.float32), key))
 
     def build_artifact_metadata(self, result: EpisodeResult) -> dict[str, Any]:
         return build_artifact_metadata(self.provenance, result)

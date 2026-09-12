@@ -23,7 +23,20 @@ from bc_manager.economics import (
     normalize_e_history_version,
 )
 
-from rl_manager.decode import ACTION_TENSOR_SHAPES, LOGPROB_GROUPS
+# Keep these legacy schema constants framework-neutral.  Importing
+# ``rl_manager.decode`` here would pull the Torch model into spawned CPU
+# workers even though the buffer itself only stores NumPy arrays.
+ACTION_TENSOR_SHAPES: dict[str, tuple[int, ...]] = {
+    "crop": (5,),
+    "animal": (3,),
+    "land": (),
+    "fertilizer": (5,),
+    "care": (3,),
+    "sell_presence": (9, 6),
+    "sell_quantity": (9, 6),
+}
+LOGPROB_GROUPS = ("crop", "animal", "land", "fertilizer", "care",
+                  "sell_presence")
 
 TRAJECTORY_SCHEMA_VERSION = 2
 _LEGACY_TRAJECTORY_SCHEMA_VERSION = 1

@@ -55,6 +55,7 @@ from .stage25_mechanics import (
     initialize_crop_ledger,
     unplaced_animal_counts,
 )
+from .stage25_types import Stage25BehaviorIdentity
 
 STATE_VERSION = "stage25_provider_state_v2"
 SOURCE_TRANSFER = "encoder_only"
@@ -81,6 +82,25 @@ class Stage25OutOfOrderError(Stage25ProviderError):
 
 class Stage25TerminalError(Stage25ProviderError):
     """Terminal observations never create or apply a manager action."""
+
+
+@dataclass(frozen=True)
+class Stage25InferenceContext:
+    """Read-only pre-decision payload handed to a parent inference owner."""
+
+    decision_key: Stage25DecisionKey
+    behavior_identity: Stage25BehaviorIdentity
+    inputs: Mapping[str, np.ndarray]
+    crop_capacity: tuple[int, ...]
+    physical_context: PhysicalContext
+    support: Mapping[str, Any]
+    observation: Mapping[str, Any]
+
+    @property
+    def request_id(self) -> str:
+        return (f"episode={self.decision_key.episode_id}/"
+                f"seat={self.decision_key.seat}/day={self.decision_key.day}"
+                f"/behavior={self.behavior_identity.identity_id()}")
 
 
 def _scalar_int(value: object, what: str, *, minimum: int = 0) -> int:
@@ -489,6 +509,7 @@ class Stage25PlanProvider:
         mode: DecisionMode = "deterministic", seed: int = 0,
         curriculum: Stage25CurriculumConfig | None = None,
         source_history_version: str | None = None,
+        behavior_identity: Stage25BehaviorIdentity | None = None,
     ) -> None:
         self.episode_id = _json_scalar(episode_id, "episode_id")
         self.seat = _scalar_int(seat, "seat")
@@ -509,6 +530,10 @@ class Stage25PlanProvider:
         self.e_history_version = E_HISTORY_CORRECTED_V1
         self.source_history_version = None if source_history_version is None else \
             normalize_e_history_version(source_history_version)
+        if behavior_identity is not None and not isinstance(
+                behavior_identity, Stage25BehaviorIdentity):
+            raise TypeError("behavior_identity must be Stage25BehaviorIdentity")
+        self.behavior_identity = behavior_identity
         if native_policy is not None and policy is not None:
             raise ValueError("pass native_policy or policy, not both")
         self._native_policy = native_policy or policy
@@ -528,6 +553,11 @@ class Stage25PlanProvider:
         self._e_history: tuple[int, float] | None = None
         self._last_inputs: dict[str, np.ndarray] | None = None
         self._diagnostics: dict[str, Any] = {}
+
+    @property
+    def expected_behavior_identity(self) -> Stage25BehaviorIdentity | None:
+        """The immutable policy snapshot expected for external responses."""
+        return self.behavior_identity
 
     @property
     def crop_capacity(self) -> tuple[int, ...] | None:
@@ -624,6 +654,8 @@ class Stage25PlanProvider:
             "curriculum_version": curriculum.version,
             "curriculum": _curriculum_json(curriculum),
         }
+        if self.behavior_identity is not None:
+            result["behavior_identity"] = self.behavior_identity.to_json_dict()
         if self.source_history_version is not None:
             result["source_history_version"] = self.source_history_version
             result["source_e_identity"] = {
@@ -695,6 +727,120 @@ class Stage25PlanProvider:
         )
         return inputs, context, initial
 
+    def _support_payload(
+        self, context: PhysicalContext, initial: tuple[int, ...]
+    ) -> dict[str, Any]:
+        """Materialize the pre-decision support without sampling anything."""
+        land = tuple(land_target_support_mask(context.observed_land))
+        # Animal/crop support is autoregressive.  The parent receives the
+        # immutable physical premises and these first-step masks; the native
+        # policy remains authoritative for prefix-conditioned masks.
+        animals = tuple(
+            animal_target_support_mask(
+                context, context.observed_land, species,
+                context.placed_animals[:species])
+            for species in range(3)
+        )
+        total_capacity = max(
+            physical_crop_capacity(context, context.observed_land,
+                                   context.placed_animals), 0)
+        crops = tuple(
+            crop_delta_support_mask(goal, total_capacity)
+            for goal in initial)
+        return {"land": land, "animals": animals, "crops": crops}
+
+    def prepare_inference_context(
+        self, obs: Mapping[str, Any],
+        previous_execution: Mapping[str, int] | None = None, *,
+        decision_key: Stage25DecisionKey | None = None,
+        decision_id: str | None = None,
+        behavior_identity: Stage25BehaviorIdentity | None = None,
+    ) -> Stage25InferenceContext:
+        """Build a read-only parent request before accepting a decision."""
+        if not isinstance(obs, Mapping):
+            raise Stage25ProviderError("obs must be a mapping")
+        if _terminal_observation(obs):
+            raise Stage25TerminalError(
+                "terminal delivery does not sample or apply")
+        day = _scalar_int(obs.get("day"), "obs.day")
+        key = self._key(day, decision_key, decision_id)
+        self._check_delivery(key)
+        identity = behavior_identity or self.behavior_identity
+        if not isinstance(identity, Stage25BehaviorIdentity):
+            raise Stage25ProviderError(
+                "external Stage 2.5 inference requires behavior_identity")
+        self.effective_curriculum()
+        inputs, context, initial = self._stage_observation(
+            obs, previous_execution)
+        frozen_inputs: dict[str, np.ndarray] = {}
+        for name, value in inputs.items():
+            copied = np.array(value, copy=True)
+            copied.setflags(write=False)
+            frozen_inputs[name] = copied
+        return Stage25InferenceContext(
+            decision_key=key,
+            behavior_identity=identity,
+            inputs=frozen_inputs,
+            crop_capacity=tuple(initial),
+            physical_context=context,
+            support=self._support_payload(context, initial),
+            observation=copy.deepcopy(dict(obs)),
+        )
+
+    def prepare_bootstrap_context(
+        self, obs: Mapping[str, Any],
+        previous_execution: Mapping[str, int] | None = None,
+    ) -> Stage25InferenceContext:
+        """Build a non-deliverable next-state context for truncation value only.
+
+        This intentionally bypasses ``_check_delivery`` and uses a distinct
+        row identity.  Callers may evaluate the critic at the final observed
+        state, but cannot accidentally submit the resulting classes as the
+        next manager decision or advance the crop ledger.
+        """
+        if not isinstance(obs, Mapping) or _terminal_observation(obs):
+            raise Stage25TerminalError("terminal state has no bootstrap context")
+        day = _scalar_int(obs.get("day"), "obs.day")
+        identity = self.behavior_identity
+        if not isinstance(identity, Stage25BehaviorIdentity):
+            raise Stage25ProviderError(
+                "Stage 2.5 bootstrap requires an immutable behavior identity")
+        self.effective_curriculum()
+        inputs, context, initial = self._stage_observation(obs, previous_execution)
+        frozen_inputs: dict[str, np.ndarray] = {}
+        for name, value in inputs.items():
+            copied = np.array(value, copy=True)
+            copied.setflags(write=False)
+            frozen_inputs[name] = copied
+        return Stage25InferenceContext(
+            decision_key=Stage25DecisionKey(
+                self.episode_id, self.seat, day, "bootstrap"),
+            behavior_identity=identity,
+            inputs=frozen_inputs,
+            crop_capacity=tuple(initial),
+            physical_context=context,
+            support=self._support_payload(context, initial),
+            observation=copy.deepcopy(dict(obs)),
+        )
+
+    def accept_inference_response(
+        self, request: Stage25InferenceContext,
+        action_classes: Sequence[int], *,
+        behavior_identity: Stage25BehaviorIdentity | None = None,
+    ) -> DailyPlan:
+        """Validate response identity, then perform exactly one K transition."""
+        if not isinstance(request, Stage25InferenceContext):
+            raise TypeError("request must be Stage25InferenceContext")
+        expected = behavior_identity or self.behavior_identity
+        if expected is None or request.behavior_identity != expected:
+            raise Stage25ProviderError(
+                "Stage 2.5 response behavior identity does not match request")
+        return self.accept_classes(
+            request.observation, action_classes,
+            decision_key=request.decision_key,
+            expected_behavior_identity=expected,
+        )
+
     def _commit(
         self, key: Stage25DecisionKey, classes: tuple[int, ...],
         goals: tuple[int, ...], plan: DailyPlan, inputs: dict[str, np.ndarray],
@@ -731,12 +877,18 @@ class Stage25PlanProvider:
         previous_execution: Mapping[str, int] | None = None, *,
         decision_key: Stage25DecisionKey | None = None,
         decision_id: str | None = None, terminal: bool = False,
+        expected_behavior_identity: Stage25BehaviorIdentity | None = None,
     ) -> DailyPlan:
         """Accept one external nine-class decision and lower it once."""
         if terminal or (isinstance(obs, Mapping) and _terminal_observation(obs)):
             raise Stage25TerminalError("terminal delivery does not sample or apply")
         if not isinstance(obs, Mapping):
             raise Stage25ProviderError("obs must be a mapping")
+        if (expected_behavior_identity is not None
+                and self.behavior_identity is not None
+                and expected_behavior_identity != self.behavior_identity):
+            raise Stage25ProviderError(
+                "Stage 2.5 response behavior identity does not match provider")
         day = _scalar_int(obs.get("day"), "obs.day")
         key = self._key(day, decision_key, decision_id)
         self._check_delivery(key)
@@ -772,6 +924,14 @@ class Stage25PlanProvider:
                 obs, supplied, previous_execution,
                 decision_key=decision_key, decision_id=decision_id)
         day = _scalar_int(obs.get("day"), "obs.day")
+        if day < self.manager_start_day:
+            # The executor still asks for a daily plan during opening days.
+            # Supply a neutral, non-deliverable plan without touching K or
+            # creating a manager trajectory row; the first real boundary is
+            # accepted by the runner at manager_start_day.
+            return _lower_plan(
+                (0, 0, 0, 0, 100, 100, 100, 100, 100),
+                (0, 0, 0, 0, 0))
         if self._cached_plan is not None and self.last_accepted_day == day:
             # A read with no action identity is benign.  If a caller supplies
             # one, it is a duplicate submission check, not a cache read.

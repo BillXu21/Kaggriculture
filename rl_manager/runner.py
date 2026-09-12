@@ -49,7 +49,6 @@ from oracle.batched_backend import BatchedEngineBackend, make_batched_backend
 from oracle.canonical import canonical_state_fast
 from replay_daily.constants import total_hire_cost
 
-from rl_manager.decode import plans_from_action_tensors
 from rl_manager.debug_trace import TraceRecorder
 from rl_manager.executor_factory import make_default_executor_factory
 from rl_manager.land import farm_utilization_snapshot, observed_land_purchase_events
@@ -60,6 +59,11 @@ from rl_manager.provenance import (
     sha256_hex,
 )
 from rl_manager.provider import QueuedPlanProvider
+from rl_manager.stage25_provider import (
+    Stage25InferenceContext,
+    Stage25PlanProvider,
+)
+from rl_manager.stage25_types import Stage25BehaviorIdentity, Stage25PolicyOutputs
 from rl_manager.reward import RewardConfig, TERMINAL_OWN_BANK, terminal_rewards
 from rl_manager.trajectory import TrajectoryBuffer, Transition, \
     TransitionMetadata
@@ -144,6 +148,12 @@ class RunnerConfig:
     record_official_replay: bool = False  # stage 2.5 capture: official toJSON + status history
     reward_config: RewardConfig = field(default_factory=RewardConfig)
     openings: tuple[str, str] | None = None
+    # Native Stage 2.5 is opt-in; legacy V0/E behavior remains unchanged.
+    stage25_enabled: bool = False
+    stage25: bool = False  # compatibility alias used by small smoke callers
+    stage25_mode: Literal["deterministic", "stochastic"] = "deterministic"
+    stage25_fixed_inference_batch_size: int | None = 16
+    stage25_curriculum: Any | None = None
 
     def __post_init__(self) -> None:
         if (isinstance(self.manager_start_day, bool)
@@ -175,6 +185,17 @@ class RunnerConfig:
                 or self.inference_batch_wait_seconds < 0):
             raise ValueError(
                 "inference_batch_wait_seconds must be finite and >= 0")
+        if self.stage25:
+            object.__setattr__(self, "stage25_enabled", True)
+        if self.stage25_mode not in ("deterministic", "stochastic"):
+            raise ValueError(
+                "stage25_mode must be 'deterministic' or 'stochastic'")
+        stage25_size = self.stage25_fixed_inference_batch_size
+        if (stage25_size is not None and
+                (isinstance(stage25_size, bool) or
+                 not isinstance(stage25_size, int) or stage25_size < 1)):
+            raise ValueError(
+                "stage25_fixed_inference_batch_size must be a positive int")
 
     def opening_for_seat(self, seat: int) -> str:
         """Resolve the configured opening without changing single-name behavior."""
@@ -451,6 +472,28 @@ class _EpisodeState:
             if config.record_debug_trace else None)
         self.current_canonical_state: dict[str, Any] | None = None
         self.providers = [QueuedPlanProvider(), QueuedPlanProvider()]
+        self.stage25_contexts: dict[tuple[int, int], Stage25InferenceContext] = {}
+        self.stage25_enabled = bool(config.stage25_enabled)
+        if self.stage25_enabled:
+            stage25_providers = []
+            for seat, policy in enumerate(spec.policies):
+                identity = getattr(policy, "behavior_identity", None)
+                if identity is None and isinstance(
+                        getattr(policy, "identity", None),
+                        Stage25BehaviorIdentity):
+                    identity = policy.identity
+                curriculum = config.stage25_curriculum
+                if curriculum is None:
+                    curriculum = getattr(policy, "curriculum", None)
+                if curriculum is None:
+                    model_config = getattr(policy, "config", None)
+                    curriculum = getattr(model_config, "curriculum", None)
+                stage25_providers.append(Stage25PlanProvider(
+                    spec.episode_index, seat, config.manager_start_day,
+                    mode=config.stage25_mode,
+                    curriculum=curriculum,
+                    behavior_identity=identity))
+            self.providers = stage25_providers
         factory = provenance["executor_factory"]
         self.executors = []
         self.openings = []
@@ -727,6 +770,8 @@ class SelfPlayRunner:
         trajectory_buffer: TrajectoryBuffer | None = None,
         executor_factory: Any | None = None,
         master_seed: int | None = None,
+        stage25_trajectory: Any | None = None,
+        stage25_trajectory_buffer: Any | None = None,
     ) -> None:
         self.config = config
         if config.debug_trace_seat not in (None, 0, 1):
@@ -735,8 +780,15 @@ class SelfPlayRunner:
                 or not config.debug_trace_view:
             raise ValueError("debug_trace_view must be a non-empty string")
         self.buffer = trajectory_buffer
+        self.stage25_trajectory = (stage25_trajectory
+                                   if stage25_trajectory is not None
+                                   else stage25_trajectory_buffer)
         if executor_factory is None:
-            if config.low_telemetry:
+            if config.stage25_enabled:
+                from rl_manager.executor_factory import make_stage25_executor_factory
+
+                executor_factory = make_stage25_executor_factory()
+            elif config.low_telemetry:
                 from executor_v0.agent import AgentConfig
 
                 executor_factory = make_default_executor_factory(
@@ -961,6 +1013,9 @@ class SelfPlayRunner:
         self,
         active: list[_EpisodeState],
     ) -> None:
+        if active and active[0].stage25_enabled:
+            self._collect_and_apply_stage25_decisions(active)
+            return
         start_day = self.config.manager_start_day
         requests: list[tuple[_EpisodeState, int, int]] = []
         for state in active:
@@ -1019,11 +1074,271 @@ class SelfPlayRunner:
                 raise ValueError(
                     f"policy returned batch {outputs.batch_size}, expected "
                     f"{expected}")
+            # Keep the legacy Torch decoder off the spawned worker import path.
+            # Stage 2.5 supplies native classes through the parent-owned
+            # inference adapter and never needs this compatibility decoder.
+            from rl_manager.decode import plans_from_action_tensors
             plans = plans_from_action_tensors(outputs.action_tensors)
             for row, (state, seat, day) in enumerate(group):
                 self._record_transition(state, seat, day, policy, outputs,
                                         row, encodings[(id(state), seat, day)],
                                         plans[row])
+
+    def _collect_and_apply_stage25_decisions(
+        self, active: list[_EpisodeState],
+    ) -> None:
+        """Collect one immutable Stage 2.5 request per seat/day boundary."""
+        start_day = self.config.manager_start_day
+        requests: list[tuple[_EpisodeState, int, int, Stage25InferenceContext]] = []
+        for state in active:
+            state.ensure_policy_identity()
+            day = int(state.obs[0]["day"])
+            hour = int(state.obs[0]["hour"])
+            if hour != 0 or day < start_day:
+                continue
+            state.record_daily_utilization(day)
+            for seat in range(2):
+                if day in state.planned_days[seat]:
+                    continue
+                provider = state.providers[seat]
+                context = provider.prepare_inference_context(
+                    state.obs[seat], state.previous_execution[seat],
+                    decision_id=(
+                        f"episode={state.spec.episode_index}/seat={seat}/"
+                        f"day={day}"),
+                    behavior_identity=provider.expected_behavior_identity)
+                state.stage25_contexts[(seat, day)] = context
+                requests.append((state, seat, day, context))
+        if not requests:
+            return
+
+        groups: dict[str, list[tuple[_EpisodeState, int, int,
+                                      Stage25InferenceContext]]] = {}
+        for item in requests:
+            identity = item[3].behavior_identity.identity_id()
+            groups.setdefault(identity, []).append(item)
+        for identity_id, group in sorted(groups.items()):
+            group.sort(key=lambda item: (
+                item[0].spec.episode_index, item[1], item[2],
+                item[3].request_id))
+            policy = group[0][0].spec.policies[group[0][1]]
+            inputs = {
+                key: np.concatenate([item[3].inputs[key] for item in group],
+                                     axis=0)
+                for key in sorted(group[0][3].inputs)}
+            contexts = [item[3].physical_context for item in group]
+            supports = [item[3].support for item in group]
+            capacities = np.asarray(
+                [item[3].crop_capacity for item in group], dtype=np.int16)
+            row_ids = [item[3].request_id for item in group]
+            set_context = getattr(policy, "set_request_context", None)
+            if callable(set_context):
+                set_context([item[3] for item in group])
+            outputs = self._stage25_policy_batch(
+                policy, inputs, capacities, contexts, supports, row_ids,
+                f"stage25/policy={identity_id}")
+            if outputs.policy_identity != group[0][3].behavior_identity:
+                raise ValueError(
+                    "Stage 2.5 policy response behavior identity mismatch")
+            classes = np.asarray(outputs.classes)
+            for row, (state, seat, day, context) in enumerate(group):
+                # Identity and output shape are checked before accept_classes;
+                # this is the only call that can mutate provider K/history.
+                if outputs.policy_identity != context.behavior_identity:
+                    raise ValueError(
+                        f"Stage 2.5 response identity mismatch for {context.request_id}")
+                self._close_stage25_outgoing(
+                    state, seat, day, context.inputs,
+                    next_crop_capacity=context.crop_capacity)
+                state.providers[seat].accept_inference_response(
+                    context, classes[row].tolist(),
+                    behavior_identity=context.behavior_identity)
+                # Stage 2.5 rows are owned by the dedicated collector (when
+                # enabled), but result accounting still records exactly one
+                # transition for this seat/day boundary.
+                state.planned_days[seat].add(day)
+                state.transition_index[(seat, day)] = self._record_stage25_transition(
+                    state, seat, day, policy, outputs, row, context)
+
+    def _close_stage25_outgoing(
+        self, state: _EpisodeState, seat: int, day: int,
+        next_inputs: Mapping[str, np.ndarray], *,
+        next_crop_capacity: Sequence[int],
+    ) -> None:
+        collector = getattr(self, "stage25_trajectory", None)
+        if collector is None or day <= self.config.manager_start_day:
+            return
+        close = getattr(collector, "close_outgoing", None)
+        if not callable(close):
+            return
+        close(
+            episode_index=state.spec.episode_index, seat=seat,
+            next_day=day, next_inputs=next_inputs,
+            next_crop_capacity=np.asarray(next_crop_capacity, dtype=np.int16),
+            terminal=False, truncated=False)
+
+    @staticmethod
+    def _stage25_policy_batch(
+        policy: Any, inputs: Mapping[str, np.ndarray],
+        crop_capacity: np.ndarray, contexts: Sequence[Any],
+        supports: Sequence[Any], row_ids: Sequence[str], prng_id: str,
+    ) -> Stage25PolicyOutputs:
+        """Call the parent Stage 2.5 owner through compatible method seams."""
+        infer = (getattr(policy, "infer_batch", None) or
+                 getattr(policy, "stage25_infer_batch", None) or
+                 getattr(policy, "plan_batch_with_context", None))
+        if callable(infer):
+            try:
+                raw = infer(
+                    inputs=inputs, crop_capacity=crop_capacity,
+                    physical_contexts=contexts, supports=supports,
+                    row_ids=row_ids, prng_id=prng_id)
+            except TypeError:
+                raw = infer(inputs, crop_capacity, contexts, supports,
+                            row_ids, prng_id)
+        else:
+            raw = policy.plan_batch(inputs, prng_id)
+        if isinstance(raw, Stage25PolicyOutputs):
+            return raw
+        if not isinstance(raw, Mapping):
+            raise TypeError("Stage 2.5 owner must return Stage25PolicyOutputs")
+        identity = getattr(raw, "policy_identity", None)
+        if identity is None:
+            identity = getattr(policy, "behavior_identity", None)
+        if identity is None and isinstance(getattr(policy, "identity", None),
+                                           Stage25BehaviorIdentity):
+            identity = policy.identity
+        if not isinstance(identity, Stage25BehaviorIdentity):
+            raise TypeError("Stage 2.5 owner returned no behavior identity")
+        classes = np.asarray(raw["classes"], dtype=np.int16)
+        component = np.asarray(raw.get("component_logprobs",
+                                      raw.get("logprob_components")),
+                               dtype=np.float32)
+        joint = np.asarray(raw.get("joint_logprob",
+                                   raw.get("logprob_total")), dtype=np.float32)
+        value = np.asarray(raw["value"], dtype=np.float32)
+        goals = np.asarray(raw.get("decoded_goals",
+                                   raw.get("crop_goals")), dtype=np.int16)
+        valid = np.asarray(raw.get("valid", raw.get("validity")),
+                           dtype=np.bool_)
+        return Stage25PolicyOutputs(
+            classes=classes, component_logprobs=component,
+            joint_logprob=joint, value=value, decoded_goals=goals,
+            valid=valid, policy_identity=identity,
+            batch_size=int(classes.shape[0]))
+
+    def _record_stage25_transition(
+        self, state: _EpisodeState, seat: int, day: int,
+        policy: Any, outputs: Stage25PolicyOutputs, row: int,
+        context: Stage25InferenceContext,
+    ) -> int | None:
+        """Use the optional Stage 2.5 collector without changing legacy data."""
+        collector = getattr(self, "stage25_trajectory", None)
+        if collector is None:
+            return None
+        opponent = getattr(state.spec.policies[1 - seat],
+                           "behavior_identity", None)
+        if opponent is None and isinstance(
+                getattr(state.spec.policies[1 - seat], "identity", None),
+                Stage25BehaviorIdentity):
+            opponent = state.spec.policies[1 - seat].identity
+        provenance = {
+            "policy": outputs.policy_identity.to_json_dict(),
+            "curriculum": {"version": outputs.policy_identity.curriculum_version},
+            "history": {"e_history_version": outputs.policy_identity.e_history_version},
+            "physical": {
+                "version": outputs.policy_identity.physical_support_version,
+                "crop_capacity": list(context.crop_capacity),
+                "context": {
+                    "observed_land": context.physical_context.observed_land,
+                    "crop_build_cells_by_land": list(
+                        context.physical_context.crop_build_cells_by_land),
+                    "placed_animals": list(
+                        context.physical_context.placed_animals),
+                    "reusable_empty_coops": (
+                        context.physical_context.reusable_empty_coops),
+                    "reusable_empty_pastures": (
+                        context.physical_context.reusable_empty_pastures),
+                    "unplaced_animals": list(
+                        context.physical_context.unplaced_animals),
+                },
+                "support": context.support,
+            },
+            "executor": _executor_factory_provenance(
+                self.provenance["executor_factory"]),
+        }
+        if not isinstance(opponent, Stage25BehaviorIdentity):
+            raise ValueError("Stage 2.5 trajectory requires both seat identities")
+        record = getattr(collector, "record_decision", None)
+        if callable(record):
+            record(
+                episode_index=state.spec.episode_index,
+                seed=state.spec.seed, seat=seat, day=day,
+                inputs=context.inputs,
+                crop_capacity=np.asarray(context.crop_capacity, dtype=np.int16),
+                classes=outputs.classes[row],
+                component_logprobs=outputs.component_logprobs[row],
+                joint_logprob=float(outputs.joint_logprob[row]),
+                value=float(outputs.value[row]),
+                behavior_identity=outputs.policy_identity,
+                executor_provenance=_executor_factory_provenance(
+                    self.provenance["executor_factory"]),
+                trainable=seat in state.spec.trainable_seats,
+            )
+            return None
+        append = getattr(collector, "append", None)
+        if callable(append):
+            row_outputs = Stage25PolicyOutputs(
+                classes=outputs.classes[row:row + 1],
+                component_logprobs=outputs.component_logprobs[row:row + 1],
+                joint_logprob=outputs.joint_logprob[row:row + 1],
+                value=outputs.value[row:row + 1],
+                decoded_goals=outputs.decoded_goals[row:row + 1],
+                valid=outputs.valid[row:row + 1],
+                policy_identity=outputs.policy_identity, batch_size=1)
+            from rl_manager.stage25_trajectory import row_from_policy_outputs
+
+            row = row_from_policy_outputs(
+                episode_id=state.spec.episode_index, seat=seat, day=day,
+                inputs=context.inputs, outputs=row_outputs,
+                opponent_identity=opponent, provenance=provenance,
+                row_id=context.request_id, seed=state.spec.seed,
+                trainable=seat in state.spec.trainable_seats)
+            return append(row)
+        raise TypeError("Stage 2.5 trajectory collector has no append hook")
+
+    @staticmethod
+    def _stage25_bootstrap_value(
+        state: _EpisodeState, seat: int,
+    ) -> float:
+        """Read the critic at the final state without accepting a plan."""
+        provider = state.providers[seat]
+        context = provider.prepare_bootstrap_context(
+            state.obs[seat], state.previous_execution[seat])
+        policy = state.spec.policies[seat]
+        value_fn = (getattr(policy, "bootstrap_value", None) or
+                    getattr(policy, "value_batch", None) or
+                    getattr(policy, "infer_value", None))
+        if not callable(value_fn):
+            raise ValueError(
+                "Stage 2.5 truncation requires a value-only parent inference "
+                "method; sampling a replacement plan is forbidden")
+        try:
+            raw = value_fn(
+                inputs=context.inputs,
+                crop_capacity=np.asarray([context.crop_capacity], dtype=np.int16),
+                physical_contexts=(context.physical_context,),
+                row_ids=(context.request_id,),
+                prng_id="stage25/bootstrap")
+        except TypeError:
+            raw = value_fn(context.inputs, context.physical_context)
+        if isinstance(raw, Mapping):
+            raw = raw.get("value", raw.get("values"))
+        values = np.asarray(raw, dtype=np.float32)
+        if values.shape not in ((), (1,)) or not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"Stage 2.5 bootstrap value must be one finite scalar, got {values.shape}")
+        return float(values.reshape(-1)[0])
 
     def _record_transition(
         self,
@@ -1174,10 +1489,34 @@ class SelfPlayRunner:
                     day for (s, day) in state.transition_index if s == seat)
                 if days:
                     last_index = state.transition_index[(seat, days[-1])]
-                    self.buffer.patch_terminal(last_index, rewards[seat],
-                                               terminated)
+                    if last_index is not None:
+                        self.buffer.patch_terminal(last_index, rewards[seat],
+                                                   terminated)
+                        if state.truncated:
+                            self.buffer.patch_truncated(last_index)
+
+        stage25_buffer = getattr(self, "stage25_trajectory", None)
+        if state.stage25_enabled and stage25_buffer is not None:
+            patch_terminal = getattr(stage25_buffer, "patch_terminal", None)
+            patch_truncated = getattr(stage25_buffer, "patch_truncated", None)
+            if callable(patch_terminal) and callable(patch_truncated):
+                for seat in range(2):
+                    days = sorted(day for (s, day) in state.transition_index
+                                  if s == seat)
+                    if not days:
+                        continue
+                    index = state.transition_index[(seat, days[-1])]
+                    if index is None:
+                        continue
                     if state.truncated:
-                        self.buffer.patch_truncated(last_index)
+                        # Read the final-state critic through the parent-owned
+                        # value-only seam.  This never accepts a plan or
+                        # changes provider K.
+                        patch_truncated(
+                            index,
+                            np.float32(self._stage25_bootstrap_value(state, seat)))
+                    else:
+                        patch_terminal(index, np.float32(rewards[seat]), True)
             self._patch_executor_diagnostics(state)
 
         opening_diagnostics = [
@@ -1234,6 +1573,24 @@ class SelfPlayRunner:
                 (seat, day): dict(self.buffer.sidecar_records[index].plan_json)
                 for (seat, day), index in state.transition_index.items()
             } if self.buffer is not None else {}
+
+        if state.stage25_enabled:
+            collector = getattr(self, "stage25_trajectory", None)
+            close = getattr(collector, "close_episode", None)
+            if callable(close):
+                for seat in range(2):
+                    # The final canonical observation supplies truncation
+                    # bootstrap inputs.  No additional manager plan/value
+                    # request is made, and a true terminal is zero-bootstrap.
+                    close(
+                        episode_index=state.spec.episode_index, seat=seat,
+                        next_inputs=state.encode_seat(seat),
+                        terminal=not state.truncated,
+                        truncated=state.truncated,
+                        bootstrap_value=(0.0 if not state.truncated else None),
+                        executor_provenance=_executor_factory_provenance(
+                            self.provenance["executor_factory"]),
+                    )
 
         episode_digest = hashlib.sha256()
         for day in sorted(state.day_digests):
@@ -1295,6 +1652,8 @@ class SelfPlayRunner:
 
     def _patch_executor_diagnostics(self, state: _EpisodeState) -> None:
         """Compact per-day executor diagnostics into sidecar metadata."""
+        if self.buffer is None:
+            return
         for seat in range(2):
             try:
                 diagnostics = state.executors[seat].diagnostics_json()

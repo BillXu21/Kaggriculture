@@ -20,12 +20,19 @@ from rl_manager.parallel_protocol import (
     EpisodeAssignment,
     InferenceRequest,
     InferenceResponse,
+    Stage25InferenceRequest,
+    Stage25InferenceResponse,
+    Stage25BootstrapRequest,
+    Stage25BootstrapResponse,
+    Stage25RequestIdentity,
     WorkerFailed,
     WorkerFinished,
     WorkerTask,
     policy_row_request_id,
 )
 from rl_manager.runner import EpisodeSpec, SelfPlayRunner
+from rl_manager.stage25_provider import Stage25InferenceContext
+from rl_manager.stage25_types import Stage25PolicyOutputs
 from rl_manager.types import PolicyIdentity, PolicyOutputs
 
 
@@ -56,12 +63,15 @@ class RemotePlanPolicy:
         self._request_queue = request_queue
         self._response_queue = response_queue
         self._worker_id = int(worker_id)
-        self._request_context: list[tuple[int, int, int]] | None = None
+        self._request_context: list[Any] | None = None
 
     def set_request_context(
-            self, rows: Sequence[tuple[int, int, int]]) -> None:
+            self, rows: Sequence[Any]) -> None:
         """Receive the runner's exact batch row identities before forwarding."""
-        self._request_context = [tuple(map(int, row)) for row in rows]
+        if rows and isinstance(rows[0], Stage25InferenceContext):
+            self._request_context = list(rows)
+        else:
+            self._request_context = [tuple(map(int, row)) for row in rows]
 
     def plan_batch(self, inputs: Mapping[str, np.ndarray],
                    prng_id: str) -> PolicyOutputs:
@@ -75,6 +85,8 @@ class RemotePlanPolicy:
             raise ValueError(
                 f"remote policy context has {len(rows)} rows, expected "
                 f"{batch_size}")
+        if rows and isinstance(rows[0], Stage25InferenceContext):
+            return self._stage25_plan_batch(inputs, prng_id, rows)
         requests: list[InferenceRequest] = []
         for row, (episode_index, seat, day) in enumerate(rows):
             request_id = policy_row_request_id(
@@ -116,6 +128,99 @@ class RemotePlanPolicy:
             row_outputs.append(received[request.request_id])
         return _stack_row_outputs(row_outputs)
 
+    def _stage25_plan_batch(
+        self, inputs: Mapping[str, np.ndarray], prng_id: str,
+        rows: Sequence[Stage25InferenceContext],
+    ) -> Stage25PolicyOutputs:
+        requests: list[Stage25InferenceRequest] = []
+        for row, context in enumerate(rows):
+            identity = Stage25RequestIdentity(
+                context.decision_key.episode_id if isinstance(
+                    context.decision_key.episode_id, int) else row,
+                context.decision_key.seat, context.decision_key.day,
+                context.behavior_identity,
+                crop_capacity=context.crop_capacity,
+                physical_context=context.physical_context,
+                support=context.support)
+            row_inputs = {
+                key: np.ascontiguousarray(np.asarray(value[row:row + 1]))
+                for key, value in inputs.items()}
+            requests.append(Stage25InferenceRequest(
+                identity=identity, worker_id=self._worker_id,
+                prng_id=str(prng_id), inputs=row_inputs,
+                crop_capacity=np.asarray([context.crop_capacity], dtype=np.int16),
+                physical_context=context.physical_context,
+                support=context.support, queued_at=time.perf_counter()))
+        for request in requests:
+            self._request_queue.put(request)
+        expected = {request.request_id for request in requests}
+        received: dict[str, Stage25PolicyOutputs] = {}
+        while expected - received.keys():
+            response = self._response_queue.get()
+            if isinstance(response, WorkerFailed):
+                raise RuntimeError(
+                    f"inference owner failure: {response.error_message}")
+            if not isinstance(response, Stage25InferenceResponse):
+                raise RuntimeError(
+                    f"worker {self._worker_id} received unexpected IPC message "
+                    f"{type(response).__name__}")
+            if (response.request_id not in expected or
+                    response.identity != next(
+                        r.identity for r in requests
+                        if r.request_id == response.request_id) or
+                    response.outputs.policy_identity != response.identity.behavior_identity):
+                raise RuntimeError(
+                    f"worker {self._worker_id} received mismatched Stage 2.5 response")
+            received[response.request_id] = response.outputs
+        return _stack_stage25_row_outputs([
+            received[request.request_id] for request in requests])
+
+    def bootstrap_value(
+        self, *, inputs: Mapping[str, np.ndarray], crop_capacity: Any,
+        physical_contexts: Sequence[Any], row_ids: Sequence[Any] | None = None,
+        prng_id: str | None = None,
+    ) -> np.ndarray:
+        """Request a critic value without creating or accepting a plan."""
+        del prng_id
+        contexts = tuple(physical_contexts)
+        if len(contexts) != 1:
+            raise ValueError("remote Stage 2.5 bootstrap requires one context")
+        context = contexts[0]
+        if row_ids is None or len(tuple(row_ids)) != 1:
+            raise ValueError("remote Stage 2.5 bootstrap requires one row id")
+        row_id = str(tuple(row_ids)[0])
+        fields = {
+            item.split("=", 1)[0]: item.split("=", 1)[1]
+            for item in row_id.split("/") if "=" in item}
+        try:
+            episode_id = int(fields["episode"])
+            seat = int(fields["seat"])
+            day = int(fields["day"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                f"bootstrap row id is not a manager identity: {row_id!r}") from exc
+        identity = Stage25RequestIdentity(
+            episode_id, seat, day, self.identity,
+            crop_capacity=tuple(int(value) for value in np.asarray(
+                crop_capacity).reshape(-1)),
+            physical_context=context)
+        request = Stage25BootstrapRequest(
+            identity=identity, worker_id=self._worker_id,
+            inputs={name: np.ascontiguousarray(np.asarray(value))
+                    for name, value in inputs.items()},
+            crop_capacity=np.asarray(crop_capacity, dtype=np.int16),
+            physical_context=context, support=None,
+            queued_at=time.perf_counter())
+        self._request_queue.put(request)
+        response = self._response_queue.get()
+        if (not isinstance(response, Stage25BootstrapResponse) or
+                response.request_id != request.request_id or
+                response.identity != request.identity or
+                response.policy_identity != self.identity):
+            raise RuntimeError(
+                f"worker {self._worker_id} received mismatched Stage 2.5 bootstrap response")
+        return np.asarray([response.value], dtype=np.float32)
+
 
 def _stack_row_outputs(outputs: Sequence[PolicyOutputs]) -> PolicyOutputs:
     if not outputs:
@@ -139,12 +244,38 @@ def _stack_row_outputs(outputs: Sequence[PolicyOutputs]) -> PolicyOutputs:
         batch_size=len(outputs))
 
 
+def _stack_stage25_row_outputs(
+        outputs: Sequence[Stage25PolicyOutputs]) -> Stage25PolicyOutputs:
+    if not outputs:
+        raise ValueError("cannot stack empty Stage 2.5 output list")
+    identity = outputs[0].policy_identity
+    if any(output.policy_identity != identity for output in outputs):
+        raise RuntimeError("Stage 2.5 response identities differ in one batch")
+    return Stage25PolicyOutputs(
+        classes=np.concatenate([output.classes for output in outputs], axis=0),
+        component_logprobs=np.concatenate(
+            [output.component_logprobs for output in outputs], axis=0),
+        joint_logprob=np.asarray(
+            [output.joint_logprob[0] for output in outputs], dtype=np.float32),
+        value=np.asarray([output.value[0] for output in outputs],
+                         dtype=np.float32),
+        decoded_goals=np.concatenate(
+            [output.decoded_goals for output in outputs], axis=0),
+        valid=np.asarray([output.valid[0] for output in outputs], dtype=np.bool_),
+        policy_identity=identity, batch_size=len(outputs))
+
+
 def _factory_from_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
     if (isinstance(factory, tuple) and len(factory) == 2
             and factory[0] == "executor_v0@config"):
         from rl_manager.executor_factory import make_default_executor_factory
 
         return make_default_executor_factory(factory[1])
+    if (isinstance(factory, tuple) and len(factory) == 2
+            and factory[0] == "stage25_executor@config"):
+        from rl_manager.executor_factory import make_stage25_executor_factory
+
+        return make_stage25_executor_factory(factory[1])
     if factory == "executor_v0@default":
         from rl_manager.executor_factory import make_default_executor_factory
         return make_default_executor_factory()
@@ -196,14 +327,22 @@ def worker_main(task_queue: Any, request_queue: Any, response_queue: Any,
             trajectory = TrajectoryBuffer(
                 capacity=int(task.trajectory_capacity), input_spec=e_input_spec(),
                 e_history_version=task.runner_config.e_history_version)
+        stage25_trajectory = None
+        if task.stage25_trajectory_capacity is not None:
+            from rl_manager.stage25_trajectory import Stage25TrajectoryBuffer
+            stage25_trajectory = Stage25TrajectoryBuffer(
+                int(task.stage25_trajectory_capacity))
         runner = SelfPlayRunner(
             task.runner_config, trajectory_buffer=trajectory,
             executor_factory=_factory_from_wire(
                 task.executor_factory,
                 low_telemetry=task.runner_config.low_telemetry),
-            master_seed=task.master_seed)
+            master_seed=task.master_seed,
+            stage25_trajectory=stage25_trajectory)
         results = tuple(runner.run(specs))
-        result_queue.put(WorkerFinished(task.worker_id, results, trajectory))
+        result_queue.put(WorkerFinished(
+            task.worker_id, results,
+            stage25_trajectory if stage25_trajectory is not None else trajectory))
     except BaseException as exc:  # noqa: BLE001 - transport all worker errors
         worker_id = int(task.worker_id) if task is not None else -1
         result_queue.put(WorkerFailed(
