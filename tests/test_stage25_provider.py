@@ -169,6 +169,40 @@ def test_export_import_is_strict_and_preserves_cached_plan() -> None:
         restored.import_state(bad)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "official 1.32.7 observations omit 'step' for the non-acting seat; the "
+        "provider must derive step from day/hour instead of failing the live "
+        "observation contract."
+    ),
+)
+def test_provider_derives_step_when_observation_omits_it() -> None:
+    provider = Stage25PlanProvider(7, 0, 3)
+    obs = _obs(day=3)
+    obs.pop("step")  # official engine seat-1 observation shape
+    provider.accept_classes(obs, HOLD)
+    assert provider.crop_capacity == (1, 0, 0, 0, 0)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "fast-engine animal tiles carry 'age' (days since placement) rather "
+        "than 'placed_day'; the live corrected-E normalizer rejects the 'age' "
+        "key, so stochastic native rollouts cannot encode the observation."
+    ),
+)
+def test_provider_accepts_fast_engine_age_animal_tiles() -> None:
+    provider = Stage25PlanProvider(7, 0, 3)
+    obs = _obs(day=3)
+    goose = obs["farms"][0]["tiles"][0][1]
+    del goose["placed_day"]
+    goose["age"] = 3
+    provider.accept_classes(obs, HOLD)
+    assert provider.crop_capacity == (1, 0, 0, 0, 0)
+
+
 def test_external_import_and_acceptance_can_run_with_torch_and_jax_blocked() -> None:
     script = """
 import builtins, sys

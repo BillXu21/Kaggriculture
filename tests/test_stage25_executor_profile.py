@@ -175,6 +175,23 @@ def test_failed_expansion_keeps_requested_and_feasible_plans_distinct():
     assert record["land_purchase"]["submitted"] is False
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the required Stage 2.5 heuristic_care profile crashes on the "
+        "fast-engine animal tile shape, which carries 'age' instead of "
+        "'placed_day', so the native-provider smoke fails in stochastic mode."
+    ),
+)
+def test_heuristic_care_accepts_fast_engine_age_tiles():
+    from executor_v0.upkeep import care_has_payoff
+
+    tile = {"kind": "COOP", "animal": "GOOSE", "age": 2,
+            "fed_today": True, "cared_today": False}
+    # Must decide using 'age' (current_day - age) rather than raising KeyError.
+    assert care_has_payoff(tile, 3) in (True, False)
+
+
 def test_goal_change_releases_obsolete_plant_and_conversion_queue_work():
     scheduler = PersistentTaskScheduler()
     old_plant = _task(
