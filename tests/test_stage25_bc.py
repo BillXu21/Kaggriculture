@@ -10,6 +10,7 @@ import jax
 import numpy as np
 import pytest
 
+from bc_manager.economics import E_HISTORY_LEGACY
 from rl_manager.stage25_bc import (
     Stage25BCBatch,
     Stage25BCConfig,
@@ -135,6 +136,54 @@ def test_loss_smoke_and_fitting_reduces_loss():
     final = float(loss_and_metrics(params, batch, config)["loss"])
     assert np.isfinite(initial) and np.isfinite(final)
     assert final < initial
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "stage25_bc.save_checkpoint silently drops e_history_version/"
+        "source_identity/provenance metadata that collide with reserved "
+        "checkpoint keys, so a legacy-history E transfer is recorded as "
+        "corrected-history parity with empty provenance."
+    ),
+)
+def test_bc_wrapper_preserves_import_history_and_source_identity(tmp_path):
+    config = Stage25BCConfig(model=Stage25ModelConfig.tiny(), batch_size=2)
+    params = init_stage25_params(config.model, seed=41)
+    state = init_opt_state(params, config)
+    path = tmp_path / "history.npz"
+    save_checkpoint(path, params, state, jax.random.PRNGKey(41), config=config,
+                    step=1, epoch=0, metadata={
+                        "e_history_version": E_HISTORY_LEGACY,
+                        "source_identity": {"checkpoint": "historical-e"},
+                        "provenance": {"run": "review"},
+                    })
+    meta = load_checkpoint(path, config=config)[3]
+    assert meta["e_history_version"] == E_HISTORY_LEGACY
+    assert meta["source_identity"] == {"checkpoint": "historical-e"}
+    assert meta["provenance"] == {"run": "review"}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the high-level BC wrapper exposes no explicit legacy-history opt-in, "
+        "so an explicitly legacy E BC checkpoint cannot be resumed."
+    ),
+)
+def test_bc_wrapper_resumes_explicit_legacy_history_checkpoint(tmp_path):
+    from rl_manager.stage25_checkpoint import save_stage25_bc_checkpoint
+
+    config = Stage25BCConfig(model=Stage25ModelConfig.tiny(), batch_size=2)
+    params = init_stage25_params(config.model, seed=43)
+    state = init_opt_state(params, config)
+    path = tmp_path / "legacy.npz"
+    save_stage25_bc_checkpoint(path, params, state,
+                               np.asarray([7, 9], dtype=np.uint32), config.model,
+                               seed=43, step=2, epoch=0, optimizer_config=config,
+                               e_history_version=E_HISTORY_LEGACY)
+    loaded = load_checkpoint(path, config=config)
+    assert _flat_equal(params, loaded[0])
 
 
 def test_native_save_load_and_torch_blocked_startup(tmp_path):
