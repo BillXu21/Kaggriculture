@@ -558,8 +558,15 @@ def _policy_core(
     capacity ``C`` is derived here from the decoded context after the land and
     animal steps; it is never supplied by the caller.
     """
-    z = _manager_representation(params["encoder"], inputs,
-                                config.manager_config, _Dropout(0.0, None), "E")
+    dropout_rng = None
+    if mode == "train":
+        # Training is the only path that enables the existing corrected-E
+        # dropout sites.  Use one explicit batch key; evaluation and PPO keep
+        # the historical no-dropout behavior bit-for-bit.
+        dropout_rng = jax.random.fold_in(rng_keys[0], 0x25)
+    z = _manager_representation(
+        params["encoder"], inputs, config.manager_config,
+        _Dropout(config.dropout if mode == "train" else 0.0, dropout_rng), "E")
     z = z + (crop_capacity / 100.0) @ params["capacity_conditioning"]
     value = (z @ params["value_head"]["kernel"] +
              params["value_head"]["bias"])[:, 0]
