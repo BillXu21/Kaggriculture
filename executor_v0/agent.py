@@ -314,12 +314,17 @@ def _task_route_eta(
 
 class ExecutorAgent:
     def __init__(self, provider: PlanProvider, *, seat: int | None = None,
-                 config: AgentConfig | None = None) -> None:
+                 config: AgentConfig | None = None,
+                 profile: Mapping[str, Any] | None = None) -> None:
         self.provider = provider
         self.seat = seat
         if seat is not None and seat not in (0, 1):
             raise ValueError(f"seat must be None, 0, or 1, got {seat!r}")
         self.config = config or AgentConfig()
+        if profile is not None and not isinstance(profile, Mapping):
+            raise TypeError("profile must be a mapping when provided")
+        self._effective_profile = (
+            copy.deepcopy(dict(profile)) if profile is not None else None)
         _require_positive_int(self.config.tasks_per_worker, "config.tasks_per_worker")
         _require_positive_int(self.config.max_market_orders, "config.max_market_orders")
         _require_positive_int(self.config.shed_capacity, "config.shed_capacity")
@@ -1883,6 +1888,11 @@ class ExecutorAgent:
         """Return a defensive copy of the latest primitive-turn snapshot."""
         return copy.deepcopy(self._debug_trace_turn)
 
+    @property
+    def effective_profile(self) -> dict[str, Any] | None:
+        """Return the immutable-at-construction executor profile, if any."""
+        return copy.deepcopy(self._effective_profile)
+
     def finalize_diagnostics(self, obs: Mapping, seat: int) -> None:
         """Complete the current day's realized-state diagnostic at terminal."""
         if self._day is None or int(obs["day"]) != self._day:
@@ -1937,6 +1947,9 @@ class ExecutorAgent:
             },
             "fallback_errors": [dict(e) for e in self._errors],
         }
+        if self._effective_profile is not None:
+            diagnostics["effective_profile"] = copy.deepcopy(
+                self._effective_profile)
         if self.config.starvation_workload_visibility_repair:
             diagnostics["config"]["starvation_workload_visibility_repair"] = True
         provider_diagnostics = getattr(self.provider, "diagnostics_json", None)
@@ -1948,12 +1961,13 @@ class ExecutorAgent:
 def make_agent(*, provider: PlanProvider | None = None,
                checkpoint: str | None = None, device: str = "cpu",
                seat: int | None = None,
-               config: AgentConfig | None = None) -> ExecutorAgent:
+               config: AgentConfig | None = None,
+               profile: Mapping[str, Any] | None = None) -> ExecutorAgent:
     if (provider is None) == (checkpoint is None):
         raise ValueError("provide exactly one of provider= or checkpoint=")
     if checkpoint is not None:
         provider = CheckpointPlanProvider(checkpoint, device=device)
-    return ExecutorAgent(provider, seat=seat, config=config)
+    return ExecutorAgent(provider, seat=seat, config=config, profile=profile)
 
 
 AgentCallable = Callable[[Mapping], dict[str, Any]]

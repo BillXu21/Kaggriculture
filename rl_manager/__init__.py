@@ -32,6 +32,14 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "E_VS_PASS": ("rl_manager.types", "E_VS_PASS"),
     "EXECUTOR_FACTORY_VERSION": (
         "rl_manager.executor_factory", "EXECUTOR_FACTORY_VERSION"),
+    "STAGE25_EXECUTOR_PROFILE_NAME": (
+        "rl_manager.executor_factory", "STAGE25_EXECUTOR_PROFILE_NAME"),
+    "STAGE25_EXECUTOR_PROFILE_VERSION": (
+        "rl_manager.executor_factory", "STAGE25_EXECUTOR_PROFILE_VERSION"),
+    "Stage25ExecutorFactory": (
+        "rl_manager.executor_factory", "Stage25ExecutorFactory"),
+    "Stage25ExecutorProfile": (
+        "rl_manager.executor_factory", "Stage25ExecutorProfile"),
     "EpisodeResult": ("rl_manager.runner", "EpisodeResult"),
     "EpisodeSpec": ("rl_manager.runner", "EpisodeSpec"),
     "PromotionConfig": ("rl_manager.evaluation", "PromotionConfig"),
@@ -76,6 +84,14 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "PolicyIdentity": ("rl_manager.types", "PolicyIdentity"),
     "PolicyOutputs": ("rl_manager.types", "PolicyOutputs"),
     "QueuedPlanProvider": ("rl_manager.provider", "QueuedPlanProvider"),
+    "Stage25DecisionKey": (
+        "rl_manager.stage25_provider", "Stage25DecisionKey"),
+    "Stage25LifecycleState": (
+        "rl_manager.stage25_provider", "Stage25LifecycleState"),
+    "Stage25NativePolicy": (
+        "rl_manager.stage25_provider", "Stage25NativePolicy"),
+    "Stage25PlanProvider": (
+        "rl_manager.stage25_provider", "Stage25PlanProvider"),
     "RL_PPO_CHECKPOINT_FORMAT": (
         "rl_manager.ppo_checkpoint", "RL_PPO_CHECKPOINT_FORMAT"),
     "RunnerConfig": ("rl_manager.runner", "RunnerConfig"),
@@ -114,6 +130,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "load_trajectory": ("rl_manager.trajectory", "load_trajectory"),
     "make_default_executor_factory": (
         "rl_manager.executor_factory", "make_default_executor_factory"),
+    "make_stage25_executor_factory": (
+        "rl_manager.executor_factory", "make_stage25_executor_factory"),
     "params_fingerprint": ("rl_manager.policy", "params_fingerprint"),
     "plans_from_action_tensors": (
         "rl_manager.decode", "plans_from_action_tensors"),
