@@ -106,6 +106,27 @@ def test_row_ids_make_sampling_stable_under_reorder_and_padding():
     np.testing.assert_array_equal(padded.joint_logprob[:2], first.joint_logprob)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the single-process runner samples with prng_id 'stage25/policy=...' "
+        "while the parallel parent dispatches with 'stage25/behavior=...'; the "
+        "same checkpoint/seed/row therefore yields different stochastic actions "
+        "depending on the execution topology"
+    ),
+)
+def test_row_action_is_stable_across_runner_and_parent_prng_namespaces():
+    adapter = _adapter()
+    row = "episode=0/seat=0/day=4/behavior=" + adapter.identity.identity_id()
+    local = adapter.plan_batch_with_row_ids(
+        _inputs(1), (row,), "stage25/policy=" + adapter.identity.identity_id(),
+        physical_contexts=(_context(),))
+    parent = adapter.plan_batch_with_row_ids(
+        _inputs(1), (row,), "stage25/behavior=" + adapter.identity.identity_id(),
+        physical_contexts=(_context(),))
+    np.testing.assert_array_equal(local.classes, parent.classes)
+
+
 def test_checkpoint_binds_curriculum_and_rejects_provider_mismatch(tmp_path):
     enabled = Stage25CurriculumConfig(enabled=True, max_positive_crop_delta=1)
     checkpoint, config = _adapter(tmp_path, curriculum=enabled)

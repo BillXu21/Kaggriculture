@@ -13,6 +13,7 @@ from importlib.util import find_spec
 
 from rl_manager.parallel import ParallelSelfPlayRunner
 from rl_manager.parallel_protocol import (
+    Stage25BootstrapRequest,
     Stage25InferenceRequest,
     Stage25RequestIdentity,
 )
@@ -82,6 +83,17 @@ def _request(index: int, day: int = 4) -> Stage25InferenceRequest:
         queued_at=0.0)
 
 
+def _bootstrap_request(index: int, day: int = 4) -> Stage25BootstrapRequest:
+    provider = Stage25PlanProvider(
+        index, 0, day, behavior_identity=IDENTITY)
+    prepared = provider.prepare_bootstrap_context(_obs(day=day))
+    identity = Stage25RequestIdentity(index, 0, day, IDENTITY)
+    return Stage25BootstrapRequest(
+        identity=identity, worker_id=0, inputs=prepared.inputs,
+        crop_capacity=np.asarray([prepared.crop_capacity], dtype=np.int16),
+        physical_context=prepared.physical_context, support=None, queued_at=0.0)
+
+
 def _runner(size: int = 4) -> ParallelSelfPlayRunner:
     return ParallelSelfPlayRunner(
         RunnerConfig(stage25_enabled=True,
@@ -135,6 +147,60 @@ def test_stage25_row_reordering_does_not_change_owner_row_rng_tokens():
     _runner(4)._dispatch(
         IDENTITY, second_requests, 0.0, {IDENTITY: second_policy}, [Queue()])
     assert first_policy.row_ids == second_policy.row_ids
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "a decision request and a truncation bootstrap request for the same "
+        "behavior identity can share one pending batch; _dispatch routes the "
+        "whole mixed list by requests[0], so the parent builds the wrong "
+        "response type and raises request_id/identity disagreement"
+    ),
+)
+def test_stage25_mixed_decision_and_bootstrap_batch_is_routed_by_type():
+    from rl_manager.parallel_protocol import (
+        Stage25BootstrapResponse,
+        Stage25InferenceResponse,
+    )
+
+    policy = _Stage25Policy()
+    queue = Queue()
+    runner = _runner(2)
+    requests = [_request(9, 4), _bootstrap_request(9, 4)]
+    runner._dispatch(IDENTITY, requests, 0.0, {IDENTITY: policy}, [queue])
+    types = sorted(type(queue.get_nowait()).__name__ for _ in range(2))
+    assert types == [Stage25BootstrapResponse.__name__,
+                     Stage25InferenceResponse.__name__]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the parallel worker constructs its Stage25PlanProvider without the "
+        "checkpoint curriculum, while its behavior identity advertises it; the "
+        "provider then accepts a crop class the advertised curriculum forbids"
+    ),
+)
+def test_stage25_provider_binds_curriculum_to_behavior_identity():
+    from rl_manager.stage25_config import Stage25CurriculumConfig
+    from rl_manager.stage25_inference import curriculum_fingerprint
+
+    enabled = Stage25CurriculumConfig(enabled=True, max_positive_crop_delta=1)
+    identity = Stage25BehaviorIdentity(
+        name="stage25-test", version="v1", parameter_fingerprint="f" * 64,
+        observation_schema_version="e_v1",
+        policy_schema_version="stage25_policy_v1",
+        e_history_version="E_CORRECTED_V1",
+        curriculum_version=enabled.version,
+        curriculum_fingerprint=curriculum_fingerprint(enabled))
+    provider = Stage25PlanProvider(7, 0, 4, behavior_identity=identity)
+    context = provider.prepare_inference_context(
+        _obs(day=4), behavior_identity=identity)
+    violating = (0, 1, 0, 1, 105, 100, 100, 100, 100)
+    with pytest.raises(Stage25ProviderError, match="curriculum"):
+        provider.accept_inference_response(
+            context, violating, behavior_identity=identity)
 
 
 def test_stage25_response_identity_mismatch_leaves_provider_unchanged():
