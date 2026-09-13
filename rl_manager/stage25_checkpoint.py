@@ -44,12 +44,14 @@ from rl_manager.stage25_policy import Stage25ModelConfig, init_stage25_params
 STAGE25_CHECKPOINT_VERSION = "stage25_native_checkpoint_v1"
 INFERENCE_PAYLOAD_KIND = "stage25_inference_params_v1"
 BC_TRAINING_PAYLOAD_KIND = "stage25_bc_training_state_v1"
+PPO_TRAINING_PAYLOAD_KIND = "stage25_ppo_training_state_v1"
 ARCHITECTURE_VERSION = "stage25_policy_v1"
 OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_v1"
 PERSISTENT_LEDGER_VERSION = "stage25_crop_capacity_ledger_v1"
 PHYSICAL_SUPPORT_VERSION = ACTION_SCHEMA_VERSION
 BC_TARGET_VERSION = "stage25_outcome_proxy_v1"
 RESUME_BOUNDARY = "after_completed_update_before_next_batch"
+PPO_RESUME_BOUNDARY = "after_completed_rollout_update_before_next_rollout"
 
 OBSERVATION_VOCABULARY = (
     "board_kind", "board_crop", "board_animal", "board_numeric",
@@ -79,7 +81,17 @@ _REQUIRED_META = frozenset({
 _OWNED_META = _REQUIRED_META | frozenset({
     "source_e_identity", "step", "epoch", "optimizer_config",
     "optimizer_leaf_count", "optimizer_leaf_manifest", "optimizer_tree",
-    "data_order_position", "resume_boundary",
+    "data_order_position", "resume_boundary", "source_history_version",
+    "ppo_config",
+    "update_counter", "rollout_seed", "rollout_progression",
+    "behavior_identity", "physical_contract",
+})
+
+_PPO_REQUIRED_META = frozenset({
+    "ppo_config", "update_counter", "rollout_seed", "rollout_progression",
+    "behavior_identity", "physical_contract", "optimizer_config",
+    "optimizer_leaf_count", "optimizer_leaf_manifest", "optimizer_tree",
+    "resume_boundary",
 })
 
 
@@ -371,7 +383,8 @@ def _validate_meta(meta: Mapping[str, Any], path: Path, expected_kind: str) -> N
         except Exception as exc:
             raise Stage25CheckpointError(
                 f"{path}: invalid source E history version") from exc
-    if meta.get("resume_boundary") not in (None, RESUME_BOUNDARY):
+    if meta.get("resume_boundary") not in (None, RESUME_BOUNDARY,
+                                            PPO_RESUME_BOUNDARY):
         raise Stage25CheckpointError(f"{path}: unsupported resume boundary")
     if expected_kind == BC_TRAINING_PAYLOAD_KIND:
         for key in ("step", "epoch", "data_order_position", "optimizer_leaf_count",
@@ -391,6 +404,45 @@ def _validate_meta(meta: Mapping[str, Any], path: Path, expected_kind: str) -> N
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise Stage25CheckpointError(
                     f"{path}: data_order_position field {key!r} is invalid")
+    if expected_kind == PPO_TRAINING_PAYLOAD_KIND:
+        for key in _PPO_REQUIRED_META:
+            if key not in meta:
+                raise Stage25CheckpointError(
+                    f"{path}: PPO metadata missing required field {key!r}")
+        if meta.get("resume_boundary") != PPO_RESUME_BOUNDARY:
+            raise Stage25CheckpointError(
+                f"{path}: unsupported PPO resume boundary "
+                f"{meta.get('resume_boundary')!r}")
+        update_counter = meta.get("update_counter")
+        if (isinstance(update_counter, bool) or not isinstance(update_counter, int)
+                or update_counter < 0):
+            raise Stage25CheckpointError(
+                f"{path}: PPO update_counter must be a nonnegative integer")
+        rollout_seed = meta.get("rollout_seed")
+        if rollout_seed is not None and (
+                isinstance(rollout_seed, bool) or not isinstance(rollout_seed, int)
+                or rollout_seed < 0):
+            raise Stage25CheckpointError(
+                f"{path}: PPO rollout_seed must be a nonnegative integer or null")
+        if not isinstance(meta.get("rollout_progression"), (Mapping, list, tuple, str,
+                                                              int, float, bool)) \
+                and meta.get("rollout_progression") is not None:
+            raise Stage25CheckpointError(
+                f"{path}: PPO rollout_progression is not JSON metadata")
+        for key in ("behavior_identity", "physical_contract"):
+            if not isinstance(meta.get(key), Mapping):
+                raise Stage25CheckpointError(
+                    f"{path}: PPO {key} must be an object")
+        if not isinstance(meta.get("ppo_config"), Mapping):
+            raise Stage25CheckpointError(f"{path}: PPO ppo_config must be an object")
+        if not isinstance(meta.get("optimizer_config"), Mapping):
+            raise Stage25CheckpointError(
+                f"{path}: PPO optimizer_config must be an object")
+        optimizer_count = meta.get("optimizer_leaf_count")
+        if (isinstance(optimizer_count, bool) or not isinstance(optimizer_count, int)
+                or optimizer_count < 0):
+            raise Stage25CheckpointError(
+                f"{path}: PPO optimizer_leaf_count must be a nonnegative integer")
 
 
 def _check_history(meta: Mapping[str, Any], *, expected: str | None,
@@ -672,6 +724,284 @@ def load_stage25_bc_checkpoint(
     return params, optimizer_state, jnp.asarray(rng), dict(meta)
 
 
+def _metadata_object(value: Any, *, what: str) -> dict[str, Any]:
+    """Normalize an identity/contract object without accepting opaque leaves."""
+    to_json = getattr(value, "to_json_dict", None)
+    if callable(to_json):
+        value = to_json()
+    normalized = _jsonable(value)
+    if not isinstance(normalized, Mapping):
+        raise Stage25CheckpointError(f"{what} must be a metadata object")
+    return dict(normalized)
+
+
+def _curriculum_metadata(
+    config: Stage25ModelConfig,
+    curriculum: Stage25CurriculumConfig | Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if curriculum is None:
+        active = config.curriculum
+    elif isinstance(curriculum, Stage25CurriculumConfig):
+        active = curriculum
+    elif isinstance(curriculum, Mapping):
+        try:
+            active = Stage25CurriculumConfig(**dict(curriculum))
+        except Exception as exc:
+            raise Stage25CheckpointError(
+                f"PPO curriculum is incompatible: {exc}") from exc
+    else:
+        raise Stage25CheckpointError("PPO curriculum must be a config or object")
+    if active != config.curriculum:
+        raise Stage25CheckpointError(
+            "PPO curriculum must match the Stage25ModelConfig curriculum")
+    return _jsonable(dataclasses.asdict(active))
+
+
+def _validate_ppo_arrays(flat: Mapping[str, np.ndarray], path: Path) -> None:
+    allowed = {key for key in flat if key == "rng" or key.startswith("param:")
+               or key.startswith("opt:")}
+    if allowed != set(flat):
+        raise Stage25CheckpointError(
+            f"{path}: PPO archive contains unexpected leaves "
+            f"{sorted(set(flat) - allowed)}")
+
+
+def save_stage25_ppo_checkpoint(
+    path: str | Path, params: Mapping[str, Any], optimizer_state: Any, rng: Any,
+    config: Stage25ModelConfig, *, seed: int = 0, update_counter: int = 0,
+    rollout_seed: int | None = None, rollout_progression: Any = None,
+    ppo_config: Any = None, optimizer_config: Any = None,
+    curriculum: Stage25CurriculumConfig | Mapping[str, Any] | None = None,
+    behavior_identity: Any = None, provenance: Mapping[str, Any] | None = None,
+    physical_contract: Mapping[str, Any] | None = None,
+    executor: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    source_identity: Mapping[str, Any] | None = None,
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
+    source_history_version: str | None = None,
+) -> Path:
+    """Save native PPO state at a completed-rollout/update boundary.
+
+    The boundary deliberately excludes in-progress episodes and minibatches;
+    the persisted rollout progression identifies the next complete rollout to
+    collect, while the optimizer tree is validated from its exact template.
+    """
+    if not isinstance(config, Stage25ModelConfig):
+        raise TypeError("config must be Stage25ModelConfig")
+    if isinstance(update_counter, bool) or not isinstance(update_counter, (int, np.integer)) \
+            or int(update_counter) < 0:
+        raise Stage25CheckpointError(
+            "update_counter must be a nonnegative integer")
+    if rollout_seed is not None and (
+            isinstance(rollout_seed, bool)
+            or not isinstance(rollout_seed, (int, np.integer))
+            or int(rollout_seed) < 0):
+        raise Stage25CheckpointError(
+            "rollout_seed must be a nonnegative integer or null")
+    template = init_stage25_params(config, seed=int(seed))
+    param_flat = validate_array_tree(params, template, what="params")
+    arrays = {f"param:{key}": value for key, value in param_flat.items()}
+    try:
+        opt_leaves = jax.tree_util.tree_leaves(optimizer_state)
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        raise Stage25CheckpointError(
+            "optimizer_state is not a valid JAX pytree") from exc
+    opt_arrays: list[np.ndarray] = []
+    for index, leaf in enumerate(opt_leaves):
+        array = np.asarray(leaf)
+        if array.dtype.hasobject:
+            raise Stage25CheckpointError(
+                f"optimizer leaf {index} has forbidden object dtype")
+        opt_arrays.append(array)
+        arrays[f"opt:{index:05d}"] = array
+    rng_array = np.asarray(rng)
+    if rng_array.dtype.hasobject or rng_array.shape != (2,) \
+            or rng_array.dtype != np.uint32:
+        raise Stage25CheckpointError(
+            f"rng must be uint32 [2], got {rng_array.shape}/{rng_array.dtype}")
+    arrays["rng"] = np.array(rng_array, copy=True)
+
+    ppo_payload = {} if ppo_config is None else _metadata_object(
+        ppo_config, what="PPO configuration")
+    optimizer_payload = (ppo_payload if optimizer_config is None else
+                         _metadata_object(optimizer_config,
+                                          what="optimizer configuration"))
+    physical_payload = _metadata_object(
+        physical_contract if physical_contract is not None else {
+            "version": PHYSICAL_SUPPORT_VERSION,
+            "action_vocabulary": list(ACTION_ORDER),
+            "action_class_counts": list(ACTION_CLASS_COUNTS),
+        }, what="physical_contract")
+    identity_payload = _metadata_object(
+        behavior_identity if behavior_identity is not None else {},
+        what="behavior_identity")
+    progression_payload = ({} if rollout_progression is None else
+                           _jsonable(rollout_progression))
+    meta = _metadata(
+        payload_kind=PPO_TRAINING_PAYLOAD_KIND, config=config, seed=int(seed),
+        flat=arrays, metadata=metadata, source_identity=source_identity,
+        provenance=provenance, executor=executor,
+        e_history_version=e_history_version,
+        source_history_version=source_history_version,
+        optimizer_config=optimizer_payload)
+    meta.update({
+        "ppo_config": ppo_payload,
+        "update_counter": int(update_counter),
+        "rollout_seed": (None if rollout_seed is None else int(rollout_seed)),
+        "rollout_progression": progression_payload,
+        "behavior_identity": identity_payload,
+        "physical_contract": physical_payload,
+        "optimizer_leaf_count": len(opt_arrays),
+        "optimizer_tree": _tree_signature(optimizer_state),
+        "optimizer_leaf_manifest": _leaf_manifest({
+            f"opt:{index:05d}": value
+            for index, value in enumerate(opt_arrays)}),
+        "resume_boundary": PPO_RESUME_BOUNDARY,
+    })
+    return _write_archive(path, arrays, meta)
+
+
+def load_stage25_ppo_checkpoint(
+    path: str | Path, *, config: Stage25ModelConfig | None = None,
+    seed: int | None = None, optimizer_state_template: Any | None = None,
+    ppo_config: Any | None = None, optimizer_config: Any | None = None,
+    curriculum: Stage25CurriculumConfig | Mapping[str, Any] | None = None,
+    expected_behavior_identity: Any | None = None,
+    expected_physical_contract: Mapping[str, Any] | None = None,
+    expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
+    allow_legacy_e: bool = False,
+) -> tuple[dict[str, Any], Any, jax.Array, dict[str, Any]]:
+    """Load ``(params, optimizer_state, rng, metadata)`` for native PPO.
+
+    An optimizer template is required because arbitrary optimizer pytrees
+    cannot be safely reconstructed from JSON.  This keeps resume exact and
+    makes a mid-minibatch or mid-episode claim impossible at this boundary.
+    """
+    flat, meta, stored_config = _load_params(path, PPO_TRAINING_PAYLOAD_KIND)
+    path = Path(path)
+    _validate_ppo_arrays(flat, path)
+    _check_history(meta, expected=expected_e_history_version,
+                   allow_legacy_e=allow_legacy_e, path=path)
+    if config is not None and config != stored_config:
+        raise Stage25CheckpointError(
+            "checkpoint config is incompatible with requested config")
+    stored_seed = int(meta["init_params"]["seed"])
+    if seed is not None and int(seed) != stored_seed:
+        raise Stage25CheckpointError("checkpoint seed does not match requested seed")
+    if curriculum is not None and _curriculum_metadata(stored_config, curriculum) \
+            != meta["curriculum"]:
+        raise Stage25CheckpointError(
+            "checkpoint curriculum is incompatible with requested curriculum")
+    if ppo_config is not None and _metadata_object(
+            ppo_config, what="PPO configuration") != meta["ppo_config"]:
+        raise Stage25CheckpointError(
+            "checkpoint PPO configuration does not match requested configuration")
+    if optimizer_config is not None and _metadata_object(
+            optimizer_config, what="optimizer configuration") != meta["optimizer_config"]:
+        raise Stage25CheckpointError(
+            "checkpoint optimizer configuration does not match requested configuration")
+    if expected_behavior_identity is not None and _metadata_object(
+            expected_behavior_identity, what="behavior_identity") != meta["behavior_identity"]:
+        raise Stage25CheckpointError(
+            "checkpoint behavior identity does not match requested identity")
+    if expected_physical_contract is not None and _metadata_object(
+            expected_physical_contract, what="physical_contract") != meta["physical_contract"]:
+        raise Stage25CheckpointError(
+            "checkpoint physical contract does not match requested contract")
+
+    params_template = init_stage25_params(stored_config, seed=stored_seed)
+    params = _rebuild(
+        params_template,
+        {key[len("param:"):]: value for key, value in flat.items()
+         if key.startswith("param:")})
+    rng = flat.get("rng")
+    if rng is None or rng.shape != (2,) or rng.dtype != np.uint32:
+        raise Stage25CheckpointError(
+            f"{path}: missing or invalid rng leaf")
+    if optimizer_state_template is None:
+        raise Stage25CheckpointError(
+            "optimizer_state_template is required to resume PPO")
+    try:
+        expected_leaves = jax.tree_util.tree_leaves(optimizer_state_template)
+    except Exception as exc:  # pragma: no cover - defensive boundary
+        raise Stage25CheckpointError(
+            "optimizer_state_template is not a valid JAX pytree") from exc
+    if _tree_signature(optimizer_state_template) != meta["optimizer_tree"]:
+        raise Stage25CheckpointError(
+            "checkpoint optimizer pytree structure is incompatible")
+    opt_items = {key: value for key, value in flat.items()
+                 if key.startswith("opt:")}
+    expected_opt_count = meta["optimizer_leaf_count"]
+    expected_opt_keys = {f"opt:{index:05d}" for index in range(expected_opt_count)}
+    if set(opt_items) != expected_opt_keys:
+        raise Stage25CheckpointError(
+            f"{path}: optimizer leaf set is incomplete or has extras")
+    _validate_flat_against_manifest(
+        opt_items, {"leaf_manifest": meta["optimizer_leaf_manifest"]}, path)
+    if len(expected_leaves) != expected_opt_count:
+        raise Stage25CheckpointError(
+            f"{path}: optimizer leaf count {expected_opt_count} != "
+            f"template {len(expected_leaves)}")
+    for index, expected in enumerate(expected_leaves):
+        actual = opt_items[f"opt:{index:05d}"]
+        expected_array = np.asarray(expected)
+        if actual.shape != expected_array.shape or actual.dtype != expected_array.dtype:
+            raise Stage25CheckpointError(
+                f"{path}: optimizer leaf {index} shape/dtype "
+                f"{actual.shape}/{actual.dtype} != "
+                f"{expected_array.shape}/{expected_array.dtype}")
+    optimizer_state = jax.tree_util.tree_unflatten(
+        jax.tree_util.tree_structure(optimizer_state_template),
+        [jnp.asarray(opt_items[f"opt:{index:05d}"])
+         for index in range(expected_opt_count)])
+    return params, optimizer_state, jnp.asarray(rng), dict(meta)
+
+
+def initialize_stage25_ppo_from_checkpoint(
+    source: str | Path, config: Stage25ModelConfig | None = None, *,
+    seed: int | None = None,
+    expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
+    allow_legacy_e: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load params for a fresh PPO run from native BC or inference state.
+
+    Optimizer state is intentionally not transferred: the caller creates a
+    fresh PPO optimizer for the returned parameter tree.
+    """
+    source_path = Path(source)
+    flat, meta = _read_archive(source_path)
+    kind = meta.get("payload_kind")
+    if kind == INFERENCE_PAYLOAD_KIND:
+        params, loaded_meta = load_stage25_inference_checkpoint(
+            source_path, config=config, seed=seed,
+            expected_e_history_version=expected_e_history_version,
+            allow_legacy_e=allow_legacy_e)
+        return params, loaded_meta
+    if kind != BC_TRAINING_PAYLOAD_KIND:
+        raise Stage25CheckpointError(
+            f"{source_path}: PPO initialization requires native BC or inference "
+            f"checkpoint, got {kind!r}")
+    flat, loaded_meta, stored_config = _load_params(
+        source_path, BC_TRAINING_PAYLOAD_KIND)
+    _check_history(loaded_meta, expected=expected_e_history_version,
+                   allow_legacy_e=allow_legacy_e, path=source_path)
+    if config is not None and config != stored_config:
+        raise Stage25CheckpointError(
+            "source checkpoint config is incompatible with requested config")
+    stored_seed = int(loaded_meta["init_params"]["seed"])
+    if seed is not None and int(seed) != stored_seed:
+        raise Stage25CheckpointError("source checkpoint seed does not match requested seed")
+    params_template = init_stage25_params(stored_config, seed=stored_seed)
+    params = _rebuild(
+        params_template,
+        {key[len("param:"):]: value for key, value in flat.items()
+         if key.startswith("param:")})
+    return params, dict(loaded_meta)
+
+
+init_stage25_ppo_from_checkpoint = initialize_stage25_ppo_from_checkpoint
+
+
 def _extract_encoder(params: Mapping[str, Any]) -> dict[str, Any]:
     names = ("manager_token", "role_embedding", "tile_encoder", "global_encoders",
              "encoder", "encoder_norm")
@@ -764,16 +1094,22 @@ save_inference_checkpoint = save_stage25_inference_checkpoint
 load_inference_checkpoint = load_stage25_inference_checkpoint
 save_bc_checkpoint = save_stage25_bc_checkpoint
 load_bc_checkpoint = load_stage25_bc_checkpoint
+save_ppo_checkpoint = save_stage25_ppo_checkpoint
+load_ppo_checkpoint = load_stage25_ppo_checkpoint
 
 
 __all__ = [
     "ACTION_ORDER", "ACTION_CLASS_COUNTS", "ARCHITECTURE_VERSION",
     "BC_TARGET_VERSION", "BC_TRAINING_PAYLOAD_KIND", "INFERENCE_PAYLOAD_KIND",
+    "PPO_RESUME_BOUNDARY", "PPO_TRAINING_PAYLOAD_KIND",
     "OBSERVATION_SCHEMA_VERSION", "OBSERVATION_VOCABULARY",
     "PERSISTENT_LEDGER_VERSION", "PHYSICAL_SUPPORT_VERSION", "RESUME_BOUNDARY",
     "STAGE25_CHECKPOINT_VERSION", "Stage25CheckpointError", "validate_array_tree",
     "save_stage25_inference_checkpoint", "load_stage25_inference_checkpoint",
     "save_stage25_bc_checkpoint", "load_stage25_bc_checkpoint",
+    "save_stage25_ppo_checkpoint", "load_stage25_ppo_checkpoint",
+    "initialize_stage25_ppo_from_checkpoint", "init_stage25_ppo_from_checkpoint",
     "save_inference_checkpoint", "load_inference_checkpoint", "save_bc_checkpoint",
-    "load_bc_checkpoint", "import_historical_encoder",
+    "load_bc_checkpoint", "save_ppo_checkpoint", "load_ppo_checkpoint",
+    "import_historical_encoder",
 ]

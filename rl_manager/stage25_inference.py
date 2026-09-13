@@ -610,6 +610,7 @@ class Stage25InferenceAdapter:
         self, inputs: Mapping[str, Any], *,
         physical_contexts: Sequence[PhysicalContext] | None = None,
         crop_capacity: Any = None, row_ids: Sequence[Any] | None = None,
+        prng_id: str | None = None,
     ) -> np.ndarray:
         """Evaluate only the critic at a truncation next state.
 
@@ -618,6 +619,11 @@ class Stage25InferenceAdapter:
         observation before decoding heads, so teacher forcing is sufficient to
         obtain the bootstrap while preserving the no-extra-plan rule.
         """
+        # The runner carries the same namespace on decision and value-only
+        # requests.  Critic evaluation is deterministic and does not consume
+        # that namespace, but accepting it preserves the Packet 5A transport
+        # contract without accidentally sampling a replacement plan.
+        del prng_id
         merged = dict(inputs)
         if crop_capacity is not None:
             if "crop_capacity" in merged and not np.array_equal(
