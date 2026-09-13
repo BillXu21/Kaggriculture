@@ -85,13 +85,16 @@ _OWNED_META = _REQUIRED_META | frozenset({
     "ppo_config",
     "update_counter", "rollout_seed", "rollout_progression",
     "behavior_identity", "physical_contract",
+    "opponent_identity", "opponent_leaf_count", "opponent_leaf_manifest",
+    "opponent_tree",
 })
 
 _PPO_REQUIRED_META = frozenset({
     "ppo_config", "update_counter", "rollout_seed", "rollout_progression",
     "behavior_identity", "physical_contract", "optimizer_config",
     "optimizer_leaf_count", "optimizer_leaf_manifest", "optimizer_tree",
-    "resume_boundary",
+    "resume_boundary", "opponent_identity", "opponent_leaf_count",
+    "opponent_leaf_manifest", "opponent_tree",
 })
 
 
@@ -443,6 +446,15 @@ def _validate_meta(meta: Mapping[str, Any], path: Path, expected_kind: str) -> N
                 or optimizer_count < 0):
             raise Stage25CheckpointError(
                 f"{path}: PPO optimizer_leaf_count must be a nonnegative integer")
+        if not isinstance(meta.get("opponent_leaf_manifest"), Mapping) \
+                or not isinstance(meta.get("opponent_tree"), str):
+            raise Stage25CheckpointError(
+                f"{path}: PPO opponent manifest/tree is invalid")
+        opponent_count = meta.get("opponent_leaf_count")
+        if (isinstance(opponent_count, bool) or not isinstance(opponent_count, int)
+                or opponent_count < 1):
+            raise Stage25CheckpointError(
+                f"{path}: PPO opponent_leaf_count must be a positive integer")
 
 
 def _check_history(meta: Mapping[str, Any], *, expected: str | None,
@@ -492,7 +504,10 @@ def _load_params(path: str | Path, expected_kind: str) -> tuple[dict[str, np.nda
     flat, meta = _read_archive(path)
     _validate_meta(meta, path, expected_kind)
     config = _config_from_json(meta["config"])
-    _validate_flat_against_manifest(flat, meta, path)
+    manifest_flat = (flat if expected_kind != PPO_TRAINING_PAYLOAD_KIND else
+                     {key: value for key, value in flat.items()
+                      if not key.startswith("opponent:")})
+    _validate_flat_against_manifest(manifest_flat, meta, path)
     params = init_stage25_params(config, seed=int(meta["init_params"]["seed"]))
     param_items = {key[len("param:"):]: value for key, value in flat.items()
                    if key.startswith("param:")}
@@ -757,9 +772,24 @@ def _curriculum_metadata(
     return _jsonable(dataclasses.asdict(active))
 
 
+def _physical_contract_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize the action contract and runtime physical batch separately."""
+    payload = _metadata_object(value, what="physical_contract")
+    action = payload.get("action_contract")
+    if action is not None and not isinstance(action, Mapping):
+        raise Stage25CheckpointError("physical_contract.action_contract must be an object")
+    batch_size = payload.get("inference_batch_size")
+    if batch_size is not None and (
+            isinstance(batch_size, bool) or not isinstance(batch_size, int)
+            or batch_size < 1):
+        raise Stage25CheckpointError(
+            "physical_contract.inference_batch_size must be a positive integer")
+    return payload
+
+
 def _validate_ppo_arrays(flat: Mapping[str, np.ndarray], path: Path) -> None:
     allowed = {key for key in flat if key == "rng" or key.startswith("param:")
-               or key.startswith("opt:")}
+               or key.startswith("opt:") or key.startswith("opponent:")}
     if allowed != set(flat):
         raise Stage25CheckpointError(
             f"{path}: PPO archive contains unexpected leaves "
@@ -779,6 +809,8 @@ def save_stage25_ppo_checkpoint(
     source_identity: Mapping[str, Any] | None = None,
     e_history_version: str = E_HISTORY_CORRECTED_V1,
     source_history_version: str | None = None,
+    opponent_params: Mapping[str, Any] | None = None,
+    opponent_identity: Any = None,
 ) -> Path:
     """Save native PPO state at a completed-rollout/update boundary.
 
@@ -798,9 +830,16 @@ def save_stage25_ppo_checkpoint(
             or int(rollout_seed) < 0):
         raise Stage25CheckpointError(
             "rollout_seed must be a nonnegative integer or null")
+    _curriculum_metadata(config, curriculum)
     template = init_stage25_params(config, seed=int(seed))
     param_flat = validate_array_tree(params, template, what="params")
     arrays = {f"param:{key}": value for key, value in param_flat.items()}
+    opponent_template = template
+    opponent_flat = validate_array_tree(
+        params if opponent_params is None else opponent_params,
+        opponent_template, what="opponent_params")
+    arrays.update({f"opponent:{key}": value
+                   for key, value in opponent_flat.items()})
     try:
         opt_leaves = jax.tree_util.tree_leaves(optimizer_state)
     except Exception as exc:  # pragma: no cover - defensive boundary
@@ -826,20 +865,29 @@ def save_stage25_ppo_checkpoint(
     optimizer_payload = (ppo_payload if optimizer_config is None else
                          _metadata_object(optimizer_config,
                                           what="optimizer configuration"))
-    physical_payload = _metadata_object(
+    physical_payload = _physical_contract_metadata(
         physical_contract if physical_contract is not None else {
             "version": PHYSICAL_SUPPORT_VERSION,
-            "action_vocabulary": list(ACTION_ORDER),
-            "action_class_counts": list(ACTION_CLASS_COUNTS),
-        }, what="physical_contract")
+            "action_contract": {
+                "schema_version": ACTION_SCHEMA_VERSION,
+                "action_vocabulary": list(ACTION_ORDER),
+                "action_class_counts": list(ACTION_CLASS_COUNTS),
+            },
+        })
     identity_payload = _metadata_object(
         behavior_identity if behavior_identity is not None else {},
         what="behavior_identity")
+    opponent_identity_payload = _metadata_object(
+        ({} if behavior_identity is None else behavior_identity)
+        if opponent_identity is None else opponent_identity,
+        what="opponent_identity")
     progression_payload = ({} if rollout_progression is None else
                            _jsonable(rollout_progression))
     meta = _metadata(
         payload_kind=PPO_TRAINING_PAYLOAD_KIND, config=config, seed=int(seed),
-        flat=arrays, metadata=metadata, source_identity=source_identity,
+        flat={key: value for key, value in arrays.items()
+              if not key.startswith("opponent:")},
+        metadata=metadata, source_identity=source_identity,
         provenance=provenance, executor=executor,
         e_history_version=e_history_version,
         source_history_version=source_history_version,
@@ -850,6 +898,7 @@ def save_stage25_ppo_checkpoint(
         "rollout_seed": (None if rollout_seed is None else int(rollout_seed)),
         "rollout_progression": progression_payload,
         "behavior_identity": identity_payload,
+        "opponent_identity": opponent_identity_payload,
         "physical_contract": physical_payload,
         "optimizer_leaf_count": len(opt_arrays),
         "optimizer_tree": _tree_signature(optimizer_state),
@@ -857,6 +906,10 @@ def save_stage25_ppo_checkpoint(
             f"opt:{index:05d}": value
             for index, value in enumerate(opt_arrays)}),
         "resume_boundary": PPO_RESUME_BOUNDARY,
+        "opponent_leaf_count": len(opponent_flat),
+        "opponent_tree": _tree_signature(opponent_params if opponent_params is not None else params),
+        "opponent_leaf_manifest": _leaf_manifest({
+            f"opponent:{key}": value for key, value in opponent_flat.items()}),
     })
     return _write_archive(path, arrays, meta)
 
@@ -870,7 +923,8 @@ def load_stage25_ppo_checkpoint(
     expected_physical_contract: Mapping[str, Any] | None = None,
     expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
     allow_legacy_e: bool = False,
-) -> tuple[dict[str, Any], Any, jax.Array, dict[str, Any]]:
+    return_opponent: bool = False,
+) -> tuple[dict[str, Any], Any, jax.Array, dict[str, Any]] | tuple[dict[str, Any], Any, jax.Array, dict[str, Any], dict[str, Any]]:
     """Load ``(params, optimizer_state, rng, metadata)`` for native PPO.
 
     An optimizer template is required because arbitrary optimizer pytrees
@@ -914,6 +968,24 @@ def load_stage25_ppo_checkpoint(
         params_template,
         {key[len("param:"):]: value for key, value in flat.items()
          if key.startswith("param:")})
+    opponent_items = {key[len("opponent:"):]: value
+                      for key, value in flat.items()
+                      if key.startswith("opponent:")}
+    opponent_manifest = meta["opponent_leaf_manifest"]
+    if meta["opponent_tree"] != _tree_signature(params_template):
+        raise Stage25CheckpointError(
+            f"{path}: checkpoint opponent pytree structure is incompatible")
+    if meta["opponent_leaf_count"] != len(opponent_manifest):
+        raise Stage25CheckpointError(
+            f"{path}: opponent leaf count does not match its manifest")
+    if set(opponent_items) != {key[len("opponent:"):]
+                               for key in opponent_manifest}:
+        raise Stage25CheckpointError(
+            f"{path}: opponent leaf set is incomplete or has extras")
+    _validate_flat_against_manifest(
+        {f"opponent:{key}": value for key, value in opponent_items.items()},
+        {"leaf_manifest": opponent_manifest}, path)
+    opponent = _rebuild(params_template, opponent_items)
     rng = flat.get("rng")
     if rng is None or rng.shape != (2,) or rng.dtype != np.uint32:
         raise Stage25CheckpointError(
@@ -954,7 +1026,10 @@ def load_stage25_ppo_checkpoint(
         jax.tree_util.tree_structure(optimizer_state_template),
         [jnp.asarray(opt_items[f"opt:{index:05d}"])
          for index in range(expected_opt_count)])
-    return params, optimizer_state, jnp.asarray(rng), dict(meta)
+    result = (params, optimizer_state, jnp.asarray(rng), dict(meta))
+    if return_opponent:
+        return (*result, opponent)
+    return result
 
 
 def initialize_stage25_ppo_from_checkpoint(

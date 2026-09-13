@@ -13,14 +13,6 @@ from rl_manager.stage25_inference import Stage25InferenceAdapter
 from rl_manager.stage25_policy import init_stage25_params, tiny_stage25_config
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the PPO CLI records executor={'name': 'stage25_executor_factory', "
-        "'version': 'native'} instead of the Stage 2.5 executor factory's real "
-        "name/version identity that Packet 5A trajectory rows persist"
-    ),
-)
 def test_ppo_cli_records_the_real_executor_identity(monkeypatch, tmp_path) -> None:
     config = tiny_stage25_config()
     learner = Stage25InferenceAdapter(

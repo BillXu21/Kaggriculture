@@ -40,21 +40,34 @@ expected initial audit is ratio approximately `1` and KL approximately `0`.
 
 The learner and frozen opponent are explicit `Stage25BehaviorIdentity`
 snapshots.  Parameters and curriculum remain frozen for collection and all
-epochs consuming its rollout.  After an update, the learner parameter
-fingerprint changes and the next collection creates a fresh inference
-adapter; stale adapters/caches are not reused.
+epochs consuming its rollout.  Local and spawned-worker inference share the
+same seed-scoped RNG namespace and immutable request-id row token; worker
+count, reorder, and physical padding do not change a real row.  After an
+update, the learner parameter fingerprint changes and the next collection
+creates a fresh inference adapter; stale adapters/caches are not reused.
 
 Native PPO checkpoints are distinct from inference and BC payloads:
 `stage25_ppo_training_state_v1`.  They are pickle-free NPZ archives with a
 strict JSON metadata record and atomic same-directory `fsync`/`os.replace`
 writes.  They contain the parameter and optimizer trees, RNG, update counter,
-rollout seed/progression, PPO/model configuration, curriculum, behavior and
-physical contracts, executor identity, operating/source provenance, and the
-explicit completed-rollout/update resume boundary.  Loading requires the
-exact optimizer-state template and rejects incompatible paths, shapes, dtypes,
-versions, configuration, identity, and provenance fields.  Native BC or
-inference checkpoints may initialize PPO parameters, but always receive a
-fresh PPO optimizer.
+rollout seed/progression, PPO/model configuration, curriculum, learner and
+frozen opponent parameter/identity snapshots, physical contracts, executor
+identity, operating/source provenance, and the explicit completed-rollout/
+update resume boundary.  The physical contract separates the action
+vocabulary/support schema from the configured inference batch size; exact v1
+resume rejects a batch-size override.  Loading requires the exact PPO
+optimizer-state template and rejects incompatible paths, shapes, dtypes,
+versions, configuration, identity, executor, and physical-contract fields.
+Native BC or inference checkpoints may initialize PPO parameters, but always
+receive a fresh PPO optimizer.
+
+The checkpoint's corrected operating history (`e_history_version`/`e_identity`)
+is distinct from imported source history (`source_e_identity`) and original
+source provenance (`source_identity`).  Re-saving a resume carries those
+fields forward and stores only a compact immediate `resume_from` reference;
+previous checkpoint metadata is never recursively embedded.  Resume validates
+both loaded learner and opponent identities against their parameter trees and
+the configured runtime executor before collecting a new rollout.
 
 ## Commands
 

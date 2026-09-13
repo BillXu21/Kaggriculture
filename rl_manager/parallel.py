@@ -684,9 +684,10 @@ class ParallelSelfPlayRunner:
             for request in physical_requests], axis=0)
         contexts = [request.physical_context for request in physical_requests]
         supports = [request.support for request in physical_requests]
-        row_ids = [
-            f"{request.request_id}/rng-seed={request.seed}"
-            for request in requests]
+        # The request identity is authoritative. The explicit rollout seed
+        # is already part of the shared namespace; appending it here would
+        # diverge from SelfPlayRunner's local row token.
+        row_ids = [request.request_id for request in requests]
         row_ids.extend(
             f"padding/behavior={first.identity.behavior_identity.identity_id()}"
             f"/batch={'|'.join(request.request_id for request in requests)}"

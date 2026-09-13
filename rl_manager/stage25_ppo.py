@@ -56,7 +56,10 @@ def compute_stage25_gae(
         "bootstrap_patched": np.asarray(bootstrap_patched, dtype=bool),
     }
     shapes = {name: value.shape for name, value in arrays.items()}
-    if not shapes or any(shape != (len(arrays["episode_id"]),) for shape in shapes.values()):
+    n = arrays["episode_id"].shape[0] if arrays["episode_id"].ndim == 1 else None
+    if not shapes or n is None or n < 1 or any(
+            value.ndim != 1 or value.shape != (n,)
+            for value in arrays.values()):
         raise ValueError(f"GAE fields must all be rank-one and row-aligned; got {shapes}")
     if not 0.0 <= float(gamma) <= 1.0 or not 0.0 <= float(gae_lambda) <= 1.0:
         raise ValueError("gamma and gae_lambda must be finite values in [0, 1]")
@@ -184,6 +187,7 @@ class Stage25PPOBatch:
     day: np.ndarray
     physical_contexts: Sequence[Any] | None = None
     row_ids: np.ndarray | None = None
+    source_row_ids: tuple[str, ...] | None = None
     behavior_identity: Stage25BehaviorIdentity | None = None
 
     def __post_init__(self) -> None:
@@ -195,6 +199,8 @@ class Stage25PPOBatch:
         if np.any(classes < 0) or np.any(classes >= counts[None, :]):
             raise ValueError("classes contain an out-of-vocabulary action")
         n = classes.shape[0]
+        if n < 1:
+            raise ValueError("PPO batch must contain at least one learner row")
         fields = {
             "old_component_logprobs": (self.old_component_logprobs, (n, 9)),
             "old_joint_logprobs": (self.old_joint_logprobs, (n,)),
@@ -234,6 +240,18 @@ class Stage25PPOBatch:
             if row_ids.shape != (n,):
                 raise ValueError("row_ids must have shape [N]")
             object.__setattr__(self, "row_ids", row_ids)
+        source_row_ids = self.source_row_ids
+        if source_row_ids is None:
+            source_row_ids = tuple(str(index) for index in range(n))
+        else:
+            source_row_ids = tuple(source_row_ids)
+            if len(source_row_ids) != n or any(
+                    not isinstance(value, str) or not value
+                    for value in source_row_ids):
+                raise ValueError("source_row_ids must contain one nonempty string per row")
+            if len(set(source_row_ids)) != n:
+                raise ValueError("source_row_ids must be unique")
+        object.__setattr__(self, "source_row_ids", source_row_ids)
         object.__setattr__(self, "classes", classes)
         for name, array in normalized.items():
             object.__setattr__(self, name, array)
@@ -248,6 +266,7 @@ class Stage25PPOBatch:
             self.old_joint_logprobs[indices], self.old_values[indices],
             self.advantages[indices], self.returns[indices], self.episode_id[indices],
             self.seat[indices], self.day[indices], contexts, ids,
+            tuple(self.source_row_ids[int(i)] for i in indices),
             self.behavior_identity)
 
 
@@ -300,6 +319,7 @@ def build_stage25_ppo_batch(
         old_values=old_values, advantages=advantages.astype(np.float32),
         returns=returns, episode_id=episode_id, seat=seat, day=day,
         physical_contexts=None, row_ids=np.arange(len(selected), dtype=np.int64),
+        source_row_ids=tuple(str(row.row_id) for row in selected),
         behavior_identity=learner_identity)
 
 
@@ -443,7 +463,13 @@ def audit_stage25_ppo_rollout(
                   "joint_logprob": output["joint_logprob"],
                   "value": output["value"]}[name]
         if not np.allclose(np.asarray(actual), expected, atol=config.audit_atol, rtol=config.audit_rtol, equal_nan=False):
-            raise ValueError(f"PPO unchanged-weight audit mismatch in {name}: max error {error}")
+            absolute = np.abs(np.asarray(actual) - expected)
+            difference = (absolute if absolute.ndim == 1 else
+                          np.max(absolute, axis=tuple(range(1, absolute.ndim))))
+            row = int(np.argmax(difference))
+            raise ValueError(
+                f"PPO unchanged-weight audit mismatch in {name}: max error "
+                f"{error} at collected row {batch.source_row_ids[row]!r}")
     if not np.isfinite(np.asarray(metrics["kl"])).all():
         raise ValueError("PPO unchanged-weight audit produced nonfinite KL")
     return {"ok": True, "max_abs_error": errors,
@@ -475,11 +501,17 @@ class Stage25PPOTrainState:
     rollout_seed: int = 0
     rollout_progression: Mapping[str, Any] = None
     behavior_identity: Stage25BehaviorIdentity | None = None
+    opponent_params: Mapping[str, Any] | None = None
+    opponent_identity: Stage25BehaviorIdentity | None = None
 
     def __post_init__(self) -> None:
-        if isinstance(self.update_counter, bool) or self.update_counter < 0:
+        if (isinstance(self.update_counter, bool)
+                or not isinstance(self.update_counter, (int, np.integer))
+                or self.update_counter < 0):
             raise ValueError("update_counter must be a nonnegative integer")
         _normal_key(self.rng)
+        if (self.opponent_params is None) != (self.opponent_identity is None):
+            raise ValueError("opponent_params and opponent_identity must be paired")
 
 
 def init_stage25_ppo_state(
@@ -512,7 +544,10 @@ def ppo_update(
         state: Stage25PPOTrainState, batch: Stage25PPOBatch,
         config: Stage25PPOConfig) -> tuple[Stage25PPOTrainState, dict[str, Any]]:
     """Run all PPO epochs on one frozen rollout, atomically on validation failure."""
-    if batch.behavior_identity is not None and state.behavior_identity is not None and not _identity_matches(batch.behavior_identity, state.behavior_identity):
+    if ((batch.behavior_identity is None) != (state.behavior_identity is None)
+            or (batch.behavior_identity is not None
+                and not _identity_matches(batch.behavior_identity,
+                                          state.behavior_identity))):
         raise ValueError("PPO batch behavior identity does not match the frozen state identity")
     audit = audit_stage25_ppo_rollout(state.params, batch, config)
     optimizer = make_stage25_ppo_optimizer(state.params, config)

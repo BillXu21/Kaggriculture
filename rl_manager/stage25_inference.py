@@ -54,6 +54,7 @@ from rl_manager.stage25_types import (
     Stage25BehaviorIdentity,
     Stage25PolicyOutputs,
     stage25_rng_namespace,
+    stage25_row_token,
 )
 
 
@@ -268,15 +269,7 @@ def _validate_context_consistency(
 
 
 def _row_token(value: Any) -> int:
-    if isinstance(value, (str, np.str_)):
-        text = "s:" + str(value)
-    elif isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
-        text = "i:" + str(int(value))
-    else:
-        raise ValueError("row_ids must contain non-empty strings or integers")
-    if text in ("s:",):
-        raise ValueError("row_ids must not contain empty strings")
-    return int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:4], "little") % (2**31 - 1)
+    return stage25_row_token(value)
 
 
 def _normalise_row_ids(row_ids: Sequence[Any], batch: int) -> np.ndarray:

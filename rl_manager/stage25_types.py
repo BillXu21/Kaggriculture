@@ -31,6 +31,21 @@ def stage25_rng_namespace(identity: "Stage25BehaviorIdentity", seed: int = 0) ->
             f"/behavior={identity.identity_id()}")
 
 
+def stage25_row_token(row_id: object) -> int:
+    """Map one immutable logical row identity to a stable policy token."""
+    if isinstance(row_id, (str, np.str_)):
+        text = "s:" + str(row_id)
+    elif isinstance(row_id, (int, np.integer)) and not isinstance(
+            row_id, (bool, np.bool_)):
+        text = "i:" + str(int(row_id))
+    else:
+        raise ValueError("row_ids must contain non-empty strings or integers")
+    if text == "s:":
+        raise ValueError("row_ids must not contain empty strings")
+    return int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:4],
+                          "little") % (2**31 - 1)
+
+
 @dataclass(frozen=True)
 class Stage25BehaviorIdentity:
     """Immutable identity for one exact Stage 2.5 behavior distribution."""

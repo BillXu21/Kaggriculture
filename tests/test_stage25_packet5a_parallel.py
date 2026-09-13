@@ -118,8 +118,8 @@ def test_stage25_parent_padding_has_no_extra_responses_and_stable_rows():
     runner._dispatch(IDENTITY, requests, 0.0, {IDENTITY: policy}, [queue])
 
     assert len(policy.row_ids) == 1
-    assert policy.row_ids[0][0].startswith(requests[1].request_id + "/")
-    assert policy.row_ids[0][1].startswith(requests[0].request_id + "/")
+    assert policy.row_ids[0][0] == requests[1].request_id
+    assert policy.row_ids[0][1] == requests[0].request_id
     assert policy.row_ids[0][2].startswith("padding/")
     assert len([queue.get_nowait() for _ in range(2)]) == 2
     assert runner.inference_metrics["real_requests"] == 2
@@ -358,15 +358,6 @@ def test_stage25_spawned_worker_fast_engine_smoke(tmp_path):
 
 @pytest.mark.skipif(find_spec("fast_env._kaggriculture_env") is None,
                     reason="native fast_env extension is unavailable")
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the single-process runner samples row token 'request_id' while the "
-        "parallel parent appends '/rng-seed=<seed>', so the same checkpoint, "
-        "seed, spec, and row produce different stochastic actions for "
-        "--workers 1 versus --workers 2"
-    ),
-)
 def test_stage25_local_and_parallel_sampling_agree(tmp_path):
     from rl_manager.stage25_inference import Stage25InferenceAdapter
     from rl_manager.stage25_policy import init_stage25_params, tiny_stage25_config
@@ -390,12 +381,22 @@ def test_stage25_local_and_parallel_sampling_agree(tmp_path):
         ParallelSelfPlayRunner(
             config, num_workers=workers, inference_batch_wait_seconds=0.01,
             stage25_trajectory_buffer=buffer).run(specs)
-        return {(row.episode_id, row.seat, row.day): row.classes.tolist()
+        return {(row.episode_id, row.seat, row.day): (
+                    row.row_id, row.classes.copy(),
+                    row.component_logprobs.copy(), float(row.joint_logprob),
+                    float(row.value))
                 for row in buffer.rows}
 
     local = rollout(1)
     parallel = rollout(2)
-    assert local[(0, 0, 4)] == parallel[(0, 0, 4)]
+    assert local.keys() == parallel.keys()
+    assert local[(0, 0, 4)][0] == parallel[(0, 0, 4)][0]
+    for key in local:
+        left, right = local[key], parallel[key]
+        assert left[0] == right[0]
+        np.testing.assert_array_equal(left[1], right[1])
+        np.testing.assert_allclose(left[2], right[2], atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(left[3:], right[3:], atol=1e-6, rtol=1e-6)
 
 
 def test_stage25_runner_trajectory_closes_truncation_without_extra_plan(monkeypatch):

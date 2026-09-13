@@ -11,7 +11,7 @@ import argparse
 from dataclasses import replace
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from rl_manager.parallel import ParallelSelfPlayRunner
 from rl_manager.runner import RunnerConfig, build_episode_spec
@@ -80,6 +80,35 @@ def _config(args: argparse.Namespace) -> Stage25PPOConfig:
         gradient_clip=args.gradient_clip)
 
 
+def _physical_contract(config: Stage25PPOConfig) -> dict[str, Any]:
+    from rl_manager.stage25_checkpoint import PHYSICAL_SUPPORT_VERSION
+    from rl_manager.stage25_mechanics import (
+        ACTION_CLASS_COUNTS, ACTION_ORDER, ACTION_SCHEMA_VERSION)
+    return {
+        "version": PHYSICAL_SUPPORT_VERSION,
+        "action_contract": {
+            "schema_version": ACTION_SCHEMA_VERSION,
+            "action_vocabulary": list(ACTION_ORDER),
+            "action_class_counts": list(ACTION_CLASS_COUNTS),
+        },
+        "inference_batch_size": config.physical_batch_size,
+    }
+
+
+def _identity_from_meta(meta: Mapping[str, Any], field: str) -> Stage25BehaviorIdentity:
+    from rl_manager.stage25_types import Stage25BehaviorIdentity
+    payload = meta.get(field)
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError(f"PPO checkpoint {field} is missing")
+    fields = ("name", "version", "parameter_fingerprint",
+              "observation_schema_version", "policy_schema_version",
+              "e_history_version", "curriculum_version",
+              "curriculum_fingerprint", "physical_support_version")
+    if not all(item in payload for item in fields):
+        raise ValueError(f"PPO checkpoint {field} is incomplete")
+    return Stage25BehaviorIdentity(**{item: str(payload[item]) for item in fields})
+
+
 def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stage25PPOTrainState, dict[str, Any]]:
     from rl_manager.stage25_checkpoint import (
         initialize_stage25_ppo_from_checkpoint, load_stage25_ppo_checkpoint)
@@ -90,17 +119,45 @@ def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stag
         params, source_meta = initialize_stage25_ppo_from_checkpoint(
             args.init, config=config.model, seed=None)
         return init_stage25_ppo_state(config, seed=args.seed, params=params), source_meta
+    from rl_manager.executor_factory import make_stage25_executor_factory
+    from rl_manager.runner import _executor_factory_provenance
+    from rl_manager.stage25_inference import Stage25InferenceAdapter
     fresh = init_stage25_ppo_state(config, seed=args.seed)
-    params, optimizer_state, rng, meta = load_stage25_ppo_checkpoint(
+    runtime_executor = _executor_factory_provenance(make_stage25_executor_factory())
+    expected_physical = _physical_contract(config)
+    params, optimizer_state, rng, meta, opponent_params = load_stage25_ppo_checkpoint(
         args.resume, config=config.model, seed=None,
         optimizer_state_template=fresh.optimizer_state,
-        ppo_config=config.to_dict(), optimizer_config=config.to_dict())
+        ppo_config=config.to_dict(), optimizer_config=config.to_dict(),
+        curriculum=config.model.curriculum,
+        expected_physical_contract=expected_physical, return_opponent=True)
+    if meta.get("executor") != runtime_executor:
+        raise ValueError(
+            "PPO checkpoint executor provenance does not match the configured "
+            f"factory: {meta.get('executor')!r} != {runtime_executor!r}")
+    learner_identity = _identity_from_meta(meta, "behavior_identity")
+    learner_adapter = Stage25InferenceAdapter(
+        params=params, config=config.model, name=learner_identity.name,
+        version=learner_identity.version, seed=args.seed, mode="stochastic")
+    if learner_adapter.identity != learner_identity:
+        raise ValueError(
+            "PPO checkpoint behavior identity does not match loaded parameters "
+            "and curriculum")
+    opponent_identity = _identity_from_meta(meta, "opponent_identity")
+    opponent_adapter = Stage25InferenceAdapter(
+        params=opponent_params, config=config.model, name=opponent_identity.name,
+        version=opponent_identity.version, seed=args.seed, mode="stochastic")
+    if opponent_adapter.identity != opponent_identity:
+        raise ValueError(
+            "PPO checkpoint opponent identity does not match loaded parameters "
+            "and curriculum")
     state = replace(
         fresh, params=params, optimizer_state=optimizer_state, rng=rng,
         update_counter=int(meta["update_counter"]),
         rollout_seed=int(meta.get("rollout_seed") or args.seed),
         rollout_progression=meta.get("rollout_progression") or {},
-        behavior_identity=_identity(meta))
+        behavior_identity=learner_identity, opponent_params=opponent_params,
+        opponent_identity=opponent_identity)
     return state, meta
 
 
@@ -109,15 +166,23 @@ def _collection(
         *, seed: int, args: argparse.Namespace,
         previous_params: Any | None = None,
 ) -> tuple[Stage25TrajectoryBuffer, Stage25InferenceAdapter, dict[str, Any]]:
+    from rl_manager.executor_factory import make_stage25_executor_factory
+    from rl_manager.runner import _executor_factory_provenance
     from rl_manager.stage25_inference import Stage25InferenceAdapter
     from rl_manager.stage25_ppo import build_stage25_ppo_batch
     learner = Stage25InferenceAdapter(
         params=state.params, config=config.model, name="stage25_learner",
         version="ppo-native-v1", seed=seed, mode="stochastic")
     opponent = Stage25InferenceAdapter(
-        params=(state.params if previous_params is None else previous_params),
-        config=config.model, name="stage25_opponent", version="frozen-v1",
+        params=(state.params if state.opponent_params is None else state.opponent_params),
+        config=config.model,
+        name=("stage25_opponent" if state.opponent_identity is None
+              else state.opponent_identity.name),
+        version=("frozen-v1" if state.opponent_identity is None
+                 else state.opponent_identity.version),
         seed=seed + 1, mode="stochastic")
+    if state.opponent_identity is not None and opponent.identity != state.opponent_identity:
+        raise ValueError("restored opponent identity does not match its parameters")
     capacity = max(1, args.rollout_size * 2 * 26)
     trajectory = Stage25TrajectoryBuffer(capacity)
     runner_config = RunnerConfig(
@@ -127,6 +192,7 @@ def _collection(
         stage25_mode="stochastic", stage25_fixed_inference_batch_size=config.physical_batch_size)
     runner = ParallelSelfPlayRunner(
         runner_config, num_workers=args.workers, master_seed=seed,
+        executor_factory=make_stage25_executor_factory(),
         stage25_trajectory_buffer=trajectory)
     specs = tuple(build_episode_spec(
         index, seed + index, "candidate_vs_frozen", learner, opponent)
@@ -144,12 +210,22 @@ def _collection(
         "final_banks": [float(bank) for result in results for bank in result.final_banks],
         "inference_metrics": runner.inference_metrics,
         "behavior_identity": learner.identity.to_json_dict(),
+        "opponent_identity": opponent.identity.to_json_dict(),
+        "executor_provenance": _executor_factory_provenance(
+            runner.provenance["executor_factory"]),
     }
+    for row in trajectory.rows:
+        if row.provenance.get("executor") != stats["executor_provenance"]:
+            raise ValueError(
+                f"trajectory row {row.row_id!r} executor provenance disagrees "
+                "with configured factory")
     return trajectory, learner, stats
 
 
 def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     from rl_manager.stage25_checkpoint import save_stage25_ppo_checkpoint
+    from rl_manager.executor_factory import make_stage25_executor_factory
+    from rl_manager.runner import _executor_factory_provenance
     from rl_manager.stage25_ppo import build_stage25_ppo_batch, ppo_update
     if args.updates < 1 or args.rollout_size < 1 or args.workers < 1:
         raise ValueError("updates, rollout-size, and workers must be positive")
@@ -161,22 +237,51 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             "--physical-batch-size 1")
     state, source_meta = _new_state(args, config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    previous_params = None
     all_metrics = []
     for _ in range(args.updates):
         trajectory, learner, rollout_stats = _collection(
             state, config, seed=state.rollout_seed, args=args,
-            previous_params=previous_params)
-        previous_params = state.params
+            previous_params=None)
         state = replace(state, behavior_identity=learner.identity)
+        if state.opponent_params is None:
+            from rl_manager.stage25_inference import Stage25InferenceAdapter
+            initial_opponent = Stage25InferenceAdapter(
+                params=state.params, config=config.model,
+                name="stage25_opponent", version="frozen-v1",
+                seed=state.rollout_seed + 1, mode="stochastic")
+            state = replace(state, opponent_params=state.params,
+                            opponent_identity=initial_opponent.identity)
+        executor_provenance = rollout_stats.get("executor_provenance")
+        expected_executor = _executor_factory_provenance(
+            make_stage25_executor_factory())
+        if executor_provenance is None:
+            # Unit-level collection doubles may omit runtime statistics; the
+            # production collection always supplies this factory-derived
+            # value and is checked below.
+            executor_provenance = expected_executor
+        if executor_provenance != expected_executor:
+            raise ValueError("rollout executor provenance is not the configured factory")
+        previous_learner_params = state.params
         state, update_stats = ppo_update(state, build_stage25_ppo_batch(
             trajectory, learner_identity=learner.identity, gamma=config.gamma,
             gae_lambda=config.gae_lambda,
             normalize_advantages=config.normalize_advantages), config)
+        from rl_manager.stage25_inference import Stage25InferenceAdapter
+        next_opponent = Stage25InferenceAdapter(
+            params=previous_learner_params, config=config.model,
+            name="stage25_opponent", version="frozen-v1",
+            seed=state.rollout_seed + 1, mode="stochastic")
+        state = replace(state, opponent_params=previous_learner_params,
+                        opponent_identity=next_opponent.identity)
         state = replace(state, rollout_seed=state.rollout_seed + args.rollout_size)
         metadata = {
             "run": {"cli": "rl_manager.stage25_ppo_cli", "source": str(args.init) if args.init else None},
-            "source_checkpoint_metadata": source_meta,
+            "resume_from": (
+                None if not args.resume else {
+                    "path": str(args.resume),
+                    "payload_kind": source_meta.get("payload_kind"),
+                    "update_counter": source_meta.get("update_counter"),
+                }),
         }
         checkpoint = args.output_dir / "latest.npz"
         save_stage25_ppo_checkpoint(
@@ -185,12 +290,16 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             rollout_seed=state.rollout_seed, rollout_progression=state.rollout_progression,
             ppo_config=config.to_dict(), optimizer_config=config.to_dict(),
             curriculum=config.model.curriculum, behavior_identity=state.behavior_identity,
-            source_identity=({"path": str(args.init), "payload_kind": source_meta.get("payload_kind")}
-                             if args.init is not None else None),
-            provenance={"run": metadata, "physical_contract": {"version": "stage25_physical_v1"}},
-            physical_contract={"version": "stage25_physical_v1", "physical_batch_size": config.physical_batch_size},
-            executor={"name": "stage25_executor_factory", "version": "native"},
-            metadata={"cli_args": vars(args)})
+            provenance={"run": metadata},
+            physical_contract=_physical_contract(config),
+            executor=executor_provenance,
+            metadata={"cli_args": vars(args)},
+            opponent_params=state.opponent_params,
+            opponent_identity=state.opponent_identity,
+            source_identity=(source_meta.get("source_identity") or None),
+            source_history_version=(
+                (source_meta.get("source_e_identity") or {}).get("history_version")),
+        )
         record = {"update": state.update_counter, **rollout_stats, "update_metrics": update_stats, "checkpoint": str(checkpoint)}
         print(json.dumps(record, sort_keys=True, allow_nan=False), flush=True)
         all_metrics.append(record)

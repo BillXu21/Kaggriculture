@@ -11,8 +11,8 @@ import pytest
 
 from bc_manager.economics import E_HISTORY_LEGACY
 from bc_manager_jax.train import TrainConfig
+from rl_manager.stage25_ppo import Stage25PPOConfig, make_stage25_ppo_optimizer
 from rl_manager import stage25_checkpoint as checkpoint
-from rl_manager.stage25_bc import init_opt_state
 from rl_manager.stage25_checkpoint import (
     PPO_RESUME_BOUNDARY,
     PPO_TRAINING_PAYLOAD_KIND,
@@ -38,8 +38,9 @@ def _same_tree(left, right) -> bool:
 
 def _ppo_state(config: Stage25ModelConfig):
     params = init_stage25_params(config, seed=7)
-    optimizer_config = TrainConfig()
-    return params, init_opt_state(params, optimizer_config)
+    ppo_config = Stage25PPOConfig(model=config, physical_batch_size=1,
+                                  minibatch_size=1, epochs=1)
+    return params, make_stage25_ppo_optimizer(params, ppo_config).init(params)
 
 
 def test_ppo_round_trip_is_distinct_and_preserves_resume_contract(
@@ -66,13 +67,22 @@ def test_ppo_round_trip_is_distinct_and_preserves_resume_contract(
         source_history_version=E_HISTORY_LEGACY,
     )
 
-    loaded, loaded_opt, rng, meta = load_stage25_ppo_checkpoint(
+    loaded, loaded_opt, rng, meta, loaded_opponent = load_stage25_ppo_checkpoint(
         path, config=config, seed=7, optimizer_state_template=optimizer_state,
         ppo_config=ppo_config, expected_behavior_identity=behavior,
-        expected_physical_contract=physical)
+        expected_physical_contract=physical, return_opponent=True)
 
     assert _same_tree(params, loaded)
     assert _same_tree(optimizer_state, loaded_opt)
+    assert _same_tree(params, loaded_opponent)
+    optimizer = make_stage25_ppo_optimizer(
+        params, Stage25PPOConfig(model=config, physical_batch_size=1,
+                                 minibatch_size=1, epochs=1))
+    gradients = jax.tree_util.tree_map(np.ones_like, params)
+    update_a, next_opt_a = optimizer.update(gradients, optimizer_state, params)
+    update_b, next_opt_b = optimizer.update(gradients, loaded_opt, loaded)
+    assert _same_tree(update_a, update_b)
+    assert _same_tree(next_opt_a, next_opt_b)
     assert np.array_equal(np.asarray(rng), np.asarray([11, 13], dtype=np.uint32))
     assert meta["payload_kind"] == PPO_TRAINING_PAYLOAD_KIND
     assert meta["resume_boundary"] == PPO_RESUME_BOUNDARY
@@ -90,26 +100,23 @@ def test_ppo_round_trip_is_distinct_and_preserves_resume_contract(
             == PPO_TRAINING_PAYLOAD_KIND
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "save_stage25_ppo_checkpoint accepts a curriculum argument but never "
-        "uses it; it silently persists config.curriculum instead of rejecting "
-        "a mismatched explicit curriculum, so the load-time curriculum check "
-        "can only ever see the model-config curriculum"
-    ),
-)
 def test_ppo_checkpoint_rejects_explicit_curriculum_mismatch(tmp_path: Path) -> None:
     from rl_manager.stage25_config import Stage25CurriculumConfig
 
     config = _config()  # disabled curriculum
     params, optimizer_state = _ppo_state(config)
     enabled = Stage25CurriculumConfig(enabled=True, max_positive_crop_delta=1)
+    existing = tmp_path / "existing.npz"
+    save_stage25_ppo_checkpoint(
+        existing, params, optimizer_state, np.asarray([2, 3], dtype=np.uint32),
+        config, seed=7, ppo_config={"x": 1})
+    before = existing.read_bytes()
     with pytest.raises(Stage25CheckpointError, match="curriculum"):
         save_stage25_ppo_checkpoint(
-            tmp_path / "mismatch.npz", params, optimizer_state,
+            existing, params, optimizer_state,
             np.asarray([2, 3], dtype=np.uint32), config, seed=7,
             curriculum=enabled, ppo_config={"x": 1})
+    assert existing.read_bytes() == before
 
 
 def test_fresh_ppo_initialization_accepts_native_inference_and_bc(
