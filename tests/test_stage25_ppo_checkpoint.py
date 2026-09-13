@@ -9,7 +9,7 @@ import jax
 import numpy as np
 import pytest
 
-from bc_manager.economics import E_HISTORY_CORRECTED_V1, E_HISTORY_LEGACY
+from bc_manager.economics import E_HISTORY_LEGACY
 from bc_manager_jax.train import TrainConfig
 from rl_manager import stage25_checkpoint as checkpoint
 from rl_manager.stage25_bc import init_opt_state
@@ -88,6 +88,28 @@ def test_ppo_round_trip_is_distinct_and_preserves_resume_contract(
         assert all(archive[name].dtype != object for name in archive.files)
         assert json.loads(archive["__meta__"].tobytes().decode("utf-8"))["payload_kind"] \
             == PPO_TRAINING_PAYLOAD_KIND
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "save_stage25_ppo_checkpoint accepts a curriculum argument but never "
+        "uses it; it silently persists config.curriculum instead of rejecting "
+        "a mismatched explicit curriculum, so the load-time curriculum check "
+        "can only ever see the model-config curriculum"
+    ),
+)
+def test_ppo_checkpoint_rejects_explicit_curriculum_mismatch(tmp_path: Path) -> None:
+    from rl_manager.stage25_config import Stage25CurriculumConfig
+
+    config = _config()  # disabled curriculum
+    params, optimizer_state = _ppo_state(config)
+    enabled = Stage25CurriculumConfig(enabled=True, max_positive_crop_delta=1)
+    with pytest.raises(Stage25CheckpointError, match="curriculum"):
+        save_stage25_ppo_checkpoint(
+            tmp_path / "mismatch.npz", params, optimizer_state,
+            np.asarray([2, 3], dtype=np.uint32), config, seed=7,
+            curriculum=enabled, ppo_config={"x": 1})
 
 
 def test_fresh_ppo_initialization_accepts_native_inference_and_bc(

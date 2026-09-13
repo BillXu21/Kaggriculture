@@ -356,6 +356,48 @@ def test_stage25_spawned_worker_fast_engine_smoke(tmp_path):
     assert len(reloaded) == 24
 
 
+@pytest.mark.skipif(find_spec("fast_env._kaggriculture_env") is None,
+                    reason="native fast_env extension is unavailable")
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the single-process runner samples row token 'request_id' while the "
+        "parallel parent appends '/rng-seed=<seed>', so the same checkpoint, "
+        "seed, spec, and row produce different stochastic actions for "
+        "--workers 1 versus --workers 2"
+    ),
+)
+def test_stage25_local_and_parallel_sampling_agree(tmp_path):
+    from rl_manager.stage25_inference import Stage25InferenceAdapter
+    from rl_manager.stage25_policy import init_stage25_params, tiny_stage25_config
+
+    model_config = tiny_stage25_config()
+    policy = Stage25InferenceAdapter(
+        params=init_stage25_params(model_config, seed=7), config=model_config,
+        name="stage25_learner", version="ppo-native-v1", seed=17,
+        mode="stochastic")
+
+    def rollout(workers: int) -> dict:
+        config = RunnerConfig(
+            stage25_enabled=True, stage25_mode="stochastic",
+            manager_start_day=4, max_turns=144,
+            openings=("none", "none"), low_telemetry=True,
+            stage25_fixed_inference_batch_size=1)
+        specs = [build_episode_spec(
+            index, 100 + index, "candidate_vs_frozen", policy, policy)
+            for index in range(2)]
+        buffer = Stage25TrajectoryBuffer(64)
+        ParallelSelfPlayRunner(
+            config, num_workers=workers, inference_batch_wait_seconds=0.01,
+            stage25_trajectory_buffer=buffer).run(specs)
+        return {(row.episode_id, row.seat, row.day): row.classes.tolist()
+                for row in buffer.rows}
+
+    local = rollout(1)
+    parallel = rollout(2)
+    assert local[(0, 0, 4)] == parallel[(0, 0, 4)]
+
+
 def test_stage25_runner_trajectory_closes_truncation_without_extra_plan(monkeypatch):
     from test_rl_manager_runner import _TraceBackend, _TraceExecutorFactory
 
