@@ -44,6 +44,22 @@ _EXPORTS: dict[str, str] = {
     "Priority": "tasks",
     "Task": "tasks",
     "generate_tasks": "tasks",
+    "BlockReason": "strip_work",
+    "RowKey": "strip_work",
+    "WorkStatus": "strip_work",
+    "WorkItem": "strip_work",
+    "WorkChain": "strip_work",
+    "SupplyRequirement": "strip_work",
+    "SupplyDemand": "strip_work",
+    "SupplySnapshot": "strip_work",
+    "RowSummary": "strip_work",
+    "RowWorkload": "strip_work",
+    "WorkDiagnostics": "strip_work",
+    "StripWorkConfig": "strip_work",
+    "StripWorkPlan": "strip_work",
+    "StripWorkResult": "strip_work",
+    "row_key_for_tile": "strip_work",
+    "build_strip_work_plan": "strip_work",
 }
 
 __all__ = sorted(_EXPORTS)
