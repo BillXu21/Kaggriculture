@@ -60,6 +60,16 @@ _EXPORTS: dict[str, str] = {
     "StripWorkResult": "strip_work",
     "row_key_for_tile": "strip_work",
     "build_strip_work_plan": "strip_work",
+    "HorizontalRouteCandidate": "strip_routes",
+    "RouteAssignment": "strip_routes",
+    "RoutePhase": "strip_routes",
+    "StripRoute": "strip_routes",
+    "WorkerId": "strip_routes",
+    "assign_horizontal_routes": "strip_routes",
+    "generate_horizontal_route_candidates": "strip_routes",
+    "StripExecutorConfig": "strip_executor",
+    "StripExecutorController": "strip_executor",
+    "StripExecutorResult": "strip_executor",
 }
 
 __all__ = sorted(_EXPORTS)
