@@ -13,9 +13,7 @@ def test_seed_and_fertilizer_shortages_are_distinct_global_and_inventory_blocks(
 
     board = [[None] * 10 for _ in range(10)]
     board[0][0] = plant("WHEAT", planted_day=1)
-    fertilizer_short = build_strip_work_plan(
-        obs(board, day=3), plan(fertilizer_by_crop={"WHEAT": 1})
-    )
+    fertilizer_short = build_strip_work_plan(obs(board, day=3), plan())
     treatment = next(item for item in fertilizer_short.items if item.kind == "FERTILIZE")
     water = next(
         item for item in fertilizer_short.items

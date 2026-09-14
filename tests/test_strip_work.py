@@ -123,6 +123,22 @@ def test_empty_crop_is_plant_then_water_and_seeds_are_global():
     assert not any(x.kind == "PICKUP" for x in result.items)
 
 
+def test_new_crop_water_waits_for_plant_but_chain_counts_both():
+    result = build_strip_work_plan(
+        obs(seeds={"WHEAT": 1}),
+        plan(crop_targets={"WHEAT": 1}),
+        config=StripWorkConfig(),
+    )
+    planting = next(x for x in result.items if x.kind == "PLANT")
+    watering = next(x for x in result.items if x.kind == "WATER")
+    assert planting.status == WorkStatus.READY
+    assert watering.status == WorkStatus.BLOCKED
+    assert watering.block_reason == BlockReason.DEPENDENCY_BLOCKED
+    assert watering.depends_on == (planting.id,)
+    chain = next(c for c in result.chains if c.kind == "CROP_GROWTH")
+    assert chain.interaction_turns == 2
+
+
 def test_replacement_has_harvest_plant_water_but_reduction_has_no_replacement():
     board = [[None] * 10 for _ in range(10)]
     board[0][0] = plant("WHEAT", planted_day=0, yield_units=3)
@@ -137,6 +153,18 @@ def test_replacement_has_harvest_plant_water_but_reduction_has_no_replacement():
     assert [
         next(x for x in replacement.items if x.id == i).kind for i in chain.item_ids
     ] == ["HARVEST", "PLANT", "WATER"]
+    by_id = {x.id: x for x in replacement.items}
+    harvest = by_id[chain.item_ids[0]]
+    plant_step = by_id[chain.item_ids[1]]
+    water_step = by_id[chain.item_ids[2]]
+    assert harvest.status == WorkStatus.READY
+    assert plant_step.status == WorkStatus.BLOCKED
+    assert plant_step.block_reason == BlockReason.DEPENDENCY_BLOCKED
+    assert plant_step.depends_on == (harvest.id,)
+    assert water_step.status == WorkStatus.BLOCKED
+    assert water_step.block_reason == BlockReason.DEPENDENCY_BLOCKED
+    assert water_step.depends_on == (plant_step.id,)
+    assert chain.interaction_turns == 3
     board[0][1] = plant("WHEAT", planted_day=0, yield_units=1)
     reduced = build_strip_work_plan(obs(board, day=3), plan(crop_targets={"WHEAT": 1}))
     assert not kinds(reduced, "PLANT")
@@ -165,58 +193,161 @@ def test_land_request_is_explicit_locked_land_without_coordinates():
     land = kinds(result, "BUY_LAND")
     assert len(land) == 1 and land[0].tile is None
     assert land[0].land == "NE"
-    assert land[0].block_reason == BlockReason.LOCKED_LAND
+    assert land[0].status == WorkStatus.READY
+    assert land[0].block_reason is None
     unresolved = next(x for x in result.items if x.id == "UNRESOLVED_PLANT:WHEAT")
     assert unresolved.block_reason == BlockReason.LOCKED_LAND
     assert land[0].id in unresolved.depends_on
     assert result.diagnostics.unresolved_land_delta == 1
 
 
+def test_land_purchase_is_blocked_without_money_but_demand_remains():
+    result = build_strip_work_plan(
+        obs(money=0.0),
+        plan(crop_targets={"WHEAT": 101}, land_count=2),
+    )
+    land = kinds(result, "BUY_LAND")
+    assert len(land) == 1 and land[0].land == "NE"
+    assert land[0].status == WorkStatus.BLOCKED
+    assert land[0].block_reason == BlockReason.MISSING_GLOBAL_RESOURCE
+    unresolved = next(x for x in result.items if x.id == "UNRESOLVED_PLANT:WHEAT")
+    assert unresolved.block_reason == BlockReason.LOCKED_LAND
+    assert land[0].id in unresolved.depends_on
+
+
+def test_multi_land_purchases_are_ordered_not_independent():
+    result = build_strip_work_plan(obs(), plan(land_count=3))
+    land = sorted(kinds(result, "BUY_LAND"), key=lambda x: x.id)
+    assert [x.land for x in land] == ["NE", "SW"]
+    first, second = land
+    assert first.status == WorkStatus.READY
+    assert first.depends_on == ()
+    assert second.status == WorkStatus.BLOCKED
+    assert first.id in second.depends_on
+
+
 def test_feed_then_care_separates_missing_feed_from_care_dependency():
+    # Strip CARE is executor-owned: zero care_by_animal counts still forecast.
     board = [[None] * 10 for _ in range(10)]
     board[0][0] = animal("GOOSE")
-    result = build_strip_work_plan(obs(board), plan(care_by_animal={"GOOSE": 1}))
+    result = build_strip_work_plan(obs(board), plan())
     feed, care = kinds(result, "FEED")[0], kinds(result, "CARE")[0]
     assert feed.block_reason == BlockReason.MISSING_SUPPLY
     assert care.block_reason == BlockReason.DEPENDENCY_BLOCKED
-    ready = build_strip_work_plan(
-        obs(board, shed={"WHEAT": 1}), plan(care_by_animal={"GOOSE": 1})
-    )
-    assert all(
-        x.status == WorkStatus.READY
-        for x in kinds(ready, "FEED") + kinds(ready, "CARE")
-    )
-    late = build_strip_work_plan(
-        obs(board, day=29, shed={"WHEAT": 1}),
-        plan(care_by_animal={"GOOSE": 1}),
-    )
+    assert care.depends_on == (feed.id,)
+    ready = build_strip_work_plan(obs(board, shed={"WHEAT": 1}), plan())
+    feed, care = kinds(ready, "FEED")[0], kinds(ready, "CARE")[0]
+    assert feed.status == WorkStatus.READY
+    assert care.status == WorkStatus.BLOCKED
+    assert care.block_reason == BlockReason.DEPENDENCY_BLOCKED
+    assert care.depends_on == (feed.id,)
+    chain = next(c for c in ready.chains if c.kind == "ANIMAL_CARE")
+    assert chain.interaction_turns == 2
+    late = build_strip_work_plan(obs(board, day=29, shed={"WHEAT": 1}), plan())
     assert not kinds(late, "CARE")
 
 
+def test_fed_animal_gets_standalone_ready_care_and_cared_gets_none():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = animal("GOOSE", fed_today=True)
+    fed = build_strip_work_plan(obs(board), plan())
+    assert not kinds(fed, "FEED")
+    care = kinds(fed, "CARE")[0]
+    assert care.status == WorkStatus.READY
+    cared_board = [[None] * 10 for _ in range(10)]
+    cared_board[0][0] = animal("GOOSE", fed_today=True, cared_today=True)
+    cared = build_strip_work_plan(obs(cared_board), plan())
+    assert not kinds(cared, "CARE")
+    assert not kinds(cared, "FEED")
+
+
 def test_fertilizer_policy_is_limited_to_wheat_and_strawberry_and_does_not_duplicate():
+    # Strip fertilizer is executor-owned: zero fertilizer_by_crop counts still
+    # forecast under ON permissions.
     board = [[None] * 10 for _ in range(10)]
     board[0][0] = plant("WHEAT", planted_day=1)
     board[0][1] = plant("STRAWBERRY", planted_day=-6)
     board[0][2] = plant("CARROT", planted_day=1)
     result = build_strip_work_plan(
         obs(board, day=3, shed={"FERTILIZER": 2}),
-        plan(fertilizer_by_crop={"WHEAT": 1, "STRAWBERRY": 1, "CARROT": 1}),
+        plan(),
     )
     assert {(x.crop, x.tile) for x in kinds(result, "FERTILIZE")} == {
         ("WHEAT", (0, 0)),
         ("STRAWBERRY", (0, 1)),
     }
     for crop, tile in (("WHEAT", (0, 0)), ("STRAWBERRY", (0, 1))):
+        treatment = next(
+            x for x in kinds(result, "FERTILIZE") if x.tile == tile
+        )
+        assert treatment.status == WorkStatus.READY
         water = [x for x in kinds(result, "WATER") if x.tile == tile]
         assert len(water) == 1
         assert water[0].source == "fertilizer_linked_productive"
+        assert water[0].status == WorkStatus.BLOCKED
+        assert water[0].block_reason == BlockReason.DEPENDENCY_BLOCKED
+        assert water[0].depends_on == (treatment.id,)
     active = copy.deepcopy(board)
     active[0][0]["fertilized_until_day"] = 9
     again = build_strip_work_plan(
         obs(active, day=3, shed={"FERTILIZER": 2}),
-        plan(fertilizer_by_crop={"WHEAT": 1}),
+        plan(),
     )
-    assert not kinds(again, "FERTILIZE")
+    # Active wheat treatment suppresses wheat only; strawberry remains.
+    assert {(x.crop, x.tile) for x in kinds(again, "FERTILIZE")} == {
+        ("STRAWBERRY", (0, 1))
+    }
+
+
+def test_fertilizer_permission_off_suppresses_only_that_crop():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("WHEAT", planted_day=1)
+    board[0][1] = plant("STRAWBERRY", planted_day=-6)
+    no_wheat = build_strip_work_plan(
+        obs(board, day=3, shed={"FERTILIZER": 2}),
+        plan(),
+        config=StripWorkConfig(allow_wheat_fertilizer=False),
+    )
+    assert {(x.crop, x.tile) for x in kinds(no_wheat, "FERTILIZE")} == {
+        ("STRAWBERRY", (0, 1))
+    }
+    no_berry = build_strip_work_plan(
+        obs(board, day=3, shed={"FERTILIZER": 2}),
+        plan(),
+        config=StripWorkConfig(allow_strawberry_fertilizer=False),
+    )
+    assert {(x.crop, x.tile) for x in kinds(no_berry, "FERTILIZE")} == {
+        ("WHEAT", (0, 0))
+    }
+
+
+def test_scarce_fertilizer_represents_all_demand_with_stable_order():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("STRAWBERRY", planted_day=-6)
+    board[0][1] = plant("STRAWBERRY", planted_day=-6)
+    board[0][2] = plant("STRAWBERRY", planted_day=-6)
+    result = build_strip_work_plan(
+        obs(board, day=3, shed={"FERTILIZER": 1}),
+        plan(),
+    )
+    treatments = sorted(kinds(result, "FERTILIZE"), key=lambda x: x.tile)
+    assert [x.tile for x in treatments] == [(0, 0), (0, 1), (0, 2)]
+    assert treatments[0].status == WorkStatus.READY
+    assert treatments[1].block_reason == BlockReason.MISSING_SUPPLY
+    assert treatments[2].block_reason == BlockReason.MISSING_SUPPLY
+    assert result.diagnostics.supply_demand is not None
+    demand = {
+        (d.item, d.scope): d
+        for d in result.diagnostics.supply_demand
+    }
+    assert demand[("FERTILIZER", "inventory")].requested == 3
+    assert demand[("FERTILIZER", "inventory")].available == 1
+    assert demand[("FERTILIZER", "inventory")].missing == 2
+    again = build_strip_work_plan(
+        obs(copy.deepcopy(board), day=3, shed={"FERTILIZER": 1}),
+        plan(),
+    )
+    assert [x.id for x in again.items] == [x.id for x in result.items]
 
 
 def test_routine_watering_uses_default_ages_and_stable_reasons():
@@ -272,12 +403,38 @@ def test_sell_includes_carried_delivery_and_retains_shortage_sell():
         obs(shed={"WHEAT": 1}, inventories=[{"WHEAT": 2}, {}]),
         plan(sell_quantities={"WHEAT": {0: 3}}),
     )
-    assert kinds(result, "DELIVERY")[0].quantity == 2
-    assert kinds(result, "SELL")[0].status == WorkStatus.READY
+    delivery = kinds(result, "DELIVERY")[0]
+    assert delivery.quantity == 2
+    assert delivery.status == WorkStatus.READY
+    sell = kinds(result, "SELL")[0]
+    assert sell.status == WorkStatus.BLOCKED
+    assert sell.block_reason == BlockReason.DEPENDENCY_BLOCKED
+    assert sell.depends_on == (delivery.id,)
+    chain = next(c for c in result.chains if c.kind == "SELL_INTENT")
+    assert chain.interaction_turns == 2
     short = build_strip_work_plan(
         obs(shed={}, inventories=[{}, {}]), plan(sell_quantities={"WHEAT": {0: 2}})
     )
     assert kinds(short, "SELL")[0].block_reason == BlockReason.MISSING_SUPPLY
+
+
+def test_blocked_chain_workload_still_counts_complete_forecast():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("WHEAT", planted_day=0, yield_units=3)
+    for y in range(5):
+        for x in range(5):
+            if board[y][x] is None:
+                board[y][x] = "LOCKED"
+    result = build_strip_work_plan(
+        obs(board, day=3, seeds={"TOMATO": 1}), plan(crop_targets={"TOMATO": 1})
+    )
+    chain = next(c for c in result.chains if c.kind == "CROP_GROWTH")
+    assert chain.status == WorkStatus.BLOCKED
+    assert chain.interaction_turns == 3
+    row = result.row_summary_by_key[row_key_for_tile((0, 0))]
+    assert row.ready_interactions == 1
+    assert row.future_interactions == 2
+    assert row.nontravel_turns == 3
 
 
 def test_animal_purchase_is_blocked_by_authoritative_farm_money():

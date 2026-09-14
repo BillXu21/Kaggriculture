@@ -4,6 +4,24 @@ This module describes mechanical work implied by a :class:`DailyPlan`.  It
 does not assign workers, route them, buy anything, dispatch actions, or mutate
 the observation or plan.  Coordinates are always canonical ``(y, x)`` board
 coordinates and the board is read from ``obs['farms'][seat]['tiles']``.
+
+Manager/executor boundary for the strip experiment: the manager owns crop
+targets, animal targets, the land target, and strategic sell intent.  The
+strip executor owns watering, harvest mechanics, feeding, care, and
+wheat/strawberry fertilizer timing under configured permissions.  In
+particular this builder ignores ``plan.care_by_animal`` and
+``plan.fertilizer_by_crop``; CARE and fertilizer work is generated from
+mechanical eligibility, not legacy count fields.
+
+Status contract: ``READY`` means the primitive interaction is mechanically
+executable from the current represented state (subject only to
+worker/location assignment, which Packet 1 does not model).  Any item with a
+non-empty ``depends_on`` refers to future sequential work that has not yet
+occurred, so it is ``BLOCKED`` with ``DEPENDENCY_BLOCKED`` unless a more
+specific own reason (missing supply, missing purchase, locked land, ...)
+applies.  Chains may therefore be foreseeable/feasible as a whole while only
+their first primitive is ``READY``; workload totals still include every
+member.
 """
 
 from __future__ import annotations
@@ -29,7 +47,7 @@ from executor_v0.upkeep import (
     fertilizer_extra_units,
     wheat_harvest_eligibility,
 )
-from replay_daily.constants import ANIMALS, CROPS, LAND_ORDER, PRODUCTS
+from replay_daily.constants import ANIMALS, CROPS, LAND_ORDER, LAND_PRICES, PRODUCTS
 from replay_daily.lifecycle import canonical_board, resolve_observation_step
 
 __all__ = [
@@ -634,19 +652,26 @@ class _Builder:
         land: str | None = None,
         source: str = "strip_forecast",
     ) -> WorkItem:
+        """Register one primitive interaction.
+
+        ``READY`` means executable now from the represented state.  A
+        non-empty ``depends_on`` always names represented future work that has
+        not occurred yet, so the item is ``BLOCKED``/``DEPENDENCY_BLOCKED``
+        unless its own mechanics or supplies already fail with a more specific
+        reason (which takes precedence).
+        """
         deps = tuple(sorted(set(depends_on)))
         supply_reason = self._requirements(requirements)
         own_reason = block_reason or supply_reason
-        if own_reason is None and any(
-            dep not in self.items or self.items[dep].status != WorkStatus.READY
-            for dep in deps
-        ):
+        if own_reason is None and deps:
             own_reason = BlockReason.DEPENDENCY_BLOCKED
         status = WorkStatus.BLOCKED if own_reason else WorkStatus.READY
         if id in self.items:
             old = self.items[id]
             deps = tuple(sorted(set(old.depends_on) | set(deps)))
             own_reason = old.block_reason or own_reason
+            if own_reason is None and deps:
+                own_reason = BlockReason.DEPENDENCY_BLOCKED
             status = WorkStatus.BLOCKED if own_reason else WorkStatus.READY
             requirements = old.required_supplies + tuple(
                 r for r in requirements if r not in old.required_supplies
@@ -720,19 +745,16 @@ class _Builder:
         )
 
     def resolve_dependencies(self) -> None:
+        # Enforce the READY-means-executable invariant: an item with declared
+        # dependencies is future work awaiting those steps, so it stays
+        # BLOCKED unless it already carries a more specific own reason.
+        # Packet 1 never simulates execution, so dependencies are never
+        # "already satisfied" here; this pass is idempotent with add().
         for _ in range(len(self.items) + 1):
             changed = False
             for item_id, item in list(self.items.items()):
-                dep_block = next(
-                    (
-                        self.items[d].block_reason
-                        for d in item.depends_on
-                        if d in self.items and self.items[d].status != WorkStatus.READY
-                    ),
-                    None,
-                )
                 reason = item.block_reason or (
-                    BlockReason.DEPENDENCY_BLOCKED if dep_block else None
+                    BlockReason.DEPENDENCY_BLOCKED if item.depends_on else None
                 )
                 replacement = WorkItem(
                     item.id,
@@ -833,7 +855,14 @@ def build_strip_work_plan(
     acting_seat: int | None = None,
     seat: int | None = None,
 ) -> StripWorkPlan:
-    """Build a deterministic pure work forecast for one acting seat."""
+    """Build a deterministic pure work forecast for one acting seat.
+
+    The manager contributes crop/animal/land targets and sell intent; CARE,
+    feeding, watering, and fertilizer timing are executor mechanics derived
+    from observed state (legacy ``care_by_animal``/``fertilizer_by_crop``
+    counts are ignored).  ``READY`` means executable now; anything awaiting a
+    represented prerequisite is ``BLOCKED``/``DEPENDENCY_BLOCKED``.
+    """
     if not isinstance(obs, Mapping):
         raise TypeError("obs must be a mapping")
     if not isinstance(plan, DailyPlan):
@@ -859,14 +888,32 @@ def build_strip_work_plan(
     current_land = len(unlocked)
     land_item_ids: tuple[str, ...] = ()
     if plan.land_count > current_land:
+        # Sequential ordered acquisition: plot N+1 must be bought before plot
+        # N+2 is legal, so each purchase depends on the previous one.  Only
+        # the next legal purchase can be READY; later ones wait on it.
+        # Affordability is charged sequentially against authoritative land
+        # prices.  Downstream plot-less work stays LOCKED_LAND on these ids.
+        quadrants = LAND_ORDER[max(0, current_land - 1) : plan.land_count - 1]
         ids = []
-        for quadrant in LAND_ORDER[max(0, current_land - 1) : plan.land_count - 1]:
+        remaining_land_money = money
+        prev_land_id: str | None = None
+        for offset, quadrant in enumerate(quadrants):
+            price_index = (current_land - 1) + offset
+            cost = (
+                float(LAND_PRICES[price_index])
+                if 0 <= price_index < len(LAND_PRICES)
+                else None
+            )
+            affordable = cost is not None and remaining_land_money >= cost
             land_id = f"BUY_LAND:{quadrant}"
             builder.add(
                 id=land_id,
                 kind="BUY_LAND",
                 land=quadrant,
-                block_reason=BlockReason.LOCKED_LAND,
+                depends_on=(prev_land_id,) if prev_land_id is not None else (),
+                block_reason=(
+                    None if affordable else BlockReason.MISSING_GLOBAL_RESOURCE
+                ),
                 source="land_intent",
             )
             builder.chain(
@@ -876,6 +923,9 @@ def build_strip_work_plan(
                 land=quadrant,
             )
             ids.append(land_id)
+            if affordable and cost is not None:
+                remaining_land_money -= cost
+            prev_land_id = land_id
         land_item_ids = tuple(ids)
     remaining_money = money
     represented_animals: Counter[str] = Counter()
@@ -1075,13 +1125,16 @@ def build_strip_work_plan(
             source="crop_unresolved",
         )
 
+    # CARE is owned by the strip executor, not the manager: every animal that
+    # is mechanically care-worthwhile gets a service chain.  Legacy
+    # plan.care_by_animal counts are deliberately ignored.  An unfed animal
+    # needs FEED (supply-checked) before CARE; an already-fed animal gets a
+    # standalone READY CARE.  Already-cared or no-payoff animals get nothing.
+    allowed_quadrants = set(unlocked)
     for animal in ANIMAL_ORDER:
-        remaining = int(plan.care_by_animal_dict[animal])
-        if not remaining:
-            continue
         for y, row in enumerate(board):
             for x, tile in enumerate(row):
-                if remaining <= 0 or quadrant_of(y, x) not in set(unlocked):
+                if quadrant_of(y, x) not in allowed_quadrants:
                     continue
                 if not (isinstance(tile, Mapping) and tile.get("animal") == animal):
                     continue
@@ -1104,7 +1157,7 @@ def build_strip_work_plan(
                         tile=(y, x),
                         animal=animal,
                         requirements=(SupplyRequirement("WHEAT", 1, "inventory"),),
-                        source="care_request",
+                        source="strip_care",
                     )
                     ids.append(feed_id)
                 care_id = f"CARE:{animal}:{y},{x}"
@@ -1114,7 +1167,7 @@ def build_strip_work_plan(
                     tile=(y, x),
                     animal=animal,
                     depends_on=ids,
-                    source="care_request",
+                    source="strip_care",
                 )
                 ids.append(care_id)
                 builder.chain(
@@ -1124,7 +1177,6 @@ def build_strip_work_plan(
                     tile=(y, x),
                     animal=animal,
                 )
-                remaining -= 1
 
     for animal, quantity in layouts.animals.unresolved:
         builder.add(
@@ -1137,20 +1189,22 @@ def build_strip_work_plan(
             source="animal_unresolved",
         )
 
-    fert_plan = plan.fertilizer_by_crop_dict
+    # Fertilizer timing is owned by the strip experiment, not the manager:
+    # legacy plan.fertilizer_by_crop counts are deliberately ignored.  When a
+    # crop permission is ON, every mechanically eligible plant is represented.
+    # The supply ledger marks the first affordable applications READY (stable
+    # y,x order) and the excess MISSING_SUPPLY, so total useful demand stays
+    # visible under scarcity.  No purchase/top-up is ever created.
     for crop, enabled, ages in (
         ("WHEAT", cfg.allow_wheat_fertilizer, cfg.wheat_fertilizer_ages),
         ("STRAWBERRY", cfg.allow_strawberry_fertilizer, cfg.strawberry_fertilizer_ages),
     ):
         if not enabled:
             continue
-        remaining = int(fert_plan[crop])
-        if not remaining:
-            continue
         candidates: list[tuple[int, int]] = []
         for y, row in enumerate(board):
             for x, tile in enumerate(row):
-                if remaining <= 0 or quadrant_of(y, x) not in set(unlocked):
+                if quadrant_of(y, x) not in allowed_quadrants:
                     continue
                 if not (
                     isinstance(tile, Mapping)
@@ -1171,7 +1225,7 @@ def build_strip_work_plan(
                 ):
                     continue
                 candidates.append((y, x))
-        for y, x in candidates[:remaining]:
+        for y, x in candidates:
             fert_id = f"FERTILIZE:{crop}:{y},{x}"
             _supply_item(
                 builder,
