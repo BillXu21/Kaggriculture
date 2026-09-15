@@ -13,6 +13,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from executor_v0.plan import DailyPlan
+from executor_v0.strip_market import (
+    MarketBootstrapState,
+    build_market_turn_plan,
+)
 from executor_v0.strip_routes import (
     RouteAssignment,
     RoutePhase,
@@ -54,6 +58,9 @@ class StripExecutorConfig:
 
     acting_seat: int = 0
     work_config: StripWorkConfig = field(default_factory=StripWorkConfig)
+    shed_capacity: int = 100
+    max_market_orders: int = 10
+    market_params: Mapping[str, Mapping[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +105,9 @@ class StripExecutorController:
         self._latest_inventories: dict[WorkerId, dict[str, int]] = {}
         self._initial_shed: dict[str, int] = {}
         self._daily: dict[str, Any] = {}
+        self._daily_plan: DailyPlan | None = None
+        self._market_state = MarketBootstrapState()
+        self._routes_finalized = False
 
     @property
     def routes(self) -> tuple[StripRoute, ...]:
@@ -107,8 +117,8 @@ class StripExecutorController:
     def diagnostics(self) -> dict[str, Any]:
         return self._diagnostics()
 
-    def reset_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
-        """Discard route state and assign the current fixed workforce."""
+    def _finalize_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
+        """Freeze Packet 2 ownership and Packet 3 reservations once."""
 
         day = int(obs.get("day", 0))
         work_plan = self._build_work_plan(obs, plan)
@@ -180,15 +190,62 @@ class StripExecutorController:
         }
         return work_plan
 
+    def reset_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
+        """Start a day and return its preliminary Packet 1 forecast."""
+
+        self._start_day(obs, plan)
+        self._plan = self._build_work_plan(obs, plan)
+        return self._plan
+
     def act(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripExecutorResult:
-        """Return one action per current worker and refresh work once."""
+        """Reconcile bootstrap first, then execute frozen routes plus sell bins."""
 
         day = int(obs.get("day", 0))
         if self._day != day:
-            work_plan = self.reset_day(obs, plan)
-        else:
-            work_plan = self._build_work_plan(obs, plan)
-            self._plan = work_plan
+            self._start_day(obs, plan)
+        if self._daily_plan is None:
+            self._daily_plan = plan
+        active_plan = self._daily_plan
+        work_plan = self._build_work_plan(obs, active_plan)
+        self._plan = work_plan
+        self._confirm_pending_supply_pickups(obs)
+
+        if not self._routes_finalized:
+            self._reconcile_market_observation(obs)
+            market_plan = build_market_turn_plan(
+                obs,
+                active_plan,
+                work_plan,
+                self._market_state,
+                acting_seat=self.config.acting_seat,
+                shed_capacity=self._shed_capacity(obs),
+                max_orders=self._max_market_orders(obs),
+                market_params=self._market_params(obs),
+            )
+            self._market_state.bootstrap_turns += bool(market_plan.orders)
+            self._market_state.pending_buys = market_plan.pending_buys
+            self._market_state.latest_diagnostics = market_plan.diagnostics
+            if market_plan.orders:
+                return self._pass_result(obs)
+            work_plan = self._finalize_day(obs, active_plan)
+            self._routes_finalized = True
+            self._market_state.finalized_hour = int(obs.get("hour", 0))
+
+        self._reconcile_market_observation(obs)
+        protected = self._outstanding_reservations()
+        market_plan = build_market_turn_plan(
+            obs,
+            active_plan,
+            work_plan,
+            self._market_state,
+            acting_seat=self.config.acting_seat,
+            shed_capacity=self._shed_capacity(obs),
+            max_orders=self._max_market_orders(obs),
+            market_params=self._market_params(obs),
+            protected_reservations=protected,
+            purchases_enabled=False,
+        )
+        self._market_state.latest_diagnostics = market_plan.diagnostics
 
         positions = self._worker_positions(obs)
         self._latest_inventories = {
@@ -213,11 +270,129 @@ class StripExecutorController:
         return StripExecutorResult(
             farmer_action=farmer_action,
             hands_actions=hands_actions,
-            market_actions=(),
+            market_actions=market_plan.orders,
             diagnostics=self._diagnostics(),
         )
 
     next_worker_actions = act
+
+    def _start_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> None:
+        self._day = int(obs.get("day", 0))
+        self._daily_plan = plan
+        self._routes = {}
+        self._assignment = None
+        self._unassigned_ids = ()
+        self._passed_work = {}
+        self._supply_plans = {}
+        self._supply_states = {}
+        self._latest_inventories = {}
+        self._initial_shed = {}
+        self._market_state = MarketBootstrapState()
+        self._routes_finalized = False
+        self._daily = {"day": self._day, "assignment_hour": int(obs.get("hour", 0))}
+
+    def _shed_capacity(self, obs: Mapping[str, Any]) -> int:
+        configuration = obs.get("configuration")
+        if isinstance(configuration, Mapping):
+            return max(1, int(configuration.get("shedCapacity", self.config.shed_capacity)))
+        return max(1, self.config.shed_capacity)
+
+    def _max_market_orders(self, obs: Mapping[str, Any]) -> int:
+        configuration = obs.get("configuration")
+        if isinstance(configuration, Mapping):
+            return max(1, int(configuration.get("maxMarketOrdersPerTurn", self.config.max_market_orders)))
+        return max(1, self.config.max_market_orders)
+
+    def _market_params(self, obs: Mapping[str, Any]) -> Mapping[str, Mapping[str, Any]] | None:
+        if self.config.market_params is not None:
+            return self.config.market_params
+        market = obs.get("market")
+        params = market.get("params") if isinstance(market, Mapping) else None
+        return params if isinstance(params, Mapping) else None
+
+    def _pass_result(self, obs: Mapping[str, Any]) -> StripExecutorResult:
+        positions = self._worker_positions(obs)
+        actions = tuple(("PASS",) for _ in sorted(positions))
+        return StripExecutorResult(
+            farmer_action=actions[0] if actions else ("PASS",),
+            hands_actions=actions[1:],
+            market_actions=tuple(
+                tuple(order) for order in self._market_state.latest_diagnostics.get("market_orders", ())
+            ),
+            diagnostics=self._diagnostics(),
+        )
+
+    def _reconcile_market_observation(self, obs: Mapping[str, Any]) -> None:
+        """Confirm pending buys from observed deltas, with two no-progress tries."""
+
+        if not self._market_state.pending_buys:
+            return
+        farm = (obs.get("farms") or ())[self.config.acting_seat]
+        private = obs.get("private") or {}
+        shed = private.get("shed") or {}
+        seeds = private.get("seeds") or {}
+        unlocked = set(farm.get("unlocked_quadrants") or ())
+        for pending in self._market_state.pending_buys:
+            if int(obs.get("step", 0)) <= pending.submitted_step:
+                continue
+            if pending.kind == "BUY_SEED":
+                now = int(seeds.get(pending.item, 0))
+            elif pending.kind == "BUY_LAND":
+                now = int(pending.item in unlocked)
+            else:
+                now = int(shed.get(pending.item, 0))
+            gained = max(0, now - pending.observed_before + pending.same_item_sold)
+            realized = min(pending.quantity, gained)
+            if realized:
+                self._market_state.buy_observed[pending.key] = (
+                    self._market_state.buy_observed.get(pending.key, 0) + realized
+                )
+                self._market_state.no_progress_counts.pop(pending.key, None)
+                continue
+            attempts = self._market_state.no_progress_counts.get(pending.key, 0) + 1
+            self._market_state.no_progress_counts[pending.key] = attempts
+            if attempts >= 2:
+                self._market_state.failed_intents.add(pending.key)
+        self._market_state.pending_buys = ()
+
+    def _confirm_pending_supply_pickups(self, obs: Mapping[str, Any]) -> None:
+        """Apply observation-confirmed Packet 3 pickup progress before SELL."""
+
+        for route_id, supply_state in self._supply_states.items():
+            pending = supply_state.pending
+            if pending is None:
+                continue
+            inventory = self._worker_inventory(obs, self._supply_plans[route_id].owner)
+            gained = max(0, int(inventory.get(pending.item, 0)) - pending.inventory_before)
+            acquired = min(pending.quantity, gained)
+            if acquired:
+                supply_state.acquired[pending.item] = (
+                    supply_state.acquired.get(pending.item, 0) + acquired
+                )
+            remaining = pending.quantity - acquired
+            supply_state.pending = None
+            if remaining:
+                attempts = supply_state.attempts.get(pending.item, 0)
+                shed = (obs.get("private") or {}).get("shed") or {}
+                if not acquired or attempts >= 2 or int(shed.get(pending.item, 0)) <= 0:
+                    supply_state.failed_or_unfulfilled[pending.item] = (
+                        supply_state.failed_or_unfulfilled.get(pending.item, 0) + remaining
+                    )
+
+    def _outstanding_reservations(self) -> dict[str, int]:
+        protected: dict[str, int] = {}
+        for route_id, plan in self._supply_plans.items():
+            state = self._supply_states.get(route_id, RouteSupplyState())
+            for item, reserved in plan.reserved_from_shed:
+                outstanding = max(
+                    0,
+                    reserved
+                    - state.acquired.get(item, 0)
+                    - state.failed_or_unfulfilled.get(item, 0),
+                )
+                if outstanding:
+                    protected[item] = protected.get(item, 0) + outstanding
+        return protected
 
     def _build_work_plan(
         self, obs: Mapping[str, Any], plan: DailyPlan
@@ -358,24 +533,6 @@ class StripExecutorController:
 
         inventory = self._worker_inventory(obs, route.owner)
         shed = ((obs.get("private") or {}).get("shed") or {})
-        if supply_state.pending is not None:
-            pending = supply_state.pending
-            gained = max(0, int(inventory.get(pending.item, 0)) - pending.inventory_before)
-            acquired = min(pending.quantity, gained)
-            if acquired:
-                supply_state.acquired[pending.item] = (
-                    supply_state.acquired.get(pending.item, 0) + acquired
-                )
-            remaining = pending.quantity - acquired
-            supply_state.pending = None
-            if remaining:
-                attempts = supply_state.attempts.get(pending.item, 0)
-                if not acquired or attempts >= 2 or int(shed.get(pending.item, 0)) <= 0:
-                    supply_state.failed_or_unfulfilled[pending.item] = (
-                        supply_state.failed_or_unfulfilled.get(pending.item, 0)
-                        + remaining
-                    )
-
         while True:
             batch = next(
                 (
@@ -605,6 +762,8 @@ class StripExecutorController:
             payload["supply_diagnostics"] = self._supply_daily_diagnostics(
                 self._initial_shed
             )
+        payload["market_diagnostics"] = self._market_state.to_json_dict()
+        payload["routes_finalized"] = self._routes_finalized
         return payload
 
 

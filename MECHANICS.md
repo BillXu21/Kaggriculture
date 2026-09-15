@@ -1,6 +1,24 @@
 # Kaggriculture Mechanics Ledger
 
-Last updated: 2026-08-31
+Last updated: 2026-09-15
+
+## Experimental Strip Packet 4 Market Contract (2026-09-15)
+
+- `CONFIRMED_SOURCE`: pinned official `kaggle_environments==1.32.7`
+  `_process_market()` truncates each player's ordered market queue to
+  `maxMarketOrdersPerTurn` (default 10), handles `BUY_LAND` atomically, and
+  commits `SELL`/`BUY_*` one unit at a time in list order. Sale proceeds and
+  freed shed room are therefore visible to later orders in the same list.
+- `CONFIRMED_SOURCE`: shed occupancy is the sum of every shed product and
+  animal unit; `shedCapacity` is a runtime configuration value (default 100).
+  Seeds are global and do not occupy shed room. `BUY_PRODUCT` is legal only
+  for WHEAT/FERTILIZER, has no market-inventory floor, and quotes at the
+  market price for inventory minus one. Packet 4 emits WHEAT only.
+- `CONFIRMED_SOURCE`: seed costs are the crop table values (10/20/50/100/80),
+  animal costs are 300/400/500 for GOOSE/COW/SHEEP, and land costs are
+  1000/2000/4000 in NW -> NE -> SW -> SE expansion order. Product prices are
+  derived from the current observed market inventory/price contract; no
+  product prices are hard-coded in the executor.
 
 ## Issue #30 E Economic History (2026-08-31)
 
