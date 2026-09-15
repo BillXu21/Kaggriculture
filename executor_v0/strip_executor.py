@@ -280,9 +280,8 @@ class StripExecutorController:
                 if self._pending_hires is not None:
                     if int(obs.get("step", 0)) <= self._pending_hires["submitted_step"]:
                         return self._bootstrap_pass_result(obs, ())
+                    # Reconciliation always clears the pending record on this path.
                     self._reconcile_hire_observation(obs)
-                    if self._pending_hires is not None:
-                        return self._bootstrap_pass_result(obs, ())
                 if self._hiring_blocked:
                     self._daily["hire_stop_reason"] = "FAILED"
                 else:
@@ -304,6 +303,7 @@ class StripExecutorController:
                         farm_hand_cost_mult=self._hire_cost_mult(obs),
                     )
                     self._daily["hiring_diagnostics"] = self._hire_plan.to_json_dict()
+                    self._daily["hire_stop_reason"] = self._hire_plan.stop_reason.value
                     if self._hire_plan.orders:
                         submitted = len(self._hire_plan.orders)
                         farm = obs["farms"][self.config.acting_seat]
@@ -314,7 +314,6 @@ class StripExecutorController:
                             "submitted": submitted,
                         }
                         self._hire_submitted += submitted
-                        self._daily["hire_stop_reason"] = self._hire_plan.stop_reason.value
                         return self._bootstrap_pass_result(obs, self._hire_plan.orders)
                 self._bootstrap_stage = "FINALIZED"
             work_plan = self._finalize_day(obs, active_plan)
@@ -929,6 +928,11 @@ class StripExecutorController:
                 "submitted_hires": self._hire_submitted,
                 "observed_hires": self._hire_observed,
                 "failed_hires": self._hire_failures,
+                # When hiring is permanently blocked, the retained hiring plan
+                # describes the last attempt rather than the current turn.
+                "hiring_diagnostics_status": (
+                    "LAST_ATTEMPT" if self._hiring_blocked else "CURRENT"
+                ),
                 "sequential_hire_costs": list(
                     self._hire_plan.sequential_hire_costs if self._hire_plan else ()
                 ),

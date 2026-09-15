@@ -6,7 +6,12 @@ import copy
 
 from executor_v0.plan import DailyPlan
 from executor_v0.strip_executor import StripExecutorController
-from executor_v0.strip_hiring import plan_strip_hiring
+from executor_v0.strip_hiring import (
+    HireStopReason,
+    RouteLaborEstimate,
+    StripHiringPlan,
+    plan_strip_hiring,
+)
 from executor_v0.strip_routes import WorkerId, generate_horizontal_route_candidates
 from executor_v0.strip_work import (
     RowSummary,
@@ -44,10 +49,11 @@ def item(
     source: str = "strip_forecast",
     status=WorkStatus.READY,
     requirements=(),
+    x: int = 0,
 ) -> WorkItem:
-    tile = (row, 0)
+    tile = (row, x)
     return WorkItem(
-        id=f"{kind}:{row}",
+        id=f"{kind}:{row}:{x}",
         kind=kind,
         status=status,
         tile=tile,
@@ -111,23 +117,41 @@ def observation(*, hands=(), money=1000, hour=0, hires_today=0, shed=None) -> di
     }
 
 
-def hiring_plan(items, *, hands=(), money=1000, hour=0, hires_today=0):
+def hiring_plan(
+    items,
+    *,
+    hands=(),
+    money=1000,
+    hour=0,
+    hires_today=0,
+    shed=None,
+    inventories=None,
+    max_orders=10,
+    positions=None,
+):
     forecast = work_plan(*items)
     candidates = generate_horizontal_route_candidates(forecast)
-    positions = {WorkerId(0): (0, 0)}
-    positions.update({WorkerId(index): (0, 0) for index in range(1, len(hands) + 1)})
+    if positions is None:
+        positions = {WorkerId(0): (0, 0)}
+        positions.update(
+            {WorkerId(index): (0, 0) for index in range(1, len(hands) + 1)}
+        )
+    carried = {worker: {} for worker in positions}
+    if inventories:
+        carried.update(inventories)
     return plan_strip_hiring(
         observation(
             hands=hands,
             money=money,
             hour=hour,
             hires_today=hires_today,
+            shed=shed,
         ),
         forecast,
         candidates,
         positions,
-        {worker: {} for worker in positions},
-        max_orders=10,
+        carried,
+        max_orders=max_orders,
     )
 
 
@@ -313,3 +337,134 @@ def test_confirmed_hire_uses_real_endpoint_and_packet3_supply_plan():
     assert hand_supply["supply_plan"]["pickup_sequence"] == [
         {"item": "WHEAT", "quantity": 1}
     ]
+
+
+# --- Packet 5B first-use ETA correction ---------------------------------------
+
+
+def _fertilizer_before_water_row():
+    """NE row 0 (farmer) plus a prospective-hire NW row 0.
+
+    The new hand sweeps (0,4)->(0,0): three feasible fertilizer applications
+    precede the routine WATER on (0,0), the first hire-driving item.
+    """
+
+    fertilizer = (SupplyRequirement("FERTILIZER", 1),)
+    return [
+        item("WATER", 0, x=5),  # NE route sorts first -> farmer-owned
+        item("FERTILIZE", 0, x=1, source="fertilizer_policy", requirements=fertilizer),
+        item("FERTILIZE", 0, x=2, source="fertilizer_policy", requirements=fertilizer),
+        item("FERTILIZE", 0, x=3, source="fertilizer_policy", requirements=fertilizer),
+        item("WATER", 0, x=0, source="optional_deferrable"),
+    ]
+
+
+def test_preceding_fertilizer_delays_first_use_past_deadline():
+    result = hiring_plan(_fertilizer_before_water_row(), shed={"FERTILIZER": 10}, hour=14)
+    estimate = result.route_estimates[1]
+    assert estimate.route_index == 1
+    assert estimate.first_use_work_id == "WATER:0:0"
+    # entry (0,4) from predicted spawn (4,4): movement 4, sweep to (0,0) 4,
+    # one batched FERTILIZER pickup, three fertilizer interactions, one water.
+    assert estimate.movement_turns == 4
+    assert estimate.preceding_interaction_turns == 3
+    assert estimate.pickup_turns == 1
+    assert estimate.first_use_eta == 4 + 4 + 1 + 3 + 1
+    assert estimate.future_action_slots == 9
+    assert estimate.useful_before_deadline is False
+    # The late route must not independently raise the coverage target.
+    assert result.target_workers == 1
+    assert result.wanted_hires == 0
+    assert result.orders == ()
+
+
+def test_preceding_fertilizer_still_useful_earlier_in_day():
+    result = hiring_plan(_fertilizer_before_water_row(), shed={"FERTILIZER": 10}, hour=8)
+    estimate = result.route_estimates[1]
+    assert estimate.first_use_eta == 13
+    assert estimate.future_action_slots == 15
+    assert estimate.useful_before_deadline is True
+    assert result.target_workers == 2
+    assert result.wanted_hires == result.submittable_hires == 1
+
+
+def test_first_use_eta_unchanged_when_no_preceding_work():
+    result = hiring_plan([item("WATER", 0, x=5), item("WATER", 0, x=0)], hour=8)
+    estimate = result.route_estimates[1]
+    assert estimate.preceding_interaction_turns == 0
+    assert estimate.pickup_turns == 0
+    # Identical to the pre-Packet-5B value: entry travel + sweep + interaction.
+    assert estimate.first_use_eta == 4 + 4 + 0 + 0 + 1
+
+
+def test_preceding_fertilizer_pickup_is_batched():
+    result = hiring_plan(_fertilizer_before_water_row(), shed={"FERTILIZER": 10}, hour=14)
+    estimate = result.route_estimates[1]
+    # Three fertilizer applications require one batched PICKUP, not three.
+    assert estimate.preceding_interaction_turns == 3
+    assert estimate.pickup_turns == 1
+
+
+def test_carried_fertilizer_removes_pickup_but_keeps_interactions():
+    result = hiring_plan(
+        _fertilizer_before_water_row(),
+        hands=((4, 4),),
+        inventories={WorkerId(1): {"FERTILIZER": 3}},
+        positions={WorkerId(0): (0, 0), WorkerId(1): (4, 4)},
+        hour=14,
+    )
+    estimate = result.route_estimates[1]
+    assert estimate.preceding_interaction_turns == 3
+    assert estimate.pickup_turns == 0
+
+
+def test_supplies_needed_after_first_driving_do_not_inflate_eta():
+    result = hiring_plan(
+        [
+            item("WATER", 0, x=5),  # NE route -> farmer
+            item("WATER", 0, x=4, source="optional_deferrable"),  # entry tile, first driving
+            item("FEED", 0, x=3, requirements=(SupplyRequirement("WHEAT", 1),)),
+        ],
+        shed={"WHEAT": 5},
+        hour=8,
+    )
+    estimate = result.route_estimates[1]
+    assert estimate.first_use_work_id == "WATER:0:4"
+    assert estimate.preceding_interaction_turns == 0
+    # WHEAT is only needed by the later FEED and must not add a pickup turn.
+    assert estimate.pickup_turns == 0
+    assert estimate.first_use_eta == 4 + 0 + 0 + 0 + 1
+
+
+# --- Packet 5B diagnostics cleanups -------------------------------------------
+
+
+def test_order_cap_reason_wins_when_cap_is_immediate_bound():
+    result = hiring_plan(
+        [item("WATER", r) for r in range(10)],
+        money=12,
+        max_orders=3,
+    )
+    assert result.wanted_hires == 9
+    assert result.affordable_hires == 5
+    assert result.submittable_hires == 3
+    assert result.stop_reason is HireStopReason.ORDER_CAP
+
+
+def test_controller_populates_top_level_stop_reason_for_covered_no_hire():
+    forecast = work_plan(item("WATER", 0))
+    controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: forecast)
+    result = controller.act(observation(money=1000), daily_plan())
+    assert result.market_actions == ()
+    assert result.diagnostics["routes_finalized"] is True
+    assert result.diagnostics["hire_stop_reason"] == "COVERED"
+    assert result.diagnostics["hiring_diagnostics_status"] == "CURRENT"
+
+
+def test_strip_hiring_public_exports_are_lazy():
+    import executor_v0
+
+    assert executor_v0.StripHiringPlan is StripHiringPlan
+    assert executor_v0.plan_strip_hiring is plan_strip_hiring
+    assert executor_v0.HireStopReason is HireStopReason
+    assert executor_v0.RouteLaborEstimate is RouteLaborEstimate

@@ -13,6 +13,7 @@ from typing import Any
 
 from replay_daily.constants import FARM_HAND_COST_MULT_DEFAULT, hire_cost
 
+from executor_v0.foreman import SHED_ACCESS_TILES
 from executor_v0.strip_routes import HorizontalRouteCandidate, WorkerId
 from executor_v0.strip_supply import LOCAL_ACTION_PRIORITY
 from executor_v0.strip_work import (
@@ -53,6 +54,13 @@ class RouteLaborEstimate:
     route_overloaded: bool
     first_use_work_id: str | None
     reasons: tuple[str, ...] = ()
+    # Time-accounting breakdown for the corrected first-use ETA.  ``movement``
+    # includes the Packet 3 pickup detour when a pickup is required;
+    # ``preceding_interaction_turns`` counts every executable local interaction
+    # performed before the first hire-driving item.
+    movement_turns: int = 0
+    pickup_turns: int = 0
+    preceding_interaction_turns: int = 0
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -142,6 +150,18 @@ def _spawn_positions(
         spawned.append(tile)
         occupancy[tile] += 1
     return tuple(spawned)
+
+
+def _nearest_shed_access(position: tuple[int, int]) -> tuple[int, int]:
+    """Mirror Packet 3's nearest shed-access tile (Manhattan, then tile order)."""
+
+    return min(
+        SHED_ACCESS_TILES,
+        key=lambda tile: (
+            abs(position[0] - tile[0]) + abs(position[1] - tile[1]),
+            tile,
+        ),
+    )
 
 
 def _is_fertilizer_only_item(
@@ -254,7 +274,8 @@ def _estimate_route(
     fertilizer_item_ids: frozenset[str],
 ) -> RouteLaborEstimate:
     traversal, items = _ordered_route_items(candidate, work_plan, position)
-    route_carried = _positive_counts(carried)
+    original_carried = _positive_counts(carried)
+    route_carried = dict(original_carried)
     feasible_ids: set[str] = set()
     feasible: list[WorkItem] = []
     for item in items:
@@ -273,16 +294,53 @@ def _estimate_route(
     fertilizer_only = bool(items) and not represented_driving
     first = driving[0] if driving else None
     first_use_eta: int | None = None
+    movement_turns = 0
+    pickup_turns = 0
+    preceding_interaction_turns = 0
     if first is not None and first.tile is not None:
         entry = traversal[0]
         entry_travel = abs(position[0] - entry[0]) + abs(position[1] - entry[1])
         sweep_travel = traversal.index(first.tile)
-        pickup_items = {
-            requirement.item
-            for requirement in first.required_supplies
-            if requirement.scope != "global_seed"
-        }
-        first_use_eta = entry_travel + sweep_travel + len(pickup_items) + 1
+        # The real executor stops on every tile and performs each executable
+        # local interaction before moving on.  Everything feasible ahead of the
+        # first hire-driving item (e.g. fertilizer upkeep) therefore costs turns.
+        preceding = feasible[: feasible.index(first)]
+        preceding_interaction_turns = sum(
+            item.interaction_turns for item in preceding
+        )
+        # Packet 3 performs one batched pickup per distinct inventory item that
+        # the worker does not already carry.  Only supplies needed by work up to
+        # and including the first driving item affect the first-use ETA.
+        prep_demand: dict[str, int] = {}
+        for item in (*preceding, first):
+            for requirement in item.required_supplies:
+                if requirement.scope == "global_seed" or requirement.quantity <= 0:
+                    continue
+                prep_demand[requirement.item] = (
+                    prep_demand.get(requirement.item, 0) + requirement.quantity
+                )
+        pickup_turns = sum(
+            1
+            for item, quantity in prep_demand.items()
+            if original_carried.get(item, 0) < quantity
+        )
+        if pickup_turns:
+            pickup_tile = _nearest_shed_access(position)
+            movement_turns = (
+                abs(position[0] - pickup_tile[0])
+                + abs(position[1] - pickup_tile[1])
+                + abs(pickup_tile[0] - entry[0])
+                + abs(pickup_tile[1] - entry[1])
+            )
+        else:
+            movement_turns = entry_travel
+        first_use_eta = (
+            movement_turns
+            + sweep_travel
+            + pickup_turns
+            + preceding_interaction_turns
+            + first.interaction_turns
+        )
 
     inventory_items = {
         requirement.item
@@ -315,6 +373,9 @@ def _estimate_route(
         route_overloaded=bool(items) and estimated_full_turns > action_slots,
         first_use_work_id=first.id if first else None,
         reasons=tuple(reasons),
+        movement_turns=movement_turns,
+        pickup_turns=pickup_turns,
+        preceding_interaction_turns=preceding_interaction_turns,
     )
 
 
@@ -403,10 +464,11 @@ def plan_strip_hiring(
         stop = HireStopReason.NO_HIRE_DRIVING_WORK
     elif wanted == 0:
         stop = HireStopReason.COVERED if useful_indices else HireStopReason.TIME
-    elif affordable == 0 or affordable < wanted:
-        stop = HireStopReason.CASH
-    elif submittable < wanted:
+    elif submittable < affordable:
+        # The per-turn market-order cap, not cash, limits this submission.
         stop = HireStopReason.ORDER_CAP
+    elif affordable < wanted:
+        stop = HireStopReason.CASH
     else:
         stop = HireStopReason.COVERED
     return StripHiringPlan(
