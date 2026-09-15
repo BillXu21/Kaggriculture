@@ -213,11 +213,11 @@ def build_market_turn_plan(
         for requirement in item.required_supplies
         if requirement.scope == "inventory" and requirement.item == "WHEAT"
     )
+    # The current observation is authoritative: observed shed already contains any
+    # realized purchase, so historical ``buy_observed`` must not be netted again.
     wheat_shortage = max(0, feed_demand - carried.get("WHEAT", 0) - shed.get("WHEAT", 0))
     if wheat_shortage:
-        shortage = max(0, wheat_shortage - state.buy_observed.get("BUY_PRODUCT:WHEAT", 0))
-        if shortage:
-            intents.append(MarketIntent("BUY_PRODUCT:WHEAT", "BUY_PRODUCT", "WHEAT", shortage))
+        intents.append(MarketIntent("BUY_PRODUCT:WHEAT", "BUY_PRODUCT", "WHEAT", wheat_shortage))
 
     seed_demand = {crop: 0 for crop in CROP_ORDER}
     for item in work_plan.items:
@@ -230,8 +230,8 @@ def build_market_turn_plan(
             if requirement.scope == "global_seed" and requirement.item in seed_demand:
                 seed_demand[requirement.item] += requirement.quantity
     for crop in CROP_ORDER:
+        # Observed seeds are authoritative and already include realized buys.
         shortage = max(0, seed_demand[crop] - seeds.get(crop, 0))
-        shortage = max(0, shortage - state.buy_observed.get(f"BUY_SEED:{crop}", 0))
         if shortage:
             intents.append(MarketIntent(f"BUY_SEED:{crop}", "BUY_SEED", crop, shortage))
 
@@ -240,9 +240,8 @@ def build_market_turn_plan(
         if item.kind == "BUY_ANIMAL" and item.animal in animal_demand:
             animal_demand[item.animal] += max(1, int(item.quantity))
     for animal in ANIMAL_ORDER:
-        animal_demand[animal] = max(
-            0, animal_demand[animal] - state.buy_observed.get(f"BUY_ANIMAL:{animal}", 0)
-        )
+        # Packet 1 already drops concrete BUY_ANIMAL work once the animal is in
+        # the observed shed/carried inventory, so no historical netting here.
         if animal_demand[animal]:
             intents.append(MarketIntent(
                 f"BUY_ANIMAL:{animal}", "BUY_ANIMAL", animal, animal_demand[animal]

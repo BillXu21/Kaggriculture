@@ -191,7 +191,14 @@ class StripExecutorController:
         return work_plan
 
     def reset_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
-        """Start a day and return its preliminary Packet 1 forecast."""
+        """Begin a two-phase day and return its preliminary Packet 1 forecast.
+
+        This initializes daily strategic/market state and builds the preliminary
+        work forecast.  Route ownership and Packet 3 reservations are finalized
+        later by :meth:`_finalize_day`, once any bootstrap market procurement has
+        been observed (or bounded out); callers that only need the forecast use
+        this method, while :meth:`act` drives the full bootstrap.
+        """
 
         self._start_day(obs, plan)
         self._plan = self._build_work_plan(obs, plan)
@@ -230,8 +237,9 @@ class StripExecutorController:
             work_plan = self._finalize_day(obs, active_plan)
             self._routes_finalized = True
             self._market_state.finalized_hour = int(obs.get("hour", 0))
-
-        self._reconcile_market_observation(obs)
+        else:
+            # Already finalized: still reconcile each new observation exactly once.
+            self._reconcile_market_observation(obs)
         protected = self._outstanding_reservations()
         market_plan = build_market_turn_plan(
             obs,
@@ -529,7 +537,12 @@ class StripExecutorController:
         supply_state: RouteSupplyState,
         obs: Mapping[str, Any],
     ) -> tuple | None:
-        """Advance one bounded pickup step, confirming the prior one first."""
+        """Advance one bounded pickup step for an unfinalized supply batch.
+
+        Prior pickup confirmation is applied once per observation by
+        :meth:`_confirm_pending_supply_pickups` before workers act, so this
+        method only issues movement or the next batched ``PICKUP``.
+        """
 
         inventory = self._worker_inventory(obs, route.owner)
         shed = ((obs.get("private") or {}).get("shed") or {})

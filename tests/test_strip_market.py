@@ -357,3 +357,104 @@ def test_finalized_sell_protects_packet3_reservation_and_ignores_carried_stock()
     # reserved, so only two of the six shed units are legal to sell.
     assert result.orders == (("SELL", "WHEAT", 2),)
     assert all(order[1] != "CARROT" for order in result.orders)
+
+
+def test_partial_wheat_realization_keeps_remaining_feed_shortage_visible():
+    state = MarketBootstrapState()
+    # A previous turn already observed one realized unit; the shed below holds it.
+    state.buy_observed["BUY_PRODUCT:WHEAT"] = 1
+    result = plan_market(
+        observation(money=1000, shed={"WHEAT": 1}, step=1),
+        daily_plan(),
+        work(item("FEED", supplies=(SupplyRequirement("WHEAT", 3, "inventory"),))),
+        state=state,
+    )
+    # 3 demand - 1 observed shed = 2, not 1.
+    assert result.orders == (("BUY_PRODUCT", "WHEAT", 2),)
+
+
+def test_partial_seed_realization_keeps_remaining_plant_shortage_visible():
+    state = MarketBootstrapState()
+    state.buy_observed["BUY_SEED:WHEAT"] = 1
+    result = plan_market(
+        observation(money=1000, seeds={"WHEAT": 1}, step=1),
+        daily_plan(),
+        work(item(
+            "PLANT",
+            crop="WHEAT",
+            tile=(0, 0),
+            supplies=(SupplyRequirement("WHEAT", 3, "global_seed"),),
+        )),
+        state=state,
+    )
+    # 3 demand - 1 observed seed = 2, not 1.
+    assert result.orders == (("BUY_SEED", "WHEAT", 2),)
+
+
+def test_fully_realized_purchase_produces_no_further_buy():
+    state = MarketBootstrapState()
+    state.buy_observed["BUY_PRODUCT:WHEAT"] = 3
+    result = plan_market(
+        observation(money=1000, shed={"WHEAT": 3}, step=1),
+        daily_plan(),
+        work(item("FEED", supplies=(SupplyRequirement("WHEAT", 3, "inventory"),))),
+        state=state,
+    )
+    assert result.orders == ()
+
+    seed_state = MarketBootstrapState()
+    seed_state.buy_observed["BUY_SEED:WHEAT"] = 3
+    seed_result = plan_market(
+        observation(money=1000, seeds={"WHEAT": 3}, step=1),
+        daily_plan(),
+        work(item(
+            "PLANT",
+            crop="WHEAT",
+            tile=(0, 0),
+            supplies=(SupplyRequirement("WHEAT", 3, "global_seed"),),
+        )),
+        state=seed_state,
+    )
+    assert seed_result.orders == ()
+
+
+def test_multiple_partial_observations_follow_current_stock_exactly():
+    forecast = work(item("FEED", supplies=(SupplyRequirement("WHEAT", 5, "inventory"),)))
+    # current stock 1 -> 4 left, 3 -> 2 left, 5 -> 0 left, regardless of history
+    for stock, expected in ((1, 4), (3, 2), (5, 0)):
+        state = MarketBootstrapState()
+        state.buy_observed["BUY_PRODUCT:WHEAT"] = stock
+        result = plan_market(
+            observation(money=1000, shed={"WHEAT": stock}, step=stock),
+            daily_plan(),
+            forecast,
+            state=state,
+        )
+        if expected:
+            assert result.orders == (("BUY_PRODUCT", "WHEAT", expected),)
+        else:
+            assert result.orders == ()
+
+
+def test_animal_demand_is_not_reduced_by_historical_observation():
+    # Packet 1 still reports a concrete BUY_ANIMAL deficit, but the shed does not
+    # yet hold the animal: the planner must still buy it even if history says so.
+    state = MarketBootstrapState()
+    state.buy_observed["BUY_ANIMAL:COW"] = 1
+    still_needed = plan_market(
+        observation(money=1000, shed={}, step=1),
+        daily_plan(),
+        work(item("BUY_ANIMAL", animal="COW")),
+        state=state,
+    )
+    assert still_needed.orders == (("BUY_ANIMAL", "COW", 1),)
+
+    # Once the animal is observed in the shed, rebuilt Packet 1 work drops the
+    # BUY_ANIMAL item, so no order is emitted (removed exactly once).
+    observed = plan_market(
+        observation(money=1000, shed={"COW": 1}, step=1),
+        daily_plan(),
+        work(),
+        state=state,
+    )
+    assert observed.orders == ()
