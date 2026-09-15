@@ -1,4 +1,4 @@
-"""Opt-in Packet 2 executor for fixed five-tile strip ownership.
+"""Opt-in Packet 2/3 executor for fixed five-tile strip ownership.
 
 This controller is intentionally separate from :mod:`executor_v0.agent` and
 does not use the persistent scheduler.  Ownership is assigned once at the
@@ -21,6 +21,14 @@ from executor_v0.strip_routes import (
     assign_horizontal_routes,
     generate_horizontal_route_candidates,
 )
+from executor_v0.strip_supply import (
+    LOCAL_ACTION_PRIORITY,
+    PendingPickup,
+    RouteSupplyPlan,
+    RouteSupplyState,
+    build_route_supply_plans,
+    extract_tile_supply_demand,
+)
 from executor_v0.strip_work import (
     BlockReason,
     StripWorkConfig,
@@ -37,25 +45,12 @@ __all__ = [
 ]
 
 
-_LOCAL_PRIORITY = {
-    # Maintenance that would otherwise be lost by a later action comes first.
-    "FEED": 10,
-    "FERTILIZE": 20,
-    "WATER": 30,
-    "CARE": 40,
-    "COLLECT_FERTILIZER": 50,
-    "HARVEST": 60,
-    "DIG": 70,
-    "BUILD_COOP": 80,
-    "BUILD_PASTURE": 81,
-    "PLACE": 90,
-    "PLANT": 100,
-}
+_LOCAL_PRIORITY = LOCAL_ACTION_PRIORITY
 
 
 @dataclass(frozen=True)
 class StripExecutorConfig:
-    """Packet 2 policy knobs; no hiring, pickup, or route optimization."""
+    """Packet 2 routing plus Packet 3 prep policy knobs; no hiring or optimization."""
 
     acting_seat: int = 0
     work_config: StripWorkConfig = field(default_factory=StripWorkConfig)
@@ -98,6 +93,10 @@ class StripExecutorController:
         self._unassigned_ids: tuple[str, ...] = ()
         self._plan: StripWorkPlan | None = None
         self._passed_work: dict[str, dict[str, str]] = {}
+        self._supply_plans: dict[str, RouteSupplyPlan] = {}
+        self._supply_states: dict[str, RouteSupplyState] = {}
+        self._latest_inventories: dict[WorkerId, dict[str, int]] = {}
+        self._initial_shed: dict[str, int] = {}
         self._daily: dict[str, Any] = {}
 
     @property
@@ -126,6 +125,34 @@ class StripExecutorController:
         self._routes = {route.owner: route for route in assignment.routes}
         self._unassigned_ids = tuple(route.route_id for route in assignment.unassigned)
         self._passed_work = {route.route_id: {} for route in assignment.routes}
+        self._latest_inventories = {
+            worker: self._worker_inventory(obs, worker) for worker in positions
+        }
+        self._initial_shed = {
+            str(item): max(0, int(amount))
+            for item, amount in ((obs.get("private") or {}).get("shed") or {}).items()
+        }
+        self._supply_plans = {
+            route.route_id: supply_plan
+            for route, supply_plan in zip(
+                assignment.routes,
+                build_route_supply_plans(
+                    assignment.routes,
+                    work_plan,
+                    self._latest_inventories,
+                    ((obs.get("private") or {}).get("shed") or {}),
+                    positions,
+                ),
+            )
+        }
+        self._supply_states = {
+            route.route_id: RouteSupplyState() for route in assignment.routes
+        }
+        for route in assignment.routes:
+            if not self._supply_plans[route.route_id].requires_pickup:
+                route.phase = RoutePhase.TRAVEL_TO_ENTRY
+            else:
+                route.phase = RoutePhase.PREPARE_SUPPLIES
         self._daily = {
             "day": day,
             "assignment_hour": int(obs.get("hour", 0)),
@@ -134,6 +161,12 @@ class StripExecutorController:
             "unassigned_routes": len(assignment.unassigned),
             "workers": len(positions),
             "unassigned_active_routes": list(self._unassigned_ids),
+            "unassigned_supply_demand": {
+                candidate.route_id: dict(
+                    extract_tile_supply_demand(candidate.owned_tiles, work_plan)
+                )
+                for candidate in assignment.unassigned
+            },
             "route_workload": {
                 candidate.route_id: candidate.workload_interactions
                 for candidate in candidates
@@ -141,6 +174,9 @@ class StripExecutorController:
             "tileless_unresolved_work": [
                 item.id for item in work_plan.items if item.tile is None
             ],
+            "supply_diagnostics": self._supply_daily_diagnostics(
+                self._initial_shed
+            ),
         }
         return work_plan
 
@@ -155,6 +191,9 @@ class StripExecutorController:
             self._plan = work_plan
 
         positions = self._worker_positions(obs)
+        self._latest_inventories = {
+            worker: self._worker_inventory(obs, worker) for worker in positions
+        }
         for worker, route in self._routes.items():
             if worker not in positions and route.phase not in (
                 RoutePhase.DONE,
@@ -225,6 +264,16 @@ class StripExecutorController:
         hour = int(obs.get("hour", 0))
         if route.phase == RoutePhase.INVALID:
             return ("PASS",)
+        supply_plan = self._supply_plans.get(route.route_id)
+        supply_state = self._supply_states.setdefault(
+            route.route_id, RouteSupplyState()
+        )
+        if route.phase == RoutePhase.PREPARE_SUPPLIES and supply_plan is not None:
+            action = self._prepare_supplies(
+                route, position, supply_plan, supply_state, obs
+            )
+            if action is not None:
+                return action
         # Late-work observation runs every turn, including after DONE, so work
         # missed by the one-pass sweep stays visible without reopening the route.
         self._record_late_work(route, work_plan)
@@ -252,7 +301,6 @@ class StripExecutorController:
                     return ("PASS",)
                 route.movement_turns += 1
                 return movement
-            # Arrival confirmed: the tile we just left is now passed.
             departing = route.current_tile
             route.cursor = route.pending_cursor
             route.pending_cursor = None
@@ -287,11 +335,95 @@ class StripExecutorController:
             self._mark_tile_passed(route, target)
             route.phase = RoutePhase.DONE
             route.completion_hour = hour
+            supply_state.remaining_at_completion = {
+                item: int(inventory.get(item, 0))
+                for item, _ in supply_plan.demand
+                if int(inventory.get(item, 0)) > 0
+            }
             return ("PASS",)
         route.pending_cursor = route.cursor + 1
         return _vertical_first_step(position, route.traversal[route.pending_cursor]) or (
             "PASS",
         )
+
+    def _prepare_supplies(
+        self,
+        route: StripRoute,
+        position: tuple[int, int],
+        supply_plan: RouteSupplyPlan,
+        supply_state: RouteSupplyState,
+        obs: Mapping[str, Any],
+    ) -> tuple | None:
+        """Advance one bounded pickup step, confirming the prior one first."""
+
+        inventory = self._worker_inventory(obs, route.owner)
+        shed = ((obs.get("private") or {}).get("shed") or {})
+        if supply_state.pending is not None:
+            pending = supply_state.pending
+            gained = max(0, int(inventory.get(pending.item, 0)) - pending.inventory_before)
+            acquired = min(pending.quantity, gained)
+            if acquired:
+                supply_state.acquired[pending.item] = (
+                    supply_state.acquired.get(pending.item, 0) + acquired
+                )
+            remaining = pending.quantity - acquired
+            supply_state.pending = None
+            if remaining:
+                attempts = supply_state.attempts.get(pending.item, 0)
+                if not acquired or attempts >= 2 or int(shed.get(pending.item, 0)) <= 0:
+                    supply_state.failed_or_unfulfilled[pending.item] = (
+                        supply_state.failed_or_unfulfilled.get(pending.item, 0)
+                        + remaining
+                    )
+
+        while True:
+            batch = next(
+                (
+                    candidate
+                    for candidate in supply_plan.pickup_sequence
+                    if (
+                        candidate.quantity
+                        - supply_state.acquired.get(candidate.item, 0)
+                        - supply_state.failed_or_unfulfilled.get(candidate.item, 0)
+                    )
+                    > 0
+                ),
+                None,
+            )
+            if batch is None:
+                route.phase = RoutePhase.TRAVEL_TO_ENTRY
+                return None
+            remaining = (
+                batch.quantity
+                - supply_state.acquired.get(batch.item, 0)
+                - supply_state.failed_or_unfulfilled.get(batch.item, 0)
+            )
+            attempts = supply_state.attempts.get(batch.item, 0)
+            available = max(0, int(shed.get(batch.item, 0)))
+            if attempts >= 2 or available <= 0:
+                supply_state.failed_or_unfulfilled[batch.item] = (
+                    supply_state.failed_or_unfulfilled.get(batch.item, 0) + remaining
+                )
+                continue
+            if position != supply_plan.pickup_tile:
+                movement = _vertical_first_step(position, supply_plan.pickup_tile)
+                if movement is None:
+                    route.blocked_local_work["SUPPLY_ROUTE_BLOCKED"] = (
+                        route.blocked_local_work.get("SUPPLY_ROUTE_BLOCKED", 0) + 1
+                    )
+                    supply_state.failed_or_unfulfilled[batch.item] = (
+                        supply_state.failed_or_unfulfilled.get(batch.item, 0) + remaining
+                    )
+                    continue
+                supply_state.travel_turns += 1
+                return movement
+            quantity = min(remaining, available)
+            supply_state.pending = PendingPickup(
+                batch.item, quantity, max(0, int(inventory.get(batch.item, 0)))
+            )
+            supply_state.attempts[batch.item] = attempts + 1
+            supply_state.pickup_turns += 1
+            return ("PICKUP", batch.item, quantity)
 
     def _try_local_action(
         self,
@@ -402,6 +534,43 @@ class StripExecutorController:
             ):
                 route.late_work_ids.add(item.id)
 
+    def _supply_daily_diagnostics(self, shed: Mapping[str, int]) -> dict[str, Any]:
+        plans = tuple(self._supply_plans.values())
+        initial = {
+            str(item): max(0, int(amount))
+            for item, amount in shed.items()
+            if int(amount) > 0
+        }
+        reservations: dict[str, int] = {}
+        shortage: dict[str, int] = {}
+        for plan in plans:
+            for item, amount in plan.reserved_from_shed:
+                reservations[item] = reservations.get(item, 0) + amount
+            for item, amount in plan.missing_stock:
+                shortage[item] = shortage.get(item, 0) + amount
+        fully = sum(plan.fully_supplied for plan in plans if plan.demand)
+        partial = sum(
+            bool(plan.demand)
+            and not plan.fully_supplied
+            and any(amount for _, amount in plan.already_carried + plan.reserved_from_shed)
+            for plan in plans
+        )
+        zero = sum(
+            bool(plan.demand)
+            and not any(amount for _, amount in plan.already_carried + plan.reserved_from_shed)
+            for plan in plans
+        )
+        return {
+            "initial_reservable_shed_stock": dict(sorted(initial.items())),
+            "total_reservations_by_item": dict(sorted(reservations.items())),
+            "unreserved_shortage_by_item": dict(sorted(shortage.items())),
+            "routes_requiring_pickup": sum(plan.requires_pickup for plan in plans),
+            "routes_fully_supplied": fully,
+            "routes_partially_supplied": partial,
+            "routes_with_zero_supply_fulfillment": zero,
+            "route_supply_plans": [plan.to_json_dict() for plan in plans],
+        }
+
     def _diagnostics(self) -> dict[str, Any]:
         assignment = self._assignment
         routes = self.routes
@@ -415,7 +584,14 @@ class StripExecutorController:
                 ],
                 "completed_routes": completed,
                 "unfinished_routes": len(routes) - completed,
-                "route_diagnostics": [route.to_json_dict() for route in routes],
+                "route_diagnostics": [
+                    {
+                        **route.to_json_dict(),
+                        "supply_plan": self._supply_plans[route.route_id].to_json_dict(),
+                        "supply_state": self._supply_states[route.route_id].to_json_dict(),
+                    }
+                    for route in routes
+                ],
                 "actual_interactions_completed": sum(
                     route.interaction_turns for route in routes
                 ),
@@ -425,6 +601,10 @@ class StripExecutorController:
                 },
             }
         )
+        if self._supply_plans:
+            payload["supply_diagnostics"] = self._supply_daily_diagnostics(
+                self._initial_shed
+            )
         return payload
 
 

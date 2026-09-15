@@ -70,6 +70,13 @@ _EXPORTS: dict[str, str] = {
     "StripExecutorConfig": "strip_executor",
     "StripExecutorController": "strip_executor",
     "StripExecutorResult": "strip_executor",
+    "PickupBatch": "strip_supply",
+    "PendingPickup": "strip_supply",
+    "RouteSupplyPlan": "strip_supply",
+    "RouteSupplyState": "strip_supply",
+    "build_route_supply_plans": "strip_supply",
+    "extract_route_supply_demand": "strip_supply",
+    "extract_tile_supply_demand": "strip_supply",
 }
 
 __all__ = sorted(_EXPORTS)

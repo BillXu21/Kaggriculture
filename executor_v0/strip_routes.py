@@ -26,6 +26,7 @@ __all__ = [
 
 
 class RoutePhase(StrEnum):
+    PREPARE_SUPPLIES = "PREPARE_SUPPLIES"
     TRAVEL_TO_ENTRY = "TRAVEL_TO_ENTRY"
     SWEEP = "SWEEP"
     DONE = "DONE"
