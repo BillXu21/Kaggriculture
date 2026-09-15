@@ -86,6 +86,9 @@ class StripRoute:
     blocked_local_work: dict[str, int] = field(default_factory=dict)
     unavailable_supply_work: dict[str, int] = field(default_factory=dict)
     late_work_ids: set[str] = field(default_factory=set)
+    # Tiles whose departure has been confirmed by a later observation, plus the
+    # final tile once the route completes.  Used only for diagnostics.
+    passed_tiles: set[tuple[int, int]] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not self.owned_tiles:
@@ -134,6 +137,7 @@ class StripRoute:
                 sorted(self.unavailable_supply_work.items())
             ),
             "late_work_ids": sorted(self.late_work_ids),
+            "passed_tiles": [list(tile) for tile in sorted(self.passed_tiles)],
         }
 
 

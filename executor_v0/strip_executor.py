@@ -225,14 +225,25 @@ class StripExecutorController:
         hour = int(obs.get("hour", 0))
         if route.phase == RoutePhase.INVALID:
             return ("PASS",)
+        # Late-work observation runs every turn, including after DONE, so work
+        # missed by the one-pass sweep stays visible without reopening the route.
+        self._record_late_work(route, work_plan)
         if route.phase == RoutePhase.DONE:
             route.pass_turns_after_completion += 1
             return ("PASS",)
-        self._record_late_work(route, work_plan)
 
         if route.pending_cursor is not None:
             expected = route.traversal[route.pending_cursor]
             if position != expected:
+                # Departure is not confirmed yet.  If we are still standing on
+                # the tile we tried to leave, local work that appeared in the
+                # meantime still belongs to this worker and must be handled
+                # before moving on; the tile is not passed until we observe
+                # ourselves elsewhere.
+                if position == route.current_tile:
+                    action = self._try_local_action(route, position, work_plan, obs)
+                    if action is not None:
+                        return action
                 movement = _vertical_first_step(position, expected)
                 if movement is None:
                     route.blocked_local_work["ROUTE_BLOCKED"] = (
@@ -241,9 +252,12 @@ class StripExecutorController:
                     return ("PASS",)
                 route.movement_turns += 1
                 return movement
+            # Arrival confirmed: the tile we just left is now passed.
+            departing = route.current_tile
             route.cursor = route.pending_cursor
             route.pending_cursor = None
             route.phase = RoutePhase.SWEEP
+            self._mark_tile_passed(route, departing)
 
         target = route.current_tile
         if route.phase == RoutePhase.TRAVEL_TO_ENTRY or position != target:
@@ -259,21 +273,18 @@ class StripExecutorController:
                 route.movement_turns += 1
                 return movement
 
+        action = self._try_local_action(route, target, work_plan, obs)
+        if action is not None:
+            return action
+
         inventory = self._worker_inventory(obs, route.owner)
         local_items = tuple(item for item in work_plan.items if item.tile == target)
-        item = self._select_local_item(local_items, inventory)
-        if item is not None:
-            action = _interaction_action(item)
-            if action is not None:
-                route.actions_performed[item.kind] = (
-                    route.actions_performed.get(item.kind, 0) + 1
-                )
-                route.interaction_turns += item.interaction_turns
-                return action
-
         self._record_skipped_work(route, local_items, inventory)
-        self._record_passed_tile(route, target, local_items)
+        self._snapshot_tile_work(route, target, local_items)
         if route.cursor + 1 >= len(route.traversal):
+            # The final tile is processed: mark it passed so late work on it
+            # stays diagnosable after completion.
+            self._mark_tile_passed(route, target)
             route.phase = RoutePhase.DONE
             route.completion_hour = hour
             return ("PASS",)
@@ -281,6 +292,29 @@ class StripExecutorController:
         return _vertical_first_step(position, route.traversal[route.pending_cursor]) or (
             "PASS",
         )
+
+    def _try_local_action(
+        self,
+        route: StripRoute,
+        tile: tuple[int, int],
+        work_plan: StripWorkPlan,
+        obs: Mapping[str, Any],
+    ) -> tuple | None:
+        """Execute one supported local item on ``tile``, else return ``None``."""
+
+        inventory = self._worker_inventory(obs, route.owner)
+        local_items = tuple(item for item in work_plan.items if item.tile == tile)
+        item = self._select_local_item(local_items, inventory)
+        if item is None:
+            return None
+        action = _interaction_action(item)
+        if action is None:
+            return None
+        route.actions_performed[item.kind] = (
+            route.actions_performed.get(item.kind, 0) + 1
+        )
+        route.interaction_turns += item.interaction_turns
+        return action
 
     def _select_local_item(
         self, items: tuple[WorkItem, ...], inventory: Mapping[str, int]
@@ -324,30 +358,45 @@ class StripExecutorController:
                     route.blocked_local_work.get(reason, 0) + 1
                 )
 
-    def _record_passed_tile(
+    def _snapshot_tile_work(
         self, route: StripRoute, tile: tuple[int, int], items: tuple[WorkItem, ...]
     ) -> None:
+        """Record item statuses as the worker leaves/handles ``tile``.
+
+        This is the baseline used to tell work that was already handled from
+        work that became ``READY`` only after the worker moved on.  It does not
+        by itself mean the tile is passed.
+        """
+
         passed = self._passed_work.setdefault(route.route_id, {})
         for item in items:
             if item.tile == tile:
                 passed[item.id] = item.status.value
 
+    def _mark_tile_passed(self, route: StripRoute, tile: tuple[int, int]) -> None:
+        route.passed_tiles.add(tile)
+
     def _record_late_work(self, route: StripRoute, work_plan: StripWorkPlan) -> None:
-        if route.cursor == 0:
+        # Only confirmed-passed tiles can hold late work; the current tile and
+        # future route tiles still belong to the worker.  A set keeps repeated
+        # observations idempotent.
+        if not route.passed_tiles:
             return
         passed = self._passed_work.setdefault(route.route_id, {})
+        passed_tiles = route.passed_tiles
         by_id = {item.id: item for item in work_plan.items}
         for item_id, previous_status in passed.items():
             item = by_id.get(item_id)
             if (
                 item is not None
+                and item.tile in passed_tiles
                 and item.status == WorkStatus.READY
                 and previous_status != WorkStatus.READY
             ):
                 route.late_work_ids.add(item_id)
         for item in work_plan.items:
             if (
-                item.tile in route.traversal[: route.cursor]
+                item.tile in passed_tiles
                 and item.id not in passed
                 and item.status == WorkStatus.READY
             ):

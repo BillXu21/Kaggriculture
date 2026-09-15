@@ -346,3 +346,132 @@ def test_day_boundary_discards_old_cursor_and_assignment():
     assert new_route.assignment_hour == 0
     assert new_route.cursor == 0
     assert new_route.entry_tile == (0, 0)
+
+
+def test_failed_departure_does_not_mark_tile_passed():
+    def builder(obs, plan, **kwargs):
+        del obs, plan, kwargs
+        return fake_plan((work_item("WATER", (0, 4)),))
+
+    controller = StripExecutorController(work_builder=builder)
+    controller.act(observation(hour=0, farmer=(0, 0)), plan())
+    route = controller.routes[0]
+    assert route.pending_cursor == 1
+
+    # The engine reports no movement: departure is unconfirmed.
+    result = controller.act(observation(hour=1, farmer=(0, 0)), plan())
+    assert result.farmer_action == ("EAST",)
+    assert route.cursor == 0
+    assert route.pending_cursor == 1
+    assert (0, 0) not in route.passed_tiles
+
+
+def test_confirmed_departure_marks_prior_tile_passed():
+    def builder(obs, plan, **kwargs):
+        del obs, plan, kwargs
+        return fake_plan((work_item("WATER", (0, 4)),))
+
+    controller = StripExecutorController(work_builder=builder)
+    controller.act(observation(hour=0, farmer=(0, 0)), plan())
+    controller.act(observation(hour=1, farmer=(1, 0)), plan())
+    route = controller.routes[0]
+    assert route.cursor == 1
+    assert route.pending_cursor == 2  # already committed to the next sweep step
+    assert (0, 0) in route.passed_tiles
+    assert (0, 1) not in route.passed_tiles
+
+
+def test_work_appearing_before_confirmed_departure_is_executed():
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        if hour == 0:
+            return fake_plan((work_item("WATER", (0, 4)),))
+        if hour == 1:
+            return fake_plan((work_item("WATER", (0, 0)),))
+        return fake_plan((work_item("WATER", (0, 4)),))
+
+    controller = StripExecutorController(work_builder=builder)
+    controller.act(observation(hour=0, farmer=(0, 0)), plan())
+    route = controller.routes[0]
+    result = controller.act(observation(hour=1, farmer=(0, 0)), plan())
+    assert result.farmer_action == ("WATER",)
+    assert route.cursor == 0
+    assert route.pending_cursor == 1
+    assert (0, 0) not in route.passed_tiles
+    assert "WATER:0,0" not in route.late_work_ids
+
+
+def test_work_after_confirmed_departure_is_late_but_not_revisited():
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        if hour == 0:
+            return fake_plan((work_item("WATER", (0, 4)),))
+        if hour >= 2:
+            return fake_plan((work_item("HARVEST", (0, 0), crop="WHEAT"),))
+        return fake_plan(())
+
+    controller = StripExecutorController(work_builder=builder)
+    controller.act(observation(hour=0, farmer=(0, 0)), plan())
+    controller.act(observation(hour=1, farmer=(1, 0)), plan())
+    route = controller.routes[0]
+    assert (0, 0) in route.passed_tiles
+
+    result = controller.act(observation(hour=2, farmer=(2, 0)), plan())
+    assert result.farmer_action == ("EAST",)  # forward, never backward
+    assert route.cursor == 2
+    assert "HARVEST:0,0" in route.late_work_ids
+
+
+def test_post_completion_late_work_is_recorded_once():
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        if hour == 0:
+            return fake_plan((work_item("WATER", (0, 4)),))
+        if hour >= 5:
+            return fake_plan((work_item("HARVEST", (0, 0), crop="WHEAT"),))
+        return fake_plan(())
+
+    controller = StripExecutorController(work_builder=builder)
+    for hour in range(4):
+        controller.act(observation(hour=hour, farmer=(hour, 0)), plan())
+    done = controller.act(observation(hour=4, farmer=(4, 0)), plan())
+    route = controller.routes[0]
+    assert done.farmer_action == ("PASS",)
+    assert route.phase == RoutePhase.DONE
+    assert route.completion_hour == 4
+    assert route.late_work_ids == set()
+
+    for hour in range(5, 8):
+        later = controller.act(observation(hour=hour, farmer=(4, 0)), plan())
+        assert later.farmer_action == ("PASS",)
+    assert route.phase == RoutePhase.DONE
+    assert route.cursor == 4
+    assert route.late_work_ids == {"HARVEST:0,0"}
+
+
+def test_post_completion_late_work_on_final_tile_is_recorded():
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        if hour == 0:
+            return fake_plan((work_item("WATER", (0, 4)),))
+        if hour >= 5:
+            return fake_plan((work_item("HARVEST", (0, 4), crop="WHEAT"),))
+        return fake_plan(())
+
+    controller = StripExecutorController(work_builder=builder)
+    for hour in range(4):
+        controller.act(observation(hour=hour, farmer=(hour, 0)), plan())
+    done = controller.act(observation(hour=4, farmer=(4, 0)), plan())
+    route = controller.routes[0]
+    assert done.farmer_action == ("PASS",)
+    assert route.phase == RoutePhase.DONE
+    assert (0, 4) in route.passed_tiles
+
+    later = controller.act(observation(hour=5, farmer=(4, 0)), plan())
+    assert later.farmer_action == ("PASS",)
+    assert route.phase == RoutePhase.DONE
+    assert "HARVEST:0,4" in route.late_work_ids

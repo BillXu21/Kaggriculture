@@ -43,3 +43,11 @@ Diagnostics include daily route counts, unassigned routes, idle workers,
 tile-less unresolved work, route ownership/traversal/entry, cursor and phase,
 completion and post-completion PASS turns, action/movement/interaction counts,
 blocked local work, unavailable carried supplies, and late passed-tile work.
+
+A tile is recorded as passed only once a later observation confirms the worker
+has actually left it (or, for the final tile, once the route completes); issuing
+a movement action does not mark it passed.  While a departure is still
+unconfirmed, local work that appears on the current tile is executed normally and
+is not counted as late.  Late-work observation continues after the route reaches
+`DONE`, so work that appears on an already-swept tile is recorded in
+`late_work_ids` without reopening the route or moving backward.
