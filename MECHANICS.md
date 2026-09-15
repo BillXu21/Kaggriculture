@@ -406,6 +406,29 @@ same-action replay).
 - workers reset near the central shed at day end;
 - carried inventory auto-drops to shed at day end;
 - default shed capacity is 100;
+
+### HIRE audit for Packet 5
+
+The pinned official `kaggle_environments==1.32.7` interpreter and the matching
+Rust fast engine agree on the following HIRE contract.  `HIRE` is a one-element
+atomic market order; each queued HIRE is processed in market-queue order, after
+all farmer/hand actions for the current primitive turn.  The queue is truncated
+to `maxMarketOrdersPerTurn` (10 by default), and multiple HIRE orders in one
+queue therefore produce sequential hires with costs
+`hire_cost(hires_today)`, `hire_cost(hires_today + 1)`, and so on.  The cost is
+`farmHandCostMult * fib(hires_today)`, with `fib(0)=fib(1)=1`.
+
+An affordable HIRE deducts its exact cost, increments `hires_today`, appends one
+hand, and appends one empty worker inventory.  The hand spawns at the least
+occupied shed-access tile in deterministic NW, NE, SW, SE order, counting the
+farmer and earlier hands; ties retain that order.  An unaffordable HIRE is a
+silent no-op and does not increment either field.  Hires are processed
+sequentially, so an earlier successful hire can make a later order unaffordable.
+New hands cannot act on the hire turn; they first appear in the next real
+observation and act on the following primitive turn.  At the day boundary hands,
+their inventories, and `hires_today` reset.  Confidence: `CONFIRMED_SOURCE`,
+from the pinned Python interpreter, `rust/kaggriculture_env/src/lib.rs`, and
+the fast/official parity tests.
 - overflow is discarded;
 - seeds are separate from shed product capacity;
 - movement onto locked tiles is allowed, while tile actions there generally no-op.

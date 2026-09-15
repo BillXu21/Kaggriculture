@@ -1,9 +1,9 @@
 """Opt-in Packet 2/3 executor for fixed five-tile strip ownership.
 
 This controller is intentionally separate from :mod:`executor_v0.agent` and
-does not use the persistent scheduler.  Ownership is assigned once at the
-start of a day; only the immutable Packet 1 forecast is refreshed on later
-turns.
+does not use the persistent scheduler.  Procurement and coverage-driven
+hiring are bootstrapped before ownership is assigned once at the start of a
+day; only the Packet 1 forecast is refreshed on later turns.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from executor_v0.strip_routes import (
     assign_horizontal_routes,
     generate_horizontal_route_candidates,
 )
+from executor_v0.strip_hiring import StripHiringPlan, plan_strip_hiring
 from executor_v0.strip_supply import (
     LOCAL_ACTION_PRIORITY,
     PendingPickup,
@@ -54,7 +55,7 @@ _LOCAL_PRIORITY = LOCAL_ACTION_PRIORITY
 
 @dataclass(frozen=True)
 class StripExecutorConfig:
-    """Packet 2 routing plus Packet 3 prep policy knobs; no hiring or optimization."""
+    """Packet 2 routing, Packet 3 prep, and strip bootstrap policy knobs."""
 
     acting_seat: int = 0
     work_config: StripWorkConfig = field(default_factory=StripWorkConfig)
@@ -108,6 +109,17 @@ class StripExecutorController:
         self._daily_plan: DailyPlan | None = None
         self._market_state = MarketBootstrapState()
         self._routes_finalized = False
+        self._bootstrap_stage = "PROCUREMENT"
+        self._pending_hires: dict[str, int] | None = None
+        self._hire_no_progress = 0
+        self._hiring_blocked = False
+        self._hire_plan: StripHiringPlan | None = None
+        self._candidate_routes = ()
+        self._worker_count_before_hiring = 0
+        self._hire_submitted = 0
+        self._hire_observed = 0
+        self._hire_failures = 0
+        self._observation_for_diagnostics: Mapping[str, Any] = {}
 
     @property
     def routes(self) -> tuple[StripRoute, ...]:
@@ -121,6 +133,8 @@ class StripExecutorController:
         """Freeze Packet 2 ownership and Packet 3 reservations once."""
 
         day = int(obs.get("day", 0))
+        bootstrap_diagnostics = self._daily.get("hiring_diagnostics")
+        hire_stop_reason = self._daily.get("hire_stop_reason")
         work_plan = self._build_work_plan(obs, plan)
         positions = self._worker_positions(obs)
         candidates = generate_horizontal_route_candidates(work_plan)
@@ -188,6 +202,29 @@ class StripExecutorController:
                 self._initial_shed
             ),
         }
+        if bootstrap_diagnostics is not None:
+            self._daily["hiring_diagnostics"] = bootstrap_diagnostics
+        if hire_stop_reason is not None:
+            self._daily["hire_stop_reason"] = hire_stop_reason
+        self._daily["worker_count_before_hiring"] = self._worker_count_before_hiring
+        self._daily["worker_count_final"] = len(positions)
+        self._daily["candidate_routes"] = [candidate.route_id for candidate in candidates]
+        estimates = {
+            estimate.route_id: estimate
+            for estimate in (self._hire_plan.route_estimates if self._hire_plan else ())
+        }
+        self._daily["unassigned_hire_driving_routes"] = [
+            candidate.route_id
+            for candidate in assignment.unassigned
+            if estimates.get(candidate.route_id, None)
+            and estimates[candidate.route_id].hire_driving
+        ]
+        self._daily["unassigned_fertilizer_only_routes"] = [
+            candidate.route_id
+            for candidate in assignment.unassigned
+            if estimates.get(candidate.route_id, None)
+            and estimates[candidate.route_id].fertilizer_only
+        ]
         return work_plan
 
     def reset_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
@@ -207,6 +244,7 @@ class StripExecutorController:
     def act(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripExecutorResult:
         """Reconcile bootstrap first, then execute frozen routes plus sell bins."""
 
+        self._observation_for_diagnostics = obs
         day = int(obs.get("day", 0))
         if self._day != day:
             self._start_day(obs, plan)
@@ -219,21 +257,66 @@ class StripExecutorController:
 
         if not self._routes_finalized:
             self._reconcile_market_observation(obs)
-            market_plan = build_market_turn_plan(
-                obs,
-                active_plan,
-                work_plan,
-                self._market_state,
-                acting_seat=self.config.acting_seat,
-                shed_capacity=self._shed_capacity(obs),
-                max_orders=self._max_market_orders(obs),
-                market_params=self._market_params(obs),
-            )
-            self._market_state.bootstrap_turns += bool(market_plan.orders)
-            self._market_state.pending_buys = market_plan.pending_buys
-            self._market_state.latest_diagnostics = market_plan.diagnostics
-            if market_plan.orders:
-                return self._pass_result(obs)
+            if self._bootstrap_stage == "PROCUREMENT":
+                market_plan = build_market_turn_plan(
+                    obs,
+                    active_plan,
+                    work_plan,
+                    self._market_state,
+                    acting_seat=self.config.acting_seat,
+                    shed_capacity=self._shed_capacity(obs),
+                    max_orders=self._max_market_orders(obs),
+                    market_params=self._market_params(obs),
+                )
+                self._market_state.bootstrap_turns += bool(market_plan.orders)
+                self._market_state.pending_buys = market_plan.pending_buys
+                self._market_state.latest_diagnostics = market_plan.diagnostics
+                if market_plan.orders:
+                    return self._bootstrap_pass_result(obs, market_plan.orders)
+                self._bootstrap_stage = "HIRING"
+                self._worker_count_before_hiring = len(self._worker_positions(obs))
+
+            if self._bootstrap_stage == "HIRING":
+                if self._pending_hires is not None:
+                    if int(obs.get("step", 0)) <= self._pending_hires["submitted_step"]:
+                        return self._bootstrap_pass_result(obs, ())
+                    self._reconcile_hire_observation(obs)
+                    if self._pending_hires is not None:
+                        return self._bootstrap_pass_result(obs, ())
+                if self._hiring_blocked:
+                    self._daily["hire_stop_reason"] = "FAILED"
+                else:
+                    candidates = generate_horizontal_route_candidates(work_plan)
+                    positions = self._worker_positions(obs)
+                    inventories = {
+                        worker: self._worker_inventory(obs, worker)
+                        for worker in positions
+                    }
+                    self._candidate_routes = candidates
+                    self._hire_plan = plan_strip_hiring(
+                        obs,
+                        work_plan,
+                        candidates,
+                        positions,
+                        inventories,
+                        acting_seat=self.config.acting_seat,
+                        max_orders=self._max_market_orders(obs),
+                        farm_hand_cost_mult=self._hire_cost_mult(obs),
+                    )
+                    self._daily["hiring_diagnostics"] = self._hire_plan.to_json_dict()
+                    if self._hire_plan.orders:
+                        submitted = len(self._hire_plan.orders)
+                        farm = obs["farms"][self.config.acting_seat]
+                        self._pending_hires = {
+                            "submitted_step": int(obs.get("step", 0)),
+                            "hands_before": len(farm.get("hands") or ()),
+                            "hires_before": int(farm.get("hires_today", 0)),
+                            "submitted": submitted,
+                        }
+                        self._hire_submitted += submitted
+                        self._daily["hire_stop_reason"] = self._hire_plan.stop_reason.value
+                        return self._bootstrap_pass_result(obs, self._hire_plan.orders)
+                self._bootstrap_stage = "FINALIZED"
             work_plan = self._finalize_day(obs, active_plan)
             self._routes_finalized = True
             self._market_state.finalized_hour = int(obs.get("hour", 0))
@@ -297,6 +380,17 @@ class StripExecutorController:
         self._initial_shed = {}
         self._market_state = MarketBootstrapState()
         self._routes_finalized = False
+        self._bootstrap_stage = "PROCUREMENT"
+        self._pending_hires = None
+        self._hire_no_progress = 0
+        self._hiring_blocked = False
+        self._hire_plan = None
+        self._candidate_routes = ()
+        self._worker_count_before_hiring = 0
+        self._hire_submitted = 0
+        self._hire_observed = 0
+        self._hire_failures = 0
+        self._observation_for_diagnostics = obs
         self._daily = {"day": self._day, "assignment_hour": int(obs.get("hour", 0))}
 
     def _shed_capacity(self, obs: Mapping[str, Any]) -> int:
@@ -311,6 +405,12 @@ class StripExecutorController:
             return max(1, int(configuration.get("maxMarketOrdersPerTurn", self.config.max_market_orders)))
         return max(1, self.config.max_market_orders)
 
+    def _hire_cost_mult(self, obs: Mapping[str, Any]) -> int:
+        configuration = obs.get("configuration")
+        if isinstance(configuration, Mapping):
+            return max(0, int(configuration.get("farmHandCostMult", 1)))
+        return 1
+
     def _market_params(self, obs: Mapping[str, Any]) -> Mapping[str, Mapping[str, Any]] | None:
         if self.config.market_params is not None:
             return self.config.market_params
@@ -319,16 +419,45 @@ class StripExecutorController:
         return params if isinstance(params, Mapping) else None
 
     def _pass_result(self, obs: Mapping[str, Any]) -> StripExecutorResult:
+        return self._bootstrap_pass_result(
+            obs,
+            tuple(
+                tuple(order)
+                for order in self._market_state.latest_diagnostics.get("market_orders", ())
+            ),
+        )
+
+    def _bootstrap_pass_result(
+        self, obs: Mapping[str, Any], market_actions: tuple[tuple, ...] | tuple
+    ) -> StripExecutorResult:
         positions = self._worker_positions(obs)
         actions = tuple(("PASS",) for _ in sorted(positions))
         return StripExecutorResult(
             farmer_action=actions[0] if actions else ("PASS",),
             hands_actions=actions[1:],
-            market_actions=tuple(
-                tuple(order) for order in self._market_state.latest_diagnostics.get("market_orders", ())
-            ),
+            market_actions=tuple(tuple(order) for order in market_actions),
             diagnostics=self._diagnostics(),
         )
+
+    def _reconcile_hire_observation(self, obs: Mapping[str, Any]) -> None:
+        pending = self._pending_hires
+        if pending is None or int(obs.get("step", 0)) <= pending["submitted_step"]:
+            return
+        farm = obs["farms"][self.config.acting_seat]
+        hands_delta = max(0, len(farm.get("hands") or ()) - pending["hands_before"])
+        hires_delta = max(0, int(farm.get("hires_today", 0)) - pending["hires_before"])
+        observed = min(pending["submitted"], hands_delta, hires_delta)
+        self._hire_observed += observed
+        self._hire_failures += max(0, pending["submitted"] - observed)
+        self._pending_hires = None
+        if observed:
+            self._hire_no_progress = 0
+        else:
+            self._hire_no_progress += 1
+            if self._hire_no_progress >= 2:
+                self._hiring_blocked = True
+        self._daily["hires_observed"] = self._hire_observed
+        self._daily["failed_hires"] = self._hire_failures
 
     def _reconcile_market_observation(self, obs: Mapping[str, Any]) -> None:
         """Confirm pending buys from observed deltas, with two no-progress tries."""
@@ -746,6 +875,18 @@ class StripExecutorController:
         routes = self.routes
         completed = sum(route.phase == RoutePhase.DONE for route in routes)
         payload = dict(self._daily)
+        farm_values = self._observation_for_diagnostics.get("farms") or ()
+        positions = (
+            self._worker_positions(self._observation_for_diagnostics)
+            if self.config.acting_seat < len(farm_values)
+            else {}
+        )
+        farm = (
+            farm_values[self.config.acting_seat]
+            if self.config.acting_seat < len(farm_values)
+            else {}
+        )
+        estimates = self._hire_plan.route_estimates if self._hire_plan else ()
         payload.update(
             {
                 "idle_workers": [
@@ -769,6 +910,35 @@ class StripExecutorController:
                     route_id: workload
                     for route_id, workload in payload.get("route_workload", {}).items()
                 },
+                "bootstrap_stage": self._bootstrap_stage,
+                "worker_count_before_hiring": self._worker_count_before_hiring,
+                "worker_count_final": len(positions),
+                "hire_driving_routes": [
+                    estimate.route_id for estimate in estimates if estimate.hire_driving
+                ],
+                "fertilizer_only_routes": [
+                    estimate.route_id for estimate in estimates if estimate.fertilizer_only
+                ],
+                "coverage_prefix": list(
+                    self._hire_plan.coverage_prefix if self._hire_plan else ()
+                ),
+                "wanted_hires": self._hire_plan.wanted_hires if self._hire_plan else 0,
+                "affordable_hires": (
+                    self._hire_plan.affordable_hires if self._hire_plan else 0
+                ),
+                "submitted_hires": self._hire_submitted,
+                "observed_hires": self._hire_observed,
+                "failed_hires": self._hire_failures,
+                "sequential_hire_costs": list(
+                    self._hire_plan.sequential_hire_costs if self._hire_plan else ()
+                ),
+                "cash_before_hiring": (
+                    self._hire_plan.cash_before_hiring if self._hire_plan else None
+                ),
+                "cash_after_observed_hiring": float(farm.get("money", 0.0)),
+                "future_action_slots": (
+                    self._hire_plan.future_action_slots if self._hire_plan else 0
+                ),
             }
         )
         if self._supply_plans:
