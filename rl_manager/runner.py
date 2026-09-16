@@ -311,12 +311,16 @@ def _executor_factory_provenance(factory: Any) -> dict[str, Any]:
     name = str(getattr(factory, "name", "unknown"))
     version = str(getattr(factory, "version", "unknown"))
     identifier = f"{name}@{version}"
-    return {
+    provenance = {
         "name": name,
         "version": version,
         "identifier": identifier,
         "version_sha256": sha256_hex(identifier),
     }
+    effective_profile = getattr(factory, "effective_profile", None)
+    if effective_profile is not None:
+        provenance["effective_profile"] = copy.deepcopy(dict(effective_profile))
+    return provenance
 
 
 def _runner_opening_provenance(config: RunnerConfig) -> dict[str, Any]:

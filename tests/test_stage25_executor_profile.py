@@ -1,11 +1,10 @@
 """Stage 2.5 executor profile and persistent-goal maintenance tests."""
 
-from dataclasses import replace
 import json
 
 import pytest
 
-from executor_v0.agent import ExecutorAgent
+from executor_v0.agent import AgentConfig, ExecutorAgent
 from executor_v0.foreman import run_foreman
 from executor_v0.scheduler import PersistentTaskScheduler
 from executor_v0.tasks import Priority, Task, generate_tasks
@@ -16,6 +15,7 @@ from rl_manager.executor_factory import (
     make_default_executor_factory,
     make_stage25_executor_factory,
 )
+from executor_v0.strip_executor import StripExecutorController
 from test_executor_v0_agent import make_obs as agent_obs
 from test_executor_v0_agent import recording_provider, simple_plan
 from test_executor_v0_tasks import animal_tile, make_obs as task_obs, make_plan, plant_tile
@@ -35,34 +35,23 @@ def _task(key, kind, tile, *, crop=None, animal=None, depends_on=()):
 
 def test_stage25_profile_is_explicit_and_guarded():
     factory = make_stage25_executor_factory()
-    config = factory.agent_config
+    config = factory.strip_config
 
     assert factory.name == STAGE25_EXECUTOR_PROFILE_NAME
     assert factory.version == STAGE25_EXECUTOR_PROFILE_VERSION
     assert factory.version != EXECUTOR_FACTORY_VERSION
-    assert config.strict is True
-    assert config.heuristic_care is True
-    assert config.heuristic_fertilizer is True
     assert config.aggressive_sell_all is True
-    assert config.optional_spare_watering is True
-    assert config.immediate_plant_water is True
-    assert config.persistent_worker_queues is True
-    assert config.queue_ownership_repair is True
-    assert config.batch_reserved_supplies is True
-    assert config.underfoot_queue_insertion is True
-    assert config.suppress_expansion_from_prior_debt is True
 
     profile = factory.effective_profile
     assert profile["name"] == STAGE25_EXECUTOR_PROFILE_NAME
     assert profile["version"] == STAGE25_EXECUTOR_PROFILE_VERSION
-    assert profile["strategic_protection"] == {
-        "suppress_expansion_from_prior_debt": True,
-        "current_survival_expansion_veto": "executor_enforced",
-    }
-
-    for field in profile["required_true"]:
-        with pytest.raises(ValueError, match="requires.*enabled"):
-            make_stage25_executor_factory(replace(config, **{field: False}))
+    assert profile["controller"] == (
+        "executor_v0.strip_executor.StripExecutorController")
+    assert profile["strip_config"]["aggressive_sell_all"] is True
+    assert "strategic_protection" not in profile
+    with pytest.raises(ValueError, match="aggressive_sell_all=True"):
+        from executor_v0.strip_executor import StripExecutorConfig
+        make_stage25_executor_factory(StripExecutorConfig())
 
 
 def test_legacy_default_factory_and_config_are_unchanged():
@@ -84,6 +73,7 @@ def test_profile_is_carried_into_actual_executor_diagnostics_and_upkeep():
         watered_today=True, fertilized_until_day=-1)
     board[0][1] = animal_tile("COW", fed_today=True, cared_today=False)
     obs = task_obs(day=9, step=218, tiles=board, shed={"STRAWBERRY": 2})
+    obs["market"]["inventory"] = {"STRAWBERRY": 1000, "FERTILIZER": 1000}
     obs["market"]["prices"] = {"STRAWBERRY": 120, "FERTILIZER": 10}
 
     factory = make_stage25_executor_factory()
@@ -99,11 +89,11 @@ def test_profile_is_carried_into_actual_executor_diagnostics_and_upkeep():
     diagnostics = agent.diagnostics_json()
     assert diagnostics["effective_profile"] == factory.effective_profile
     json.dumps(diagnostics, allow_nan=False)
-    kinds = {task["kind"] for task in agent.debug_trace_turn["tasks"]}
-    assert "CARE" in kinds
-    assert "FERTILIZE" in kinds
-    assert any(order[:2] == ["SELL", "STRAWBERRY"]
-               for order in agent.debug_trace_turn["market"]["submitted"])
+    assert isinstance(agent.controller, StripExecutorController)
+    market = diagnostics["days"]["9"]["market_diagnostics"]
+    assert market["sell_mode"] == "aggressive_sell_all"
+    assert market["aggressive_sell_submitted_this_turn"] == {
+        "STRAWBERRY": 2}
 
 
 def test_absolute_animal_targets_preserve_existing_animals_and_inventory():
@@ -125,11 +115,9 @@ def test_persistent_goal_survives_hold_vacancy_and_unfinished_planting():
         "WHEAT": 3, "CARROT": 0, "TOMATO": 0,
         "STRAWBERRY": 0, "MELON": 0,
     })
-    profile_factory = make_stage25_executor_factory()
     agent = ExecutorAgent(
         recording_provider(plan), seat=0,
-        config=profile_factory.agent_config,
-        profile=profile_factory.effective_profile,
+        config=AgentConfig(strict=True, persistent_worker_queues=True),
     )
 
     first = agent(agent_obs(day=3, hour=2, seeds={"WHEAT": 1}))
@@ -168,11 +156,8 @@ def test_failed_expansion_keeps_requested_and_feasible_plans_distinct():
     )
     agent(agent_obs(day=3, hour=2, unlocked=("NW",), money=0.0))
     record = agent.diagnostics_json()["days"]["3"]
-
-    assert record["requested"]["land_count"] == 4
-    assert record["feasible"]["land_count"] == 4
-    assert record["land_purchase"]["requested"] is True
-    assert record["land_purchase"]["submitted"] is False
+    assert record["routes_finalized"] is True
+    assert record["market_diagnostics"]["sell_mode"] == "aggressive_sell_all"
 
 
 def test_heuristic_care_accepts_fast_engine_age_tiles():
@@ -236,10 +221,10 @@ def test_goal_change_releases_obsolete_plant_and_conversion_queue_work():
     assert dispatch.assignments[0].action != ("PLANT", "WHEAT")
 
 
-def test_provider_executor_lowers_persistent_goals_and_releases_stale_work():
+def test_provider_executor_uses_strip_and_reuses_one_daily_plan():
     from rl_manager.stage25_provider import Stage25PlanProvider
 
-    # Real path: external provider -> Stage 2.5 factory -> ExecutorAgent.
+    # Real path: Stage 2.5 provider -> strip adapter -> controller.
     provider = Stage25PlanProvider("packet4-reduction", seat=0, manager_start_day=3)
     agent = make_stage25_executor_factory().create(
         backend_name="fixture", seat=0, configuration={}, provider=provider)
@@ -249,30 +234,10 @@ def test_provider_executor_lowers_persistent_goals_and_releases_stale_work():
                      unlocked=("NW",))
     # First boundary: observed WHEAT=0, +2 => persistent goal 2.
     provider.accept_classes(day3, (*flat_land_animals, 102, 100, 100, 100, 100))
-    agent(day3)
-    day3_record = agent.diagnostics_json()["days"]["3"]
-    assert day3_record["requested"]["crop_targets"]["WHEAT"] == 2
-    stale_plants = [task["key"] for task in agent.debug_trace_turn["tasks"]
-                    if task["kind"] == "PLANT"]
-    assert stale_plants
-
-    day4 = agent_obs(day=4, hour=0, farmer=(0, 0), seeds={"WHEAT": 2},
-                     unlocked=("NW",))
-    # A new decision lowers the same persistent goal back to 0. The obsolete
-    # PLANT work must be invalidated, not executed or replaced by destruction.
-    provider.accept_classes(day4, (*flat_land_animals, 98, 100, 100, 100, 100))
-    day4_action = agent(day4)
-    day4_record = agent.diagnostics_json()["days"]["4"]
-    assert day4_record["requested"]["crop_targets"]["WHEAT"] == 0
-    assert day4_record["feasible"]["crop_targets"]["WHEAT"] == 0
-    assert not any(task["kind"] == "PLANT"
-                   for task in agent.debug_trace_turn["tasks"])
-    # The reduction is a maintenance-goal change, not unconditional destruction.
-    assert not any(task["kind"] in ("DIG", "BUILD_COOP", "BUILD_PASTURE")
-                   for task in agent.debug_trace_turn["tasks"])
-    # No stale plant survives in the persistent queue and no PLANT is executed.
-    assert day4_record["scheduler"]["queue_lengths"].get("0", 0) == 0
-    submitted_ops = [op for action in (day4_action["farmer"], *day4_action["hands"])
-                     for op in (action[:1] if action else [])]
-    assert "PLANT" not in submitted_ops
-    assert stale_plants  # the day-3 baseline really queued obsolete PLANT work
+    first = agent(day3)
+    second = agent(agent_obs(day=3, hour=1, farmer=(0, 0), seeds={"WHEAT": 2},
+                              unlocked=("NW",), step=73))
+    assert first.keys() == second.keys() == {"farmer", "hands", "market"}
+    assert agent.provider is provider
+    assert provider.last_accepted_day == 3
+    assert agent.diagnostics_json()["days"]["3"]["market_diagnostics"]

@@ -1,16 +1,16 @@
 """Executor factory / version seam (issue #9, architecture req. on executors).
 
 The executor stays entirely outside the RL gradient.  The legacy factory
-continues to build the default `executor_v0.ExecutorAgent`; the explicit
-Stage 2.5 factory selects a versioned configuration of the same executor
-through this seam.  Both are parameterized by backend name/seat/configuration
-and an injected plan provider, so swapping the factory does not change
-RL-semantics.
+builds the default :class:`executor_v0.agent.ExecutorAgent`; the explicit
+Stage 2.5 factory adapts its injected plan provider to the fixed-strip
+controller.  Both are parameterized by backend name/seat/configuration and an
+injected plan provider, so swapping the factory does not change RL semantics.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import copy
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping, Protocol
 
 from rl_manager.provider import QueuedPlanProvider
@@ -22,90 +22,94 @@ __all__ = [
     "RlExecutorFactory",
     "Stage25ExecutorFactory",
     "Stage25ExecutorProfile",
+    "Stage25StripExecutorAgent",
     "make_default_executor_factory",
     "make_stage25_executor_factory",
 ]
 
 EXECUTOR_FACTORY_VERSION = "executor_v0.make_agent(strict=True)@stage-a-v1"
-STAGE25_EXECUTOR_PROFILE_VERSION = "stage25_executor_v1"
-STAGE25_EXECUTOR_PROFILE_NAME = "stage25_executor"
-
-# These are intentionally explicit rather than a best-effort overlay.  A
-# Stage 2.5 rollout must be reproducible from its recorded profile, and an
-# accidental false value here would turn the zero-valued transport scaffolds
-# into missing mechanics.
-_STAGE25_REQUIRED_TRUE = (
-    "strict",
-    "heuristic_care",
-    "heuristic_fertilizer",
-    "aggressive_sell_all",
-    "suppress_expansion_from_prior_debt",
-    "optional_spare_watering",
-    "immediate_plant_water",
-    "deadline_safe_planting",
-    "deadline_safe_hiring",
-    "persistent_worker_queues",
-    "queue_ownership_repair",
-    "batch_reserved_supplies",
-    "underfoot_queue_insertion",
-    "starvation_workload_visibility_repair",
-)
+STAGE25_EXECUTOR_PROFILE_VERSION = "strip_executor_v1@stage25-v1"
+STAGE25_EXECUTOR_PROFILE_NAME = "stage25_strip_executor"
 
 
 @dataclass(frozen=True)
 class Stage25ExecutorProfile:
-    """Versioned, introspectable executor settings for Stage 2.5.
+    """Versioned, introspectable fixed-strip settings for Stage 2.5."""
 
-    The policy transport deliberately carries zero CARE/fertilizer/sell
-    fields.  These settings supply the deterministic executor-side behavior
-    without changing the policy action schema.  This is an executor profile,
-    not a promoted strategy label or a claim about final policy quality.
-    """
-
-    agent_config: Any
+    strip_config: Any
     name: str = STAGE25_EXECUTOR_PROFILE_NAME
     version: str = STAGE25_EXECUTOR_PROFILE_VERSION
 
     def __post_init__(self) -> None:
-        disabled = [name for name in _STAGE25_REQUIRED_TRUE
-                    if not hasattr(self.agent_config, name)
-                    or getattr(self.agent_config, name) is not True]
-        if disabled:
+        if getattr(self.strip_config, "aggressive_sell_all", None) is not True:
             raise ValueError(
-                "Stage 2.5 executor profile requires these settings enabled: "
-                f"{disabled}; refusing to silently alter the profile")
+                "Stage 2.5 strip profile requires aggressive_sell_all=True")
 
     def to_json_dict(self) -> dict[str, Any]:
-        config = asdict(self.agent_config)
+        config = asdict(self.strip_config)
+        config["acting_seat"] = "factory_injected_seat"
         return {
             "name": self.name,
             "version": self.version,
-            "agent_config": config,
-            "required_true": list(_STAGE25_REQUIRED_TRUE),
-            "strategic_protection": {
-                "suppress_expansion_from_prior_debt": bool(
-                    self.agent_config.suppress_expansion_from_prior_debt),
-                "current_survival_expansion_veto": "executor_enforced",
-            },
+            "controller": "executor_v0.strip_executor.StripExecutorController",
+            "strip_config": config,
+            "aggressive_sell_all": bool(self.strip_config.aggressive_sell_all),
         }
 
 
-def _validate_stage25_config(config: Any, agent_config_type: type) -> None:
-    if not isinstance(config, agent_config_type):
+def _validate_stage25_config(config: Any, strip_config_type: type) -> None:
+    if not isinstance(config, strip_config_type):
         raise TypeError(
-            "agent_config must be an executor_v0.agent.AgentConfig instance")
-    missing = [name for name in _STAGE25_REQUIRED_TRUE
-               if not hasattr(config, name)]
-    if missing:
+            "strip_config must be an executor_v0.strip_executor."
+            "StripExecutorConfig instance")
+    if config.aggressive_sell_all is not True:
         raise ValueError(
-            "Stage 2.5 executor profile is missing required settings: "
-            f"{missing}")
-    disabled = [name for name in _STAGE25_REQUIRED_TRUE
-                if getattr(config, name) is not True]
-    if disabled:
-        raise ValueError(
-            "Stage 2.5 executor profile requires these settings enabled: "
-            f"{disabled}; refusing to silently alter the profile")
+            "Stage 2.5 strip profile requires aggressive_sell_all=True")
+
+
+class Stage25StripExecutorAgent:
+    """Callable runner adapter around one fixed-strip controller.
+
+    The provider remains authoritative for manager cadence and persistent-K
+    lifecycle.  This adapter only retrieves one already-accepted ``DailyPlan``
+    at a day boundary and reuses it for that day's primitive turns.
+    """
+
+    def __init__(self, *, provider: Any, seat: int, strip_config: Any,
+                 profile: Mapping[str, Any]) -> None:
+        from executor_v0.strip_executor import StripExecutorController
+
+        self.provider = provider
+        self.seat = int(seat)
+        self.config = replace(strip_config, acting_seat=self.seat)
+        self.controller = StripExecutorController(config=self.config)
+        self.effective_profile = copy.deepcopy(dict(profile))
+        self._day: int | None = None
+        self._plan: Any | None = None
+        self._days: dict[str, dict[str, Any]] = {}
+
+    def __call__(self, obs: Mapping[str, Any]) -> dict[str, Any]:
+        day = int(obs["day"])
+        if self._day != day:
+            self._plan = self.provider.daily_plan(obs, self.seat)
+            self._day = day
+        result = self.controller.act(obs, self._plan)
+        self._days[str(day)] = copy.deepcopy(result.diagnostics)
+        return result.action_dict()
+
+    def diagnostics_json(self) -> dict[str, Any]:
+        diagnostics = {
+            "schema_version": 1,
+            "seat": self.seat,
+            "effective_profile": copy.deepcopy(self.effective_profile),
+            "config": asdict(self.config),
+            "days": copy.deepcopy(self._days),
+            "fallback_errors": [],
+        }
+        provider_diagnostics = getattr(self.provider, "diagnostics_json", None)
+        if callable(provider_diagnostics):
+            diagnostics["provider_diagnostics"] = provider_diagnostics()
+        return diagnostics
 
 
 @dataclass(frozen=True)
@@ -124,7 +128,12 @@ class Stage25ExecutorFactory:
 
     @property
     def agent_config(self) -> Any:
-        return self.profile.agent_config
+        """Deprecated compatibility alias for the registered factory wire."""
+        return self.profile.strip_config
+
+    @property
+    def strip_config(self) -> Any:
+        return self.profile.strip_config
 
     @property
     def effective_profile(self) -> dict[str, Any]:
@@ -139,46 +148,24 @@ class Stage25ExecutorFactory:
         provider: QueuedPlanProvider,
     ) -> object:
         del backend_name, configuration
-        from executor_v0.agent import make_agent
-
-        return make_agent(
-            provider=provider,
-            seat=seat,
-            config=self.profile.agent_config,
+        return Stage25StripExecutorAgent(
+            provider=provider, seat=seat,
+            strip_config=self.profile.strip_config,
             profile=self.profile.to_json_dict(),
         )
 
 
 def make_stage25_executor_factory(
-    agent_config: Any | None = None,
+    strip_config: Any | None = None,
 ) -> RlExecutorFactory:
-    """Build the explicit Stage 2.5 executor profile.
+    """Build the explicit Stage 2.5 fixed-strip executor profile."""
+    from executor_v0.strip_executor import StripExecutorConfig
 
-    Passing a config is useful for an explicit telemetry-only variation, but
-    required upkeep, liquidation, and expansion-protection settings must
-    remain enabled.  The config is never silently patched.
-    """
-    from executor_v0.agent import AgentConfig
-
-    resolved_config = agent_config or AgentConfig(
-        strict=True,
-        suppress_expansion_from_prior_debt=True,
-        aggressive_sell_all=True,
-        optional_spare_watering=True,
-        immediate_plant_water=True,
-        deadline_safe_planting=True,
-        deadline_safe_hiring=True,
-        persistent_worker_queues=True,
-        queue_ownership_repair=True,
-        batch_reserved_supplies=True,
-        underfoot_queue_insertion=True,
-        starvation_workload_visibility_repair=True,
-        heuristic_care=True,
-        heuristic_fertilizer=True,
-    )
-    _validate_stage25_config(resolved_config, AgentConfig)
+    resolved_config = strip_config or StripExecutorConfig(
+        aggressive_sell_all=True)
+    _validate_stage25_config(resolved_config, StripExecutorConfig)
     return Stage25ExecutorFactory(
-        profile=Stage25ExecutorProfile(agent_config=resolved_config))
+        profile=Stage25ExecutorProfile(strip_config=resolved_config))
 
 
 class RlExecutorFactory(Protocol):

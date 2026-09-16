@@ -106,8 +106,8 @@ def pad_batch_to_physical(
 
 def _factory_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
     """Use a child-local default factory with its complete config."""
-    if (getattr(factory, "name", None) == "stage25_executor"):
-        return ("stage25_executor@config", factory.agent_config)
+    if (getattr(factory, "name", None) == "stage25_strip_executor"):
+        return ("stage25_strip_executor@config:v1", factory.strip_config)
     if (getattr(factory, "name", None) == "executor_v0"
             and getattr(factory, "version", None) == EXECUTOR_FACTORY_VERSION):
         del low_telemetry
