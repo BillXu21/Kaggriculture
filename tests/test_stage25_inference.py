@@ -4,14 +4,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from rl_manager.stage25_checkpoint import save_stage25_inference_checkpoint
 from rl_manager.stage25_config import Stage25CurriculumConfig
-from rl_manager.stage25_inference import Stage25InferenceAdapter
-from rl_manager.stage25_mechanics import PhysicalContext
-from rl_manager.stage25_policy import init_stage25_params, tiny_stage25_config
+from rl_manager.stage25_inference import (
+    Stage25InferenceAdapter, _normalise_row_ids, _root_key, _row_rng_keys,
+)
+from rl_manager.stage25_mechanics import (
+    PhysicalContext, animal_target_support_mask, crop_delta_support_mask,
+    land_target_support_mask, physical_crop_capacity,
+)
+from rl_manager.stage25_policy import (
+    greedy_act, init_stage25_params, stochastic_act, tiny_stage25_config,
+)
 from rl_manager.stage25_types import Stage25PolicyOutputs
 
 
@@ -104,6 +113,102 @@ def test_row_ids_make_sampling_stable_under_reorder_and_padding():
         physical_contexts=(_context(), _context(), _context()))
     np.testing.assert_array_equal(padded.classes[:2], first.classes)
     np.testing.assert_array_equal(padded.joint_logprob[:2], first.joint_logprob)
+
+
+def test_optimized_row_keys_are_exactly_the_legacy_fold_sequence():
+    adapter = _adapter()
+    ids = _normalise_row_ids(("row-a", 17, "row-c"), 3)
+    root = _root_key("same-day", adapter.identity, adapter.seed)
+    legacy = np.asarray(jnp.stack([
+        jax.random.fold_in(root, int(row_id)) for row_id in ids
+    ]), dtype=np.uint32)
+    optimized = np.asarray(_row_rng_keys(root, ids), dtype=np.uint32)
+    np.testing.assert_array_equal(optimized, legacy)
+
+
+def test_optimized_adapter_matches_legacy_policy_outputs_exactly():
+    adapter = _adapter()
+    inputs = _inputs(3)
+    contexts = (_context(),) * 3
+    row_ids = ("a", "b", "c")
+    ids = _normalise_row_ids(row_ids, 3)
+    output = adapter.plan_batch_with_row_ids(
+        inputs, row_ids, "same-day", physical_contexts=contexts)
+    root = _root_key("same-day", adapter.identity, adapter.seed)
+    legacy = stochastic_act(
+        adapter.params, inputs, adapter.config,
+        rng_keys=np.asarray(jnp.stack([
+            jax.random.fold_in(root, int(row_id)) for row_id in ids
+        ]), dtype=np.uint32), physical_contexts=contexts, row_ids=ids,
+        reject_invalid=False)
+    for name in ("classes", "component_logprobs", "joint_logprob", "value",
+                 "decoded_goals", "valid"):
+        np.testing.assert_array_equal(getattr(output, name), np.asarray(legacy[name]))
+
+
+def test_deterministic_adapter_classes_and_scores_match_policy_exactly():
+    stochastic = _adapter()
+    adapter = Stage25InferenceAdapter(
+        params=stochastic.params, config=stochastic.config, mode="deterministic")
+    inputs = _inputs(2)
+    contexts = (_context(),) * 2
+    ids = _normalise_row_ids(("a", "b"), 2)
+    output = adapter.plan_batch_with_row_ids(
+        inputs, ("a", "b"), "ignored", physical_contexts=contexts)
+    legacy = greedy_act(
+        adapter.params, inputs, adapter.config, physical_contexts=contexts,
+        row_ids=ids)
+    for name in ("classes", "component_logprobs", "joint_logprob", "value",
+                 "decoded_goals", "valid"):
+        legacy_name = "validity" if name == "valid" else name
+        np.testing.assert_array_equal(getattr(output, name), np.asarray(legacy[legacy_name]))
+
+
+def test_neighboring_rows_do_not_change_row_stable_stochastic_outputs():
+    adapter = _adapter()
+    base = adapter.plan_batch_with_row_ids(
+        _inputs(1), ("target",), "same-day", physical_contexts=(_context(),))
+    expanded = adapter.plan_batch_with_row_ids(
+        _inputs(3), ("neighbor-left", "target", "neighbor-right"),
+        "same-day", physical_contexts=(_context(),) * 3)
+    for name in ("classes", "component_logprobs", "joint_logprob", "value",
+                 "decoded_goals", "valid"):
+        if name == "value":
+            np.testing.assert_allclose(
+                getattr(expanded, name)[1], getattr(base, name)[0],
+                rtol=0.0, atol=1.0e-6)
+        else:
+            np.testing.assert_array_equal(
+                getattr(expanded, name)[1], getattr(base, name)[0])
+
+
+def test_infer_batch_rejects_physical_support_that_exceeds_context():
+    adapter = _adapter()
+    context = _context()
+    total_capacity = physical_crop_capacity(
+        context, context.observed_land, context.placed_animals)
+    valid_support = {
+        "land": list(land_target_support_mask(context.observed_land)),
+        "animals": [list(animal_target_support_mask(
+            context, context.observed_land, species,
+            context.placed_animals[:species])) for species in range(3)],
+        "crops": [list(crop_delta_support_mask(0, total_capacity))
+                   for _ in range(5)],
+    }
+    invalid_animals = list(valid_support["animals"][0])
+    invalid_animals[invalid_animals.index(False)] = True
+    invalid_support = {
+        **valid_support,
+        "animals": [
+            invalid_animals,
+            valid_support["animals"][1],
+            valid_support["animals"][2],
+        ],
+    }
+    with pytest.raises(ValueError, match="physical support"):
+        adapter.infer_batch(
+            _inputs(), physical_contexts=(context,),
+            supports=(invalid_support,), row_ids=("row",), prng_id="day")
 
 
 def test_row_action_is_stable_across_runner_and_parent_prng_namespaces():
