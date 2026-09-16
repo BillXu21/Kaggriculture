@@ -427,9 +427,13 @@ _stage25_policy_eval_jit = jax.jit(
     _policy_eval_chunks_impl, static_argnames=("model", "explicit"))
 
 
-def _map_policy_eval(params: Mapping[str, Any], batch: Stage25PPOBatch, config: Stage25PPOConfig):
+def _map_policy_eval(
+        params: Mapping[str, Any], batch: Stage25PPOBatch,
+        config: Stage25PPOConfig, *, logical_size: int | None = None,
+):
     prepared, capacity, classes, contexts, row_ids, _real_rows, chunks, total, n, explicit = _physical_views(
-        batch, config.model, config.physical_batch_size)
+        batch, config.model, config.physical_batch_size,
+        logical_size=logical_size)
     output = _stage25_policy_eval_jit(
         params, prepared, capacity, classes, contexts, row_ids,
         config.model, explicit)
@@ -581,9 +585,11 @@ _compiled_stage25_ppo_step = jax.jit(
 
 def evaluate_stage25_ppo(
         params: Mapping[str, Any], batch: Stage25PPOBatch,
-        config: Stage25PPOConfig) -> tuple[Mapping[str, Any], dict[str, Any]]:
+        config: Stage25PPOConfig, *, logical_size: int | None = None,
+) -> tuple[Mapping[str, Any], dict[str, Any]]:
     """Evaluate one logical batch through fixed physical shapes."""
-    output = _map_policy_eval(params, batch, config)
+    output = _map_policy_eval(
+        params, batch, config, logical_size=logical_size)
     loss, metrics, _ = _objective_from_output(output, batch, config)
     del loss
     return output, {name: np.asarray(value) for name, value in metrics.items()}
@@ -593,37 +599,71 @@ def audit_stage25_ppo_rollout(
         params: Mapping[str, Any], batch: Stage25PPOBatch,
         config: Stage25PPOConfig) -> dict[str, Any]:
     """Fail before updating if unchanged weights do not reproduce rollout data."""
-    output, metrics = evaluate_stage25_ppo(params, batch, config)
-    classes = np.asarray(output["classes"])
-    if not np.array_equal(classes, batch.classes):
-        raise ValueError("PPO unchanged-weight audit changed stored classes")
-    if not np.all(np.asarray(output["valid"], dtype=bool)):
-        raise ValueError("PPO unchanged-weight audit produced invalid diagnostic rows")
-    errors = {
-        "component_logprobs": float(np.max(np.abs(np.asarray(output["component_logprobs"]) - batch.old_component_logprobs))),
-        "joint_logprob": float(np.max(np.abs(np.asarray(output["joint_logprob"]) - batch.old_joint_logprobs))),
-        "value": float(np.max(np.abs(np.asarray(output["value"]) - batch.old_values))),
-    }
-    for name, error in errors.items():
-        expected = {"component_logprobs": batch.old_component_logprobs,
-                    "joint_logprob": batch.old_joint_logprobs,
-                    "value": batch.old_values}[name]
-        actual = {"component_logprobs": output["component_logprobs"],
-                  "joint_logprob": output["joint_logprob"],
-                  "value": output["value"]}[name]
-        if not np.allclose(np.asarray(actual), expected, atol=config.audit_atol, rtol=config.audit_rtol, equal_nan=False):
-            absolute = np.abs(np.asarray(actual) - expected)
-            difference = (absolute if absolute.ndim == 1 else
-                          np.max(absolute, axis=tuple(range(1, absolute.ndim))))
-            row = int(np.argmax(difference))
+    chunk_size = config.minibatch_size
+    errors = {name: 0.0 for name in (
+        "component_logprobs", "joint_logprob", "value")}
+    weighted_ratio = 0.0
+    weighted_kl = 0.0
+    rows = len(batch.classes)
+    chunks = 0
+    for start in range(0, rows, chunk_size):
+        chunk = batch.take(np.arange(start, min(start + chunk_size, rows)))
+        output, metrics = evaluate_stage25_ppo(
+            params, chunk, config, logical_size=chunk_size)
+        chunks += 1
+
+        classes = np.asarray(output["classes"])
+        if not np.array_equal(classes, chunk.classes):
+            changed = np.any(classes != chunk.classes, axis=1)
+            row = int(np.flatnonzero(changed)[0])
             raise ValueError(
-                f"PPO unchanged-weight audit mismatch in {name}: max error "
-                f"{error} at collected row {batch.source_row_ids[row]!r}")
-    if not np.isfinite(np.asarray(metrics["kl"])).all():
-        raise ValueError("PPO unchanged-weight audit produced nonfinite KL")
+                "PPO unchanged-weight audit changed stored classes at "
+                f"collected row {chunk.source_row_ids[row]!r}")
+        valid = np.asarray(output["valid"], dtype=bool)
+        if not np.all(valid):
+            row = int(np.flatnonzero(~valid)[0])
+            raise ValueError(
+                "PPO unchanged-weight audit produced invalid diagnostics at "
+                f"collected row {chunk.source_row_ids[row]!r}")
+
+        expected_values = {
+            "component_logprobs": chunk.old_component_logprobs,
+            "joint_logprob": chunk.old_joint_logprobs,
+            "value": chunk.old_values,
+        }
+        actual_values = {
+            "component_logprobs": output["component_logprobs"],
+            "joint_logprob": output["joint_logprob"],
+            "value": output["value"],
+        }
+        for name, expected in expected_values.items():
+            actual = np.asarray(actual_values[name])
+            absolute = np.abs(actual - expected)
+            chunk_error = float(np.max(absolute))
+            errors[name] = max(errors[name], chunk_error)
+            if not np.allclose(
+                    actual, expected, atol=config.audit_atol,
+                    rtol=config.audit_rtol, equal_nan=False):
+                difference = (absolute if absolute.ndim == 1 else
+                              np.max(absolute, axis=tuple(
+                                  range(1, absolute.ndim))))
+                row = int(np.argmax(difference))
+                raise ValueError(
+                    f"PPO unchanged-weight audit mismatch in {name}: max error "
+                    f"{chunk_error} at collected row "
+                    f"{chunk.source_row_ids[row]!r}")
+
+        chunk_rows = len(chunk.classes)
+        kl = np.asarray(metrics["kl"])
+        if not np.isfinite(kl).all():
+            raise ValueError("PPO unchanged-weight audit produced nonfinite KL")
+        weighted_ratio += float(np.asarray(metrics["ratio_mean"])) * chunk_rows
+        weighted_kl += float(kl) * chunk_rows
+
     return {"ok": True, "max_abs_error": errors,
-            "initial_ratio_mean": float(np.asarray(metrics["ratio_mean"])),
-            "initial_kl": float(np.asarray(metrics["kl"]))}
+            "initial_ratio_mean": weighted_ratio / rows,
+            "initial_kl": weighted_kl / rows,
+            "chunk_size": chunk_size, "chunks": chunks}
 
 
 def make_stage25_ppo_optimizer(params: Mapping[str, Any], config: Stage25PPOConfig):
