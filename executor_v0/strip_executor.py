@@ -62,6 +62,7 @@ class StripExecutorConfig:
     shed_capacity: int = 100
     max_market_orders: int = 10
     market_params: Mapping[str, Mapping[str, Any]] | None = None
+    aggressive_sell_all: bool = False
 
 
 @dataclass(frozen=True)
@@ -267,6 +268,7 @@ class StripExecutorController:
                     shed_capacity=self._shed_capacity(obs),
                     max_orders=self._max_market_orders(obs),
                     market_params=self._market_params(obs),
+                    aggressive_sell_all=self.config.aggressive_sell_all,
                 )
                 self._market_state.bootstrap_turns += bool(market_plan.orders)
                 self._market_state.pending_buys = market_plan.pending_buys
@@ -334,6 +336,7 @@ class StripExecutorController:
             market_params=self._market_params(obs),
             protected_reservations=protected,
             purchases_enabled=False,
+            aggressive_sell_all=self.config.aggressive_sell_all,
         )
         self._market_state.latest_diagnostics = market_plan.diagnostics
 

@@ -143,6 +143,7 @@ def build_market_turn_plan(
     market_params: Mapping[str, Mapping[str, Any]] | None = None,
     protected_reservations: Mapping[str, int] | None = None,
     purchases_enabled: bool = True,
+    aggressive_sell_all: bool = False,
 ) -> MarketTurnPlan:
     """Build one deterministic market prefix from the observed state.
 
@@ -192,20 +193,6 @@ def build_market_turn_plan(
     intents: list[MarketIntent] = []
     blocked: dict[str, dict[str, Any]] = {}
 
-    # Manager sales are always the first class, and only the active bin is
-    # eligible.  There is deliberately no economic retention policy here.
-    sell_quantities = daily_plan.sell_quantities_dict
-    active_bin = sell_quantities.get(str(anchor), {})
-    for product in PRODUCTS:
-        requested = max(0, int(active_bin.get(product, 0)))
-        key = f"SELL:{anchor}:{product}"
-        state.sell_requested[(anchor, product)] = requested
-        remaining = requested - state.sell_submitted.get((anchor, product), 0)
-        if remaining <= 0:
-            continue
-        intents.append(MarketIntent(key, "SELL", product, remaining, anchor))
-
-    # Packet 1 is the authority for all represented executor deficits.
     feed_demand = sum(
         requirement.quantity
         for item in work_plan.items
@@ -213,6 +200,37 @@ def build_market_turn_plan(
         for requirement in item.required_supplies
         if requirement.scope == "inventory" and requirement.item == "WHEAT"
     )
+    feed_shed_reserve = max(0, feed_demand - carried.get("WHEAT", 0))
+    aggressive_observed = {
+        product: shed.get(product, 0)
+        for product in PRODUCTS
+        if shed.get(product, 0) > 0
+    }
+    aggressive_protected: dict[str, int] = {}
+
+    # Manager sales are the default.  Aggressive mode derives sales only from
+    # the current observed shed and deliberately ignores the manager bins.
+    sell_quantities = daily_plan.sell_quantities_dict
+    active_bin = sell_quantities.get(str(anchor), {})
+    for product in PRODUCTS:
+        requested = max(0, int(active_bin.get(product, 0)))
+        key = f"SELL:{anchor}:{product}"
+        state.sell_requested[(anchor, product)] = requested
+        if aggressive_sell_all:
+            route_protected = protected.get(product, 0)
+            if product == "WHEAT":
+                feed_shed_reserve = min(feed_shed_reserve, shed.get(product, 0))
+                route_protected = max(feed_shed_reserve, route_protected)
+            if route_protected:
+                aggressive_protected[product] = route_protected
+            sellable = max(0, shed.get(product, 0) - route_protected)
+            if sellable:
+                intents.append(MarketIntent(key, "SELL", product, sellable, anchor))
+            continue
+        remaining = requested - state.sell_submitted.get((anchor, product), 0)
+        if remaining > 0:
+            intents.append(MarketIntent(key, "SELL", product, remaining, anchor))
+
     # The current observation is authoritative: observed shed already contains any
     # realized purchase, so historical ``buy_observed`` must not be netted again.
     wheat_shortage = max(0, feed_demand - carried.get("WHEAT", 0) - shed.get("WHEAT", 0))
@@ -258,6 +276,7 @@ def build_market_turn_plan(
     pending: list[MarketPendingOrder] = []
     submitted_buy_this_turn: dict[str, int] = {}
     submitted_sell_by_product: dict[str, int] = {}
+    sell_protected = aggressive_protected if aggressive_sell_all else protected
     for intent in intents:
         if len(orders) >= max_orders:
             blocked[intent.key] = _blocked(MarketBlockReason.ORDER_CAP, intent.requested)
@@ -266,7 +285,11 @@ def build_market_turn_plan(
             blocked[intent.key] = _blocked(MarketBlockReason.FAILED, intent.requested)
             continue
         if intent.kind == "SELL":
-            available = max(0, ledger.shed.get(intent.item or "", 0) - protected.get(intent.item or "", 0))
+            available = max(
+                0,
+                ledger.shed.get(intent.item or "", 0)
+                - sell_protected.get(intent.item or "", 0),
+            )
             quantity = min(intent.requested, available)
             if quantity <= 0:
                 reason = (MarketBlockReason.RESERVATION_PROTECTED
@@ -329,6 +352,32 @@ def build_market_turn_plan(
         "shed_occupancy_before_plan": sum(shed.values()),
         "shed_occupancy_after_simulated_orders": sum(ledger.shed.values()),
         "shed_reservation_protected": dict(sorted(protected.items())),
+        "sell_mode": "aggressive_sell_all" if aggressive_sell_all else "manager_bins",
+        "aggressive_sell_observed": aggressive_observed if aggressive_sell_all else {},
+        "aggressive_sell_protected": (
+            dict(sorted(aggressive_protected.items())) if aggressive_sell_all else {}
+        ),
+        "aggressive_sell_submitted_this_turn": (
+            dict(sorted(submitted_sell_by_product.items())) if aggressive_sell_all else {}
+        ),
+        "aggressive_sell_submitted_total": (
+            {
+                product: sum(
+                    quantity
+                    for (submitted_anchor, submitted_product), quantity
+                    in state.sell_submitted.items()
+                    if submitted_product == product
+                )
+                for product in PRODUCTS
+                if any(
+                    submitted_product == product
+                    for (_submitted_anchor, submitted_product)
+                    in state.sell_submitted
+                )
+            }
+            if aggressive_sell_all
+            else {}
+        ),
         "buy_demand": {intent.key: intent.requested for intent in intents if intent.kind.startswith("BUY_")},
         "buy_submitted_this_turn": submitted_buy_this_turn,
         "sell_requested_by_bin": {

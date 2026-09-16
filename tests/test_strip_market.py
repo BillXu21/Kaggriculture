@@ -97,7 +97,17 @@ def observation(*, money=0, hour=0, step=None, shed=None, seeds=None, inventorie
     }
 
 
-def plan_market(obs, daily, work_plan, *, state=None, capacity=100, max_orders=10, protected=None):
+def plan_market(
+    obs,
+    daily,
+    work_plan,
+    *,
+    state=None,
+    capacity=100,
+    max_orders=10,
+    protected=None,
+    aggressive=False,
+):
     return build_market_turn_plan(
         obs,
         daily,
@@ -106,6 +116,7 @@ def plan_market(obs, daily, work_plan, *, state=None, capacity=100, max_orders=1
         shed_capacity=capacity,
         max_orders=max_orders,
         protected_reservations=protected,
+        aggressive_sell_all=aggressive,
     )
 
 
@@ -416,6 +427,85 @@ def test_fully_realized_purchase_produces_no_further_buy():
         state=seed_state,
     )
     assert seed_result.orders == ()
+
+
+def test_manager_bins_remain_authoritative_when_aggressive_selling_is_off():
+    result = plan_market(
+        observation(money=0, shed={"MILK": 5}),
+        daily_plan(sells={"MILK": {0: 2}}),
+        work(),
+    )
+    assert result.orders == (("SELL", "MILK", 2),)
+    assert result.diagnostics["sell_mode"] == "manager_bins"
+
+
+def test_aggressive_selling_ignores_manager_sell_quantity_and_uses_observed_shed():
+    result = plan_market(
+        observation(money=0, shed={"MILK": 5}),
+        daily_plan(sells={"MILK": {0: 1}}),
+        work(),
+        aggressive=True,
+    )
+    assert result.orders == (("SELL", "MILK", 5),)
+    assert result.diagnostics["sell_mode"] == "aggressive_sell_all"
+    assert result.diagnostics["aggressive_sell_observed"] == {"MILK": 5}
+    assert result.diagnostics["aggressive_sell_submitted_this_turn"] == {"MILK": 5}
+
+
+def test_aggressive_wheat_reserve_uses_feed_demand_minus_carried_wheat():
+    result = plan_market(
+        observation(money=0, shed={"WHEAT": 5}, inventories=[{"WHEAT": 2}]),
+        daily_plan(),
+        work(item("FEED", supplies=(SupplyRequirement("WHEAT", 4, "inventory"),))),
+        aggressive=True,
+    )
+    assert result.orders == (("SELL", "WHEAT", 3),)
+    assert result.diagnostics["aggressive_sell_protected"] == {"WHEAT": 2}
+
+
+def test_aggressive_selling_preserves_route_reservations_without_double_protecting_wheat():
+    fertilizer = plan_market(
+        observation(money=0, shed={"FERTILIZER": 5}),
+        daily_plan(),
+        work(),
+        protected={"FERTILIZER": 2},
+        aggressive=True,
+    )
+    assert fertilizer.orders == (("SELL", "FERTILIZER", 3),)
+
+    wheat = plan_market(
+        observation(money=0, shed={"WHEAT": 5}),
+        daily_plan(),
+        work(item("FEED", supplies=(SupplyRequirement("WHEAT", 3, "inventory"),))),
+        protected={"WHEAT": 3},
+        aggressive=True,
+    )
+    assert wheat.orders == (("SELL", "WHEAT", 2),)
+    assert wheat.diagnostics["aggressive_sell_protected"] == {"WHEAT": 3}
+
+
+def test_aggressive_sell_proceeds_fund_buy_land_in_the_same_turn():
+    result = plan_market(
+        observation(money=0, shed={"MILK": 7}),
+        daily_plan(),
+        work(WorkItem(id="BUY_LAND:NE", kind="BUY_LAND", land="NE")),
+        aggressive=True,
+    )
+    assert result.orders[0] == ("SELL", "MILK", 7)
+    assert result.orders[1] == ("BUY_LAND",)
+    assert result.diagnostics["money_after_simulated_orders"] >= 0
+
+
+def test_aggressive_sales_and_purchases_respect_market_order_cap():
+    result = plan_market(
+        observation(money=5000, shed={"WHEAT": 1, "CARROT": 1, "MILK": 1}),
+        daily_plan(),
+        work(WorkItem(id="BUY_LAND:NE", kind="BUY_LAND", land="NE")),
+        max_orders=2,
+        aggressive=True,
+    )
+    assert len(result.orders) == 2
+    assert result.orders == (("SELL", "WHEAT", 1), ("SELL", "CARROT", 1))
 
 
 def test_multiple_partial_observations_follow_current_stock_exactly():
