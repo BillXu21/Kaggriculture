@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import jax
 import numpy as np
 import optax
 import pytest
 
+import rl_manager.stage25_ppo as stage25_ppo
 from rl_manager.stage25_ppo import (
     Stage25PPOBatch,
     Stage25PPOConfig,
@@ -12,7 +15,9 @@ from rl_manager.stage25_ppo import (
     _map_policy_eval,
     _objective_from_output,
     _padded_training_views,
+    audit_stage25_ppo_rollout,
     compute_stage25_gae,
+    evaluate_stage25_ppo,
     init_stage25_ppo_state,
     joint_clipped_surrogate,
     make_stage25_ppo_optimizer,
@@ -209,6 +214,128 @@ def test_compiled_short_minibatch_excludes_physical_padding():
                                    atol=3e-6, rtol=3e-6)
     np.testing.assert_allclose(padded_metrics["loss"], compact_metrics["loss"],
                                atol=3e-6, rtol=3e-6)
+
+
+def test_chunked_audit_matches_whole_rollout_numerically():
+    config = Stage25PPOConfig(
+        physical_batch_size=2, minibatch_size=2, epochs=1)
+    params, batch = _ppo_fixture(config, rows=5)
+    whole_output, whole_metrics = evaluate_stage25_ppo(params, batch, config)
+
+    audit = audit_stage25_ppo_rollout(params, batch, config)
+
+    np.testing.assert_allclose(
+        audit["initial_ratio_mean"], np.asarray(whole_metrics["ratio_mean"]),
+        atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(
+        audit["initial_kl"], np.asarray(whole_metrics["kl"]),
+        atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(
+        audit["max_abs_error"]["joint_logprob"],
+        np.max(np.abs(np.asarray(whole_output["joint_logprob"])
+                      - batch.old_joint_logprobs)),
+        atol=2e-6, rtol=2e-6)
+
+
+def test_audit_chunks_are_bounded_and_pad_only_the_final_short_chunk(monkeypatch):
+    config = Stage25PPOConfig(
+        physical_batch_size=2, minibatch_size=2, epochs=1)
+    _params, batch = _ppo_fixture(config, rows=5)
+    seen = []
+
+    def fake_evaluate(_params, chunk, _config, *, logical_size=None):
+        seen.append((len(chunk.classes), logical_size))
+        return {
+            "classes": chunk.classes.copy(),
+            "valid": np.ones(len(chunk.classes), dtype=bool),
+            "component_logprobs": chunk.old_component_logprobs.copy(),
+            "joint_logprob": chunk.old_joint_logprobs.copy(),
+            "value": chunk.old_values.copy(),
+        }, {"ratio_mean": np.asarray(1.0), "kl": np.asarray(0.0)}
+
+    monkeypatch.setattr(stage25_ppo, "evaluate_stage25_ppo", fake_evaluate)
+    audit = audit_stage25_ppo_rollout(_params, batch, config)
+
+    assert seen == [(2, 2), (2, 2), (1, 2)]
+    assert audit["chunk_size"] == 2
+    assert audit["chunks"] == 3
+
+
+def test_audit_uses_global_max_and_row_weighted_means(monkeypatch):
+    config = Stage25PPOConfig(
+        physical_batch_size=2, minibatch_size=2, epochs=1)
+    _params, batch = _ppo_fixture(config, rows=5)
+    component_deltas = (1e-6, 2e-6, 4e-6)
+    joint_deltas = (2e-6, 5e-6, 3e-6)
+    value_deltas = (3e-6, 1e-6, 6e-6)
+    ratio_means = (1.0, 3.0, 5.0)
+    kls = (0.2, 0.4, 0.6)
+    call = 0
+
+    def fake_evaluate(_params, chunk, _config, *, logical_size=None):
+        nonlocal call
+        index = call
+        call += 1
+        component = chunk.old_component_logprobs.copy()
+        component[0, 0] += np.float32(component_deltas[index])
+        joint = chunk.old_joint_logprobs.copy()
+        joint[0] += np.float32(joint_deltas[index])
+        values = chunk.old_values.copy()
+        values[0] += np.float32(value_deltas[index])
+        return {
+            "classes": chunk.classes.copy(), "valid": np.ones(len(chunk.classes), bool),
+            "component_logprobs": component, "joint_logprob": joint,
+            "value": values,
+        }, {"ratio_mean": np.asarray(ratio_means[index]),
+            "kl": np.asarray(kls[index])}
+
+    monkeypatch.setattr(stage25_ppo, "evaluate_stage25_ppo", fake_evaluate)
+    audit = audit_stage25_ppo_rollout(_params, batch, config)
+
+    expected_errors = {
+        "component_logprobs": float(np.float32(component_deltas[-1])),
+        "joint_logprob": float(np.float32(joint_deltas[-2])),
+        "value": float(np.float32(value_deltas[-1])),
+    }
+    assert audit["max_abs_error"] == pytest.approx(expected_errors, abs=4e-7)
+    assert audit["initial_ratio_mean"] == pytest.approx(2.6)
+    assert audit["initial_kl"] == pytest.approx(0.36)
+
+
+def test_late_audit_failure_is_atomic_and_reports_source_row(monkeypatch):
+    config = Stage25PPOConfig(
+        physical_batch_size=2, minibatch_size=2, epochs=1)
+    params, original_batch = _ppo_fixture(config, rows=6)
+    batch = replace(
+        original_batch,
+        source_row_ids=tuple(f"source-{index}" for index in range(6)))
+    state = init_stage25_ppo_state(config, seed=23, params=params)
+    before_params = jax.tree_util.tree_map(np.asarray, state.params)
+    before_optimizer = jax.tree_util.tree_map(np.asarray, state.optimizer_state)
+    before_rng = np.asarray(state.rng).copy()
+
+    def fake_evaluate(_params, chunk, _config, *, logical_size=None):
+        values = chunk.old_values.copy()
+        if "source-4" in chunk.source_row_ids:
+            values[0] += 1.0
+        return {
+            "classes": chunk.classes.copy(), "valid": np.ones(len(chunk.classes), bool),
+            "component_logprobs": chunk.old_component_logprobs.copy(),
+            "joint_logprob": chunk.old_joint_logprobs.copy(), "value": values,
+        }, {"ratio_mean": np.asarray(1.0), "kl": np.asarray(0.0)}
+
+    monkeypatch.setattr(stage25_ppo, "evaluate_stage25_ppo", fake_evaluate)
+    with pytest.raises(ValueError, match="source-4"):
+        ppo_update(state, batch, config)
+
+    for before, after in zip(jax.tree_util.tree_leaves(before_params),
+                             jax.tree_util.tree_leaves(state.params)):
+        np.testing.assert_array_equal(before, np.asarray(after))
+    for before, after in zip(jax.tree_util.tree_leaves(before_optimizer),
+                             jax.tree_util.tree_leaves(state.optimizer_state)):
+        np.testing.assert_array_equal(before, np.asarray(after))
+    np.testing.assert_array_equal(np.asarray(state.rng), before_rng)
+    assert state.update_counter == 0
 
 
 def test_invalid_physical_row_is_rejected_before_state_commit():
