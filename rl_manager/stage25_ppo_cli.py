@@ -14,8 +14,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from rl_manager.parallel import ParallelSelfPlayRunner
+from rl_manager.reward import (
+    TERMINAL_OWN_BANK,
+    TERMINAL_WLT,
+    RewardConfig,
+)
 from rl_manager.runner import RunnerConfig, build_episode_spec
 from rl_manager.stage25_trajectory import Stage25TrajectoryBuffer
+from rl_manager.types import CANDIDATE_VS_FROZEN, CURRENT_VS_CURRENT_ECONOMIC
 
 
 def _model(name: str) -> Stage25ModelConfig:
@@ -51,6 +57,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-size", choices=("tiny", "small", "large"), default="tiny")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--engine", choices=("fast", "official"), default="fast")
+    parser.add_argument(
+        "--training-composition",
+        choices=(CANDIDATE_VS_FROZEN, CURRENT_VS_CURRENT_ECONOMIC),
+        default=CANDIDATE_VS_FROZEN,
+    )
+    parser.add_argument(
+        "--reward-mode", choices=(TERMINAL_WLT, TERMINAL_OWN_BANK),
+        default=TERMINAL_WLT,
+    )
+    parser.add_argument("--bank-reward-baseline", type=float, default=3000.0)
+    parser.add_argument("--bank-reward-scale", type=float, default=50000.0)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--rollout-size", type=int, default=2)
     parser.add_argument("--max-turns", type=int, default=144)
@@ -67,6 +84,49 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--updates", type=int, default=1)
     return parser
+
+
+def _reward_config(args: argparse.Namespace) -> RewardConfig:
+    config = RewardConfig(
+        mode=args.reward_mode,
+        bank_baseline=args.bank_reward_baseline,
+        bank_scale=args.bank_reward_scale,
+    )
+    if (args.training_composition == CURRENT_VS_CURRENT_ECONOMIC
+            and config.mode != TERMINAL_OWN_BANK):
+        raise ValueError(
+            "current_vs_current_economic requires --reward-mode "
+            "terminal_own_bank")
+    return config
+
+
+def _training_contract(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "training_composition": args.training_composition,
+        "reward": _reward_config(args).to_json_dict(),
+    }
+
+
+def _checkpoint_training_contract(meta: Mapping[str, Any]) -> dict[str, Any]:
+    stored = meta.get("training_contract")
+    if isinstance(stored, dict):
+        return dict(stored)
+    # Checkpoints written before this CLI exposed composition/reward options
+    # were always candidate-v-frozen with the RunnerConfig W/L default.
+    cli_args = meta.get("cli_args")
+    if isinstance(cli_args, dict):
+        return {
+            "training_composition": cli_args.get(
+                "training_composition", CANDIDATE_VS_FROZEN),
+            "reward": {
+                "mode": cli_args.get("reward_mode", TERMINAL_WLT),
+                "bank_baseline": float(
+                    cli_args.get("bank_reward_baseline", 3000.0)),
+                "bank_scale": float(
+                    cli_args.get("bank_reward_scale", 50000.0)),
+            },
+        }
+    return {}
 
 
 def _config(args: argparse.Namespace) -> Stage25PPOConfig:
@@ -131,6 +191,12 @@ def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stag
         ppo_config=config.to_dict(), optimizer_config=config.to_dict(),
         curriculum=config.model.curriculum,
         expected_physical_contract=expected_physical, return_opponent=True)
+    expected_contract = _training_contract(args)
+    stored_contract = _checkpoint_training_contract(meta)
+    if stored_contract != expected_contract:
+        raise ValueError(
+            "PPO checkpoint training/reward contract does not match the "
+            f"requested contract: {stored_contract!r} != {expected_contract!r}")
     if meta.get("executor") != runtime_executor:
         raise ValueError(
             "PPO checkpoint executor provenance does not match the configured "
@@ -170,6 +236,7 @@ def _collection(
     from rl_manager.runner import _executor_factory_provenance
     from rl_manager.stage25_inference import Stage25InferenceAdapter
     from rl_manager.stage25_ppo import build_stage25_ppo_batch
+    reward_config = _reward_config(args)
     learner = Stage25InferenceAdapter(
         params=state.params, config=config.model, name="stage25_learner",
         version="ppo-native-v1", seed=seed, mode="stochastic")
@@ -189,13 +256,15 @@ def _collection(
         backend_name=args.engine,
         backend_configuration={"seed": seed, "numThreads": 1},
         max_turns=args.max_turns, low_telemetry=True, stage25_enabled=True,
-        stage25_mode="stochastic", stage25_fixed_inference_batch_size=config.physical_batch_size)
+        stage25_mode="stochastic",
+        stage25_fixed_inference_batch_size=config.physical_batch_size,
+        reward_config=reward_config)
     runner = ParallelSelfPlayRunner(
         runner_config, num_workers=args.workers, master_seed=seed,
         executor_factory=make_stage25_executor_factory(),
         stage25_trajectory_buffer=trajectory)
     specs = tuple(build_episode_spec(
-        index, seed + index, "candidate_vs_frozen", learner, opponent)
+        index, seed + index, args.training_composition, learner, opponent)
                   for index in range(args.rollout_size))
     results = runner.run(specs)
     batch = build_stage25_ppo_batch(
@@ -211,6 +280,8 @@ def _collection(
         "inference_metrics": runner.inference_metrics,
         "behavior_identity": learner.identity.to_json_dict(),
         "opponent_identity": opponent.identity.to_json_dict(),
+        "training_composition": args.training_composition,
+        "reward": reward_config.to_json_dict(),
         "executor_provenance": _executor_factory_provenance(
             runner.provenance["executor_factory"]),
     }
@@ -235,6 +306,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             "Packet 5A single-process collection cannot honor a physical "
             "batch larger than one; use --workers 2+ or set "
             "--physical-batch-size 1")
+    _reward_config(args)
     state, source_meta = _new_state(args, config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     all_metrics = []
@@ -276,6 +348,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         state = replace(state, rollout_seed=state.rollout_seed + args.rollout_size)
         metadata = {
             "run": {"cli": "rl_manager.stage25_ppo_cli", "source": str(args.init) if args.init else None},
+            "training_contract": _training_contract(args),
             "resume_from": (
                 None if not args.resume else {
                     "path": str(args.resume),
@@ -293,7 +366,10 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             provenance={"run": metadata},
             physical_contract=_physical_contract(config),
             executor=executor_provenance,
-            metadata={"cli_args": vars(args)},
+            metadata={
+                "cli_args": vars(args),
+                "training_contract": _training_contract(args),
+            },
             opponent_params=state.opponent_params,
             opponent_identity=state.opponent_identity,
             source_identity=(source_meta.get("source_identity") or None),
