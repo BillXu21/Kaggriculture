@@ -1,5 +1,13 @@
 # Stage 2.5: old PPO with heuristic upkeep
 
+> **Status (2026-09-15): historical experiment.** The project has moved to the
+> experimental strip executor and native Stage 2.5 manager stack. Current
+> executor architecture, Packet 5C insta-sell findings, P-final compatibility
+> smoke, durable executor philosophy, and the proposed scratch Stage 2.5 TPU
+> experiment are documented in
+> `research/STAGE25_STRIP_EXECUTOR_STATUS_2026-09-15.md`. The results below are
+> still useful historical evidence but are not the current executor contract.
+
 Base: `ad68a58f64d93c305ecdf97f5b32101fc0223e16` on
 `codex/no-empty-animal-housing`. Experiment branch:
 `codex/stage25-upkeep-ablation`.
