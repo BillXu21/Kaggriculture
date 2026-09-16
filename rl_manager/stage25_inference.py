@@ -44,9 +44,7 @@ from rl_manager.stage25_mechanics import (
 from rl_manager.stage25_policy import (
     Stage25ModelConfig,
     _host_inputs,
-    evaluate_actions as _evaluate_actions,
-    greedy_act,
-    stochastic_act,
+    _call_prepared_policy,
 )
 from rl_manager.stage25_types import (
     STAGE25_PHYSICAL_SUPPORT_VERSION,
@@ -76,6 +74,7 @@ _BOOLEAN_INPUTS = frozenset({"board_bool"})
 _OUTPUT_FLOAT_FIELDS = ("component_logprobs", "joint_logprob", "value")
 _AUDIT_ATOL = 1.0e-6
 _AUDIT_RTOL = 1.0e-6
+_ROW_FOLD_IN = jax.vmap(jax.random.fold_in, in_axes=(None, 0))
 
 
 def _normalise_mode(mode: str, deterministic: bool) -> str:
@@ -219,6 +218,7 @@ def _normalise_contexts(
 def _validate_context_consistency(
     inputs: Mapping[str, Any], contexts: Sequence[PhysicalContext],
     crop_capacity: Any, supports: Sequence[Any] | None = None,
+    *, check_observation: bool = True,
 ) -> None:
     """Check that explicit physical payloads agree with canonical inputs.
 
@@ -230,16 +230,17 @@ def _validate_context_consistency(
     board_animals = np.asarray(inputs["board_animal"])
     capacities = np.asarray(crop_capacity).reshape(len(contexts), 5)
     for row, context in enumerate(contexts):
-        observed_land = int(np.count_nonzero(unlocked[row]))
-        placed = tuple(
-            int(np.count_nonzero(board_animals[row] == species + 1))
-            for species in range(3))
-        if context.observed_land != observed_land:
-            raise ValueError(
-                f"physical context row {row} observed_land disagrees with inputs")
-        if context.placed_animals != placed:
-            raise ValueError(
-                f"physical context row {row} placed_animals disagrees with inputs")
+        if check_observation:
+            observed_land = int(np.count_nonzero(unlocked[row]))
+            placed = tuple(
+                int(np.count_nonzero(board_animals[row] == species + 1))
+                for species in range(3))
+            if context.observed_land != observed_land:
+                raise ValueError(
+                    f"physical context row {row} observed_land disagrees with inputs")
+            if context.placed_animals != placed:
+                raise ValueError(
+                    f"physical context row {row} placed_animals disagrees with inputs")
         if supports is None:
             continue
         support = supports[row]
@@ -308,6 +309,12 @@ def _root_key(prng_id: str, identity: Stage25BehaviorIdentity,
     digest = hashlib.sha256(
         (identity.fingerprint + "|" + canonical).encode("utf-8")).digest()
     return jax.random.PRNGKey(int.from_bytes(digest[:4], "little"))
+
+
+def _row_rng_keys(root: jax.Array, row_ids: np.ndarray) -> jax.Array:
+    """Fold each stable row token into ``root`` with the legacy semantics."""
+    tokens = jnp.asarray(row_ids, dtype=jnp.uint32)
+    return _ROW_FOLD_IN(root, tokens)
 
 
 class Stage25InferenceAdapter:
@@ -455,7 +462,8 @@ class Stage25InferenceAdapter:
         contexts = None
         if physical_contexts is not None:
             contexts = _normalise_contexts(physical_contexts, batch)
-            _validate_context_consistency(inputs, contexts, capacity)
+            _validate_context_consistency(
+                inputs, contexts, inputs["crop_capacity"])
         return batch, prepared, capacity, contexts
 
     def _outputs(self, result: Mapping[str, Any], batch: int) -> Stage25PolicyOutputs:
@@ -471,41 +479,47 @@ class Stage25InferenceAdapter:
                                       batch_size=batch)
         return output
 
-    def plan_batch(
-        self, inputs: Mapping[str, Any], prng_id: str, *,
-        physical_contexts: Sequence[PhysicalContext] | None = None,
+    def _plan_prepared(
+        self, batch: int, prepared: Mapping[str, Any], capacity: jax.Array,
+        contexts: tuple[PhysicalContext, ...] | None, ids: np.ndarray,
+        prng_id: str,
     ) -> Stage25PolicyOutputs:
-        batch = _validate_inputs(inputs)
-        return self.plan_batch_with_row_ids(
-            inputs, tuple(range(batch)), prng_id,
-            physical_contexts=physical_contexts)
-
-    def plan_batch_with_row_ids(
-        self, inputs: Mapping[str, Any], row_ids: Sequence[Any], prng_id: str,
-        *, physical_contexts: Sequence[PhysicalContext] | None = None,
-    ) -> Stage25PolicyOutputs:
-        batch, prepared, capacity, contexts = self._prepare(inputs, physical_contexts)
-        ids = _normalise_row_ids(row_ids, batch)
         if self.deterministic:
-            result = greedy_act(
-                self.params, prepared, self.config,
-                physical_contexts=contexts, crop_capacity=capacity,
-                row_ids=ids)
+            result = _call_prepared_policy(
+                self.params, prepared, capacity, batch, self.config,
+                mode="greedy", physical_contexts=contexts, row_ids=ids)
         else:
             root = _root_key(prng_id, self.identity, self.seed)
-            keys = np.asarray(jnp.stack([
-                jax.random.fold_in(root, int(row_id)) for row_id in ids
-            ]), dtype=np.uint32)
-            result = stochastic_act(
-                self.params, prepared, self.config, rng_keys=keys,
-                physical_contexts=contexts, crop_capacity=capacity, row_ids=ids,
-                reject_invalid=False)
+            keys = _row_rng_keys(root, ids)
+            result = _call_prepared_policy(
+                self.params, prepared, capacity, batch, self.config,
+                mode="sample", rng_keys=keys, physical_contexts=contexts,
+                row_ids=ids, reject_invalid=False)
         output = self._outputs(result, batch)
         if not bool(np.all(output.valid)):
             raise ValueError("native stochastic inference produced unsupported physical actions")
         self.call_count += 1
         self.batch_size_history.append(batch)
         return output
+
+    def plan_batch(
+        self, inputs: Mapping[str, Any], prng_id: str, *,
+        physical_contexts: Sequence[PhysicalContext] | None = None,
+    ) -> Stage25PolicyOutputs:
+        return self.plan_batch_with_row_ids(
+            inputs, None, prng_id,
+            physical_contexts=physical_contexts)
+
+    def plan_batch_with_row_ids(
+        self, inputs: Mapping[str, Any], row_ids: Sequence[Any] | None,
+        prng_id: str,
+        *, physical_contexts: Sequence[PhysicalContext] | None = None,
+    ) -> Stage25PolicyOutputs:
+        batch, prepared, capacity, contexts = self._prepare(inputs, physical_contexts)
+        ids = (np.arange(batch, dtype=np.int32) if row_ids is None
+               else _normalise_row_ids(row_ids, batch))
+        return self._plan_prepared(
+            batch, prepared, capacity, contexts, ids, prng_id)
 
     def infer_batch(
         self, inputs: Mapping[str, Any], crop_capacity: Any = None,
@@ -528,22 +542,24 @@ class Stage25InferenceAdapter:
                     np.asarray(merged["crop_capacity"]), np.asarray(crop_capacity)):
                 raise ValueError("crop_capacity disagrees between inputs and context")
             merged["crop_capacity"] = crop_capacity
-        batch = _validate_inputs(merged)
+        batch, prepared, capacity, contexts = self._prepare(
+            merged, physical_contexts)
         support_rows = None if supports is None else tuple(supports)
         if support_rows is not None:
             if len(support_rows) != batch:
                 raise ValueError("supports must contain one row per input")
-            if physical_contexts is not None:
-                contexts = _normalise_contexts(physical_contexts, batch)
+            if contexts is not None:
                 _validate_context_consistency(
-                    merged, contexts, merged["crop_capacity"], support_rows)
+                    merged, contexts, merged["crop_capacity"], support_rows,
+                    check_observation=False)
         if prng_id is None:
             raise ValueError("prng_id is required")
         if row_ids is None:
-            return self.plan_batch(merged, prng_id,
-                                   physical_contexts=physical_contexts)
-        return self.plan_batch_with_row_ids(
-            merged, row_ids, prng_id, physical_contexts=physical_contexts)
+            ids = np.arange(batch, dtype=np.int32)
+        else:
+            ids = _normalise_row_ids(row_ids, batch)
+        return self._plan_prepared(
+            batch, prepared, capacity, contexts, ids, prng_id)
 
     stage25_infer_batch = infer_batch
     plan_batch_with_context = infer_batch
@@ -552,9 +568,10 @@ class Stage25InferenceAdapter:
         self, inputs: Mapping[str, Any], *, physical_contexts: Sequence[PhysicalContext] | None = None,
     ) -> Stage25PolicyOutputs:
         batch, prepared, capacity, contexts = self._prepare(inputs, physical_contexts)
-        result = greedy_act(
-            self.params, prepared, self.config, physical_contexts=contexts,
-            crop_capacity=capacity, row_ids=np.arange(batch, dtype=np.int32))
+        result = _call_prepared_policy(
+            self.params, prepared, capacity, batch, self.config,
+            mode="greedy", physical_contexts=contexts,
+            row_ids=np.arange(batch, dtype=np.int32))
         output = self._outputs(result, batch)
         if not bool(np.all(output.valid)):
             raise ValueError("native greedy inference produced unsupported physical actions")
@@ -583,10 +600,10 @@ class Stage25InferenceAdapter:
             raise ValueError("classes cannot be represented by int16")
         ids = (np.arange(batch, dtype=np.int32) if row_ids is None
                else _normalise_row_ids(row_ids, batch))
-        result = _evaluate_actions(
-            self.params, prepared, self.config, actions=actions,
-            physical_contexts=contexts, crop_capacity=capacity, row_ids=ids,
-            reject_invalid=reject_invalid)
+        result = _call_prepared_policy(
+            self.params, prepared, capacity, batch, self.config,
+            mode="evaluate", actions=actions, physical_contexts=contexts,
+            row_ids=ids, reject_invalid=reject_invalid)
         return self._outputs(result, batch)
 
     def evaluate_actions(self, inputs: Mapping[str, Any], classes: Any = None, *,
@@ -627,9 +644,9 @@ class Stage25InferenceAdapter:
         classes = np.zeros((batch, len(ACTION_CLASS_COUNTS)), dtype=np.int16)
         ids = (np.arange(batch, dtype=np.int32) if row_ids is None
                else _normalise_row_ids(row_ids, batch))
-        result = _evaluate_actions(
-            self.params, prepared, self.config, actions=classes,
-            physical_contexts=contexts, crop_capacity=capacity,
+        result = _call_prepared_policy(
+            self.params, prepared, capacity, batch, self.config,
+            mode="evaluate", actions=classes, physical_contexts=contexts,
             row_ids=ids, reject_invalid=False)
         return np.asarray(result["value"], dtype=np.float32)
 

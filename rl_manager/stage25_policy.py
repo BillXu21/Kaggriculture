@@ -356,27 +356,18 @@ def _host_inputs(
     base = {key: value for key, value in inputs.items()
             if key not in ("crop_capacity", "row_ids")}
     _validate_encoder_inputs(base, config.manager_config, model_variant="E")
-    prepared = {
-        key: (jnp.asarray(value, dtype=jnp.int32)
-              if key in {"board_kind", "board_crop", "board_animal",
-                         "board_mask", "shed_counts", "carried_counts",
-                         "unlocked", "seed_counts", "market_inventory",
-                         "shop_counts", "day", "days_remaining"}
-              else jnp.asarray(value, dtype=jnp.float32))
-        for key, value in base.items()
-    }
     # Economics are allowed as encoder context, but never enter the physical
     # support equations below.  This preserves the corrected-E representation
     # while keeping permanent feasibility independent of prices or money.
-    b = int(prepared["board_kind"].shape[0])
-    board = prepared["board_kind"]
+    board = np.asarray(base["board_kind"])
+    b = int(board.shape[0])
     if tuple(board.shape) != (b, BOARD_SIZE):
         raise ValueError("board_kind must have shape [B, 100]")
-    if tuple(prepared["board_animal"].shape) != tuple(board.shape):
+    if tuple(np.asarray(base["board_animal"]).shape) != tuple(board.shape):
         raise ValueError("board_animal must match board_kind")
-    if tuple(prepared["board_mask"].shape) != (b, BOARD_SIZE, 4):
+    if tuple(np.asarray(base["board_mask"]).shape) != (b, BOARD_SIZE, 4):
         raise ValueError("board_mask must have shape [B, 100, 4]")
-    unlocked = np.asarray(prepared["unlocked"])
+    unlocked = np.asarray(base["unlocked"])
     if unlocked.shape != (b, _N_LAND) or not np.all(np.isin(unlocked, (0, 1))):
         raise ValueError("unlocked must have shape [B, 4] and contain 0/1")
     prefix = np.asarray(unlocked, dtype=np.int32)
@@ -402,6 +393,15 @@ def _host_inputs(
         raise ValueError(
             "crop_capacity (persistent goal ledger K) entries must lie in "
             "[0, 100]")
+    prepared = {
+        key: (jnp.asarray(value, dtype=jnp.int32)
+              if key in {"board_kind", "board_crop", "board_animal",
+                         "board_mask", "shed_counts", "carried_counts",
+                         "unlocked", "seed_counts", "market_inventory",
+                         "shop_counts", "day", "days_remaining"}
+              else jnp.asarray(value, dtype=jnp.float32))
+        for key, value in base.items()
+    }
     return prepared, jnp.asarray(ledger_array.astype(np.int32)), b
 
 
@@ -755,6 +755,25 @@ def _call_policy(
 ) -> dict[str, Any]:
     prepared, capacity, batch = _host_inputs(
         inputs, config, crop_capacity=crop_capacity)
+    return _call_prepared_policy(
+        params, prepared, capacity, batch, config, mode=mode,
+        rng_keys=rng_keys, actions=actions,
+        physical_contexts=physical_contexts, row_ids=row_ids,
+        reject_invalid=reject_invalid)
+
+
+def _call_prepared_policy(
+        params: Mapping[str, Any], prepared: Mapping[str, jax.Array],
+        capacity: jax.Array, batch: int, config: Stage25ModelConfig, *,
+        mode: str, rng_keys: Any = None, actions: Any = None,
+        physical_contexts: Any = None, row_ids: Any = None,
+        reject_invalid: bool = True,
+) -> dict[str, Any]:
+    """Run policy computation after the host preparation contract is met.
+
+    The parent-owned inference adapter uses this seam so its host validation
+    and encoder conversion are not repeated by a public policy wrapper.
+    """
     if rng_keys is None:
         keys = jnp.zeros((batch, 2), dtype=jnp.uint32)
     else:
