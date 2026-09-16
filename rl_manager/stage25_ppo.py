@@ -356,9 +356,15 @@ def _default_context_values(batch: int) -> tuple[jax.Array, ...]:
     return tuple(jnp.zeros((batch,) if index in (0, 3, 4) else (batch, 3) if index in (2, 5) else (batch, 4,), dtype=jnp.int32) for index in range(6))
 
 
-def _physical_views(batch: Stage25PPOBatch, model: Stage25ModelConfig, physical_batch_size: int):
+def _physical_views(
+        batch: Stage25PPOBatch, model: Stage25ModelConfig,
+        physical_batch_size: int, *, logical_size: int | None = None,
+):
     n = len(batch.classes)
-    chunks = (n + physical_batch_size - 1) // physical_batch_size
+    logical_size = n if logical_size is None else logical_size
+    if logical_size < n:
+        raise ValueError("logical_size cannot be smaller than the real PPO batch")
+    chunks = (logical_size + physical_batch_size - 1) // physical_batch_size
     total = chunks * physical_batch_size
     padded_inputs = _pad_inputs(batch.inputs, total)
     prepared, capacity, size = _host_inputs(padded_inputs, model)
@@ -378,23 +384,57 @@ def _physical_views(batch: Stage25PPOBatch, model: Stage25ModelConfig, physical_
         jnp.asarray(classes, dtype=jnp.int32).reshape((chunks, physical_batch_size, 9)),
         tuple(value.reshape((chunks, physical_batch_size) + value.shape[1:]) for value in contexts),
         jnp.asarray(row_ids).reshape((chunks, physical_batch_size)),
+        jnp.arange(total, dtype=jnp.int32) < n,
         chunks, total, n)
     return views + (explicit,)
 
 
-def _map_policy_eval(params: Mapping[str, Any], batch: Stage25PPOBatch, config: Stage25PPOConfig):
-    prepared, capacity, classes, contexts, row_ids, chunks, total, n, explicit = _physical_views(batch, config.model, config.physical_batch_size)
-    keys = jnp.zeros((chunks, config.physical_batch_size, 2), dtype=jnp.uint32)
+def _flatten_chunked(value: Any, total: int) -> Any:
+    if isinstance(value, Mapping):
+        return {name: _flatten_chunked(child, total)
+                for name, child in value.items()}
+    array = jnp.asarray(value)
+    return array.reshape((total,) + array.shape[2:])
+
+
+def _trim_rows(value: Any, rows: int) -> Any:
+    if isinstance(value, Mapping):
+        return {name: _trim_rows(child, rows)
+                for name, child in value.items()}
+    return jnp.asarray(value)[:rows]
+
+
+def _policy_eval_chunks_impl(
+        params: Mapping[str, Any], prepared: Mapping[str, jax.Array],
+        capacity: jax.Array, classes: jax.Array,
+        contexts: tuple[jax.Array, ...], row_ids: jax.Array,
+        model: Stage25ModelConfig, explicit: bool,
+):
+    """Evaluate fixed physical chunks without a Python-side JAX trace."""
+    keys = jnp.zeros(classes.shape[:2] + (2,), dtype=jnp.uint32)
+
     def run(one):
         inputs, ledger, actions, context, ids, key = one
-        return _stage25_jit(params, inputs, ledger, key, actions, context, ids, config.model, "eval", explicit)
+        return _stage25_jit(
+            params, inputs, ledger, key, actions, context, ids, model,
+            "eval", explicit)
+
     mapped = jax.lax.map(run, (prepared, capacity, classes, contexts, row_ids, keys))
-    def flatten(value):
-        if isinstance(value, Mapping):
-            return {name: flatten(child) for name, child in value.items()}
-        array = jnp.asarray(value)
-        return array.reshape((total,) + array.shape[2:])[:n]
-    return flatten(mapped)
+    return _flatten_chunked(mapped, classes.shape[0] * classes.shape[1])
+
+
+_stage25_policy_eval_jit = jax.jit(
+    _policy_eval_chunks_impl, static_argnames=("model", "explicit"))
+
+
+def _map_policy_eval(params: Mapping[str, Any], batch: Stage25PPOBatch, config: Stage25PPOConfig):
+    prepared, capacity, classes, contexts, row_ids, _real_rows, chunks, total, n, explicit = _physical_views(
+        batch, config.model, config.physical_batch_size)
+    output = _stage25_policy_eval_jit(
+        params, prepared, capacity, classes, contexts, row_ids,
+        config.model, explicit)
+    del chunks, total
+    return _trim_rows(output, n)
 
 
 def _objective_from_output(
@@ -428,6 +468,115 @@ def _objective_from_output(
         "valid": jnp.asarray(output["valid"]),
     }
     return total_loss, {**metrics, **ratio_metrics}, output
+
+
+def _masked_mean(value: jax.Array, real_rows: jax.Array) -> jax.Array:
+    mask = jnp.asarray(real_rows, dtype=jnp.float32)
+    return jnp.sum(jnp.where(mask.astype(jnp.bool_), value, 0.0)) / jnp.sum(mask)
+
+
+def _padded_field(value: Any, total: int) -> jax.Array:
+    array = np.asarray(value)
+    if array.shape[0] < total:
+        array = np.concatenate(
+            (array, np.repeat(array[-1:], total - array.shape[0], axis=0)),
+            axis=0)
+    return jnp.asarray(array)
+
+
+def _padded_training_views(batch: Stage25PPOBatch, config: Stage25PPOConfig):
+    """Make every logical minibatch use the same physical compiled shape."""
+    views = _physical_views(
+        batch, config.model, config.physical_batch_size,
+        logical_size=config.minibatch_size)
+    prepared, capacity, classes, contexts, row_ids, real_rows, chunks, total, n, explicit = views
+    return (
+        prepared, capacity, classes, contexts, row_ids,
+        _padded_field(batch.old_joint_logprobs, total).astype(jnp.float32),
+        _padded_field(batch.old_values, total).astype(jnp.float32),
+        _padded_field(batch.advantages, total).astype(jnp.float32),
+        _padded_field(batch.returns, total).astype(jnp.float32),
+        real_rows, explicit)
+
+
+def _objective_from_padded_output(
+        output: Mapping[str, Any], old_joint: jax.Array,
+        old_values: jax.Array, advantages: jax.Array, returns: jax.Array,
+        real_rows: jax.Array, config: Stage25PPOConfig,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    new_joint = jnp.asarray(output["joint_logprob"], dtype=jnp.float32)
+    advantages = jnp.asarray(advantages, dtype=jnp.float32)
+    ratio = jnp.exp(new_joint - jnp.asarray(old_joint, dtype=jnp.float32))
+    clipped = jnp.clip(ratio, 1.0 - config.clip_epsilon,
+                       1.0 + config.clip_epsilon)
+    terms = jnp.minimum(ratio * advantages, clipped * advantages)
+    policy_loss = -_masked_mean(terms, real_rows)
+    new_value = jnp.asarray(output["value"], dtype=jnp.float32)
+    old_values = jnp.asarray(old_values, dtype=jnp.float32)
+    returns = jnp.asarray(returns, dtype=jnp.float32)
+    value_loss = 0.5 * _masked_mean(jnp.square(new_value - returns), real_rows)
+    entropy_surrogate = _masked_mean(
+        jnp.asarray(output["prefix_entropy_surrogate"], dtype=jnp.float32),
+        real_rows)
+    total_loss = (policy_loss + config.value_coefficient * value_loss
+                  - config.entropy_coefficient * entropy_surrogate)
+    metrics = {
+        "loss": total_loss,
+        "policy_loss": policy_loss,
+        "value_loss": value_loss,
+        "entropy_surrogate": entropy_surrogate,
+        "kl": _masked_mean(jnp.asarray(old_joint, dtype=jnp.float32) - new_joint,
+                            real_rows),
+        "clip_fraction": _masked_mean(
+            (jnp.abs(ratio - 1.0) > config.clip_epsilon).astype(jnp.float32),
+            real_rows),
+        "value_prediction": _masked_mean(new_value, real_rows),
+        "old_value_prediction": _masked_mean(old_values, real_rows),
+        "ratio_mean": _masked_mean(ratio, real_rows),
+        "component_logprobs": jnp.asarray(output["component_logprobs"]),
+        "new_joint_logprobs": new_joint,
+        "new_values": new_value,
+        "valid": jnp.asarray(output["valid"]),
+        "ratio": ratio,
+        "clipped_ratio": clipped,
+        "terms": terms,
+    }
+    return total_loss, metrics
+
+
+def _compiled_stage25_ppo_step_impl(
+        params: Mapping[str, Any], optimizer_state: Any,
+        prepared: Mapping[str, jax.Array], capacity: jax.Array,
+        classes: jax.Array, contexts: tuple[jax.Array, ...], row_ids: jax.Array,
+        old_joint: jax.Array, old_values: jax.Array, advantages: jax.Array,
+        returns: jax.Array, real_rows: jax.Array,
+        config: Stage25PPOConfig, explicit: bool,
+):
+    def objective(tree):
+        output = _policy_eval_chunks_impl(
+            tree, prepared, capacity, classes, contexts, row_ids,
+            config.model, explicit)
+        loss, metrics = _objective_from_padded_output(
+            output, old_joint, old_values, advantages, returns, real_rows,
+            config)
+        return loss, (metrics, output)
+
+    (loss, (metrics, output)), gradients = jax.value_and_grad(
+        objective, has_aux=True)(params)
+    optimizer = make_stage25_ppo_optimizer(params, config)
+    updates, next_optimizer_state = optimizer.update(
+        gradients, optimizer_state, params)
+    next_params = optax.apply_updates(params, updates)
+    compact_output = {
+        name: output[name]
+        for name in ("classes", "component_logprobs", "joint_logprob",
+                     "value", "prefix_entropy_surrogate", "valid")}
+    return (next_params, next_optimizer_state, gradients, loss, metrics,
+            compact_output)
+
+
+_compiled_stage25_ppo_step = jax.jit(
+    _compiled_stage25_ppo_step_impl, static_argnames=("config", "explicit"))
 
 
 def evaluate_stage25_ppo(
@@ -550,7 +699,6 @@ def ppo_update(
                                           state.behavior_identity))):
         raise ValueError("PPO batch behavior identity does not match the frozen state identity")
     audit = audit_stage25_ppo_rollout(state.params, batch, config)
-    optimizer = make_stage25_ppo_optimizer(state.params, config)
     params = state.params
     opt_state = state.optimizer_state
     key = _normal_key(state.rng)
@@ -561,14 +709,14 @@ def ppo_update(
         order = np.asarray(jax.random.permutation(epoch_key, n), dtype=np.int64)
         for start in range(0, n, config.minibatch_size):
             minibatch = batch.take(order[start:start + config.minibatch_size])
-            def objective(tree):
-                output = _map_policy_eval(tree, minibatch, config)
-                objective_loss, objective_metrics, objective_output = _objective_from_output(output, minibatch, config)
-                return objective_loss, (objective_metrics, objective_output)
-            (loss, (metrics, output)), grads = jax.value_and_grad(objective, has_aux=True)(params)
-            _validate_update_output(output, minibatch)
-            updates, opt_state = optimizer.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
+            views = _padded_training_views(minibatch, config)
+            (next_params, next_opt_state, grads, loss, metrics,
+             output) = _compiled_stage25_ppo_step(
+                 params, opt_state, *views[:-1], config, views[-1])
+            _validate_update_output(
+                _trim_rows(output, len(minibatch.classes)), minibatch)
+            params = next_params
+            opt_state = next_opt_state
             grad_norm = optax.global_norm(grads)
             reports.append({
                 "loss": float(np.asarray(loss)),
