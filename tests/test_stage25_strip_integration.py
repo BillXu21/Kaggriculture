@@ -88,13 +88,15 @@ def test_strip_factory_wire_reconstruction_stays_accelerator_free():
     root = Path(__file__).resolve().parents[1]
     script = """
 import sys
+import rl_manager.stage25_ppo_cli
 from rl_manager.executor_factory import make_stage25_executor_factory
 from rl_manager.parallel import _factory_wire
 from rl_manager.parallel_worker import _factory_from_wire
 factory = _factory_from_wire(_factory_wire(make_stage25_executor_factory()))
 factory.create(backend_name='fast', seat=0, configuration={}, provider=object())
 assert not any(name == 'jax' or name.startswith('jax.') or
-               name == 'libtpu' or name.startswith('libtpu.')
+               name == 'libtpu' or name.startswith('libtpu.') or
+               name == 'optax' or name.startswith('optax.')
                for name in sys.modules)
 """
     result = subprocess.run(

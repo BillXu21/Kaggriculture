@@ -12,7 +12,7 @@ from dataclasses import replace
 import json
 import math
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from rl_manager.parallel import ParallelSelfPlayRunner
 from rl_manager.reward import (
@@ -23,6 +23,12 @@ from rl_manager.reward import (
 from rl_manager.runner import RunnerConfig, build_episode_spec
 from rl_manager.stage25_trajectory import Stage25TrajectoryBuffer
 from rl_manager.types import CANDIDATE_VS_FROZEN, CURRENT_VS_CURRENT_ECONOMIC
+
+if TYPE_CHECKING:
+    from rl_manager.stage25_inference import Stage25InferenceAdapter
+    from rl_manager.stage25_policy import Stage25ModelConfig
+    from rl_manager.stage25_ppo import Stage25PPOConfig, Stage25PPOTrainState
+    from rl_manager.stage25_types import Stage25BehaviorIdentity
 
 
 def _model(name: str) -> Stage25ModelConfig:
