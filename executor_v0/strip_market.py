@@ -29,6 +29,16 @@ __all__ = [
     "sell_bin_anchor",
 ]
 
+_AGGRESSIVE_SELL_PRODUCTS = (
+    "CARROT",
+    "TOMATO",
+    "STRAWBERRY",
+    "MELON",
+    "EGG",
+    "MILK",
+    "WOOL",
+)
+
 
 class MarketBlockReason(StrEnum):
     """Mechanical reason that an observed market intent was not submitted."""
@@ -200,7 +210,6 @@ def build_market_turn_plan(
         for requirement in item.required_supplies
         if requirement.scope == "inventory" and requirement.item == "WHEAT"
     )
-    feed_shed_reserve = max(0, feed_demand - carried.get("WHEAT", 0))
     aggressive_observed = {
         product: shed.get(product, 0)
         for product in PRODUCTS
@@ -217,10 +226,9 @@ def build_market_turn_plan(
         key = f"SELL:{anchor}:{product}"
         state.sell_requested[(anchor, product)] = requested
         if aggressive_sell_all:
+            if product not in _AGGRESSIVE_SELL_PRODUCTS:
+                continue
             route_protected = protected.get(product, 0)
-            if product == "WHEAT":
-                feed_shed_reserve = min(feed_shed_reserve, shed.get(product, 0))
-                route_protected = max(feed_shed_reserve, route_protected)
             if route_protected:
                 aggressive_protected[product] = route_protected
             sellable = max(0, shed.get(product, 0) - route_protected)
