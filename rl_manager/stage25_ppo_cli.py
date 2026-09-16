@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -69,6 +70,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--bank-reward-baseline", type=float, default=3000.0)
     parser.add_argument("--bank-reward-scale", type=float, default=50000.0)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--envs-per-worker", type=int, default=1)
+    parser.add_argument("--batch-backend", action="store_true")
+    parser.add_argument("--inference-batch-wait-ms", type=float, default=20.0)
     parser.add_argument("--rollout-size", type=int, default=2)
     parser.add_argument("--max-turns", type=int, default=144)
     parser.add_argument("--physical-batch-size", type=int, default=2)
@@ -105,6 +109,33 @@ def _training_contract(args: argparse.Namespace) -> dict[str, Any]:
         "training_composition": args.training_composition,
         "reward": _reward_config(args).to_json_dict(),
     }
+
+
+def _validate_rollout_controls(args: argparse.Namespace) -> None:
+    if args.envs_per_worker < 1:
+        raise ValueError("envs-per-worker must be positive")
+    if args.batch_backend and args.engine != "fast":
+        raise ValueError("--batch-backend requires --engine fast")
+    if (not math.isfinite(args.inference_batch_wait_ms)
+            or args.inference_batch_wait_ms < 0):
+        raise ValueError(
+            "inference-batch-wait-ms must be finite and >= 0")
+
+
+def _runner_config(
+        args: argparse.Namespace, *, seed: int,
+        reward_config: RewardConfig) -> RunnerConfig:
+    _validate_rollout_controls(args)
+    return RunnerConfig(
+        backend_name=args.engine,
+        backend_configuration={"seed": seed, "numThreads": 1},
+        num_envs=args.envs_per_worker,
+        batch_backend=args.batch_backend,
+        inference_batch_wait_seconds=args.inference_batch_wait_ms / 1000.0,
+        max_turns=args.max_turns, low_telemetry=True, stage25_enabled=True,
+        stage25_mode="stochastic",
+        stage25_fixed_inference_batch_size=args.physical_batch_size,
+        reward_config=reward_config)
 
 
 def _checkpoint_training_contract(meta: Mapping[str, Any]) -> dict[str, Any]:
@@ -252,13 +283,8 @@ def _collection(
         raise ValueError("restored opponent identity does not match its parameters")
     capacity = max(1, args.rollout_size * 2 * 26)
     trajectory = Stage25TrajectoryBuffer(capacity)
-    runner_config = RunnerConfig(
-        backend_name=args.engine,
-        backend_configuration={"seed": seed, "numThreads": 1},
-        max_turns=args.max_turns, low_telemetry=True, stage25_enabled=True,
-        stage25_mode="stochastic",
-        stage25_fixed_inference_batch_size=config.physical_batch_size,
-        reward_config=reward_config)
+    runner_config = _runner_config(
+        args, seed=seed, reward_config=reward_config)
     runner = ParallelSelfPlayRunner(
         runner_config, num_workers=args.workers, master_seed=seed,
         executor_factory=make_stage25_executor_factory(),
@@ -286,7 +312,8 @@ def _collection(
             runner.provenance["executor_factory"]),
     }
     for row in trajectory.rows:
-        if row.provenance.get("executor") != stats["executor_provenance"]:
+        if (json.dumps(row.provenance.get("executor"), sort_keys=True)
+                != json.dumps(stats["executor_provenance"], sort_keys=True)):
             raise ValueError(
                 f"trajectory row {row.row_id!r} executor provenance disagrees "
                 "with configured factory")
@@ -298,6 +325,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     from rl_manager.executor_factory import make_stage25_executor_factory
     from rl_manager.runner import _executor_factory_provenance
     from rl_manager.stage25_ppo import build_stage25_ppo_batch, ppo_update
+    _validate_rollout_controls(args)
     if args.updates < 1 or args.rollout_size < 1 or args.workers < 1:
         raise ValueError("updates, rollout-size, and workers must be positive")
     config = _config(args)

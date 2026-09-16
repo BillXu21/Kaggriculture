@@ -12,6 +12,7 @@ from rl_manager import stage25_checkpoint as checkpoint
 from rl_manager import stage25_ppo as ppo
 from rl_manager import stage25_ppo_cli as cli
 from rl_manager.executor_factory import make_stage25_executor_factory
+from rl_manager.reward import RewardConfig
 from rl_manager.runner import _executor_factory_provenance
 from rl_manager.stage25_inference import Stage25InferenceAdapter
 from rl_manager.stage25_policy import init_stage25_params, tiny_stage25_config
@@ -74,6 +75,45 @@ def test_current_current_cli_contract_requires_own_bank_reward() -> None:
         "--output-dir", "out"])
     with pytest.raises(ValueError, match="requires --reward-mode"):
         cli._reward_config(args)
+
+
+def test_rollout_control_defaults_preserve_runner_defaults() -> None:
+    args = cli._parser().parse_args([
+        "--scratch", "--output-dir", "out"])
+    runner_config = cli._runner_config(
+        args, seed=17, reward_config=RewardConfig())
+
+    assert args.workers == 1
+    assert args.envs_per_worker == 1
+    assert args.batch_backend is False
+    assert args.inference_batch_wait_ms == 20.0
+    assert runner_config.num_envs == 1
+    assert runner_config.batch_backend is False
+    assert runner_config.inference_batch_wait_seconds == 0.02
+    assert runner_config.stage25_fixed_inference_batch_size == 2
+    assert runner_config.backend_configuration["numThreads"] == 1
+
+
+def test_rollout_controls_reach_runner_config() -> None:
+    args = cli._parser().parse_args([
+        "--scratch", "--engine", "fast", "--envs-per-worker", "2",
+        "--batch-backend", "--inference-batch-wait-ms", "7.5",
+        "--physical-batch-size", "16", "--output-dir", "out"])
+    runner_config = cli._runner_config(
+        args, seed=23, reward_config=RewardConfig())
+
+    assert runner_config.num_envs == 2
+    assert runner_config.batch_backend is True
+    assert runner_config.inference_batch_wait_seconds == pytest.approx(0.0075)
+    assert runner_config.stage25_fixed_inference_batch_size == 16
+
+
+def test_batch_backend_rejects_official_engine() -> None:
+    args = cli._parser().parse_args([
+        "--scratch", "--engine", "official", "--batch-backend",
+        "--output-dir", "out"])
+    with pytest.raises(ValueError, match="requires --engine fast"):
+        cli._runner_config(args, seed=0, reward_config=RewardConfig())
 
 
 def test_collection_uses_both_seats_and_does_not_mutate_snapshot(monkeypatch):
