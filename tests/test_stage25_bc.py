@@ -275,6 +275,15 @@ def test_cli_import_save_resume_preserves_history_metadata(tmp_path):
     assert meta2["provenance"] == meta1["provenance"]
 
 
+def test_cli_accepts_repeatable_canonical_data_paths():
+    import rl_manager.stage25_bc_cli as cli
+
+    args = cli.build_parser().parse_args([
+        "--data", "day-a.parquet", "--data", "day-b.parquet"])
+
+    assert args.data == [Path("day-a.parquet"), Path("day-b.parquet")]
+
+
 def test_cli_rejects_legacy_operating_resume(tmp_path):
     from rl_manager.stage25_checkpoint import save_stage25_bc_checkpoint
 
