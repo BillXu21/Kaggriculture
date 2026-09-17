@@ -100,8 +100,11 @@ python -m rl_manager.stage25_ppo_cli --resume artifacts/stage25-ppo-run/latest.n
   --seed 0 --output-dir artifacts/stage25-ppo-run-resumed
 ```
 
-The CLI prints one flushed JSON record per update with rollout row counts,
-terminal/truncation counts, reward and bank summaries, inference metrics,
-policy/value losses, entropy surrogate, KL, clip fraction, gradient norm, and
-unchanged-weight audit errors.  TPU numerical validation, executor tuning,
-league redesign, shortfall shaping, and Packet 6 optimization remain deferred.
+The CLI prints one compact, flushed human report per update and appends one
+complete JSON record per update to `metrics.jsonl`, including rollout row
+counts, terminal/truncation counts, reward and raw bank values, detailed
+inference arrays, policy/value losses, entropy surrogate, KL, clip fraction,
+gradient norm, and unchanged-weight audit errors. `--json-stdout` restores the
+complete JSON record on stdout for machine consumers. TPU numerical validation,
+executor tuning, league redesign, shortfall shaping, and Packet 6 optimization
+remain deferred.

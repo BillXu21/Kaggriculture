@@ -2,7 +2,8 @@
 
 The CLI intentionally runs complete Packet 5A rollouts between updates.  A
 checkpoint is therefore resumable only at the completed rollout/update
-boundary recorded by the native checkpoint format.
+boundary recorded by the native checkpoint format. Update 1 is normally a
+warmup/compilation update; use update 2 and later for steady-state throughput.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from dataclasses import replace
 import json
 import math
 from pathlib import Path
+import time
 from typing import TYPE_CHECKING, Any, Mapping
 
 from rl_manager.parallel import ParallelSelfPlayRunner
@@ -29,6 +31,195 @@ if TYPE_CHECKING:
     from rl_manager.stage25_policy import Stage25ModelConfig
     from rl_manager.stage25_ppo import Stage25PPOConfig, Stage25PPOTrainState
     from rl_manager.stage25_types import Stage25BehaviorIdentity
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    """Return a deterministic linearly interpolated percentile."""
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] + fraction * (ordered[upper] - ordered[lower])
+
+
+def _bank_statistics(final_banks: list[float]) -> dict[str, float | int]:
+    banks = [float(bank) for bank in final_banks]
+    if not banks:
+        return {
+            "count": 0, "mean": 0.0, "median": 0.0, "min": 0.0,
+            "bottom_decile_mean": 0.0, "p10": 0.0, "p25": 0.0,
+            "p75": 0.0, "p90": 0.0, "max": 0.0,
+            "zero_bank_fraction": 0.0,
+        }
+    ordered = sorted(banks)
+    bottom_count = math.ceil(len(ordered) * 0.10)
+    return {
+        "count": len(ordered),
+        "mean": math.fsum(ordered) / len(ordered),
+        "median": _percentile(ordered, 0.5),
+        "min": ordered[0],
+        "bottom_decile_mean": math.fsum(ordered[:bottom_count]) / bottom_count,
+        "p10": _percentile(ordered, 0.10),
+        "p25": _percentile(ordered, 0.25),
+        "p75": _percentile(ordered, 0.75),
+        "p90": _percentile(ordered, 0.90),
+        "max": ordered[-1],
+        "zero_bank_fraction": sum(bank == 0.0 for bank in ordered) / len(ordered),
+    }
+
+
+def _inference_summary(metrics: Mapping[str, Any]) -> dict[str, float | int]:
+    real_batches = [float(value) for value in metrics.get("real_batch_sizes", ())]
+    physical_rows = int(metrics.get("physical_rows", 0))
+    padding_rows = int(metrics.get("padding_rows", 0))
+    logical_requests = int(metrics.get(
+        "logical_requests", metrics.get("real_requests", metrics.get("requests", 0))))
+    return {
+        "physical_calls": int(metrics.get(
+            "physical_inference_calls", metrics.get("batches", 0))),
+        "real_requests": int(metrics.get("real_requests", 0)),
+        "logical_requests": logical_requests,
+        "physical_rows": physical_rows,
+        "padding_rows": padding_rows,
+        "padding_fraction": padding_rows / physical_rows if physical_rows else 0.0,
+        "occupancy": float(metrics.get(
+            "occupancy", logical_requests / physical_rows if physical_rows else 0.0)),
+        "mean_real_batch_size": (
+            math.fsum(real_batches) / len(real_batches) if real_batches else 0.0),
+        "min_real_batch_size": min(real_batches, default=0.0),
+        "median_real_batch_size": _percentile(real_batches, 0.5),
+        "p10_real_batch_size": _percentile(real_batches, 0.10),
+        "p90_real_batch_size": _percentile(real_batches, 0.90),
+        "max_real_batch_size": max(real_batches, default=0.0),
+        "aggregate_inference_seconds": float(metrics.get("inference_seconds", 0.0)),
+        "aggregate_queue_wait_seconds": float(metrics.get("queue_wait_seconds", 0.0)),
+    }
+
+
+def _rate(numerator: float, seconds: float) -> float:
+    return float(numerator) / seconds if seconds > 0.0 else 0.0
+
+
+def _configure_jax_compilation_cache(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        import jax
+        from jax.experimental.compilation_cache import compilation_cache
+        set_cache_dir = getattr(compilation_cache, "set_cache_dir")
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+        jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+        path.mkdir(parents=True, exist_ok=True)
+        set_cache_dir(str(path))
+    except (AttributeError, ImportError, RuntimeError, ValueError, TypeError) as exc:
+        raise RuntimeError(
+            "--jax-compilation-cache-dir is unsupported by the installed "
+            f"JAX persistent compilation-cache API: {exc}") from exc
+
+
+def _append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True, allow_nan=False))
+        handle.write("\n")
+        handle.flush()
+
+
+def _format_report(record: Mapping[str, Any]) -> str:
+    timing = record["timing"]
+    throughput = record["throughput"]
+    inference = record["inference_summary"]
+    bank = record["bank_summary"]
+    ppo = record["update_metrics"]
+
+    def value(key: str, digits: int = 2) -> str:
+        return f"{float(timing[key]):.{digits}f} s"
+
+    def rate_value(key: str, digits: int = 2) -> str:
+        return f"{float(throughput[key]):.{digits}f}"
+
+    def line(label: str, text: Any) -> str:
+        return f"{label:<26}{text}"
+
+    audit = ppo.get("unchanged_weight_audit", {})
+    audit_text = "PASS" if audit.get("ok", True) else "FAIL"
+    p10 = f"{inference['p10_real_batch_size']:.2f}"
+    p90 = f"{inference['p90_real_batch_size']:.2f}"
+    lines = [
+        "=" * 64,
+        f"STAGE 2.5 PPO | UPDATE {record['update']}",
+        "=" * 64,
+        "",
+        "WORK",
+        line("games", record["games_in_update"]),
+        line("learner rows", record.get("learner_rows", 0)),
+        line("terminal rows", record.get("terminal_rows", 0)),
+        line("truncated rows", record.get("truncated_rows", 0)),
+        "",
+        "STARTUP",
+        line("state initialization", f"{record['startup']['state_initialization_seconds']:.4f} s"),
+        "",
+        "TIMING",
+        line("episode/spec", value("episode_spec_construction_seconds")),
+        line("runner/rollout", value("runner_rollout_seconds")),
+        line("batch construction", value("batch_construction_seconds")),
+        line("collection total", value("collection_seconds")),
+        line("PPO update", value("ppo_update_seconds")),
+        line("checkpoint", value("checkpoint_seconds")),
+        line("other/overhead", value("overhead_seconds")),
+        line("update total", value("update_seconds")),
+        "",
+        "THROUGHPUT",
+        line("rollout games/s", rate_value("rollout_games_per_second")),
+        line("collection games/s", rate_value("collection_games_per_second")),
+        line("update games/s", rate_value("update_games_per_second")),
+        line("update games/hour", f"{throughput['update_games_per_hour']:.2f}"),
+        line("updates/hour", f"{throughput['updates_per_hour']:.2f}"),
+        line("learner rows/s", f"{throughput['update_learner_rows_per_second']:.2f}"),
+        "",
+        "INFERENCE (aggregate timings)",
+        line("physical calls", inference["physical_calls"]),
+        line("real/logical requests", f"{inference['real_requests']} / {inference['logical_requests']}"),
+        line("physical rows", inference["physical_rows"]),
+        line("padding rows", f"{inference['padding_rows']} ({inference['padding_fraction'] * 100.0:.2f}%)"),
+        line("occupancy", f"{inference['occupancy'] * 100.0:.2f}%"),
+        line("mean real batch", f"{inference['mean_real_batch_size']:.2f}"),
+        line("min / median batch", f"{inference['min_real_batch_size']:.2f} / {inference['median_real_batch_size']:.2f}"),
+        line("p10 / p90 batch", f"{p10} / {p90}"),
+        line("max real batch", f"{inference['max_real_batch_size']:.2f}"),
+        line("aggregate inference", f"{inference['aggregate_inference_seconds']:.4f} s"),
+        line("aggregate queue wait", f"{inference['aggregate_queue_wait_seconds']:.4f} s"),
+        "",
+        "BANK",
+        line("count", bank["count"]),
+        line("mean", f"{bank['mean']:.2f}"),
+        line("median", f"{bank['median']:.2f}"),
+        line("min", f"{bank['min']:.2f}"),
+        line("bottom-10% mean", f"{bank['bottom_decile_mean']:.2f}"),
+        line("p10 / p25", f"{bank['p10']:.2f} / {bank['p25']:.2f}"),
+        line("p75 / p90", f"{bank['p75']:.2f} / {bank['p90']:.2f}"),
+        line("max", f"{bank['max']:.2f}"),
+        line("zero-bank", f"{bank['zero_bank_fraction'] * 100.0:.2f}%"),
+        "",
+        "PPO",
+        line("loss", f"{ppo.get('loss', 0.0):.6g}"),
+        line("policy loss", f"{ppo.get('policy_loss', 0.0):.6g}"),
+        line("value loss", f"{ppo.get('value_loss', 0.0):.6g}"),
+        line("entropy", f"{ppo.get('entropy_surrogate', 0.0):.6g}"),
+        line("KL", f"{ppo.get('kl', 0.0):.6g}"),
+        line("clip fraction", f"{ppo.get('clip_fraction', 0.0):.6g}"),
+        line("gradient norm", f"{ppo.get('gradient_norm', 0.0):.6g}"),
+        line("epochs", ppo.get("epochs", 0)),
+        line("weight audit", audit_text),
+        "",
+        f"checkpoint: {record['checkpoint']}",
+        "=" * 64,
+    ]
+    return "\n".join(lines)
 
 
 def _model(name: str) -> Stage25ModelConfig:
@@ -93,6 +284,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--updates", type=int, default=1)
+    parser.add_argument(
+        "--json-stdout", action="store_true",
+        help="also emit each complete machine-readable update record")
+    parser.add_argument(
+        "--jax-compilation-cache-dir", type=Path,
+        help="optional JAX persistent compilation-cache directory")
     return parser
 
 
@@ -273,7 +470,9 @@ def _collection(
     from rl_manager.runner import _executor_factory_provenance
     from rl_manager.stage25_inference import Stage25InferenceAdapter
     from rl_manager.stage25_ppo import build_stage25_ppo_batch
+    collection_started = time.perf_counter()
     reward_config = _reward_config(args)
+    episode_spec_started = time.perf_counter()
     learner = Stage25InferenceAdapter(
         params=state.params, config=config.model, name="stage25_learner",
         version="ppo-native-v1", seed=seed, mode="stochastic")
@@ -298,11 +497,17 @@ def _collection(
     specs = tuple(build_episode_spec(
         index, seed + index, args.training_composition, learner, opponent)
                   for index in range(args.rollout_size))
+    episode_spec_seconds = time.perf_counter() - episode_spec_started
+    runner_started = time.perf_counter()
     results = runner.run(specs)
+    runner_rollout_seconds = time.perf_counter() - runner_started
+    batch_started = time.perf_counter()
     batch = build_stage25_ppo_batch(
         trajectory, learner_identity=learner.identity, gamma=config.gamma,
         gae_lambda=config.gae_lambda,
         normalize_advantages=config.normalize_advantages)
+    batch_construction_seconds = time.perf_counter() - batch_started
+    collection_seconds = time.perf_counter() - collection_started
     stats = {
         "rollout_rows": len(trajectory), "learner_rows": len(batch.classes),
         "terminal_rows": sum(int(row.terminated) for row in trajectory.rows),
@@ -316,6 +521,12 @@ def _collection(
         "reward": reward_config.to_json_dict(),
         "executor_provenance": _executor_factory_provenance(
             runner.provenance["executor_factory"]),
+        "timing": {
+            "episode_spec_construction_seconds": episode_spec_seconds,
+            "runner_rollout_seconds": runner_rollout_seconds,
+            "batch_construction_seconds": batch_construction_seconds,
+            "collection_seconds": collection_seconds,
+        },
     }
     for row in trajectory.rows:
         if (json.dumps(row.provenance.get("executor"), sort_keys=True)
@@ -331,6 +542,9 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     from rl_manager.executor_factory import make_stage25_executor_factory
     from rl_manager.runner import _executor_factory_provenance
     from rl_manager.stage25_ppo import build_stage25_ppo_batch, ppo_update
+    startup_started = time.perf_counter()
+    _configure_jax_compilation_cache(getattr(
+        args, "jax_compilation_cache_dir", None))
     _validate_rollout_controls(args)
     if args.updates < 1 or args.rollout_size < 1 or args.workers < 1:
         raise ValueError("updates, rollout-size, and workers must be positive")
@@ -342,9 +556,12 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             "--physical-batch-size 1")
     _reward_config(args)
     state, source_meta = _new_state(args, config)
+    startup_seconds = time.perf_counter() - startup_started
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = args.output_dir / "metrics.jsonl"
     all_metrics = []
     for _ in range(args.updates):
+        update_started = time.perf_counter()
         trajectory, learner, rollout_stats = _collection(
             state, config, seed=state.rollout_seed, args=args,
             previous_params=None)
@@ -368,10 +585,15 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         if executor_provenance != expected_executor:
             raise ValueError("rollout executor provenance is not the configured factory")
         previous_learner_params = state.params
-        state, update_stats = ppo_update(state, build_stage25_ppo_batch(
+        batch_rebuild_started = time.perf_counter()
+        ppo_batch = build_stage25_ppo_batch(
             trajectory, learner_identity=learner.identity, gamma=config.gamma,
             gae_lambda=config.gae_lambda,
-            normalize_advantages=config.normalize_advantages), config)
+            normalize_advantages=config.normalize_advantages)
+        ppo_batch_construction_seconds = time.perf_counter() - batch_rebuild_started
+        ppo_started = time.perf_counter()
+        state, update_stats = ppo_update(state, ppo_batch, config)
+        ppo_update_seconds = time.perf_counter() - ppo_started
         from rl_manager.stage25_inference import Stage25InferenceAdapter
         next_opponent = Stage25InferenceAdapter(
             params=previous_learner_params, config=config.model,
@@ -391,6 +613,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 }),
         }
         checkpoint = args.output_dir / "latest.npz"
+        checkpoint_started = time.perf_counter()
         save_stage25_ppo_checkpoint(
             checkpoint, state.params, state.optimizer_state, state.rng,
             config.model, seed=args.seed, update_counter=state.update_counter,
@@ -410,8 +633,67 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             source_history_version=(
                 (source_meta.get("source_e_identity") or {}).get("history_version")),
         )
-        record = {"update": state.update_counter, **rollout_stats, "update_metrics": update_stats, "checkpoint": str(checkpoint)}
-        print(json.dumps(record, sort_keys=True, allow_nan=False), flush=True)
+        checkpoint_seconds = time.perf_counter() - checkpoint_started
+        update_seconds = time.perf_counter() - update_started
+        collection_timing = dict(rollout_stats.get("timing", {}))
+        for timing_name in (
+                "episode_spec_construction_seconds", "runner_rollout_seconds",
+                "batch_construction_seconds", "collection_seconds"):
+            collection_timing.setdefault(timing_name, 0.0)
+        collection_seconds = float(collection_timing.get("collection_seconds", 0.0))
+        runner_rollout_seconds = float(collection_timing.get(
+            "runner_rollout_seconds", 0.0))
+        timing = {
+            **collection_timing,
+            "ppo_batch_construction_seconds": ppo_batch_construction_seconds,
+            "ppo_update_seconds": ppo_update_seconds,
+            "checkpoint_seconds": checkpoint_seconds,
+            "update_seconds": update_seconds,
+            "accounted_phase_seconds": (
+                collection_seconds + ppo_update_seconds + checkpoint_seconds),
+            "overhead_seconds": max(
+                0.0, update_seconds - collection_seconds - ppo_update_seconds
+                - checkpoint_seconds),
+        }
+        update_stats = dict(update_stats)
+        ppo_timing = update_stats.get("timing")
+        if not isinstance(ppo_timing, dict):
+            ppo_timing = {}
+        update_stats["timing"] = {**ppo_timing, "wall_seconds": ppo_update_seconds}
+        inference_metrics = rollout_stats.get("inference_metrics", {})
+        record = {
+            "update": state.update_counter,
+            **rollout_stats,
+            "games_in_update": args.rollout_size,
+            "update_metrics": update_stats,
+            "checkpoint": str(checkpoint),
+            "startup": {"state_initialization_seconds": startup_seconds},
+            "timing": timing,
+            "throughput": {
+                "rollout_games_per_second": _rate(
+                    args.rollout_size, runner_rollout_seconds),
+                "rollout_games_per_hour": _rate(
+                    args.rollout_size * 3600.0, runner_rollout_seconds),
+                "rollout_learner_rows_per_second": _rate(
+                    rollout_stats.get("learner_rows", 0), runner_rollout_seconds),
+                "collection_games_per_second": _rate(
+                    args.rollout_size, collection_seconds),
+                "update_games_per_second": _rate(
+                    args.rollout_size, update_seconds),
+                "update_games_per_hour": _rate(
+                    args.rollout_size * 3600.0, update_seconds),
+                "update_learner_rows_per_second": _rate(
+                    rollout_stats.get("learner_rows", 0), update_seconds),
+                "updates_per_hour": _rate(3600.0, update_seconds),
+            },
+            "inference_summary": _inference_summary(inference_metrics),
+            "bank_summary": _bank_statistics(rollout_stats.get("final_banks", [])),
+        }
+        _append_jsonl(metrics_path, record)
+        if getattr(args, "json_stdout", False):
+            print(json.dumps(record, sort_keys=True, allow_nan=False), flush=True)
+        else:
+            print(_format_report(record), flush=True)
         all_metrics.append(record)
     return all_metrics
 

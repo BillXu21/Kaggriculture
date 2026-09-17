@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import jax
@@ -20,7 +21,56 @@ from rl_manager.stage25_trajectory import INPUT_SPEC, Stage25TrajectoryRow
 from rl_manager.types import CANDIDATE_VS_FROZEN, CURRENT_VS_CURRENT_ECONOMIC
 
 
-def test_ppo_cli_records_the_real_executor_identity(monkeypatch, tmp_path) -> None:
+def test_bank_statistics_use_deterministic_bottom_decile() -> None:
+    stats = cli._bank_statistics([0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+
+    assert stats["count"] == 10
+    assert stats["mean"] == pytest.approx(45.0)
+    assert stats["median"] == pytest.approx(45.0)
+    assert stats["bottom_decile_mean"] == pytest.approx(0.0)
+    assert stats["p10"] == pytest.approx(9.0)
+    assert stats["p25"] == pytest.approx(22.5)
+    assert stats["p75"] == pytest.approx(67.5)
+    assert stats["p90"] == pytest.approx(81.0)
+    assert stats["zero_bank_fraction"] == pytest.approx(0.1)
+
+
+def test_inference_summary_reports_distribution_and_aggregate_labels() -> None:
+    summary = cli._inference_summary({
+        "physical_inference_calls": 4,
+        "real_requests": 24,
+        "logical_requests": 24,
+        "real_batch_sizes": [2, 4, 8, 10],
+        "physical_rows": 32,
+        "padding_rows": 8,
+        "occupancy": 0.75,
+        "inference_seconds": 1.25,
+        "queue_wait_seconds": 2.5,
+    })
+
+    assert summary["physical_calls"] == 4
+    assert summary["physical_rows"] == 32
+    assert summary["padding_fraction"] == pytest.approx(0.25)
+    assert summary["occupancy"] == pytest.approx(0.75)
+    assert summary["mean_real_batch_size"] == pytest.approx(6.0)
+    assert summary["min_real_batch_size"] == pytest.approx(2.0)
+    assert summary["median_real_batch_size"] == pytest.approx(6.0)
+    assert summary["p10_real_batch_size"] == pytest.approx(2.6)
+    assert summary["p90_real_batch_size"] == pytest.approx(9.4)
+    assert summary["max_real_batch_size"] == pytest.approx(10.0)
+    assert summary["aggregate_inference_seconds"] == pytest.approx(1.25)
+    assert summary["aggregate_queue_wait_seconds"] == pytest.approx(2.5)
+
+
+def test_throughput_rate_is_safe_and_derived_from_wall_seconds() -> None:
+    assert cli._rate(1024, 40.0) == pytest.approx(25.6)
+    assert cli._rate(1024 * 3600.0, 40.0) == pytest.approx(92160.0)
+    assert cli._rate(1024, 0.0) == 0.0
+
+
+@pytest.mark.parametrize("json_stdout", [False, True])
+def test_ppo_cli_records_the_real_executor_identity(
+        monkeypatch, tmp_path, capsys, json_stdout) -> None:
     config = tiny_stage25_config()
     learner = Stage25InferenceAdapter(
         params=init_stage25_params(config, seed=0), config=config,
@@ -30,7 +80,22 @@ def test_ppo_cli_records_the_real_executor_identity(monkeypatch, tmp_path) -> No
 
     def fake_collection(state, config, *, seed, args, previous_params=None):
         del state, config, seed, args, previous_params
-        return None, learner, {}
+        return None, learner, {
+            "final_banks": [0.0, 100.0],
+            "learner_rows": 3,
+            "inference_metrics": {
+                "batch_sizes": [2, 4, 8],
+                "real_batch_sizes": [2, 4, 8],
+                "physical_batch_sizes": [4, 4, 8],
+                "physical_rows": 16,
+                "padding_rows": 2,
+                "physical_inference_calls": 3,
+                "real_requests": 14,
+                "logical_requests": 14,
+                "inference_seconds": 0.5,
+                "queue_wait_seconds": 0.25,
+            },
+        }
 
     def fake_build_batch(trajectory, *, learner_identity, **kwargs):
         del trajectory, learner_identity, kwargs
@@ -50,11 +115,14 @@ def test_ppo_cli_records_the_real_executor_identity(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(ppo, "ppo_update", fake_update)
     monkeypatch.setattr(checkpoint, "save_stage25_ppo_checkpoint", fake_save)
 
-    args = cli._parser().parse_args([
+    argv = [
         "--scratch", "--model-size", "tiny", "--engine", "fast",
         "--workers", "1", "--rollout-size", "1", "--physical-batch-size", "1",
         "--minibatch-size", "1", "--epochs", "1", "--updates", "1", "--seed", "17",
-        "--output-dir", str(tmp_path)])
+        "--output-dir", str(tmp_path)]
+    if json_stdout:
+        argv.append("--json-stdout")
+    args = cli._parser().parse_args(argv)
     cli.run(args)
 
     assert captured["executor"] == _executor_factory_provenance(
@@ -67,6 +135,19 @@ def test_ppo_cli_records_the_real_executor_identity(monkeypatch, tmp_path) -> No
             "bank_scale": 50000.0,
         },
     }
+    stdout = capsys.readouterr().out
+    if json_stdout:
+        assert json.loads(stdout)["inference_metrics"]["batch_sizes"] == [2, 4, 8]
+    else:
+        assert "batch_sizes" not in stdout
+    records = (tmp_path / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(records) == 1
+    machine_record = json.loads(records[0])
+    assert machine_record["inference_metrics"]["batch_sizes"] == [2, 4, 8]
+    assert machine_record["final_banks"] == [0.0, 100.0]
+    assert all(np.isfinite(value) and value >= 0.0
+               for value in machine_record["timing"].values())
+    assert machine_record["throughput"]["update_games_per_second"] > 0.0
 
 
 def test_current_current_cli_contract_requires_own_bank_reward() -> None:

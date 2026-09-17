@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+import math
+import time
 from typing import Any
 
 import jax
@@ -738,13 +740,18 @@ def ppo_update(
                 and not _identity_matches(batch.behavior_identity,
                                           state.behavior_identity))):
         raise ValueError("PPO batch behavior identity does not match the frozen state identity")
+    ppo_started = time.perf_counter()
+    audit_started = time.perf_counter()
     audit = audit_stage25_ppo_rollout(state.params, batch, config)
+    audit_seconds = time.perf_counter() - audit_started
     params = state.params
     opt_state = state.optimizer_state
     key = _normal_key(state.rng)
     reports: list[dict[str, float]] = []
+    epoch_seconds: list[float] = []
     n = len(batch.classes)
     for epoch in range(config.epochs):
+        epoch_started = time.perf_counter()
         epoch_key = jax.random.fold_in(key, epoch)
         order = np.asarray(jax.random.permutation(epoch_key, n), dtype=np.int64)
         for start in range(0, n, config.minibatch_size):
@@ -767,6 +774,7 @@ def ppo_update(
                 "clip_fraction": float(np.asarray(metrics["clip_fraction"])),
                 "gradient_norm": float(np.asarray(grad_norm)),
             })
+        epoch_seconds.append(time.perf_counter() - epoch_started)
     next_identity = state.behavior_identity
     if next_identity is not None:
         from rl_manager.stage25_inference import parameter_fingerprint
@@ -777,10 +785,18 @@ def ppo_update(
         update_counter=state.update_counter + 1,
         rollout_progression={"completed_rollouts": state.update_counter + 1},
         behavior_identity=next_identity)
+    metrics_started = time.perf_counter()
     summary = {name: float(np.mean([report[name] for report in reports]))
                for name in reports[0]} if reports else {}
     summary.update({"rollout_rows": n, "epochs": config.epochs,
                     "unchanged_weight_audit": audit})
+    summary["timing"] = {
+        "unchanged_weight_audit_seconds": audit_seconds,
+        "optimizer_training_seconds": math.fsum(epoch_seconds),
+        "per_epoch_seconds": epoch_seconds,
+        "final_metric_calculation_seconds": time.perf_counter() - metrics_started,
+        "total_seconds": time.perf_counter() - ppo_started,
+    }
     return next_state, summary
 
 
