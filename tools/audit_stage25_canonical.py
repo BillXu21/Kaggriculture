@@ -96,6 +96,13 @@ def _class_distributions(rows: list[Any]) -> dict[str, dict[str, int]]:
 
 def _board_summary(state: Any) -> dict[str, Any]:
     state = state if isinstance(state, Mapping) else {}
+    if "crop_counts" in state or "animal_counts" in state:
+        return {
+            "unlocked_land": state.get("unlocked_land"),
+            "crop_counts": dict(state.get("crop_counts", {})),
+            "animal_counts": dict(state.get("animal_counts", {})),
+            "money": state.get("money"),
+        }
     board = state.get("board", ())
     crops: Counter[str] = Counter()
     animals: Counter[str] = Counter()
@@ -135,12 +142,12 @@ def _support_reasons(label: Any, record: dict[str, Any]) -> list[str]:
     for index, name in enumerate(CROP_ORDER):
         if name.lower() not in label.invalid_components:
             continue
-        delta = label.end_crops[index] - label.provenance.prior_crop_goals[index]
+        delta = label.crop_goals[index] - label.provenance.prior_crop_goals[index]
         if not -100 <= delta <= 100:
             reason = "delta_outside_vocabulary"
         elif not 0 <= label.provenance.prior_crop_goals[index] <= 100:
             reason = "prior_goal_out_of_range"
-        elif not 0 <= label.end_crops[index] <= 100:
+        elif not 0 <= label.crop_goals[index] <= 100:
             reason = "observed_end_goal_out_of_range"
         else:
             reason = "prefix_or_physical_capacity_support"

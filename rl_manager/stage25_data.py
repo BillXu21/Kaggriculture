@@ -282,6 +282,7 @@ __all__ = [
     "BuildCounters",
     "OutcomeProxyBuild",
     "OutcomeProxyResult",
+    "OutcomeProxyBuilder",
     "build_outcome_proxy_labels",
 ]
 
@@ -536,6 +537,20 @@ class _HistoryRow:
     reset_requested: bool
     reset_identity: Any
     target_invalid_components: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _HistoryState:
+    """Compact per-episode state retained after a logical row is consumed."""
+
+    index: int
+    day: int
+    end_crops: tuple[int, ...]
+    has_schema_version: bool
+    schema_version: Any
+    has_boundary_id: bool
+    boundary_id: Any
+    reset_identity: Any
 
 
 def _parse_row(index: int, record: object) -> _HistoryRow:
@@ -860,7 +875,8 @@ def _make_label(row: _HistoryRow, prior: OutcomeProxyProvenance,
     )
 
 
-def _boundary_adjacent(previous: _HistoryRow, current: _HistoryRow) -> bool:
+def _boundary_adjacent(previous: _HistoryRow | _HistoryState,
+                       current: _HistoryRow) -> bool:
     """Require a checkable boundary identity when either row supplies one."""
     if previous.has_boundary_id != current.has_boundary_id:
         return False
@@ -875,7 +891,7 @@ def _boundary_adjacent(previous: _HistoryRow, current: _HistoryRow) -> bool:
     return False
 
 
-def _sequence_identity_adjacent(previous: _HistoryRow,
+def _sequence_identity_adjacent(previous: _HistoryRow | _HistoryState,
                                 current: _HistoryRow) -> bool:
     if previous.has_schema_version != current.has_schema_version:
         return False
@@ -891,124 +907,145 @@ def _sequence_identity_adjacent(previous: _HistoryRow,
     return True
 
 
+class OutcomeProxyBuilder:
+    """Incrementally build labels while retaining only compact history state."""
+
+    def __init__(
+        self,
+        selected_dates: Iterable[object] | None = None,
+        min_score: float | None = None,
+    ) -> None:
+        self._dates = (None if selected_dates is None else
+                       frozenset(str(value) for value in selected_dates))
+        self._threshold = None if min_score is None else float(min_score)
+        self._history: dict[tuple[Any, Any], _HistoryState] = {}
+        self._row_count = 0
+        self._built: list[OutcomeProxyLabel] = []
+        self._partial: list[OutcomeProxyLabel] = []
+        self._counters = {
+            "crop_delta_outside_vocabulary_components": 0,
+            "crop_physical_incompatibility_components": 0,
+            "land_invalidity_rows": 0,
+            "animal_acquisition_invalidity_components": 0,
+            "history_reset_gap_rows": 0,
+            "animal_loss_ambiguity_components": 0,
+            "animal_loss_ambiguity_rows": 0,
+            "invalid_rows": 0,
+            "component_excluded_rows": 0,
+            "selection_excluded_rows": 0,
+            "target_invalidity_components": 0,
+            "target_invalidity_rows": 0,
+            "incomplete_ar_chain_rows": 0,
+        }
+
+    def consume(self, record: Mapping[str, Any]) -> OutcomeProxyLabel:
+        """Consume one row in input order and return its derived label."""
+        row = _parse_row(self._row_count, record)
+        self._row_count += 1
+        key = (row.episode_id, row.seat)
+        previous = self._history.get(key)
+        if previous is None:
+            reset = row.reset_requested
+            prior_source = ("history_reset_start_occupancy" if reset
+                            else "first_boundary_start_occupancy")
+            prior_goals = row.start_crops
+            prior_index = None
+            prior_day = None
+            gap_days = 0
+            if reset:
+                self._counters["history_reset_gap_rows"] += 1
+        elif (row.day == previous.day + 1
+              and _sequence_identity_adjacent(previous, row)
+              and not row.reset_requested):
+            prior_source = "previous_synthetic_desired_end_goal"
+            prior_goals = previous.end_crops
+            prior_index = previous.index
+            prior_day = previous.day
+            gap_days = 0
+            reset = False
+        else:
+            prior_source = "history_reset_gap_start_occupancy"
+            prior_goals = row.start_crops
+            prior_index = None
+            prior_day = None
+            gap_days = max(0, row.day - previous.day - 1)
+            reset = True
+            self._counters["history_reset_gap_rows"] += 1
+        provenance = OutcomeProxyProvenance(
+            prior_source=prior_source,
+            prior_row_index=prior_index,
+            prior_day=prior_day,
+            prior_crop_goals=tuple(prior_goals),
+            gap_days=gap_days,
+            history_reset=reset,
+        )
+        label = _make_label(row, provenance, self._counters)
+        self._history[key] = _HistoryState(
+            index=row.index,
+            day=row.day,
+            end_crops=row.end_crops,
+            has_schema_version=row.has_schema_version,
+            schema_version=row.schema_version,
+            has_boundary_id=row.has_boundary_id,
+            boundary_id=row.boundary_id,
+            reset_identity=row.reset_identity,
+        )
+        if _selected(row.record, row.metadata, self._dates, self._threshold):
+            if label.complete_ar_chain:
+                self._built.append(label)
+            elif label.valid_components:
+                self._partial.append(label)
+                self._counters["incomplete_ar_chain_rows"] += 1
+        else:
+            self._counters["selection_excluded_rows"] += 1
+        return label
+
+    def finish(self) -> OutcomeProxyBuild:
+        """Return the immutable result accumulated so far."""
+        excluded_rows = self._row_count - len(self._built) - len(self._partial)
+        counters = self._counters
+        final_counters = InvalidCounters(
+            crop_delta_outside_vocabulary_components=counters[
+                "crop_delta_outside_vocabulary_components"],
+            crop_physical_incompatibility_components=counters[
+                "crop_physical_incompatibility_components"],
+            land_invalidity_rows=counters["land_invalidity_rows"],
+            animal_acquisition_invalidity_components=counters[
+                "animal_acquisition_invalidity_components"],
+            history_reset_gap_rows=counters["history_reset_gap_rows"],
+            animal_loss_ambiguity_components=counters[
+                "animal_loss_ambiguity_components"],
+            animal_loss_ambiguity_rows=counters["animal_loss_ambiguity_rows"],
+            excluded_rows=excluded_rows,
+            invalid_rows=counters["invalid_rows"],
+            selection_excluded_rows=counters["selection_excluded_rows"],
+            component_excluded_rows=counters["component_excluded_rows"],
+            target_invalidity_components=counters[
+                "target_invalidity_components"],
+            target_invalidity_rows=counters["target_invalidity_rows"],
+            incomplete_ar_chain_rows=counters["incomplete_ar_chain_rows"],
+        )
+        return OutcomeProxyBuild(
+            schema_version=OUTCOME_PROXY_SCHEMA_VERSION,
+            rows=tuple(sorted(self._built, key=lambda label: label.row_index)),
+            counters=final_counters,
+            partial_rows=tuple(sorted(
+                self._partial, key=lambda label: label.row_index)),
+        )
+
+
 def build_outcome_proxy_labels(
     records: Iterable[Mapping[str, Any]],
     selected_dates: Iterable[object] | None = None,
     min_score: float | None = None,
 ) -> OutcomeProxyBuild:
-    """Build canonical Stage 2.5 labels from logical daily records.
+    """Build canonical Stage 2.5 labels from a one-pass logical-row iterable.
 
     Histories are built in input order before date/score selection.  Thus an
     unselected row can still establish the prior synthetic crop goal for a
     selected adjacent row, while out-of-order input cannot fabricate one.
     """
-    source = tuple(records)
-    dates = None if selected_dates is None else frozenset(str(value) for value in selected_dates)
-    threshold = None if min_score is None else float(min_score)
-    parsed = tuple(_parse_row(index, record) for index, record in enumerate(source))
-    groups: dict[tuple[Any, Any], list[_HistoryRow]] = {}
-    for row in parsed:
-        groups.setdefault((row.episode_id, row.seat), []).append(row)
-
-    counters = {
-        "crop_delta_outside_vocabulary_components": 0,
-        "crop_physical_incompatibility_components": 0,
-        "land_invalidity_rows": 0,
-        "animal_acquisition_invalidity_components": 0,
-        "history_reset_gap_rows": 0,
-        "animal_loss_ambiguity_components": 0,
-        "animal_loss_ambiguity_rows": 0,
-        "invalid_rows": 0,
-        "component_excluded_rows": 0,
-        "selection_excluded_rows": 0,
-        "target_invalidity_components": 0,
-        "target_invalidity_rows": 0,
-        "incomplete_ar_chain_rows": 0,
-    }
-    built: list[OutcomeProxyLabel] = []
-    partial: list[OutcomeProxyLabel] = []
-    for history in groups.values():
-        previous_goals: tuple[int, ...] | None = None
-        previous_row: _HistoryRow | None = None
-        for row in history:
-            if previous_row is None:
-                reset = row.reset_requested
-                prior_source = ("history_reset_start_occupancy" if reset
-                                else "first_boundary_start_occupancy")
-                prior_goals = row.start_crops
-                prior_index = None
-                prior_day = None
-                gap_days = 0
-                if reset:
-                    counters["history_reset_gap_rows"] += 1
-            elif (row.day == previous_row.day + 1
-                  and _sequence_identity_adjacent(previous_row, row)
-                  and not row.reset_requested):
-                prior_source = "previous_synthetic_desired_end_goal"
-                prior_goals = previous_goals if previous_goals is not None \
-                    else previous_row.end_crops
-                prior_index = previous_row.index
-                prior_day = previous_row.day
-                gap_days = 0
-                reset = False
-            else:
-                prior_source = "history_reset_gap_start_occupancy"
-                prior_goals = row.start_crops
-                prior_index = None
-                prior_day = None
-                gap_days = max(0, row.day - previous_row.day - 1)
-                reset = True
-                counters["history_reset_gap_rows"] += 1
-            provenance = OutcomeProxyProvenance(
-                prior_source=prior_source,
-                prior_row_index=prior_index,
-                prior_day=prior_day,
-                prior_crop_goals=tuple(prior_goals),
-                gap_days=gap_days,
-                history_reset=reset,
-            )
-            label = _make_label(row, provenance, counters)
-            previous_goals = row.end_crops
-            previous_row = row
-            if _selected(row.record, row.metadata, dates, threshold):
-                if label.complete_ar_chain:
-                    built.append(label)
-                elif label.valid_components:
-                    # Retained only as a partial diagnostic; never a complete
-                    # teacher-forcing training example.
-                    partial.append(label)
-                    counters["incomplete_ar_chain_rows"] += 1
-            else:
-                counters["selection_excluded_rows"] += 1
-
-    # Preserves the original exclusion meaning: rows excluded by selection or
-    # by having no usable component.  Partial diagnostic rows are neither
-    # trainable nor counted as fully excluded here.
-    excluded_rows = len(parsed) - len(built) - len(partial)
-    final_counters = InvalidCounters(
-        crop_delta_outside_vocabulary_components=counters[
-            "crop_delta_outside_vocabulary_components"],
-        crop_physical_incompatibility_components=counters[
-            "crop_physical_incompatibility_components"],
-        land_invalidity_rows=counters["land_invalidity_rows"],
-        animal_acquisition_invalidity_components=counters[
-            "animal_acquisition_invalidity_components"],
-        history_reset_gap_rows=counters["history_reset_gap_rows"],
-        animal_loss_ambiguity_components=counters[
-            "animal_loss_ambiguity_components"],
-        animal_loss_ambiguity_rows=counters["animal_loss_ambiguity_rows"],
-        excluded_rows=excluded_rows,
-        invalid_rows=counters["invalid_rows"],
-        selection_excluded_rows=counters["selection_excluded_rows"],
-        component_excluded_rows=counters["component_excluded_rows"],
-        target_invalidity_components=counters[
-            "target_invalidity_components"],
-        target_invalidity_rows=counters["target_invalidity_rows"],
-        incomplete_ar_chain_rows=counters["incomplete_ar_chain_rows"],
-    )
-    return OutcomeProxyBuild(
-        schema_version=OUTCOME_PROXY_SCHEMA_VERSION,
-        rows=tuple(sorted(built, key=lambda label: label.row_index)),
-        counters=final_counters,
-        partial_rows=tuple(sorted(partial, key=lambda label: label.row_index)),
-    )
+    builder = OutcomeProxyBuilder(selected_dates, min_score)
+    for record in records:
+        builder.consume(record)
+    return builder.finish()

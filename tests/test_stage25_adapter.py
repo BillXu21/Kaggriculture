@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -149,6 +150,38 @@ def test_real_projected_parquet_returns_fixed_bc_arrays_and_diagnostics(tmp_path
     assert result["diagnostics"]["hold_change_distributions"]["WHEAT"]["change"] == 1
 
 
+def test_streamed_adapter_matches_in_memory_reference_semantics(tmp_path):
+    from bc_manager.adapter import _input_arrays_from_starts
+    from rl_manager.stage25_data import build_outcome_proxy_labels
+
+    records = [
+        _record(0, "2026-08-17", end_wheat=1),
+        _record(1, "2026-08-18", start_wheat=1, end_wheat=2),
+        _record(2, "2026-08-19", start_wheat=2, end_wheat=1, score=1000),
+    ]
+    path = tmp_path / "canonical.parquet"
+    _write(path, records)
+    dates = ("2026-08-17", "2026-08-18")
+    result = load_dataset(path, dates=dates, read_batch_size=1)
+    expected = build_outcome_proxy_labels(
+        records, selected_dates=dates, min_score=2950)
+
+    assert result["labels"] == expected.rows
+    assert result["partial_rows"] == expected.partial_rows
+    assert result["diagnostics"]["counters"] == {
+        key: value for key, value in asdict(expected.counters).items()
+    }
+    physical_starts = records_to_table(records).column("start").to_pylist()
+    expected_inputs = _input_arrays_from_starts(
+        physical_starts,
+        [record["day"] for record in records],
+        include_opponent=False)
+    for name, value in expected_inputs.items():
+        np.testing.assert_array_equal(result["inputs"][name][[0, 1]], value[[0, 1]])
+    assert result["row_ids"] == tuple(
+        f"{path}::row={index}" for index in (0, 1))
+
+
 def test_history_is_built_before_date_and_score_filtering(tmp_path):
     path = tmp_path / "canonical.parquet"
     _write(path, [
@@ -161,6 +194,24 @@ def test_history_is_built_before_date_and_score_filtering(tmp_path):
     assert [label.row_index for label in result["labels"]] == [1]
     assert result["inputs"]["crop_capacity"].tolist() == [[1, 0, 0, 0, 0]]
     assert result["labels"][0].provenance.prior_source == "previous_synthetic_desired_end_goal"
+
+
+def test_train_val_split_keeps_history_through_row_excluded_from_both_splits(tmp_path):
+    path = tmp_path / "canonical.parquet"
+    _write(path, [
+        _record(0, "2026-08-17", end_wheat=1),
+        _record(1, "2026-08-18", score=1000, end_wheat=2),
+        _record(2, "2026-08-19", start_wheat=0, end_wheat=3),
+    ])
+
+    result = load_train_val(
+        path, train_dates=("2026-08-17",), val_dates=("2026-08-19",))
+
+    assert [label.row_index for label in result["train"]["labels"]] == [0]
+    assert [label.row_index for label in result["val"]["labels"]] == [2]
+    assert result["val"]["labels"][0].provenance.prior_crop_goals == (
+        2, 0, 0, 0, 0)
+    assert result["val"]["labels"][0].provenance.prior_row_index == 1
 
 
 def test_current_end_never_enters_input_or_corrected_e_context(tmp_path):
@@ -199,19 +250,145 @@ def test_configurable_paths_and_exact_projection(tmp_path, monkeypatch):
     path = tmp_path / "custom.parquet"
     _write(path, [_record(0, "custom-date")])
     seen: list[list[str]] = []
-    original = pq.read_table
+    original = pq.ParquetFile.iter_batches
 
-    def spy(*args, **kwargs):
+    def fail_full_table(*args, **kwargs):
+        raise AssertionError("canonical loader must not call pq.read_table")
+
+    def spy(self, *args, **kwargs):
         seen.append(list(kwargs["columns"]))
-        return original(*args, **kwargs)
+        return original(self, *args, **kwargs)
 
-    monkeypatch.setattr("rl_manager.stage25_adapter.pq.read_table", spy)
+    monkeypatch.setattr("rl_manager.stage25_adapter.pq.ParquetFile.iter_batches", spy)
+    monkeypatch.setattr("rl_manager.stage25_adapter.pq.read_table", fail_full_table)
     result = load_train_val(
         [path], train_dates=("custom-date",), val_dates=(), min_score=2950)
 
     assert len(result["train"]["labels"]) == 1
     assert seen == [list(PROJECTED_COLUMNS)]
     assert "events" not in seen[0]
+
+
+def test_canonical_batches_are_invariant_at_tiny_boundaries(tmp_path):
+    path = tmp_path / "canonical.parquet"
+    _write(path, [
+        _record(day, f"2026-08-{17 + day}", start_wheat=day,
+                end_wheat=day + 1)
+        for day in range(8)
+    ])
+
+    baseline = load_dataset(
+        path, dates=tuple(f"2026-08-{17 + day}" for day in range(8)),
+        read_batch_size=64)
+    for batch_size in (1, 2, 7, 64):
+        got = load_dataset(
+            path, dates=tuple(f"2026-08-{17 + day}" for day in range(8)),
+            read_batch_size=batch_size)
+        assert got["row_ids"] == baseline["row_ids"]
+        np.testing.assert_array_equal(got["actions"], baseline["actions"])
+        for name in baseline["inputs"]:
+            np.testing.assert_array_equal(
+                got["inputs"][name], baseline["inputs"][name])
+        assert [label.provenance for label in got["labels"]] == [
+            label.provenance for label in baseline["labels"]]
+        got_diagnostics = dict(got["diagnostics"])
+        baseline_diagnostics = dict(baseline["diagnostics"])
+        np.testing.assert_array_equal(
+            got_diagnostics.pop("support_validity_array"),
+            baseline_diagnostics.pop("support_validity_array"))
+        assert got_diagnostics == baseline_diagnostics
+
+
+def test_history_crosses_file_boundary_without_reset(tmp_path):
+    left = tmp_path / "a.parquet"
+    right = tmp_path / "b.parquet"
+    _write(left, [_record(0, "2026-08-17", end_wheat=2)])
+    _write(right, [_record(1, "2026-08-18", start_wheat=0, end_wheat=3)])
+
+    result = load_dataset(
+        [left, right], dates=("2026-08-17", "2026-08-18"), read_batch_size=1)
+
+    assert [label.provenance.prior_crop_goals for label in result["labels"]] == [
+        (0, 0, 0, 0, 0), (2, 0, 0, 0, 0)]
+    assert result["row_identities"][1]["source_row"] == 0
+    assert result["row_identities"][1]["row_index"] == 1
+
+
+def test_bounded_reader_consumes_multiple_batches(tmp_path, monkeypatch):
+    path = tmp_path / "canonical.parquet"
+    _write(path, [_record(day, f"2026-08-{17 + day}") for day in range(5)])
+    calls: list[int] = []
+    original = pq.ParquetFile.iter_batches
+
+    def spy(self, *args, **kwargs):
+        calls.append(kwargs["batch_size"])
+        batches = original(self, *args, **kwargs)
+
+        def counted():
+            for batch in batches:
+                calls.append(-1)
+                yield batch
+        return counted()
+
+    monkeypatch.setattr("rl_manager.stage25_adapter.pq.ParquetFile.iter_batches", spy)
+    load_dataset(path, dates=tuple(f"2026-08-{17 + day}" for day in range(5)),
+                 read_batch_size=2)
+    assert calls == [2, -1, -1, -1]
+
+
+def test_audit_invalid_crop_component_uses_authoritative_crop_goals(tmp_path):
+    from tools.audit_stage25_canonical import _examples
+
+    path = tmp_path / "canonical.parquet"
+    record = _record(0, "2026-08-17", end_wheat=1)
+    record["targets"]["crop_composition_end"]["WHEAT"] = 999
+    _write(path, [record])
+    result = load_dataset(path, dates=("2026-08-17",))
+
+    examples = _examples(result, {
+        "labels": (), "records": (), "partial_rows": result["partial_rows"],
+        "partial_records": result["partial_records"],
+    })
+    assert examples
+    assert "wheat:prefix_or_physical_capacity_support" in \
+        examples[0]["physical_support_reasons"]
+
+
+def test_canonical_bounded_arrays_complete_one_bc_checkpoint_roundtrip(tmp_path):
+    import jax
+
+    from rl_manager.stage25_bc import (
+        Stage25BCConfig,
+        init_opt_state,
+        load_checkpoint,
+        loss_and_metrics,
+        make_fixed_batch,
+        save_checkpoint,
+        train_step,
+    )
+    from rl_manager.stage25_policy import Stage25ModelConfig, init_stage25_params
+
+    path = tmp_path / "canonical.parquet"
+    _write(path, [_record(0, "2026-08-17", end_wheat=1)])
+    loaded = load_dataset(path, dates=("2026-08-17",))
+    config = Stage25BCConfig(model=Stage25ModelConfig.tiny(), batch_size=1)
+    params = init_stage25_params(config.model, seed=19)
+    opt_state = init_opt_state(params, config)
+    rng = jax.random.PRNGKey(19)
+    batch = make_fixed_batch(loaded["inputs"], loaded["actions"], 1,
+                             row_ids=loaded["row_ids"])
+    before = loss_and_metrics(params, batch, config)
+    params, opt_state, rng, _ = train_step(params, opt_state, rng, batch, config)
+    after = loss_and_metrics(params, batch, config)
+    checkpoint = tmp_path / "stage25-bc.npz"
+    save_checkpoint(checkpoint, params, opt_state, rng, config=config, step=1)
+    restored = load_checkpoint(checkpoint, config=config)
+    replayed = loss_and_metrics(restored[0], batch, config)
+
+    assert np.isfinite(float(before["loss"]))
+    assert np.isfinite(float(after["loss"]))
+    assert np.isfinite(float(replayed["loss"]))
+    np.testing.assert_allclose(after["loss"], replayed["loss"])
 
 
 def test_directory_discovers_arbitrary_nested_parquet_names(tmp_path):
