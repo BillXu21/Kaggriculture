@@ -37,15 +37,16 @@ from replay_daily.storage import (
 from .stage25_data import (
     OutcomeProxyBuild,
     OutcomeProxyLabel,
+    OutcomeProxyBuilder,
     _date as _data_date,
     _score as _data_score,
-    build_outcome_proxy_labels,
 )
 
 PROJECTED_COLUMNS = ("schema_version", "metadata", "day", "start", "targets", "end")
 DEFAULT_TRAIN_DATES = ("2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20")
 DEFAULT_VAL_DATES = ("2026-08-21",)
 DEFAULT_MIN_SCORE = 2950.0
+DEFAULT_READ_BATCH_SIZE = 256
 DEFAULT_PARQUET_PATHS = tuple(
     Path(f"canonical-{date}.parquet")
     for date in DEFAULT_TRAIN_DATES + DEFAULT_VAL_DATES
@@ -69,6 +70,7 @@ class Stage25AdapterConfig:
     min_score: float = DEFAULT_MIN_SCORE
     e_history_version: str = E_HISTORY_CORRECTED_V1
     manager_start_day: int | None = None
+    read_batch_size: int = DEFAULT_READ_BATCH_SIZE
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,29 @@ class _SourceRow:
     row_index: int
     source_path: str
     source_row: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RowInfo:
+    """Compact metadata retained after one canonical row is consumed."""
+
+    source: _SourceRow
+    metadata: dict[str, Any]
+    date: str | None
+    score: float | None
+    audit_record: dict[str, Any]
+
+    @property
+    def day(self) -> int:
+        return int(self.metadata["day"])
+
+    @property
+    def episode_id(self) -> Any:
+        return self.metadata.get("episode_id")
+
+    @property
+    def seat(self) -> Any:
+        return self.metadata.get("seat")
 
 
 def _paths(value: str | Path | Sequence[str | Path] | None) -> list[Path]:
@@ -102,7 +127,7 @@ def _paths(value: str | Path | Sequence[str | Path] | None) -> list[Path]:
     return list(dict.fromkeys(result))
 
 
-def _require_schema_version(table: pa.Table, path: Path) -> None:
+def _require_schema_version(table: pa.Table | pa.RecordBatch, path: Path) -> None:
     if "schema_version" not in table.column_names:
         raise SchemaVersionError(f"{path}: schema_version column missing")
     versions = table.column("schema_version").to_pylist()
@@ -116,16 +141,26 @@ def _require_schema_version(table: pa.Table, path: Path) -> None:
         )
 
 
-def _read_projected(path: Path) -> pa.Table:
+def _open_projected(path: Path) -> pq.ParquetFile:
     try:
-        table = pq.read_table(path, columns=list(PROJECTED_COLUMNS))
+        parquet = pq.ParquetFile(path)
+        if "schema_version" not in parquet.schema_arrow.names:
+            raise SchemaVersionError(f"{path}: schema_version column missing")
+        missing = [name for name in PROJECTED_COLUMNS
+                   if name not in parquet.schema_arrow.names]
+        if missing:
+            raise ValueError(
+                f"{path}: not a canonical Stage 2.5 Parquet file; missing "
+                f"projected columns {missing!r}"
+            )
+        return parquet
+    except SchemaVersionError:
+        raise
     except (KeyError, ValueError, pa.ArrowException) as exc:
         raise ValueError(
             f"{path}: not a canonical Stage 2.5 Parquet file ({exc}); "
             f"expected projected columns {list(PROJECTED_COLUMNS)!r}"
         ) from exc
-    _require_schema_version(table, path)
-    return table
 
 
 def _metadata(value: Any) -> dict[str, Any]:
@@ -175,20 +210,83 @@ def _logical_record(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _read_all(paths: Sequence[Path]) -> tuple[list[dict[str, Any]], list[Mapping[str, Any]], list[int], list[_SourceRow]]:
-    records: list[dict[str, Any]] = []
-    starts: list[Mapping[str, Any]] = []
-    days: list[int] = []
-    source_rows: list[_SourceRow] = []
+def _state_summary(state: Mapping[str, Any]) -> dict[str, Any]:
+    crops: Counter[str] = Counter()
+    animals: Counter[str] = Counter()
+    crop_names = {name.upper() for name in CROP_STEPS}
+    board = state.get("board", ())
+    for board_row in board if isinstance(board, (list, tuple)) else ():
+        for tile in board_row if isinstance(board_row, (list, tuple)) else ():
+            if not isinstance(tile, Mapping):
+                continue
+            crop = tile.get("crop")
+            animal = tile.get("animal")
+            if crop in crop_names:
+                crops[str(crop)] += 1
+            if animal in ("GOOSE", "COW", "SHEEP"):
+                animals[str(animal)] += 1
+    unlocked = state.get("unlocked_quadrants", ())
+    return {
+        "unlocked_land": len(unlocked) if isinstance(unlocked, (list, tuple))
+        else None,
+        "crop_counts": dict(crops),
+        "animal_counts": dict(animals),
+        "money": state.get("money"),
+    }
+
+
+def _audit_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a small audit view, never a retained canonical board."""
+    return {
+        "start": {"self": _state_summary(record["start"]["self"])},
+        "end": {"self": _state_summary(record["end"]["self"])},
+    }
+
+
+def _row_info(source: _SourceRow, record: Mapping[str, Any]) -> _RowInfo:
+    metadata = record["metadata"]
+    compact_metadata = _eval_metadata(metadata, int(record["day"]))
+    return _RowInfo(
+        source=source,
+        metadata=compact_metadata,
+        date=_data_date(record, metadata),
+        score=_data_score(record, metadata),
+        audit_record=_audit_record(record),
+    )
+
+
+def _iter_projected_batches(
+    paths: Sequence[Path],
+    *,
+    read_batch_size: int,
+):
+    """Yield bounded projected batches in deterministic file/global order."""
+    if read_batch_size <= 0:
+        raise ValueError("read_batch_size must be positive")
+    global_row = 0
     for path in paths:
-        table = _read_projected(path)
-        arrow_rows = table.to_pylist()
-        for source_row, row in enumerate(arrow_rows):
-            records.append(_logical_record(row))
-            starts.append(row["start"])
-            days.append(int(row["day"]))
-            source_rows.append(_SourceRow(len(records) - 1, str(path), source_row))
-    return records, starts, days, source_rows
+        parquet = _open_projected(path)
+        source_row = 0
+        saw_rows = False
+        try:
+            batches = parquet.iter_batches(
+                batch_size=read_batch_size, columns=list(PROJECTED_COLUMNS))
+            for batch in batches:
+                _require_schema_version(batch, path)
+                saw_rows = saw_rows or bool(batch.num_rows)
+                yield path, global_row, source_row, batch
+                global_row += batch.num_rows
+                source_row += batch.num_rows
+            if not saw_rows:
+                raise SchemaVersionError(
+                    f"{path}: schema_version contains no rows; expected {SCHEMA_VERSION}")
+        except SchemaVersionError:
+            raise
+        except (KeyError, ValueError, pa.ArrowException) as exc:
+            raise ValueError(
+                f"{path}: not a canonical Stage 2.5 Parquet file ({exc}); "
+                f"expected projected columns {list(PROJECTED_COLUMNS)!r}"
+            ) from exc
 
 
 def _take_inputs(inputs: Mapping[str, np.ndarray], indices: Sequence[int]) -> dict[str, np.ndarray]:
@@ -206,8 +304,9 @@ def _label_actions(label: OutcomeProxyLabel) -> tuple[int, ...]:
     return tuple(int(value) for value in values)
 
 
-def _identity(source: _SourceRow, record: Mapping[str, Any]) -> dict[str, Any]:
-    metadata = record["metadata"]
+def _identity(info: _RowInfo) -> dict[str, Any]:
+    metadata = info.metadata
+    source = info.source
     row_id = f"{source.source_path}::row={source.source_row}"
     return {
         "row_id": row_id,
@@ -216,7 +315,7 @@ def _identity(source: _SourceRow, record: Mapping[str, Any]) -> dict[str, Any]:
         "source_row": source.source_row,
         "episode_id": metadata.get("episode_id"),
         "seat": metadata.get("seat"),
-        "day": record["day"],
+        "day": info.day,
         "partition_date": metadata.get("partition_date"),
     }
 
@@ -233,52 +332,60 @@ def _selected(record: Mapping[str, Any], dates: set[str], min_score: float) -> t
     return True, None
 
 
-def _corpus_diagnostics(
-    records: Sequence[Mapping[str, Any]],
-    source_rows: Sequence[_SourceRow],
-    min_score: float,
-) -> dict[str, Any]:
-    """Summarize projected corpus identity and selection fields only."""
-    date_counts: Counter[str] = Counter()
-    score_counts: Counter[str] = Counter()
-    episode_ids: set[Any] = set()
-    episode_seats: set[tuple[Any, Any]] = set()
-    logical_rows: Counter[tuple[Any, Any, int]] = Counter()
-    files: Counter[str] = Counter()
-    schema_versions: Counter[str] = Counter()
-    for record, source in zip(records, source_rows):
-        metadata = record["metadata"]
-        date = _data_date(record, metadata)
-        date_counts["<missing>" if date is None else str(date)] += 1
-        score = _data_score(record, metadata)
-        if score is None:
-            score_counts["missing"] += 1
-        elif float(score) < float(min_score):
-            score_counts["below_min_score"] += 1
+class _CorpusAccumulator:
+    """Streaming corpus diagnostics with no retained canonical rows."""
+
+    def __init__(self, min_score: float) -> None:
+        self.min_score = float(min_score)
+        self.date_counts: Counter[str] = Counter()
+        self.score_counts: Counter[str] = Counter()
+        self.episode_ids: set[Any] = set()
+        self.episode_seats: set[tuple[Any, Any]] = set()
+        self.logical_rows: Counter[tuple[Any, Any, int]] = Counter()
+        self.files: Counter[str] = Counter()
+        self.schema_versions: Counter[str] = Counter()
+        self.rows_read = 0
+
+    def add(self, info: _RowInfo, schema_version: Any) -> None:
+        date = info.date
+        self.date_counts["<missing>" if date is None else str(date)] += 1
+        if info.score is None:
+            self.score_counts["missing"] += 1
+        elif info.score < self.min_score:
+            self.score_counts["below_min_score"] += 1
         else:
-            score_counts["at_or_above_min_score"] += 1
-        episode = metadata.get("episode_id")
-        seat = metadata.get("seat")
-        episode_ids.add(episode)
-        episode_seats.add((episode, seat))
-        logical_rows[(episode, seat, int(record["day"]))] += 1
-        files[source.source_path] += 1
-        schema_versions[str(record["schema_version"])] += 1
-    return {
-        "files": dict(sorted(files.items())),
-        "schema_versions": dict(sorted(schema_versions.items())),
-        "rows_read": int(len(records)),
-        "unique_episode_count": len(episode_ids),
-        "unique_episode_seat_count": len(episode_seats),
-        "duplicate_logical_row_count": sum(
-            count - 1 for count in logical_rows.values() if count > 1),
-        "date_counts": dict(sorted(date_counts.items())),
-        "score_filter_counts": {
-            **{key: int(score_counts.get(key, 0)) for key in
-               ("missing", "below_min_score", "at_or_above_min_score")},
-            "minimum_score": float(min_score),
-        },
-    }
+            self.score_counts["at_or_above_min_score"] += 1
+        self.episode_ids.add(info.episode_id)
+        self.episode_seats.add((info.episode_id, info.seat))
+        self.logical_rows[(info.episode_id, info.seat, info.day)] += 1
+        self.files[info.source.source_path] += 1
+        self.schema_versions[str(schema_version)] += 1
+        self.rows_read += 1
+
+    def finish(self) -> dict[str, Any]:
+        return {
+            "files": dict(sorted(self.files.items())),
+            "schema_versions": dict(sorted(self.schema_versions.items())),
+            "rows_read": int(self.rows_read),
+            "unique_episode_count": len(self.episode_ids),
+            "unique_episode_seat_count": len(self.episode_seats),
+            "duplicate_logical_row_count": sum(
+                count - 1 for count in self.logical_rows.values() if count > 1),
+            "date_counts": dict(sorted(self.date_counts.items())),
+            "score_filter_counts": {
+                **{key: int(self.score_counts.get(key, 0)) for key in
+                   ("missing", "below_min_score", "at_or_above_min_score")},
+                "minimum_score": self.min_score,
+            },
+        }
+
+
+def _selected_info(info: _RowInfo, dates: set[str], min_score: float) -> tuple[bool, str | None]:
+    if str(info.date) not in dates:
+        return False, "date"
+    if info.score is None or info.score < float(min_score):
+        return False, "score"
+    return True, None
 
 
 def _diagnostics(
@@ -328,8 +435,7 @@ def _diagnostics(
 
 
 def _materialize_split(
-    records: Sequence[dict[str, Any]],
-    source_rows: Sequence[_SourceRow],
+    row_infos: Sequence[_RowInfo],
     inputs_all: Mapping[str, np.ndarray],
     build: OutcomeProxyBuild,
     *,
@@ -338,16 +444,15 @@ def _materialize_split(
 ) -> dict[str, Any]:
     date_set = {str(value) for value in dates}
     complete = [label for label in build.rows
-                if label.row_index < len(records)
-                and _selected(records[label.row_index], date_set, min_score)[0]]
+                if _selected_info(row_infos[label.row_index], date_set,
+                                  min_score)[0]]
     partial = [label for label in build.partial_rows
-               if label.row_index < len(records)
-               and _selected(records[label.row_index], date_set, min_score)[0]]
-    selected_indices = [index for index, record in enumerate(records)
-                        if _selected(record, date_set, min_score)[0]]
+               if _selected_info(row_infos[label.row_index], date_set,
+                                 min_score)[0]]
+    selected_indices = [info.source.row_index for info in row_infos
+                        if _selected_info(info, date_set, min_score)[0]]
     complete_indices = [label.row_index for label in complete]
-    identities = [_identity(source_rows[index], records[index])
-                  for index in complete_indices]
+    identities = [_identity(row_infos[index]) for index in complete_indices]
     row_ids = [item["row_id"] for item in identities]
     actions = np.asarray([_label_actions(label) for label in complete], dtype=np.int16)
     if actions.size == 0:
@@ -361,7 +466,7 @@ def _materialize_split(
     inputs["crop_capacity"] = crop_capacity
     meta = []
     for index, identity in zip(complete_indices, identities):
-        item = _eval_metadata(records[index]["metadata"], records[index]["day"])
+        item = dict(row_infos[index].metadata)
         item.update(identity)
         meta.append(item)
 
@@ -369,8 +474,8 @@ def _materialize_split(
                          "invalid_or_no_valid_component": 0}
     complete_set = set(complete_indices)
     partial_set = {label.row_index for label in partial}
-    for index, record in enumerate(records):
-        selected, reason = _selected(record, date_set, min_score)
+    for index, info in enumerate(row_infos):
+        selected, reason = _selected_info(info, date_set, min_score)
         if not selected:
             selection_reasons[reason or "date"] += 1
         elif index in partial_set:
@@ -381,13 +486,13 @@ def _materialize_split(
     diagnostics = _diagnostics(
         build, complete, partial, len(selected_indices), selection_reasons)
     report = {
-        "rows_read": len(records),
+        "rows_read": len(row_infos),
         "rows_selected": len(selected_indices),
-        "rows_excluded": len(records) - len(selected_indices),
+        "rows_excluded": len(row_infos) - len(selected_indices),
         "rows_complete": len(complete),
         "rows_partial": len(partial),
         "rows_not_trainable": len(selected_indices) - len(complete),
-        "selection_excluded_rows": len(records) - len(selected_indices),
+        "selection_excluded_rows": len(row_infos) - len(selected_indices),
         "min_score": float(min_score),
         "dates": list(dates),
         "exclusion_reasons": dict(selection_reasons),
@@ -398,7 +503,7 @@ def _materialize_split(
         "animal_classes": actions[:, 1:4],
         "crop_classes": actions[:, 4:9],
     }
-    logical_records = [records[index] for index in complete_indices]
+    logical_records = [row_infos[index].audit_record for index in complete_indices]
     return {
         "inputs": inputs,
         "targets": target_arrays,
@@ -410,11 +515,71 @@ def _materialize_split(
         "row_ids": tuple(row_ids),
         "row_identities": identities,
         "partial_rows": tuple(partial),
-        "partial_records": [records[label.row_index] for label in partial],
+        "partial_records": [row_infos[label.row_index].audit_record
+                            for label in partial],
         "counters": build.counters,
         "diagnostics": diagnostics,
         "report": report,
     }
+
+
+def _load_streamed(
+    paths: Sequence[Path],
+    *,
+    selected_dates: Sequence[str],
+    min_score: float,
+    e_history_version: str,
+    manager_start_day: int | None,
+    read_batch_size: int,
+) -> tuple[list[_RowInfo], dict[str, np.ndarray], OutcomeProxyBuild,
+           dict[str, Any]]:
+    """Scan canonical Parquet with bounded nested materialization.
+
+    Only ``batch.to_pylist()`` is allowed to contain nested canonical objects.
+    Each batch is converted to compact model arrays, labels, metadata, and
+    audit summaries before its Python rows are released.
+    """
+    builder = OutcomeProxyBuilder(selected_dates, min_score)
+    corpus_builder = _CorpusAccumulator(min_score)
+    row_infos: list[_RowInfo] = []
+    input_chunks: dict[str, list[np.ndarray]] = {}
+    for path, global_start, source_start, batch in _iter_projected_batches(
+            paths, read_batch_size=read_batch_size):
+        arrow_rows = batch.to_pylist()
+        starts = [row["start"] for row in arrow_rows]
+        days = [int(row["day"]) for row in arrow_rows]
+        batch_inputs = _input_arrays_from_starts(
+            starts, days, include_opponent=False)
+        for name, value in batch_inputs.items():
+            input_chunks.setdefault(name, []).append(value)
+        for offset, arrow_row in enumerate(arrow_rows):
+            logical = _logical_record(arrow_row)
+            source = _SourceRow(
+                global_start + offset, str(path), source_start + offset)
+            info = _row_info(source, logical)
+            row_infos.append(info)
+            corpus_builder.add(info, logical["schema_version"])
+            builder.consume(logical)
+        del starts, days, batch_inputs, arrow_rows
+        del logical, arrow_row, source, info, batch
+
+    if input_chunks:
+        inputs_all = {
+            name: np.ascontiguousarray(np.concatenate(chunks, axis=0))
+            for name, chunks in input_chunks.items()
+        }
+    else:
+        inputs_all = _input_arrays_from_starts([], [], include_opponent=False)
+    inputs_all[ECONOMIC_CONTEXT_KEY] = derive_economic_context(
+        [info.episode_id for info in row_infos],
+        [info.seat for info in row_infos],
+        [info.day for info in row_infos],
+        inputs_all["scalars"][:, 0],
+        inputs_all["unlocked"].sum(axis=1),
+        e_history_version=e_history_version,
+        manager_start_day=manager_start_day,
+    )
+    return row_infos, inputs_all, builder.finish(), corpus_builder.finish()
 
 
 def load_dataset(
@@ -424,6 +589,7 @@ def load_dataset(
     min_score: float = DEFAULT_MIN_SCORE,
     e_history_version: str = E_HISTORY_CORRECTED_V1,
     manager_start_day: int | None = None,
+    read_batch_size: int = DEFAULT_READ_BATCH_SIZE,
     config: Stage25AdapterConfig | None = None,
 ) -> dict[str, Any]:
     """Load one complete Stage 2.5 split from projected canonical Parquet."""
@@ -438,24 +604,15 @@ def load_dataset(
             e_history_version = config.e_history_version
         if manager_start_day is None:
             manager_start_day = config.manager_start_day
+        if read_batch_size == DEFAULT_READ_BATCH_SIZE:
+            read_batch_size = config.read_batch_size
     path_list = _paths(paths)
-    records, starts, days, source_rows = _read_all(path_list)
-    corpus = _corpus_diagnostics(records, source_rows, min_score)
-    metadata = [record["metadata"] for record in records]
-    inputs_all = _input_arrays_from_starts(starts, days, include_opponent=False)
-    inputs_all[ECONOMIC_CONTEXT_KEY] = derive_economic_context(
-        [item.get("episode_id") for item in metadata],
-        [item.get("seat") for item in metadata],
-        days,
-        inputs_all["scalars"][:, 0],
-        inputs_all["unlocked"].sum(axis=1),
+    row_infos, inputs_all, build, corpus = _load_streamed(
+        path_list, selected_dates=dates, min_score=min_score,
         e_history_version=e_history_version,
-        manager_start_day=manager_start_day,
-    )
-    build = build_outcome_proxy_labels(
-        records, selected_dates=dates, min_score=min_score)
+        manager_start_day=manager_start_day, read_batch_size=read_batch_size)
     result = _materialize_split(
-        records, source_rows, inputs_all, build,
+        row_infos, inputs_all, build,
         dates=dates, min_score=min_score)
     result["corpus"] = corpus
     return result
@@ -469,6 +626,7 @@ def load_train_val(
     min_score: float = DEFAULT_MIN_SCORE,
     e_history_version: str = E_HISTORY_CORRECTED_V1,
     manager_start_day: int | None = None,
+    read_batch_size: int = DEFAULT_READ_BATCH_SIZE,
     config: Stage25AdapterConfig | None = None,
 ) -> dict[str, Any]:
     """Load the date-held-out train/validation Stage 2.5 batches."""
@@ -485,37 +643,28 @@ def load_train_val(
             e_history_version = config.e_history_version
         if manager_start_day is None:
             manager_start_day = config.manager_start_day
+        if read_batch_size == DEFAULT_READ_BATCH_SIZE:
+            read_batch_size = config.read_batch_size
     overlap = set(train_dates) & set(val_dates)
     if overlap:
         raise ValueError(f"train/val date lists overlap: {sorted(overlap)}")
     path_list = _paths(paths)
-    records, starts, days, source_rows = _read_all(path_list)
-    corpus = _corpus_diagnostics(records, source_rows, min_score)
-    metadata = [record["metadata"] for record in records]
-    inputs_all = _input_arrays_from_starts(starts, days, include_opponent=False)
-    inputs_all[ECONOMIC_CONTEXT_KEY] = derive_economic_context(
-        [item.get("episode_id") for item in metadata],
-        [item.get("seat") for item in metadata],
-        days,
-        inputs_all["scalars"][:, 0],
-        inputs_all["unlocked"].sum(axis=1),
-        e_history_version=e_history_version,
-        manager_start_day=manager_start_day,
-    )
     all_dates = tuple(train_dates) + tuple(val_dates)
-    build = build_outcome_proxy_labels(
-        records, selected_dates=all_dates, min_score=min_score)
+    row_infos, inputs_all, build, corpus = _load_streamed(
+        path_list, selected_dates=all_dates, min_score=min_score,
+        e_history_version=e_history_version,
+        manager_start_day=manager_start_day, read_batch_size=read_batch_size)
     train = _materialize_split(
-        records, source_rows, inputs_all, build,
+        row_infos, inputs_all, build,
         dates=train_dates, min_score=min_score)
     val = _materialize_split(
-        records, source_rows, inputs_all, build,
+        row_infos, inputs_all, build,
         dates=val_dates, min_score=min_score)
     return {
         "train": train,
         "val": val,
         "report": {
-            "rows_read": len(records),
+            "rows_read": len(row_infos),
             "rows_selected": train["report"]["rows_selected"] + val["report"]["rows_selected"],
             "train_rows": len(train["labels"]),
             "val_rows": len(val["labels"]),
@@ -534,6 +683,7 @@ load_stage25_train_val = load_train_val
 __all__ = [
     "ACTION_STEPS",
     "DEFAULT_MIN_SCORE",
+    "DEFAULT_READ_BATCH_SIZE",
     "DEFAULT_PARQUET_PATHS",
     "DEFAULT_TRAIN_DATES",
     "DEFAULT_VAL_DATES",

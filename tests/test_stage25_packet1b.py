@@ -335,6 +335,37 @@ def test_outcome_proxy_labels_reject_gaps_with_invalid_counters():
                for label in result.labels)
 
 
+def test_outcome_proxy_builder_consumes_generator_without_materializing_source():
+    module = _data_module()
+    rows = [_logical_row(0), _logical_row(1, crop_counts=(2, 0, 0, 0, 0))]
+    expected = module.build_outcome_proxy_labels(rows)
+    builder = module.OutcomeProxyBuilder()
+    for row in (row for row in rows):
+        builder.consume(row)
+    actual = builder.finish()
+
+    assert actual.rows == expected.rows
+    assert actual.partial_rows == expected.partial_rows
+    assert actual.counters == expected.counters
+
+
+def test_outcome_proxy_identity_reset_and_out_of_order_rows_do_not_join():
+    module = _data_module()
+    reset = _logical_row(1, crop_counts=(2, 0, 0, 0, 0))
+    reset["reset_marker"] = True
+    identity_break = _logical_row(2, crop_counts=(3, 0, 0, 0, 0))
+    identity_break["boundary_id"] = 99
+    out_of_order = _logical_row(0, crop_counts=(4, 0, 0, 0, 0))
+    result = module.build_outcome_proxy_labels(
+        [_logical_row(0), reset, identity_break, out_of_order])
+
+    labels = {label.row_index: label for label in result.labels}
+    assert labels[1].provenance.prior_source == "history_reset_gap_start_occupancy"
+    assert labels[2].provenance.prior_source == "history_reset_gap_start_occupancy"
+    assert labels[3].provenance.prior_source == "history_reset_gap_start_occupancy"
+    assert labels[3].provenance.prior_crop_goals == (4, 0, 0, 0, 0)
+
+
 def test_outcome_proxy_uses_observed_animal_loss_without_fabricating_transactions():
     module = _data_module()
     rows = [
