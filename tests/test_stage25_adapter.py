@@ -214,6 +214,24 @@ def test_configurable_paths_and_exact_projection(tmp_path, monkeypatch):
     assert "events" not in seen[0]
 
 
+def test_directory_discovers_arbitrary_nested_parquet_names(tmp_path):
+    corpus = tmp_path / "canonical-corpus"
+    nested = corpus / "partitions"
+    nested.mkdir(parents=True)
+    _write(nested / "day-a.parquet", [_record(0, "2026-08-17", end_wheat=1)])
+    _write(nested / "day-b.parquet", [
+        _record(1, "2026-08-18", start_wheat=0, end_wheat=1)])
+
+    result = load_dataset(
+        corpus, dates=("2026-08-17", "2026-08-18"), min_score=2950)
+
+    assert result["actions"].shape == (2, 9)
+    assert result["corpus"]["rows_read"] == 2
+    assert result["corpus"]["date_counts"] == {
+        "2026-08-17": 1, "2026-08-18": 1}
+    assert len(result["corpus"]["files"]) == 2
+
+
 def test_adapter_selection_shares_builder_score_semantics():
     from rl_manager.stage25_adapter import _selected
 

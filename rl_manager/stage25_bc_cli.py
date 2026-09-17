@@ -28,7 +28,10 @@ from rl_manager.stage25_policy import Stage25ModelConfig, init_stage25_params
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", type=Path)
+    parser.add_argument(
+        "--data", type=Path, action="append",
+        help="canonical Parquet file/directory (repeat for multiple files), "
+             "or one NPZ array dataset")
     parser.add_argument("--inputs", type=Path)
     parser.add_argument("--labels", type=Path)
     parser.add_argument("--model-size", choices=("tiny", "small", "large"), default="tiny")
@@ -58,14 +61,23 @@ def _model(size: str) -> Stage25ModelConfig:
 
 def _load(args: argparse.Namespace):
     if args.data:
-        if args.data.suffix.lower() == ".parquet":
+        data_paths = tuple(args.data)
+        canonical = any(path.is_dir() or path.suffix.lower() == ".parquet"
+                        for path in data_paths)
+        if canonical:
+            if any(not (path.is_dir() or path.suffix.lower() == ".parquet")
+                   for path in data_paths):
+                raise ValueError(
+                    "--data cannot mix canonical Parquet paths with an NPZ path")
             from rl_manager.stage25_adapter import load_dataset
             kwargs = {"min_score": args.min_score}
             if args.dates:
                 kwargs["dates"] = tuple(args.dates)
-            loaded = load_dataset(args.data, **kwargs)
+            loaded = load_dataset(data_paths, **kwargs)
             return loaded["inputs"], loaded["actions"], loaded.get("row_ids")
-        inputs, actions = load_array_dataset(args.data)
+        if len(data_paths) != 1:
+            raise ValueError("NPZ array datasets accept exactly one --data path")
+        inputs, actions = load_array_dataset(data_paths[0])
         return inputs, actions, None
     if not args.inputs or not args.labels:
         raise ValueError("provide --data or both --inputs and --labels")

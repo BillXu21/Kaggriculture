@@ -9,6 +9,7 @@ the shared BC adapter encodes the start state into compact arrays.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -81,14 +82,24 @@ def _paths(value: str | Path | Sequence[str | Path] | None) -> list[Path]:
     if value is None:
         return [Path(path) for path in DEFAULT_PARQUET_PATHS]
     if isinstance(value, (str, Path)):
-        candidate = Path(value)
-        if candidate.is_dir():
-            return [candidate / path.name for path in DEFAULT_PARQUET_PATHS]
         value = [value]
-    result = [Path(path) for path in value]
+    result: list[Path] = []
+    for item in value:
+        candidate = Path(item)
+        if candidate.is_dir():
+            discovered = sorted(
+                (path for path in candidate.rglob("*.parquet") if path.is_file()),
+                key=lambda path: path.as_posix(),
+            )
+            if not discovered:
+                raise ValueError(
+                    f"{candidate}: canonical data directory contains no Parquet files")
+            result.extend(discovered)
+        else:
+            result.append(candidate)
     if not result:
         raise ValueError("at least one canonical Parquet path is required")
-    return result
+    return list(dict.fromkeys(result))
 
 
 def _require_schema_version(table: pa.Table, path: Path) -> None:
@@ -220,6 +231,54 @@ def _selected(record: Mapping[str, Any], dates: set[str], min_score: float) -> t
     if score is None or float(score) < float(min_score):
         return False, "score"
     return True, None
+
+
+def _corpus_diagnostics(
+    records: Sequence[Mapping[str, Any]],
+    source_rows: Sequence[_SourceRow],
+    min_score: float,
+) -> dict[str, Any]:
+    """Summarize projected corpus identity and selection fields only."""
+    date_counts: Counter[str] = Counter()
+    score_counts: Counter[str] = Counter()
+    episode_ids: set[Any] = set()
+    episode_seats: set[tuple[Any, Any]] = set()
+    logical_rows: Counter[tuple[Any, Any, int]] = Counter()
+    files: Counter[str] = Counter()
+    schema_versions: Counter[str] = Counter()
+    for record, source in zip(records, source_rows):
+        metadata = record["metadata"]
+        date = _data_date(record, metadata)
+        date_counts["<missing>" if date is None else str(date)] += 1
+        score = _data_score(record, metadata)
+        if score is None:
+            score_counts["missing"] += 1
+        elif float(score) < float(min_score):
+            score_counts["below_min_score"] += 1
+        else:
+            score_counts["at_or_above_min_score"] += 1
+        episode = metadata.get("episode_id")
+        seat = metadata.get("seat")
+        episode_ids.add(episode)
+        episode_seats.add((episode, seat))
+        logical_rows[(episode, seat, int(record["day"]))] += 1
+        files[source.source_path] += 1
+        schema_versions[str(record["schema_version"])] += 1
+    return {
+        "files": dict(sorted(files.items())),
+        "schema_versions": dict(sorted(schema_versions.items())),
+        "rows_read": int(len(records)),
+        "unique_episode_count": len(episode_ids),
+        "unique_episode_seat_count": len(episode_seats),
+        "duplicate_logical_row_count": sum(
+            count - 1 for count in logical_rows.values() if count > 1),
+        "date_counts": dict(sorted(date_counts.items())),
+        "score_filter_counts": {
+            **{key: int(score_counts.get(key, 0)) for key in
+               ("missing", "below_min_score", "at_or_above_min_score")},
+            "minimum_score": float(min_score),
+        },
+    }
 
 
 def _diagnostics(
@@ -381,6 +440,7 @@ def load_dataset(
             manager_start_day = config.manager_start_day
     path_list = _paths(paths)
     records, starts, days, source_rows = _read_all(path_list)
+    corpus = _corpus_diagnostics(records, source_rows, min_score)
     metadata = [record["metadata"] for record in records]
     inputs_all = _input_arrays_from_starts(starts, days, include_opponent=False)
     inputs_all[ECONOMIC_CONTEXT_KEY] = derive_economic_context(
@@ -394,9 +454,11 @@ def load_dataset(
     )
     build = build_outcome_proxy_labels(
         records, selected_dates=dates, min_score=min_score)
-    return _materialize_split(
+    result = _materialize_split(
         records, source_rows, inputs_all, build,
         dates=dates, min_score=min_score)
+    result["corpus"] = corpus
+    return result
 
 
 def load_train_val(
@@ -428,6 +490,7 @@ def load_train_val(
         raise ValueError(f"train/val date lists overlap: {sorted(overlap)}")
     path_list = _paths(paths)
     records, starts, days, source_rows = _read_all(path_list)
+    corpus = _corpus_diagnostics(records, source_rows, min_score)
     metadata = [record["metadata"] for record in records]
     inputs_all = _input_arrays_from_starts(starts, days, include_opponent=False)
     inputs_all[ECONOMIC_CONTEXT_KEY] = derive_economic_context(
@@ -460,6 +523,7 @@ def load_train_val(
             "val_dates": list(val_dates),
             "min_score": float(min_score),
         },
+        "corpus": corpus,
     }
 
 
