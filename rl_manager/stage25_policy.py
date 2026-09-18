@@ -276,6 +276,7 @@ def init_stage25_params(
         config: Stage25ModelConfig,
         seed: int = 0,
         encoder_params: Mapping[str, Any] | None = None,
+        scratch_hold_prior_tau: float | None = None,
 ) -> dict[str, Any]:
     """Initialize a native Stage 2.5 pytree.
 
@@ -284,6 +285,10 @@ def init_stage25_params(
     """
     if not isinstance(config, Stage25ModelConfig):
         raise TypeError("config must be Stage25ModelConfig")
+    if scratch_hold_prior_tau is not None:
+        if (not math.isfinite(float(scratch_hold_prior_tau))
+                or float(scratch_hold_prior_tau) <= 0.0):
+            raise ValueError("scratch_hold_prior_tau must be finite and positive")
     source = (_init_encoder_train_params(config.manager_config, seed=int(seed),
                                          model_variant="E")
               if encoder_params is None else encoder_params)
@@ -304,13 +309,26 @@ def init_stage25_params(
             "bias": jnp.zeros((count,), jnp.float32),
         })
         embeddings.append(normal(leaves[7 + 2 * i], (count, d)))
-    # Crop logits start with the requested -abs(delta)/tau prior.
-    tau = config.crop_prior_tau if config.crop_bias_tau is None \
-        else config.crop_bias_tau
-    crop_bias = -jnp.abs(jnp.arange(-100, 101, dtype=jnp.float32)) / float(tau)
     projections = [dict(item) for item in projections]
-    for index in range(4, _N_ACTIONS):
-        projections[index]["bias"] = crop_bias
+    if scratch_hold_prior_tau is None:
+        # Preserve the established crop prior for every ordinary initializer.
+        tau = config.crop_prior_tau if config.crop_bias_tau is None \
+            else config.crop_bias_tau
+        crop_bias = -jnp.abs(
+            jnp.arange(-100, 101, dtype=jnp.float32)) / float(tau)
+        for index in range(4, _N_ACTIONS):
+            projections[index]["bias"] = crop_bias
+    else:
+        tau = float(scratch_hold_prior_tau)
+        for index, projection in enumerate(projections):
+            if index == 0:
+                classes = jnp.arange(4, dtype=jnp.float32)
+            elif index < 4:
+                classes = jnp.arange(101, dtype=jnp.float32)
+            else:
+                classes = jnp.arange(201, dtype=jnp.float32)
+            projection["bias"] = (-jnp.abs(classes - 100.0) / tau
+                                   if index >= 4 else -classes / tau)
     params = {
         "encoder": encoder,
         "capacity_conditioning": normal(leaves[0], (_N_CROPS, d)),

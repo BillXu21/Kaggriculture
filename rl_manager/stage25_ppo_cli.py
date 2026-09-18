@@ -256,6 +256,12 @@ def _parser() -> argparse.ArgumentParser:
     source.add_argument("--scratch", action="store_true", help="initialize from fresh native parameters")
     source.add_argument("--init", type=Path, help="native Stage 2.5 BC/inference checkpoint")
     source.add_argument("--resume", type=Path, help="native Stage 2.5 PPO checkpoint")
+    parser.add_argument(
+        "--opening", default="standard_mixed",
+        help="built-in opening identity for the Stage 2.5 runner")
+    parser.add_argument(
+        "--scratch-hold-prior-tau", type=float, default=None,
+        help="scratch-only output-bias hold prior temperature")
     parser.add_argument("--model-size", choices=("tiny", "small", "large"), default="tiny")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--engine", choices=("fast", "official"), default="fast")
@@ -327,6 +333,13 @@ def _validate_rollout_controls(args: argparse.Namespace) -> None:
             or args.inference_batch_wait_ms < 0):
         raise ValueError(
             "inference-batch-wait-ms must be finite and >= 0")
+    if (args.scratch_hold_prior_tau is not None
+            and not args.scratch):
+        raise ValueError("--scratch-hold-prior-tau requires --scratch")
+    if (args.scratch_hold_prior_tau is not None
+            and (not math.isfinite(args.scratch_hold_prior_tau)
+                 or args.scratch_hold_prior_tau <= 0.0)):
+        raise ValueError("scratch-hold-prior-tau must be finite and positive")
 
 
 def _runner_config(
@@ -342,7 +355,7 @@ def _runner_config(
         max_turns=args.max_turns, low_telemetry=True, stage25_enabled=True,
         stage25_mode="stochastic",
         stage25_fixed_inference_batch_size=args.physical_batch_size,
-        reward_config=reward_config)
+        reward_config=reward_config, opening=args.opening)
 
 
 def _checkpoint_training_contract(meta: Mapping[str, Any]) -> dict[str, Any]:
@@ -412,7 +425,12 @@ def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stag
         initialize_stage25_ppo_from_checkpoint, load_stage25_ppo_checkpoint)
     from rl_manager.stage25_ppo import init_stage25_ppo_state
     if args.scratch:
-        return init_stage25_ppo_state(config, seed=args.seed), {}
+        from rl_manager.stage25_policy import init_stage25_params
+        params = init_stage25_params(
+            config.model, seed=args.seed,
+            scratch_hold_prior_tau=args.scratch_hold_prior_tau)
+        return init_stage25_ppo_state(
+            config, seed=args.seed, params=params), {}
     if args.init is not None:
         params, source_meta = initialize_stage25_ppo_from_checkpoint(
             args.init, config=config.model, seed=None)
@@ -526,6 +544,7 @@ def _collection(
         "inference_metrics": runner.inference_metrics,
         "behavior_identity": learner.identity.to_json_dict(),
         "opponent_identity": opponent.identity.to_json_dict(),
+        "opening_provenance": runner.provenance.get("opening"),
         "training_composition": args.training_composition,
         "reward": reward_config.to_json_dict(),
         "executor_provenance": _executor_factory_provenance(
@@ -606,7 +625,11 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                         opponent_identity=next_opponent.identity)
         state = replace(state, rollout_seed=state.rollout_seed + args.rollout_size)
         metadata = {
-            "run": {"cli": "rl_manager.stage25_ppo_cli", "source": str(args.init) if args.init else None},
+            "run": {
+                "cli": "rl_manager.stage25_ppo_cli",
+                "source": str(args.init) if args.init else None,
+                "opening": rollout_stats.get("opening_provenance"),
+            },
             "training_contract": _training_contract(args),
             "resume_from": (
                 None if not args.resume else {

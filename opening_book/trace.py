@@ -36,6 +36,7 @@ IDENTITIES = (
     "carrot_start",
     "fourth_quadrant_s0",
     "fourth_quadrant_s1",
+    "tetsuya_s1",
 )
 
 VALID_SEATS = (0, 1)

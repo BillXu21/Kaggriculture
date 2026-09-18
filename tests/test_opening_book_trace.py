@@ -70,7 +70,7 @@ def synthetic_replay_path(tmp_path):
 def test_built_in_identities_and_default():
     assert built_in_identities() == (
         "standard_mixed", "pasture_heavy", "carrot_start",
-        "fourth_quadrant_s0", "fourth_quadrant_s1"
+        "fourth_quadrant_s0", "fourth_quadrant_s1", "tetsuya_s1"
     )
     assert DEFAULT_IDENTITY == "standard_mixed"
     for identity in built_in_identities():
@@ -168,6 +168,22 @@ def test_fourth_quadrant_trace_provenance_is_stable():
         doc = load_built_in_trace(identity)
         assert doc["provenance"] == provenance
         assert doc["content_digest"] == expected_digests[identity]
+
+
+def test_tetsuya_trace_provenance_and_content_digest_are_stable():
+    doc = load_built_in_trace("tetsuya_s1")
+    assert len(doc["turns"]) == 96
+    assert doc["provenance"] == {
+        "source_episode": 104672565,
+        "source_seat": 1,
+        "source_player": "tetsuya",
+        "source_seed": 2112243121,
+        "source_replay_sha256":
+            "6fdcd49996b068842e85afb43505263cc069cdded779d7782c931c81e99016e6",
+    }
+    assert doc["content_digest"] == (
+        "9d2cdda9e26ffb580054bb475b05ca0d8e81209f30732bc973594f8589b9b59f")
+    validate_trace(doc)
 
 
 # ---------------------------------------------------------------------------

@@ -596,6 +596,56 @@ def test_init_stage25_params_imports_encoder_leaves_and_drops_legacy_heads():
             == jax.tree_util.tree_structure(seeded))
 
 
+def test_scratch_hold_prior_changes_only_initial_output_biases():
+    config = _config()
+    tau = 2.0
+    ordinary = init_stage25_params(config, seed=71)
+    held = init_stage25_params(config, seed=71, scratch_hold_prior_tau=tau)
+
+    np.testing.assert_allclose(
+        np.asarray(held["output_projections"][0]["bias"]),
+        [0.0, -1.0 / tau, -2.0 / tau, -3.0 / tau])
+    for projection in held["output_projections"][1:4]:
+        bias = np.asarray(projection["bias"])
+        assert bias[0] == pytest.approx(0.0)
+        assert np.all(np.diff(bias) < 0.0)
+        assert bias[-1] == pytest.approx(-100.0 / tau)
+    for projection in held["output_projections"][4:]:
+        bias = np.asarray(projection["bias"])
+        assert bias[100] == pytest.approx(0.0)
+        np.testing.assert_allclose(bias, bias[::-1])
+
+    for name in ("encoder", "capacity_conditioning", "recurrent_decoder",
+                 "action_embeddings", "value_head"):
+        for before, after in zip(
+                jax.tree_util.tree_leaves(ordinary[name]),
+                jax.tree_util.tree_leaves(held[name])):
+            np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    for before, after in zip(ordinary["output_projections"],
+                             held["output_projections"]):
+        np.testing.assert_array_equal(before["kernel"], after["kernel"])
+    assert any(np.any(np.asarray(leaf) != 0.0)
+               for leaf in jax.tree_util.tree_leaves(held)
+               if np.issubdtype(np.asarray(leaf).dtype, np.number))
+
+
+def test_scratch_hold_prior_seed_reproducibility_and_ordinary_default():
+    config = _config()
+    first = init_stage25_params(config, seed=72, scratch_hold_prior_tau=1.0)
+    same = init_stage25_params(config, seed=72, scratch_hold_prior_tau=1.0)
+    other = init_stage25_params(config, seed=73, scratch_hold_prior_tau=1.0)
+    ordinary = init_stage25_params(config, seed=72)
+    for left, right in zip(jax.tree_util.tree_leaves(first),
+                           jax.tree_util.tree_leaves(same)):
+        np.testing.assert_array_equal(left, right)
+    assert any(not np.array_equal(left, right)
+               for left, right in zip(jax.tree_util.tree_leaves(first),
+                                      jax.tree_util.tree_leaves(other)))
+    assert not np.array_equal(
+        first["output_projections"][0]["bias"],
+        ordinary["output_projections"][0]["bias"])
+
+
 def test_sample_then_evaluate_has_exact_class_logprob_agreement():
     config = _config()
     params = init_stage25_params(config, seed=17)

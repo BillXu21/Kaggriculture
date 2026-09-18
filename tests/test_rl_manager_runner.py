@@ -303,6 +303,14 @@ def test_runner_single_opening_keeps_legacy_resolution_and_provenance():
     assert runner.provenance["opening"]["name"] == "pasture_heavy"
 
 
+def test_runner_records_tetsuya_opening_provenance():
+    config = _runner_config(opening="tetsuya_s1")
+    runner = SelfPlayRunner(config, executor_factory=_TraceExecutorFactory())
+    assert runner.provenance["opening"]["name"] == "tetsuya_s1"
+    assert runner.provenance["opening"]["source_provenance"]["source_episode"] \
+        == 104672565
+
+
 def test_no_opening_calls_manager_and_executor_at_d0(monkeypatch):
     class ImmediateExecutor(_TraceExecutor):
         def __init__(self, seat):

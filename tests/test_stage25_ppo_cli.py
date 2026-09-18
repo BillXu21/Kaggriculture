@@ -137,6 +137,8 @@ def test_ppo_cli_records_the_real_executor_identity(
             "bank_scale": 50000.0,
         },
     }
+    assert captured["metadata"]["cli_args"]["opening"] == "standard_mixed"
+    assert captured["metadata"]["cli_args"]["scratch_hold_prior_tau"] is None
     stdout = capsys.readouterr().out
     if json_stdout:
         assert json.loads(stdout)["inference_metrics"]["batch_sizes"] == [2, 4, 8]
@@ -191,6 +193,22 @@ def test_rollout_controls_reach_runner_config() -> None:
     assert runner_config.batch_backend is True
     assert runner_config.inference_batch_wait_seconds == pytest.approx(0.0075)
     assert runner_config.stage25_fixed_inference_batch_size == 16
+
+
+def test_opening_reaches_runner_config() -> None:
+    args = cli._parser().parse_args([
+        "--scratch", "--opening", "tetsuya_s1", "--output-dir", "out"])
+    runner_config = cli._runner_config(
+        args, seed=23, reward_config=RewardConfig())
+    assert runner_config.opening == "tetsuya_s1"
+
+
+def test_hold_prior_requires_scratch() -> None:
+    args = cli._parser().parse_args([
+        "--init", "model.npz", "--scratch-hold-prior-tau", "1.0",
+        "--output-dir", "out"])
+    with pytest.raises(ValueError, match="requires --scratch"):
+        cli._runner_config(args, seed=23, reward_config=RewardConfig())
 
 
 def test_batch_backend_rejects_official_engine() -> None:
