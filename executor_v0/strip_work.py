@@ -602,11 +602,14 @@ def _excess_crop_coords(
 class _Builder:
     def __init__(self, supply: SupplySnapshot, config: StripWorkConfig):
         self.supply, self.config = supply, config
+        self.seeds = supply.seeds_dict
+        self.shed = supply.shed_dict
+        self.carried = supply.carried_dict
         self.items: dict[str, WorkItem] = {}
         self.chains: list[WorkChain] = []
-        self.seed_remaining = dict(supply.seeds_dict)
-        self.inventory_remaining = dict(supply.shed_dict)
-        for item, amount in supply.carried_dict.items():
+        self.seed_remaining = self.seeds.copy()
+        self.inventory_remaining = self.shed.copy()
+        for item, amount in self.carried.items():
             self.inventory_remaining[item] = (
                 self.inventory_remaining.get(item, 0) + amount
             )
@@ -822,7 +825,7 @@ def _supply_item(
     block_reason=None,
     source="strip_forecast",
 ) -> WorkItem:
-    carried = builder.supply.carried_dict
+    carried = builder.carried
     pickup = sum(
         ceil(
             max(0, r.quantity - carried.get(r.item, 0))
@@ -1261,7 +1264,7 @@ def build_strip_work_plan(
     # merge-safe and keeps FERTILIZE before WATER.
     for y, row in enumerate(board):
         for x, tile in enumerate(row):
-            if quadrant_of(y, x) not in set(unlocked):
+            if quadrant_of(y, x) not in allowed_quadrants:
                 continue
             if (y, x) in removal_coords:
                 continue
@@ -1294,9 +1297,10 @@ def build_strip_work_plan(
                 source=source,
             )
 
+    sell_quantities = plan.sell_quantities_dict
     sell_totals = {
         p: sum(
-            int(plan.sell_quantities_dict[str(anchor)].get(p, 0))
+            int(sell_quantities[str(anchor)].get(p, 0))
             for anchor in (0, 4, 8, 12, 16, 20)
         )
         for p in PRODUCTS
@@ -1306,8 +1310,8 @@ def build_strip_work_plan(
         if not quantity:
             continue
         shed_amount, carried_amount = (
-            supply.shed_dict.get(product, 0),
-            supply.carried_dict.get(product, 0),
+            builder.shed.get(product, 0),
+            builder.carried.get(product, 0),
         )
         delivery_quantity = min(carried_amount, max(0, quantity - shed_amount))
         deps: tuple[str, ...] = ()
@@ -1469,6 +1473,9 @@ def _diagnostics(
     builder,
     row_summaries,
 ):
+    target_crops = plan.crop_targets_dict
+    target_animals = plan.animal_targets_dict
+    seeds, shed, carried = builder.seeds, builder.shed, builder.carried
     unresolved_crops, unresolved_animals = (
         Counter(dict(layouts.crops.unresolved_deficits)),
         Counter(dict(layouts.animals.unresolved)),
@@ -1490,26 +1497,17 @@ def _diagnostics(
         Counter(i.status.value for i in items),
     )
     counts_reason = Counter(i.block_reason.value for i in items if i.block_reason)
-    demand = tuple(
-        SupplyDemand(
-            item,
-            amount,
-            supply.seeds_dict.get(item, 0)
+    demand_rows = []
+    for (item, scope), amount in sorted(builder.demands.items()):
+        available = (
+            seeds.get(item, 0)
             if scope == "global_seed"
-            else supply.inventory_amount(item),
-            max(
-                0,
-                amount
-                - (
-                    supply.seeds_dict.get(item, 0)
-                    if scope == "global_seed"
-                    else supply.inventory_amount(item)
-                ),
-            ),
-            scope,
+            else shed.get(item, 0) + carried.get(item, 0)
         )
-        for (item, scope), amount in sorted(builder.demands.items())
-    )
+        demand_rows.append(
+            SupplyDemand(item, amount, available, max(0, amount - available), scope)
+        )
+    demand = tuple(demand_rows)
     workload = tuple(
         RowWorkload(
             r.row_key,
@@ -1522,11 +1520,11 @@ def _diagnostics(
         if r.ready_interactions or r.future_interactions
     )
     return WorkDiagnostics(
-        _pairs({c: plan.crop_targets_dict[c] - current_crops[c] for c in CROP_ORDER}),
+        _pairs({c: target_crops[c] - current_crops[c] for c in CROP_ORDER}),
         _pairs(represented_crops),
         _pairs(unresolved_crops),
         _pairs(
-            {a: plan.animal_targets_dict[a] - current_animals[a] for a in ANIMAL_ORDER}
+            {a: target_animals[a] - current_animals[a] for a in ANIMAL_ORDER}
         ),
         _pairs(represented_animals),
         _pairs(unresolved_animals),

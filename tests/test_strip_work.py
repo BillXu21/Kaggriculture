@@ -109,6 +109,27 @@ def kinds(result, kind):
     return [item for item in result.items if item.kind == kind]
 
 
+def test_sell_quantities_are_materialized_once_per_work_plan(monkeypatch):
+    accesses = 0
+    original = DailyPlan.sell_quantities_dict.fget
+
+    def counted(plan_value):
+        nonlocal accesses
+        accesses += 1
+        return original(plan_value)
+
+    monkeypatch.setattr(DailyPlan, "sell_quantities_dict", property(counted))
+    result = build_strip_work_plan(
+        obs(shed={"WHEAT": 3}),
+        plan(sell_quantities={"WHEAT": {0: 1, 4: 2}}),
+    )
+
+    assert accesses == 1
+    assert next(
+        item for item in result.items if item.id == "SELL:WHEAT"
+    ).quantity == 3
+
+
 def test_empty_crop_is_plant_then_water_and_seeds_are_global():
     result = build_strip_work_plan(
         obs(), plan(crop_targets={"WHEAT": 1}), config=StripWorkConfig()
