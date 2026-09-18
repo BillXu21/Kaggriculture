@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from queue import Queue
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from rl_manager.runner import RunnerConfig
 from rl_manager.runner import build_episode_spec
 from rl_manager.seeds import SeedStream
 from rl_manager.stage25_provider import (
+    Stage25DecisionKey,
     Stage25PlanProvider,
     Stage25ProviderError,
     Stage25TerminalError,
@@ -286,6 +288,74 @@ def test_stage25_response_identity_mismatch_leaves_provider_unchanged():
         provider.accept_inference_response(
             prepared, HOLD, behavior_identity=wrong)
     assert provider.export_state() == before
+
+
+def test_stage25_acceptance_reuses_one_frozen_prepared_context(monkeypatch):
+    provider = Stage25PlanProvider(7, 0, 4, behavior_identity=IDENTITY)
+    obs = _obs(day=4, money=3000.0)
+    calls = 0
+    original = provider._stage_observation
+
+    def counted(observation, previous_execution):
+        nonlocal calls
+        calls += 1
+        return original(observation, previous_execution)
+
+    monkeypatch.setattr(provider, "_stage_observation", counted)
+    prepared = provider.prepare_inference_context(obs, behavior_identity=IDENTITY)
+    assert calls == 1
+    assert prepared.inputs["board_kind"].flags.writeable is False
+    with pytest.raises(ValueError):
+        prepared.inputs["board_kind"][0, 0] = 99
+    with pytest.raises(TypeError):
+        prepared.support["land"] = ()
+
+    # The caller's live observation may advance while inference is outstanding;
+    # acceptance must use the retained daily-start and encoded premises.
+    obs["farms"][0]["money"] = 123.0
+    monkeypatch.setattr(
+        provider, "_stage_observation",
+        lambda *_args: pytest.fail("response acceptance re-staged observation"),
+    )
+    provider.accept_inference_response(prepared, HOLD, behavior_identity=IDENTITY)
+    assert calls == 1
+    assert provider.e_history == (4, 3000.0)
+
+
+def test_stage25_prepared_context_rejects_stale_or_wrong_identity_without_commit():
+    provider = Stage25PlanProvider(7, 0, 4, behavior_identity=IDENTITY)
+    prepared = provider.prepare_inference_context(_obs(day=4), behavior_identity=IDENTITY)
+    before = provider.export_state()
+    stale_owner = Stage25PlanProvider(7, 0, 4, behavior_identity=IDENTITY)
+    with pytest.raises(Stage25ProviderError, match="pending request"):
+        stale_owner.accept_inference_response(
+            prepared, HOLD, behavior_identity=IDENTITY)
+    for wrong_key in (
+            replace(prepared,
+                    decision_key=Stage25DecisionKey(7, 1, 4, "wrong-seat")),
+            replace(prepared,
+                    decision_key=Stage25DecisionKey(7, 0, 5, "wrong-day")),
+    ):
+        with pytest.raises(Stage25ProviderError, match="pending request"):
+            provider.accept_inference_response(
+                wrong_key, HOLD, behavior_identity=IDENTITY)
+    assert provider.export_state() == before
+
+    provider.accept_inference_response(prepared, HOLD, behavior_identity=IDENTITY)
+    with pytest.raises(Stage25ProviderError, match="pending request"):
+        provider.accept_inference_response(prepared, HOLD, behavior_identity=IDENTITY)
+    assert provider.last_accepted_decision == prepared.decision_key
+
+
+def test_stage25_reset_and_terminal_delivery_invalidate_pending_context():
+    provider = Stage25PlanProvider(7, 0, 4, behavior_identity=IDENTITY)
+    prepared = provider.prepare_inference_context(_obs(day=4), behavior_identity=IDENTITY)
+    with pytest.raises(Stage25TerminalError):
+        provider.prepare_inference_context(
+            {**_obs(day=4), "terminal": True}, behavior_identity=IDENTITY)
+    provider.reset()
+    with pytest.raises(Stage25ProviderError, match="pending request"):
+        provider.accept_inference_response(prepared, HOLD, behavior_identity=IDENTITY)
 
 
 def test_stage25_provider_transitions_k_once_and_rejects_terminal_delivery():

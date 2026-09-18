@@ -9,7 +9,7 @@ loaded lazily so importing this module remains framework-neutral.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 import copy
 from dataclasses import dataclass
 import hashlib
@@ -86,6 +86,25 @@ class Stage25TerminalError(Stage25ProviderError):
 
 
 @dataclass(frozen=True)
+class _FrozenMapping(Mapping[str, Any]):
+    """Small pickle-safe immutable mapping for retained inference premises."""
+
+    entries: tuple[tuple[str, Any], ...]
+
+    def __getitem__(self, key: str) -> Any:
+        for name, value in self.entries:
+            if name == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (name for name, _ in self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+
+@dataclass(frozen=True)
 class Stage25InferenceContext:
     """Read-only pre-decision payload handed to a parent inference owner."""
 
@@ -95,7 +114,8 @@ class Stage25InferenceContext:
     crop_capacity: tuple[int, ...]
     physical_context: PhysicalContext
     support: Mapping[str, Any]
-    observation: Mapping[str, Any]
+    daily_start: tuple[int, float]
+    curriculum: Stage25CurriculumConfig
     seed: int = 0
 
     @property
@@ -555,6 +575,7 @@ class Stage25PlanProvider:
         self._e_history: tuple[int, float] | None = None
         self._last_inputs: dict[str, np.ndarray] | None = None
         self._diagnostics: dict[str, Any] = {}
+        self._pending_context: Stage25InferenceContext | None = None
 
     @property
     def expected_behavior_identity(self) -> Stage25BehaviorIdentity | None:
@@ -775,6 +796,9 @@ class Stage25PlanProvider:
         if _terminal_observation(obs):
             raise Stage25TerminalError(
                 "terminal delivery does not sample or apply")
+        if self._pending_context is not None:
+            raise Stage25ProviderError(
+                "a Stage 2.5 inference request is already pending")
         day = _scalar_int(obs.get("day"), "obs.day")
         key = self._key(day, decision_key, decision_id)
         self._check_delivery(key)
@@ -782,7 +806,7 @@ class Stage25PlanProvider:
         if not isinstance(identity, Stage25BehaviorIdentity):
             raise Stage25ProviderError(
                 "external Stage 2.5 inference requires behavior_identity")
-        self.effective_curriculum()
+        curriculum = self.effective_curriculum()
         inputs, context, initial = self._stage_observation(
             obs, previous_execution)
         frozen_inputs: dict[str, np.ndarray] = {}
@@ -790,16 +814,20 @@ class Stage25PlanProvider:
             copied = np.array(value, copy=True)
             copied.setflags(write=False)
             frozen_inputs[name] = copied
-        return Stage25InferenceContext(
+        prepared = Stage25InferenceContext(
             decision_key=key,
             behavior_identity=identity,
-            inputs=frozen_inputs,
+            inputs=_FrozenMapping(tuple(frozen_inputs.items())),
             crop_capacity=tuple(initial),
             physical_context=context,
-            support=self._support_payload(context, initial),
-            observation=copy.deepcopy(dict(obs)),
+            support=_FrozenMapping(tuple(
+                self._support_payload(context, initial).items())),
+            daily_start=(day, float(obs["farms"][self.seat]["money"])),
+            curriculum=curriculum,
             seed=self.seed,
         )
+        self._pending_context = prepared
+        return prepared
 
     def prepare_bootstrap_context(
         self, obs: Mapping[str, Any],
@@ -830,11 +858,13 @@ class Stage25PlanProvider:
             decision_key=Stage25DecisionKey(
                 self.episode_id, self.seat, day, "bootstrap"),
             behavior_identity=identity,
-            inputs=frozen_inputs,
+            inputs=_FrozenMapping(tuple(frozen_inputs.items())),
             crop_capacity=tuple(initial),
             physical_context=context,
-            support=self._support_payload(context, initial),
-            observation=copy.deepcopy(dict(obs)),
+            support=_FrozenMapping(tuple(
+                self._support_payload(context, initial).items())),
+            daily_start=(day, float(obs["farms"][self.seat]["money"])),
+            curriculum=self.effective_curriculum(),
             seed=self.seed,
         )
 
@@ -846,25 +876,44 @@ class Stage25PlanProvider:
         """Validate response identity, then perform exactly one K transition."""
         if not isinstance(request, Stage25InferenceContext):
             raise TypeError("request must be Stage25InferenceContext")
+        if request is not self._pending_context:
+            raise Stage25ProviderError(
+                "Stage 2.5 response does not match the pending request")
         expected = behavior_identity or self.behavior_identity
         if expected is None or request.behavior_identity != expected:
             raise Stage25ProviderError(
                 "Stage 2.5 response behavior identity does not match request")
-        return self.accept_classes(
-            request.observation, action_classes,
-            decision_key=request.decision_key,
-            expected_behavior_identity=expected,
-        )
+        if self.behavior_identity is not None and expected != self.behavior_identity:
+            raise Stage25ProviderError(
+                "Stage 2.5 response behavior identity does not match provider")
+        key = self._key(
+            request.decision_key.day, request.decision_key, None)
+        self._check_delivery(key)
+        curriculum = self.effective_curriculum()
+        if request.curriculum != curriculum:
+            raise Stage25ProviderError(
+                "Stage 2.5 response curriculum does not match request")
+        classes = _class_tuple(action_classes)
+        goals = _validate_action(
+            classes, request.crop_capacity, request.physical_context,
+            curriculum)
+        plan = _lower_plan(classes, goals)
+        result = self._commit(
+            key, classes, goals, plan, request.inputs,
+            request.daily_start)
+        self._pending_context = None
+        return result
 
     def _commit(
         self, key: Stage25DecisionKey, classes: tuple[int, ...],
-        goals: tuple[int, ...], plan: DailyPlan, inputs: dict[str, np.ndarray],
-        obs: Mapping[str, Any],
+        goals: tuple[int, ...], plan: DailyPlan,
+        inputs: Mapping[str, np.ndarray],
+        daily_start: tuple[int, float],
     ) -> DailyPlan:
         # Compute every fallible value before mutating lifecycle fields so a
         # malformed observation (e.g. missing daily-start money) can never
         # leave a partially-applied decision.
-        e_history = (int(obs["day"]), float(obs["farms"][self.seat]["money"]))
+        e_history = (int(daily_start[0]), float(daily_start[1]))
         last_inputs = {name: np.array(value, copy=True)
                        for name, value in inputs.items()}
         curriculum = self.effective_curriculum()
@@ -897,6 +946,9 @@ class Stage25PlanProvider:
         """Accept one external nine-class decision and lower it once."""
         if terminal or (isinstance(obs, Mapping) and _terminal_observation(obs)):
             raise Stage25TerminalError("terminal delivery does not sample or apply")
+        if self._pending_context is not None:
+            raise Stage25ProviderError(
+                "pending inference request must be accepted through its context")
         if not isinstance(obs, Mapping):
             raise Stage25ProviderError("obs must be a mapping")
         if (expected_behavior_identity is not None
@@ -912,7 +964,9 @@ class Stage25PlanProvider:
         inputs, context, initial = self._stage_observation(obs, previous_execution)
         goals = _validate_action(classes, initial, context, curriculum)
         plan = _lower_plan(classes, goals)
-        return self._commit(key, classes, goals, plan, inputs, obs)
+        return self._commit(
+            key, classes, goals, plan, inputs,
+            (day, float(obs["farms"][self.seat]["money"])))
 
     submit_classes = accept_classes
     accept_decision = accept_classes
@@ -977,7 +1031,9 @@ class Stage25PlanProvider:
         classes_tuple = _class_tuple(sampled)
         goals = _validate_action(classes_tuple, initial, context, curriculum)
         plan = _lower_plan(classes_tuple, goals)
-        return self._commit(key, classes_tuple, goals, plan, inputs, obs)
+        return self._commit(
+            key, classes_tuple, goals, plan, inputs,
+            (day, float(obs["farms"][self.seat]["money"])))
 
     def export_state(self) -> dict[str, Any]:
         """Export lifecycle state only; executor queues are deliberately absent."""
@@ -1029,6 +1085,7 @@ class Stage25PlanProvider:
         self.source_history_version = snapshot.source_history_version
         self._last_inputs = None
         self._diagnostics = {}
+        self._pending_context = None
 
 
 __all__ = [
