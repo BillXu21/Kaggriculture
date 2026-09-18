@@ -29,7 +29,11 @@ from rl_manager.types import CANDIDATE_VS_FROZEN, CURRENT_VS_CURRENT_ECONOMIC
 if TYPE_CHECKING:
     from rl_manager.stage25_inference import Stage25InferenceAdapter
     from rl_manager.stage25_policy import Stage25ModelConfig
-    from rl_manager.stage25_ppo import Stage25PPOConfig, Stage25PPOTrainState
+    from rl_manager.stage25_ppo import (
+        Stage25PPOBatch,
+        Stage25PPOConfig,
+        Stage25PPOTrainState,
+    )
     from rl_manager.stage25_types import Stage25BehaviorIdentity
 
 
@@ -465,7 +469,12 @@ def _collection(
         state: Stage25PPOTrainState, config: Stage25PPOConfig,
         *, seed: int, args: argparse.Namespace,
         previous_params: Any | None = None,
-) -> tuple[Stage25TrajectoryBuffer, Stage25InferenceAdapter, dict[str, Any]]:
+) -> tuple[
+    Stage25TrajectoryBuffer,
+    Stage25InferenceAdapter,
+    Stage25PPOBatch,
+    dict[str, Any],
+]:
     from rl_manager.executor_factory import make_stage25_executor_factory
     from rl_manager.runner import _executor_factory_provenance
     from rl_manager.stage25_inference import Stage25InferenceAdapter
@@ -534,14 +543,14 @@ def _collection(
             raise ValueError(
                 f"trajectory row {row.row_id!r} executor provenance disagrees "
                 "with configured factory")
-    return trajectory, learner, stats
+    return trajectory, learner, batch, stats
 
 
 def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     from rl_manager.stage25_checkpoint import save_stage25_ppo_checkpoint
     from rl_manager.executor_factory import make_stage25_executor_factory
     from rl_manager.runner import _executor_factory_provenance
-    from rl_manager.stage25_ppo import build_stage25_ppo_batch, ppo_update
+    from rl_manager.stage25_ppo import ppo_update
     startup_started = time.perf_counter()
     _configure_jax_compilation_cache(getattr(
         args, "jax_compilation_cache_dir", None))
@@ -562,7 +571,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     all_metrics = []
     for _ in range(args.updates):
         update_started = time.perf_counter()
-        trajectory, learner, rollout_stats = _collection(
+        _, learner, ppo_batch, rollout_stats = _collection(
             state, config, seed=state.rollout_seed, args=args,
             previous_params=None)
         state = replace(state, behavior_identity=learner.identity)
@@ -585,12 +594,6 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         if executor_provenance != expected_executor:
             raise ValueError("rollout executor provenance is not the configured factory")
         previous_learner_params = state.params
-        batch_rebuild_started = time.perf_counter()
-        ppo_batch = build_stage25_ppo_batch(
-            trajectory, learner_identity=learner.identity, gamma=config.gamma,
-            gae_lambda=config.gae_lambda,
-            normalize_advantages=config.normalize_advantages)
-        ppo_batch_construction_seconds = time.perf_counter() - batch_rebuild_started
         ppo_started = time.perf_counter()
         state, update_stats = ppo_update(state, ppo_batch, config)
         ppo_update_seconds = time.perf_counter() - ppo_started
@@ -645,7 +648,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             "runner_rollout_seconds", 0.0))
         timing = {
             **collection_timing,
-            "ppo_batch_construction_seconds": ppo_batch_construction_seconds,
+            "ppo_batch_construction_seconds": 0.0,
             "ppo_update_seconds": ppo_update_seconds,
             "checkpoint_seconds": checkpoint_seconds,
             "update_seconds": update_seconds,

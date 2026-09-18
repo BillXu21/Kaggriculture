@@ -77,10 +77,11 @@ def test_ppo_cli_records_the_real_executor_identity(
         name="stage25_learner", version="ppo-native-v1", mode="stochastic")
 
     captured: dict = {}
+    sentinel_batch = object()
 
     def fake_collection(state, config, *, seed, args, previous_params=None):
         del state, config, seed, args, previous_params
-        return None, learner, {
+        return None, learner, sentinel_batch, {
             "final_banks": [0.0, 100.0],
             "learner_rows": 3,
             "inference_metrics": {
@@ -99,10 +100,11 @@ def test_ppo_cli_records_the_real_executor_identity(
 
     def fake_build_batch(trajectory, *, learner_identity, **kwargs):
         del trajectory, learner_identity, kwargs
-        return None
+        raise AssertionError("run() rebuilt the PPO batch after collection")
 
     def fake_update(state, batch, config):
-        del batch, config
+        assert batch is sentinel_batch
+        del config
         return state, {}
 
     def fake_save(path, *args, **kwargs):
@@ -145,6 +147,8 @@ def test_ppo_cli_records_the_real_executor_identity(
     machine_record = json.loads(records[0])
     assert machine_record["inference_metrics"]["batch_sizes"] == [2, 4, 8]
     assert machine_record["final_banks"] == [0.0, 100.0]
+    assert machine_record["timing"]["ppo_batch_construction_seconds"] == 0.0
+    assert machine_record["checkpoint"] == str(tmp_path / "latest.npz")
     assert all(np.isfinite(value) and value >= 0.0
                for value in machine_record["timing"].values())
     assert machine_record["throughput"]["update_games_per_second"] > 0.0
@@ -251,7 +255,7 @@ def test_collection_uses_both_seats_and_does_not_mutate_snapshot(monkeypatch):
         "--training-composition", CURRENT_VS_CURRENT_ECONOMIC,
         "--reward-mode", "terminal_own_bank", "--rollout-size", "1",
         "--output-dir", "out"])
-    trajectory, learner, stats = cli._collection(
+    trajectory, learner, _, stats = cli._collection(
         state, config, seed=23, args=args)
 
     spec = captured_specs[0]
@@ -314,7 +318,7 @@ def test_candidate_collection_only_batches_learner_seat(monkeypatch):
     args = cli._parser().parse_args([
         "--scratch", "--model-size", "tiny", "--physical-batch-size", "1",
         "--rollout-size", "1", "--output-dir", "out"])
-    trajectory, _, stats = cli._collection(state, config, seed=23, args=args)
+    trajectory, _, _, stats = cli._collection(state, config, seed=23, args=args)
     assert len(trajectory) == 2
     assert stats["learner_rows"] == 1
     assert [row.trainable for row in trajectory.rows] == [True, False]
