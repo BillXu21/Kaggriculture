@@ -23,9 +23,10 @@ class BatchedFastEnv:
     """One native engine owning a fixed set of simultaneous two-seat games.
 
     Returned observations use the canonical farm tile vocabulary expected by
-    the executor. Public farm/market/town objects are shared read-only between
-    seat views; private dictionaries are decoded from only that seat's native
-    row. Callers that mutate observations must copy their seat view first.
+    the executor. Public farm/market/town objects are shared between seat
+    views; the runner owns those objects and exposes consumers only a
+    defensive copy or read-only view. Private dictionaries are decoded from
+    only that seat's native row.
     """
 
     def __init__(

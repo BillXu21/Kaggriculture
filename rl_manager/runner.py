@@ -569,9 +569,13 @@ class _EpisodeState:
         reach the executor or the live encoder. The backend snapshot is read
         immediately after reset/step, so it describes exactly these
         observations; no private oracle helper is imported here."""
-        canonical = self.backend.canonical_state()
-        if self.trace_recorder is not None:
-            self.current_canonical_state = canonical
+        observations_are_canonical = getattr(
+            self.backend, "observations_are_canonical", False)
+        canonical = None
+        if self.trace_recorder is not None or not observations_are_canonical:
+            canonical = self.backend.canonical_state()
+            if self.trace_recorder is not None:
+                self.current_canonical_state = canonical
         adapted = canonical_observations(
             self.backend, observations, canonical_state=canonical)
         if self.config.read_only_agent_observations:
@@ -740,6 +744,7 @@ class _BatchedSlotBackend:
     """Scalar-shaped view over one slot in a shared batched backend."""
 
     name = "fast-batched"
+    observations_are_canonical = True
 
     def __init__(self, batch: BatchedEngineBackend, index: int) -> None:
         self._observations: list[dict[str, Any]] = []

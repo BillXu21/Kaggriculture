@@ -27,6 +27,10 @@ SUPPORTED_BACKENDS = ("official", "fast")
 
 class EngineBackend(Protocol):
     name: str
+    # A backend with this capability has already emitted the runner's
+    # canonical observation schema. The runner owns those mutable objects;
+    # consumers still receive either a defensive copy or a read-only view.
+    observations_are_canonical: bool
 
     def reset(self) -> list[dict[str, Any]]: ...
 
@@ -56,6 +60,13 @@ def canonical_observations(
     and missing per-seat ``step`` values never reach the executor or the live
     encoder. Caller-owned observations are never mutated.
     """
+    if getattr(backend, "observations_are_canonical", False):
+        # Fast scalar and batched adapters decode the canonical farm/public
+        # shape at the native-output boundary. Reusing the list avoids a
+        # second farm reconstruction and the four farm deep copies formerly
+        # made for every pair of seat views.
+        return observations if isinstance(observations, list) else list(observations)
+
     state = backend.canonical_state() if canonical_state is None else canonical_state
     canonical_farms = state["farms"]
     adapted: list[dict[str, Any]] = []
@@ -72,11 +83,14 @@ class FastBackendAdapter:
     """Adapts ``fast_env.FastKaggricultureEnv`` to the backend protocol."""
 
     name = "fast"
+    observations_are_canonical = True
 
     def __init__(self, configuration: Mapping[str, Any] | None = None) -> None:
         from fast_env import FastKaggricultureEnv  # lazy; keeps oracle import light
 
-        self._env = FastKaggricultureEnv(configuration)
+        self._env = FastKaggricultureEnv(
+            configuration, canonical_observations=True
+        )
         self._rewards: list[float] = [0.0, 0.0]
 
     def reset(self) -> list[dict[str, Any]]:

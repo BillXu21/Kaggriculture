@@ -334,10 +334,16 @@ def _decode_observation_pair(
 class FastKaggricultureEnv:
     """One exact two-seat scalar episode without Kaggle registry imports."""
 
-    def __init__(self, configuration: Mapping[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        configuration: Mapping[str, Any] | None = None,
+        *,
+        canonical_observations: bool = False,
+    ) -> None:
         self.configuration = dict(DEFAULT_CONFIGURATION)
         if configuration:
             self.configuration.update(configuration)
+        self.canonical_observations = bool(canonical_observations)
         if int(self.configuration["boardSize"]) != 10:
             raise ValueError("fast engine supports boardSize=10 only")
         if int(self.configuration["maxMarketOrdersPerTurn"]) != 10:
@@ -374,10 +380,19 @@ class FastKaggricultureEnv:
         self._statuses = ["ACTIVE", "ACTIVE"]
 
     def _decode(self, observations: np.ndarray) -> list[dict[str, Any]]:
-        self._observations = [
-            _decode_observation(observations[0, player], player, self.configuration)
-            for player in range(2)
-        ]
+        if self.canonical_observations:
+            self._observations = _decode_observation_pair(
+                observations[0], self.configuration, canonical_farms=True
+            )
+        else:
+            # Preserve the standalone facade's historical mutable seat views.
+            # The backend adapter opts into the shared canonical pair below.
+            self._observations = [
+                _decode_observation(
+                    observations[0, player], player, self.configuration
+                )
+                for player in range(2)
+            ]
         return self._observations
 
     def reset(self) -> list[dict[str, Any]]:
