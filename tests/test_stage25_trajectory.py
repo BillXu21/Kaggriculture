@@ -45,7 +45,8 @@ def _inputs(day: int = 4) -> dict[str, np.ndarray]:
     return result
 
 
-def _row(episode: int = 1, seat: int = 0, day: int = 4, row_id: str | None = None) -> Stage25TrajectoryRow:
+def _row(episode: int = 1, seat: int = 0, day: int = 4, row_id: str | None = None,
+         predecessor_closed: bool = False) -> Stage25TrajectoryRow:
     classes = np.asarray([0, 0, 0, 0, 100, 100, 100, 100, 100], dtype=np.int16)
     components = np.asarray([-0.1, -0.2, -0.3, -0.4, -0.5, -0.6, -0.7, -0.8, -0.9], dtype=np.float32)
     return Stage25TrajectoryRow(
@@ -55,6 +56,7 @@ def _row(episode: int = 1, seat: int = 0, day: int = 4, row_id: str | None = Non
         value=np.asarray(0.25, dtype=np.float32), learner_identity=_identity("learner"),
         opponent_identity=_identity("opponent"),
         provenance={"executor": {"name": "test-executor", "version": "v1"}},
+        predecessor_closed=predecessor_closed,
     )
 
 
@@ -128,6 +130,90 @@ def test_outgoing_transition_must_close_before_next_manager_row():
         episode_index=1, seat=0, next_day=5, next_inputs=_inputs(5),
         next_crop_capacity=np.asarray([1, 2, 3, 4, 5], dtype=np.int16))
     assert buffer.append(_row(day=5)) == 1
+
+
+def test_predecessor_index_preserves_day_order_for_interleaved_missing_rows():
+    buffer = Stage25TrajectoryBuffer(8)
+    buffer.append(_row(episode=1, seat=0, day=4, row_id="e1s0d4"))
+    buffer.append(_row(episode=1, seat=1, day=4, row_id="e1s1d4"))
+    buffer.close_outgoing(
+        episode_index=1, seat=0, next_day=6, next_inputs=_inputs(6),
+        next_crop_capacity=np.asarray([1, 2, 3, 4, 5], dtype=np.int16))
+    # Deliberately append day 8 before day 6; the explicit bypass remains valid.
+    buffer.append(_row(episode=1, seat=0, day=8, row_id="e1s0d8",
+                       predecessor_closed=True))
+    buffer.append(_row(episode=1, seat=0, day=6, row_id="e1s0d6",
+                       predecessor_closed=True))
+    buffer.close_outgoing(
+        episode_index=1, seat=0, next_day=8, next_inputs=_inputs(8),
+        next_crop_capacity=np.asarray([1, 2, 3, 4, 5], dtype=np.int16))
+
+    rows = list(buffer.iter_rows())
+    assert [row.day for row in rows] == [4, 4, 8, 6]
+    assert [row.predecessor_closed for row in rows] == [True, True, True, True]
+
+
+def test_duplicate_row_id_rejection_does_not_corrupt_indexes():
+    buffer = Stage25TrajectoryBuffer(3)
+    buffer.append(_row(day=4, row_id="same"))
+    with pytest.raises(ValueError, match="duplicate row_id"):
+        buffer.append(_row(episode=2, day=4, row_id="same"))
+    assert len(buffer) == 1
+    assert buffer.append(_row(day=5, row_id="next", predecessor_closed=True)) == 1
+    assert [row.row_id for row in buffer.rows] == ["same", "next"]
+
+
+def test_end_indexes_reject_append_after_terminal_and_truncation():
+    terminal = Stage25TrajectoryBuffer(2)
+    terminal.append(_row(day=4))
+    terminal.patch_terminal(0, np.asarray(1.0, dtype=np.float32))
+    with pytest.raises(ValueError, match="after an episode/seat end patch"):
+        terminal.append(_row(day=5, predecessor_closed=True))
+
+    truncated = Stage25TrajectoryBuffer(2)
+    truncated.append(_row(day=4))
+    truncated.patch_truncated(0, np.asarray(0.5, dtype=np.float32))
+    with pytest.raises(ValueError, match="after an episode/seat end patch"):
+        truncated.append(_row(day=5, predecessor_closed=True))
+
+
+def test_close_outgoing_before_and_after_successor_use_indexed_predecessor():
+    buffer = Stage25TrajectoryBuffer(3)
+    buffer.append(_row(day=4))
+    buffer.close_outgoing(
+        episode_index=1, seat=0, next_day=5, next_inputs=_inputs(5),
+        next_crop_capacity=np.asarray([1, 2, 3, 4, 5], dtype=np.int16))
+    buffer.append(_row(day=5))
+    buffer.close_outgoing(
+        episode_index=1, seat=0, next_day=6, next_inputs=_inputs(6),
+        next_crop_capacity=np.asarray([1, 2, 3, 4, 5], dtype=np.int16))
+    assert [row.predecessor_closed for row in buffer.rows] == [True, True]
+
+
+def test_diagnostic_summary_and_provenance_avoid_row_reconstruction():
+    buffer = Stage25TrajectoryBuffer(2)
+    buffer.append(_row(day=4, row_id="r0"))
+    buffer.patch_terminal(0, np.asarray(1.25, dtype=np.float32))
+    summary = buffer.diagnostic_summary()
+    assert summary == {"terminal_rows": 1, "truncated_rows": 0,
+                       "reward_sum": 1.25}
+    buffer.validate_executor_provenance({"name": "test-executor", "version": "v1"})
+    with pytest.raises(ValueError, match="r0"):
+        buffer.validate_executor_provenance({"name": "different"})
+
+
+def test_load_reconstructs_indexes_for_subsequent_append(tmp_path: Path):
+    buffer = Stage25TrajectoryBuffer(3)
+    buffer.append(_row(day=4, row_id="r0"))
+    buffer.close_outgoing(
+        episode_index=1, seat=0, next_day=5, next_inputs=_inputs(5),
+        next_crop_capacity=np.asarray([1, 2, 3, 4, 5], dtype=np.int16))
+    base = tmp_path / "indexed"
+    buffer.save(base)
+    loaded, _ = load_stage25_trajectory(base)
+    # Load intentionally preserves the existing closure-state oddity; the
+    # explicit bypass remains the public way to append after a load.
+    assert loaded.append(_row(day=5, row_id="r1", predecessor_closed=True)) == 1
 
 
 def test_truncation_requires_and_preserves_bootstrap_value(tmp_path: Path):
