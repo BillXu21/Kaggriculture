@@ -131,6 +131,25 @@ def test_policy_and_value_heads_both_update_on_real_objective():
     assert value_delta > 0.0
 
 
+def test_ppo_update_does_not_mutate_reusable_logical_batch():
+    config = Stage25PPOConfig(
+        physical_batch_size=2, minibatch_size=2, epochs=1,
+        learning_rate=1e-3, entropy_coefficient=0.0)
+    params, batch = _ppo_fixture(config)
+    before_inputs = {name: value.copy() for name, value in batch.inputs.items()}
+    before_arrays = {
+        name: getattr(batch, name).copy()
+        for name in ("classes", "old_component_logprobs", "old_joint_logprobs",
+                     "old_values", "advantages", "returns", "episode_id",
+                     "seat", "day", "row_ids")}
+    state = init_stage25_ppo_state(config, seed=23, params=params)
+    ppo_update(state, batch, config)
+    for name, before in before_inputs.items():
+        np.testing.assert_array_equal(batch.inputs[name], before)
+    for name, before in before_arrays.items():
+        np.testing.assert_array_equal(getattr(batch, name), before)
+
+
 def test_compiled_step_matches_precompiled_objective_and_optimizer():
     config = Stage25PPOConfig(
         physical_batch_size=2, minibatch_size=2, epochs=1,

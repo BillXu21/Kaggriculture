@@ -535,11 +535,10 @@ def _collection(
         normalize_advantages=config.normalize_advantages)
     batch_construction_seconds = time.perf_counter() - batch_started
     collection_seconds = time.perf_counter() - collection_started
+    trajectory_summary = trajectory.diagnostic_summary()
     stats = {
         "rollout_rows": len(trajectory), "learner_rows": len(batch.classes),
-        "terminal_rows": sum(int(row.terminated) for row in trajectory.rows),
-        "truncated_rows": sum(int(row.truncated) for row in trajectory.rows),
-        "reward_sum": float(sum(float(row.reward) for row in trajectory.rows)),
+        **trajectory_summary,
         "final_banks": [float(bank) for result in results for bank in result.final_banks],
         "inference_metrics": runner.inference_metrics,
         "behavior_identity": learner.identity.to_json_dict(),
@@ -556,12 +555,7 @@ def _collection(
             "collection_seconds": collection_seconds,
         },
     }
-    for row in trajectory.rows:
-        if (json.dumps(row.provenance.get("executor"), sort_keys=True)
-                != json.dumps(stats["executor_provenance"], sort_keys=True)):
-            raise ValueError(
-                f"trajectory row {row.row_id!r} executor provenance disagrees "
-                "with configured factory")
+    trajectory.validate_executor_provenance(stats["executor_provenance"])
     return trajectory, learner, batch, stats
 
 

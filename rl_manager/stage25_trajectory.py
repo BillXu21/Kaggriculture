@@ -232,6 +232,10 @@ class Stage25TrajectoryBuffer:
         self._opponents: list[Stage25BehaviorIdentity] = []
         self._provenance_records: list[dict[str, Any]] = []
         self._keys: set[tuple[int, int, int]] = set()
+        self._row_id_set: set[str] = set()
+        self._day_indices: dict[tuple[int, int], dict[int, int]] = {}
+        self._last_appended_index: dict[tuple[int, int], int] = {}
+        self._ended_episode_seats: set[tuple[int, int]] = set()
         self._closed_outgoing: set[tuple[int, int, int]] = set()
 
     def __len__(self) -> int:
@@ -240,6 +244,30 @@ class Stage25TrajectoryBuffer:
     @property
     def rows(self) -> tuple[Stage25TrajectoryRow, ...]:
         return tuple(self.iter_rows())
+
+    def diagnostic_summary(self) -> dict[str, Any]:
+        """Summarize canonical stored rows without reconstructing row objects."""
+        rewards = self._arrays["reward"][:self._count]
+        return {
+            "terminal_rows": int(np.count_nonzero(
+                self._arrays["terminated"][:self._count])),
+            "truncated_rows": int(np.count_nonzero(
+                self._arrays["truncated"][:self._count])),
+            # Keep the historical Python float conversion and row order.
+            "reward_sum": float(sum(float(reward) for reward in rewards)),
+        }
+
+    def validate_executor_provenance(
+            self, expected: Mapping[str, Any],
+    ) -> None:
+        """Validate executor provenance directly against stored row metadata."""
+        expected_json = json.dumps(expected, sort_keys=True)
+        for index in range(self._count):
+            actual = self._provenance_records[index].get("executor")
+            if json.dumps(actual, sort_keys=True) != expected_json:
+                raise ValueError(
+                    f"trajectory row {self._row_ids[index]!r} executor "
+                    "provenance disagrees with configured factory")
 
     def iter_rows(self):
         for index in range(self._count):
@@ -269,9 +297,20 @@ class Stage25TrajectoryBuffer:
         key = (int(self._arrays["episode_id"][index]),
                int(self._arrays["seat"][index]),
                int(self._arrays["day"][index]))
-        previous = [candidate for candidate in self._keys
-                    if candidate[:2] == key[:2] and candidate[2] < key[2]]
-        return not previous or max(previous, key=lambda item: item[2]) in self._closed_outgoing
+        predecessor = self._predecessor_key(key[:2], key[2])
+        return predecessor is None or predecessor in self._closed_outgoing
+
+    def _predecessor_key(
+            self, episode_seat: tuple[int, int], day: int,
+    ) -> tuple[int, int, int] | None:
+        """Return the greatest stored manager day strictly below ``day``."""
+        day_indices = self._day_indices.get(episode_seat)
+        if day_indices is None:
+            return None
+        for candidate_day in range(day - 1, STAGE25_MANAGER_START_DAY - 1, -1):
+            if candidate_day in day_indices:
+                return (*episode_seat, candidate_day)
+        return None
 
     def append(self, row: Stage25TrajectoryRow | None = None, **kwargs: Any) -> int:
         """Append a validated row and return its contiguous row index."""
@@ -309,17 +348,14 @@ class Stage25TrajectoryBuffer:
         key = (int(row.episode_id), int(row.seat), int(row.day))
         if key in self._keys:
             raise ValueError(f"duplicate episode/seat/day identity {key}")
-        previous = [candidate for candidate in self._keys
-                    if candidate[:2] == key[:2] and candidate[2] < key[2]]
-        if previous:
-            prior = max(previous, key=lambda item: item[2])
+        episode_seat = key[:2]
+        prior = self._predecessor_key(episode_seat, key[2])
+        if prior is not None:
             if not bool(row.predecessor_closed) and prior not in self._closed_outgoing:
                 raise ValueError(
                     "outgoing manager transition must be closed before "
                     "recording the next decision")
-        if any(self._arrays["terminated"][i] or self._arrays["truncated"][i]
-               for i in range(self._count)
-               if (int(self._arrays["episode_id"][i]), int(self._arrays["seat"][i])) == key[:2]):
+        if episode_seat in self._ended_episode_seats:
             raise ValueError("cannot append after an episode/seat end patch")
         if not isinstance(row.valid, (bool, np.bool_)) or not bool(row.valid):
             raise ValueError("invalid Stage 2.5 policy row cannot enter a trajectory")
@@ -352,7 +388,7 @@ class Stage25TrajectoryBuffer:
         row_id = row.row_id if row.row_id is not None else f"episode={int(row.episode_id)}/seat={int(row.seat)}/day={int(row.day)}"
         if not isinstance(row_id, str) or not row_id:
             raise ValueError("row_id must be a non-empty string")
-        if row_id in self._row_ids:
+        if row_id in self._row_id_set:
             raise ValueError(f"duplicate row_id {row_id!r}")
         index = self._count
         self._arrays["episode_id"][index] = int(row.episode_id)
@@ -402,6 +438,11 @@ class Stage25TrajectoryBuffer:
         self._opponents.append(row.opponent_identity)
         self._provenance_records.append(provenance)
         self._keys.add(key)
+        self._row_id_set.add(row_id)
+        self._day_indices.setdefault(episode_seat, {})[key[2]] = index
+        self._last_appended_index[episode_seat] = index
+        if bool(row.terminated) or bool(row.truncated):
+            self._ended_episode_seats.add(episode_seat)
         self._count += 1
         return index
 
@@ -440,10 +481,9 @@ class Stage25TrajectoryBuffer:
         if capacity.shape != (5,) or capacity.dtype != np.dtype(np.int16):
             raise ValueError("next_crop_capacity must be int16 [5]")
         key = (int(episode_index), int(seat), int(next_day))
-        previous = [candidate for candidate in self._keys
-                    if candidate[:2] == key[:2] and candidate[2] < key[2]]
-        if previous:
-            self._closed_outgoing.add(max(previous, key=lambda item: item[2]))
+        predecessor = self._predecessor_key(key[:2], key[2])
+        if predecessor is not None:
+            self._closed_outgoing.add(predecessor)
 
     def _require_open(self, index: int) -> None:
         self._require_index(index)
@@ -457,30 +497,24 @@ class Stage25TrajectoryBuffer:
         reward = _require_patch_scalar(reward, "reward")
         _finite(reward, "reward")
         episode_seat = (int(self._arrays["episode_id"][index]), int(self._arrays["seat"][index]))
-        if any(i > index and
-               (int(self._arrays["episode_id"][i]), int(self._arrays["seat"][i])) == episode_seat
-               for i in range(self._count)):
+        if self._last_appended_index.get(episode_seat) != index:
             raise ValueError("terminal patch must be on the final manager row for the episode/seat")
-        if any(self._arrays["terminated"][i] or self._arrays["truncated"][i]
-               for i in range(self._count) if i != index and
-               (int(self._arrays["episode_id"][i]), int(self._arrays["seat"][i])) == episode_seat):
+        if episode_seat in self._ended_episode_seats:
             raise ValueError("episode/seat already has an end patch")
         self._arrays["reward"][index] = reward
         self._arrays["terminated"][index] = 1
         self._arrays["reward_patched"][index] = 1
+        self._ended_episode_seats.add(episode_seat)
 
     def patch_truncated(self, index: int, bootstrap_value: Any = None) -> None:
         self._require_open(index)
         episode_seat = (int(self._arrays["episode_id"][index]), int(self._arrays["seat"][index]))
-        if any(i > index and
-               (int(self._arrays["episode_id"][i]), int(self._arrays["seat"][i])) == episode_seat
-               for i in range(self._count)):
+        if self._last_appended_index.get(episode_seat) != index:
             raise ValueError("truncation patch must be on the final manager row for the episode/seat")
-        if any(self._arrays["terminated"][i] or self._arrays["truncated"][i]
-               for i in range(self._count) if i != index and
-               (int(self._arrays["episode_id"][i]), int(self._arrays["seat"][i])) == episode_seat):
+        if episode_seat in self._ended_episode_seats:
             raise ValueError("episode/seat already has an end patch")
         self._arrays["truncated"][index] = 1
+        self._ended_episode_seats.add(episode_seat)
         if bootstrap_value is not None:
             self.patch_bootstrap(index, bootstrap_value)
 
@@ -655,21 +689,25 @@ class Stage25TrajectoryBuffer:
                 raise ValueError("sidecar trainable must be boolean")
             if int(record["trainable"]) != int(buffer._arrays["trainable"][i]):
                 raise ValueError(f"sidecar trainable mismatch at index {i}")
-            buffer._row_ids.append(record.get("row_id"))
-            if not isinstance(buffer._row_ids[-1], str) or not buffer._row_ids[-1]:
+            row_id = record.get("row_id")
+            if not isinstance(row_id, str) or not row_id:
                 raise ValueError("sidecar row_id must be a non-empty string")
+            key = (int(buffer._arrays["episode_id"][i]), int(buffer._arrays["seat"][i]), int(buffer._arrays["day"][i]))
+            episode_seat = key[:2]
+            if key in buffer._keys or row_id in buffer._row_id_set:
+                raise ValueError("duplicate persisted row identity")
+            if episode_seat in buffer._ended_episode_seats:
+                raise ValueError("episode/seat has rows after an end patch")
+            buffer._row_ids.append(row_id)
+            buffer._row_id_set.add(row_id)
             buffer._learners.append(_identity_from_json(record.get("learner_identity"), "learner_identity"))
             buffer._opponents.append(_identity_from_json(record.get("opponent_identity"), "opponent_identity"))
             buffer._provenance_records.append(_provenance(record.get("provenance"), buffer._learners[-1], buffer._opponents[-1]))
-            key = (int(buffer._arrays["episode_id"][i]), int(buffer._arrays["seat"][i]), int(buffer._arrays["day"][i]))
-            if key in buffer._keys or buffer._row_ids[-1] in buffer._row_ids[:-1]:
-                raise ValueError("duplicate persisted row identity")
-            if (buffer._arrays["terminated"][i] or buffer._arrays["truncated"][i]) \
-                    and any((int(buffer._arrays["episode_id"][j]), int(buffer._arrays["seat"][j])) == key[:2]
-                            and (buffer._arrays["terminated"][j] or buffer._arrays["truncated"][j])
-                            for j in range(i)):
-                raise ValueError("episode/seat has more than one end patch")
             buffer._keys.add(key)
+            buffer._day_indices.setdefault(episode_seat, {})[key[2]] = i
+            buffer._last_appended_index[episode_seat] = i
+            if buffer._arrays["terminated"][i] or buffer._arrays["truncated"][i]:
+                buffer._ended_episode_seats.add(episode_seat)
         if np.any(buffer._arrays["valid"][:count] != 1):
             raise ValueError("invalid rows are not loadable trajectories")
         if np.any(buffer._arrays["terminated"] & buffer._arrays["truncated"]):
