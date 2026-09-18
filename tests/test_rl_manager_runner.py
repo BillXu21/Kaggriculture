@@ -50,6 +50,7 @@ from rl_manager.types import (
     PolicyIdentity,
     PolicyOutputs,
 )
+from oracle.backend import FastBackendAdapter
 from tests.test_rl_manager_debug_trace import _state as _canonical_trace_state
 
 MASTER_SEED = 17
@@ -738,6 +739,23 @@ class _MutatingTraceExecutorFactory(_TraceExecutorFactory):
         return _MutatingTraceExecutor(seat)
 
 
+class _CrossSeatMutationExecutor(_TraceExecutor):
+    def __call__(self, obs):
+        if int(obs["day"]) >= 4:
+            if self.seat == 0:
+                obs["farms"][0]["money"] = 1
+            else:
+                # Seat 0's mutation must be isolated from seat 1's view.
+                assert obs["farms"][0]["money"] != 1.0
+        return super().__call__(obs)
+
+
+class _CrossSeatMutationExecutorFactory(_TraceExecutorFactory):
+    def create(self, *, backend_name, seat, configuration, provider):
+        del backend_name, configuration, provider
+        return _CrossSeatMutationExecutor(seat)
+
+
 def _debug_trace_run(*, max_turns: int, enabled: bool, monkeypatch):
     monkeypatch.setattr(
         "rl_manager.runner.make_backend",
@@ -800,6 +818,22 @@ def test_read_only_agent_observation_view_rejects_mutation(monkeypatch):
     spec = build_episode_spec(0, MASTER_SEED, E_VS_E, policy, policy)
     with pytest.raises(TypeError, match="read-only"):
         runner.run([spec])
+
+
+def test_canonical_fast_runner_keeps_mutating_seats_isolated(monkeypatch):
+    monkeypatch.setattr(
+        "rl_manager.runner.make_backend",
+        lambda name, configuration: FastBackendAdapter(configuration),
+    )
+    policy = _ConstantPlanPolicy("canonical-isolation")
+    runner = SelfPlayRunner(
+        _runner_config(max_turns=97, low_telemetry=True),
+        executor_factory=_CrossSeatMutationExecutorFactory(),
+        master_seed=MASTER_SEED,
+    )
+    spec = build_episode_spec(0, MASTER_SEED, E_VS_E, policy, policy)
+    result = runner.run([spec])[0]
+    assert not result.terminated
 
 
 def test_debug_trace_is_deterministic_and_behavior_matches_disabled_capture(monkeypatch):

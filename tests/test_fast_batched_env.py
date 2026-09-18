@@ -10,6 +10,7 @@ import pytest
 from fast_env import BatchedFastEnv, FastKaggricultureEnv
 from fast_env.api import _encode_actions
 from fast_env._kaggriculture_env import ACTION_SLOTS
+from oracle.backend import FastBackendAdapter
 from oracle.batched_backend import make_batched_backend
 
 
@@ -79,6 +80,30 @@ def test_batch_private_views_are_seat_local_and_adapter_uses_canonical_farms() -
         for tile in row
         if isinstance(tile, dict) and tile.get("kind") == "PLANT"
     )
+
+
+def test_scalar_and_batched_backend_canonical_observations_match() -> None:
+    actions = [_actions(turn) for turn in range(4)]
+    scalar = FastBackendAdapter({"seed": 7, "numThreads": 1})
+    batched = make_batched_backend("fast", 1, {"numThreads": 1})
+
+    scalar_observations = scalar.reset()
+    batched_observations = batched.reset([7])[0]
+    assert scalar_observations == batched_observations
+    assert scalar_observations[0]["farms"] is scalar_observations[1]["farms"]
+    assert scalar_observations[0]["market"] is scalar_observations[1]["market"]
+    assert scalar_observations[0]["private"] is not scalar_observations[1]["private"]
+
+    for action_pair in actions:
+        scalar_observations, scalar_rewards, scalar_statuses = scalar.step(
+            action_pair
+        )
+        batched_observations, rewards, statuses = batched.step([action_pair])
+        assert scalar_observations == batched_observations[0]
+        assert scalar_rewards == rewards[0].tolist()
+        assert scalar_statuses == batched.statuses(0) == [
+            "DONE" if value else "ACTIVE" for value in statuses[0]
+        ]
 
 
 def test_batch_terminal_statuses_and_shape_validation() -> None:
