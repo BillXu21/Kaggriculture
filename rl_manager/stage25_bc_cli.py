@@ -67,6 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffn", type=int)
     parser.add_argument("--dropout", type=float)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--host-workers", type=int, default=3,
+        help="CPU threads used to prepare batches; 0 selects synchronous batching")
+    parser.add_argument(
+        "--prefetch-batches", type=int, default=6,
+        help="bounded number of batches prepared ahead by host workers")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--steps", type=int, default=None,
@@ -313,10 +319,34 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         batches = iter_fixed_batches(
             train_inputs, train_actions, config.batch_size, seed=args.seed,
             epoch=current_epoch, shuffle=True, start_batch=begin_batch,
-            row_ids=train_row_ids)
-        for batch_index, batch in enumerate(batches):
-            params, opt_state, rng, metrics = train_step_fn(
-                params, opt_state, rng, batch)
+            row_ids=train_row_ids, host_workers=args.host_workers,
+            prefetch_batches=args.prefetch_batches)
+        batches = iter(batches)
+        batch_index = 0
+        batch_wait_wall = 0.0
+        train_step_wall = 0.0
+        while True:
+            wait_start = time.perf_counter()
+            try:
+                batch = next(batches)
+            except StopIteration:
+                break
+            except BaseException:
+                close_batches = getattr(batches, "close", None)
+                if close_batches is not None:
+                    close_batches()
+                raise
+            batch_wait_wall += time.perf_counter() - wait_start
+            step_start = time.perf_counter()
+            try:
+                params, opt_state, rng, metrics = train_step_fn(
+                    params, opt_state, rng, batch)
+            except BaseException:
+                close_batches = getattr(batches, "close", None)
+                if close_batches is not None:
+                    close_batches()
+                raise
+            train_step_wall += time.perf_counter() - step_start
             step += 1
             real = float(metrics["valid_rows"])
             train_rows += real
@@ -340,6 +370,10 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                     partial_batch = batch_index + 1
                     epoch_completed = partial_batch >= num_batches
                     break
+            batch_index += 1
+        close_batches = getattr(batches, "close", None)
+        if close_batches is not None:
+            close_batches()
         train_wall = time.perf_counter() - train_start
 
         if not epoch_completed:
@@ -363,7 +397,9 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             val_start = time.perf_counter()
             val_batches = iter_fixed_batches(
                 val_loaded[0], val_loaded[1], config.batch_size, seed=args.seed,
-                epoch=0, shuffle=False, row_ids=None)
+                epoch=0, shuffle=False, row_ids=None,
+                host_workers=args.host_workers,
+                prefetch_batches=args.prefetch_batches)
             val_metrics = validation_metrics(
                 params, val_batches, config, eval_step=eval_step)
             val_wall = time.perf_counter() - val_start
@@ -408,6 +444,8 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             "validation_rows": (None if val_metrics is None
                                 else val_metrics["valid_rows"]),
             "train_wall_seconds": train_wall,
+            "train_batch_wait_seconds": batch_wait_wall,
+            "compiled_train_step_wall_seconds": train_step_wall,
             "validation_wall_seconds": val_wall,
             "checkpoint_wall_seconds": checkpoint_wall,
             "epoch_total_wall_seconds": epoch_total,

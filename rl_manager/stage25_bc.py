@@ -8,6 +8,7 @@ masked likelihood reductions, the optimizer mask, and native training state.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, fields, is_dataclass
 import json
 from pathlib import Path
@@ -123,13 +124,20 @@ def _row_count(inputs: Mapping[str, Any]) -> int:
     return int(value.shape[0])
 
 
-def _take_rows(value: Any, indices: np.ndarray, n: int) -> Any:
+def _prepare_inputs(value: Any, n: int) -> Any:
     if isinstance(value, Mapping):
-        return {key: _take_rows(child, indices, n) for key, child in value.items()}
+        return {key: _prepare_inputs(child, n) for key, child in value.items()}
     array = np.asarray(value)
     if array.ndim == 0 or array.shape[0] != n:
         raise ValueError("all input arrays must share the dataset row count")
-    return np.array(array[indices], copy=True)
+    return array
+
+
+def _take_prepared_rows(value: Any, indices: np.ndarray) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _take_prepared_rows(child, indices)
+                for key, child in value.items()}
+    return value[indices]
 
 
 def _normalize_row_ids(value: Any, n: int) -> np.ndarray:
@@ -146,6 +154,120 @@ def _normalize_row_ids(value: Any, n: int) -> np.ndarray:
         return np.arange(n, dtype=np.int64)
 
 
+@dataclass(frozen=True)
+class _PreparedBatchSource:
+    inputs: Mapping[str, Any]
+    actions: np.ndarray
+    row_ids: np.ndarray
+    physical_contexts: Sequence[Any] | None
+    rows: int
+
+
+def _prepare_batch_source(
+        inputs: Mapping[str, Any], actions: Any, *,
+        physical_contexts: Sequence[Any] | None,
+        row_ids: Any,
+) -> _PreparedBatchSource:
+    n = _row_count(inputs)
+    prepared_inputs = _prepare_inputs(inputs, n)
+    labels = _validate_actions(actions, check_range=False)
+    if labels.shape[0] != n:
+        raise ValueError("inputs and actions must contain the same row count")
+    if physical_contexts is not None and len(physical_contexts) != n:
+        raise ValueError("physical_contexts must match dataset row count")
+    return _PreparedBatchSource(
+        inputs=prepared_inputs,
+        actions=labels,
+        row_ids=_normalize_row_ids(row_ids, n),
+        physical_contexts=physical_contexts,
+        rows=n,
+    )
+
+
+def _make_indexed_batch(source: _PreparedBatchSource,
+                        indices: np.ndarray, real_rows: int,
+                        batch_size: int) -> Stage25BCBatch:
+    if real_rows < batch_size:
+        indices = np.pad(indices, (0, batch_size - real_rows), mode="edge")
+    mask = np.zeros((batch_size,), dtype=bool)
+    mask[:real_rows] = True
+    contexts = None
+    if source.physical_contexts is not None:
+        contexts = tuple(source.physical_contexts[index] for index in indices)
+    return Stage25BCBatch(
+        _take_prepared_rows(source.inputs, indices),
+        source.actions[indices],
+        mask,
+        contexts,
+        source.row_ids[indices],
+    )
+
+
+def _batch_specs(source: _PreparedBatchSource, order: np.ndarray,
+                 batch_size: int, start_batch: int):
+    batch_count = (source.rows + batch_size - 1) // batch_size
+    for batch_index in range(start_batch, batch_count):
+        begin = batch_index * batch_size
+        end = min(begin + batch_size, source.rows)
+        yield batch_index, order[begin:end], end - begin
+
+
+def _iter_synchronous_batches(source: _PreparedBatchSource, order: np.ndarray,
+                              batch_size: int, start_batch: int):
+    for _, indices, real_rows in _batch_specs(
+            source, order, batch_size, start_batch):
+        yield _make_indexed_batch(source, indices, real_rows, batch_size)
+
+
+def _iter_prefetched_batches(source: _PreparedBatchSource, order: np.ndarray,
+                             batch_size: int, start_batch: int,
+                             host_workers: int, prefetch_batches: int):
+    executor = ThreadPoolExecutor(max_workers=host_workers,
+                                  thread_name_prefix="stage25-bc")
+    specs = iter(_batch_specs(source, order, batch_size, start_batch))
+    pending: dict[int, Future[Stage25BCBatch]] = {}
+    completed: dict[int, Future[Stage25BCBatch]] = {}
+    next_batch = start_batch
+
+    def submit_next() -> bool:
+        try:
+            batch_index, indices, real_rows = next(specs)
+        except StopIteration:
+            return False
+        pending[batch_index] = executor.submit(
+            _make_indexed_batch, source, indices, real_rows, batch_size)
+        return True
+
+    try:
+        for _ in range(prefetch_batches):
+            if not submit_next():
+                break
+        while pending or completed:
+            if pending:
+                done, _ = wait(tuple(pending.values()),
+                               return_when=FIRST_COMPLETED)
+                for batch_index, future in tuple(pending.items()):
+                    if future not in done:
+                        continue
+                    pending.pop(batch_index)
+                    # Inspect every completed future before yielding any later
+                    # batch so worker errors cannot be hidden by ordering.
+                    error = future.exception()
+                    if error is not None:
+                        raise error
+                    completed[batch_index] = future
+            future = completed.pop(next_batch, None)
+            if future is None:
+                continue
+            yield future.result()
+            next_batch += 1
+            submit_next()
+    finally:
+        for future in pending.values():
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
 def make_fixed_batch(
         inputs: Mapping[str, Any], actions: Any, batch_size: int, *,
         start: int = 0, stop: int | None = None,
@@ -153,30 +275,18 @@ def make_fixed_batch(
         row_ids: Any = None,
 ) -> Stage25BCBatch:
     """Make one fixed-size batch, repeating the final example if needed."""
-    n = _row_count(inputs)
-    labels = _validate_actions(actions, check_range=False)
-    if labels.shape[0] != n:
-        raise ValueError("inputs and actions must contain the same row count")
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+    source_data = _prepare_batch_source(
+        inputs, actions, physical_contexts=physical_contexts, row_ids=row_ids)
+    n = source_data.rows
     begin = int(start)
     end = n if stop is None else int(stop)
     if not 0 <= begin < end <= n or end - begin > batch_size:
         raise ValueError("batch range is outside the fixed batch size")
-    source = np.arange(begin, end, dtype=np.int64)
-    real = source.size
-    if real < batch_size:
-        source = np.pad(source, (0, batch_size - real), mode="edge")
-    mask = np.zeros((batch_size,), dtype=bool)
-    mask[:real] = True
-    contexts = None
-    if physical_contexts is not None:
-        if len(physical_contexts) != n:
-            raise ValueError("physical_contexts must match dataset row count")
-        contexts = tuple(physical_contexts[index] for index in source)
-    ids = _normalize_row_ids(row_ids, n)
-    return Stage25BCBatch(_take_rows(inputs, source, n), labels[source], mask,
-                          contexts, ids[source])
+    return _make_indexed_batch(
+        source_data, np.arange(begin, end, dtype=np.int64), end - begin,
+        batch_size)
 
 
 def iter_fixed_batches(
@@ -185,30 +295,36 @@ def iter_fixed_batches(
         start_batch: int = 0,
         physical_contexts: Sequence[Any] | None = None,
         row_ids: Any = None,
+        host_workers: int = 0,
+        prefetch_batches: int = 6,
 ) -> Iterable[Stage25BCBatch]:
-    """Yield deterministic fixed-shape batches for one epoch."""
-    n = _row_count(inputs)
-    labels = _validate_actions(actions, check_range=False)
-    if labels.shape[0] != n or n == 0:
+    """Yield deterministic fixed-shape batches for one epoch.
+
+    The dataset remains in its original row order.  Only the shuffled row
+    indices are retained for the epoch, and each batch gathers its own rows.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if start_batch < 0:
+        raise ValueError("start_batch must be nonnegative")
+    if host_workers < 0:
+        raise ValueError("host_workers must be nonnegative")
+    if prefetch_batches < 1:
+        raise ValueError("prefetch_batches must be positive")
+    source_data = _prepare_batch_source(
+        inputs, actions, physical_contexts=physical_contexts, row_ids=row_ids)
+    if source_data.rows == 0:
         raise ValueError("inputs/actions must be nonempty and row-aligned")
-    order = np.arange(n, dtype=np.int64)
+    order = np.arange(source_data.rows, dtype=np.int64)
     if shuffle:
         rng = np.random.default_rng(np.random.SeedSequence([int(seed), int(epoch)]))
         rng.shuffle(order)
-    shuffled_inputs = _take_rows(inputs, order, n)
-    shuffled_labels = labels[order]
-    shuffled_contexts = (None if physical_contexts is None
-                         else tuple(physical_contexts[index] for index in order))
-    shuffled_ids = _normalize_row_ids(row_ids, n)[order]
-    if start_batch < 0:
-        raise ValueError("start_batch must be nonnegative")
-    for batch_index, begin in enumerate(range(0, n, batch_size)):
-        if batch_index < start_batch:
-            continue
-        yield make_fixed_batch(shuffled_inputs, shuffled_labels, batch_size,
-                               start=begin, stop=min(begin + batch_size, n),
-                               physical_contexts=shuffled_contexts,
-                               row_ids=shuffled_ids)
+    if host_workers == 0:
+        return _iter_synchronous_batches(
+            source_data, order, batch_size, start_batch)
+    return _iter_prefetched_batches(
+        source_data, order, batch_size, start_batch, host_workers,
+        prefetch_batches)
 
 
 def _model_config(config: Stage25BCConfig | Stage25ModelConfig) -> Stage25ModelConfig:
