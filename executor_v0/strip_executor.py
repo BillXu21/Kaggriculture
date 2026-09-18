@@ -93,9 +93,11 @@ class StripExecutorController:
         *,
         config: StripExecutorConfig = StripExecutorConfig(),
         work_builder: WorkPlanBuilder = build_strip_work_plan,
+        materialize_diagnostics: bool = True,
     ) -> None:
         self.config = config
         self._work_builder = work_builder
+        self._materialize_diagnostics = bool(materialize_diagnostics)
         self._day: int | None = None
         self._routes: dict[WorkerId, StripRoute] = {}
         self._assignment: RouteAssignment | None = None
@@ -129,6 +131,11 @@ class StripExecutorController:
     @property
     def diagnostics(self) -> dict[str, Any]:
         return self._diagnostics()
+
+    def _result_diagnostics(self) -> dict[str, Any]:
+        """Build turn diagnostics only when the caller requested full telemetry."""
+
+        return self._diagnostics() if self._materialize_diagnostics else {}
 
     def _finalize_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
         """Freeze Packet 2 ownership and Packet 3 reservations once."""
@@ -364,7 +371,7 @@ class StripExecutorController:
             farmer_action=farmer_action,
             hands_actions=hands_actions,
             market_actions=market_plan.orders,
-            diagnostics=self._diagnostics(),
+            diagnostics=self._result_diagnostics(),
         )
 
     next_worker_actions = act
@@ -438,7 +445,7 @@ class StripExecutorController:
             farmer_action=actions[0] if actions else ("PASS",),
             hands_actions=actions[1:],
             market_actions=tuple(tuple(order) for order in market_actions),
-            diagnostics=self._diagnostics(),
+            diagnostics=self._result_diagnostics(),
         )
 
     def _reconcile_hire_observation(self, obs: Mapping[str, Any]) -> None:
