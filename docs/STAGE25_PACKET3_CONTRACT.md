@@ -20,6 +20,8 @@ executor wiring, live penalties, or large training runs.
 - `rl_manager.stage25_bc`
   - `Stage25BCConfig`, `Stage25BCBatch`.
   - `make_fixed_batch`, `iter_fixed_batches`, `loss_and_metrics`, `train_step`.
+  - `CompiledTrainStep` / `make_compiled_train_step`, `CompiledEvalStep` /
+    `make_compiled_eval_step`, `validation_metrics`, `evaluate_dataset`.
   - `make_optimizer`, `init_opt_state`.
   - `save_checkpoint`, `load_checkpoint`, `import_encoder_checkpoint`,
     `load_array_dataset`.
@@ -71,6 +73,40 @@ reconstructs the optimizer tree from the exact caller template (or the persisted
 optimizer config), validates the tree signature, leaf count, and every
 shape/dtype, and reproduces the next update deterministically. Re-saving after a
 resume preserves the operating/source histories and identities.
+
+The CLI's epoch trainer normalises a completed epoch's cursor to
+`(epoch + 1, batch 0)` before writing the checkpoint, so resuming a finished
+epoch begins at batch 0 of the following epoch rather than at the exhausted end
+of the previous one. A cursor whose `batch` equals the epoch's batch count is
+also normalised forward on load, which tolerates checkpoints written before this
+convention. A bounded (`--steps`) stop that lands mid-epoch preserves the exact
+`(epoch, batch)` cursor, so it resumes the same epoch from the next batch.
+
+## Overnight epoch trainer
+
+`rl_manager.stage25_bc_cli` runs whole epochs by default; `--steps` remains a
+bounded smoke/debug mode. Training and validation datasets are separate
+pickle-free NPZs (`--train-data`, `--val-data`; `--data` remains the legacy
+alias/source). Validation runs the compiled eval seam without optimizer updates
+or dropout and aggregates joint NLL, per-step NLL, and per-step accuracy weighted
+by real rows, so the final edge-padded batch contributes only its real rows.
+
+The compiled `CompiledTrainStep` / `CompiledEvalStep` seams are created once per
+static BC configuration and reuse one JAX executable per batch shape. They keep
+the same objective, support validation, optimizer, gradient clipping, AdamW
+update, dropout RNG semantics, and frozen value head as the reference
+`train_step`; numerical parity is asserted in tests.
+
+`--checkpoint-dir` writes one full resumable checkpoint per completed epoch
+(`epoch_001.npz`, ...), plus `last.npz` and, by validation joint NLL, `best.npz`.
+Checkpoints are never pruned automatically. Each epoch appends one JSON record
+to `metrics.jsonl` (joint/per-step train and validation metrics, wall times,
+learning rate, and whether the epoch became `best`); a compact epoch summary is
+printed to stdout. `--patience N` optionally early-stops after `N` epochs without
+validation improvement (`0` disables it). `--d-model`, `--layers`, `--heads`,
+`--ffn`, and `--dropout` override the selected `--model-size` inside a
+consistent `Stage25ModelConfig`; historical import shape/config validation is
+unchanged.
 
 ## Complete-row BC eligibility and padding
 
@@ -128,6 +164,19 @@ python -m rl_manager.stage25_bc_cli \
 python -m rl_manager.stage25_bc_cli \
     --data data.npz --resume stage25_bc.npz --steps 100 \
     --output stage25_bc.npz
+
+# Overnight epoch run with per-epoch retention and validation metrics.
+python -m rl_manager.stage25_bc_cli \
+    --train-data train.npz --val-data val.npz \
+    --checkpoint-dir runs/stage25-bc --epochs 20 \
+    --model-size large --batch-size 64 --import source-e.npz \
+    --allow-legacy-e
+
+# Continue an overnight run from its last completed epoch.
+python -m rl_manager.stage25_bc_cli \
+    --train-data train.npz --val-data val.npz \
+    --checkpoint-dir runs/stage25-bc --epochs 20 \
+    --resume runs/stage25-bc/last.npz
 ```
 
 ## Non-goals

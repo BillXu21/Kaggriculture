@@ -417,6 +417,171 @@ def train_step(
     return next_params, next_opt_state, next_rng, reported
 
 
+def _prepared_arrays(batch: Stage25BCBatch, model: Stage25ModelConfig):
+    """Split one fixed batch into the exact arrays the policy core consumes."""
+    prepared, capacity, contexts, row_ids, explicit = _core_inputs(batch, model)
+    labels = jnp.asarray(batch.actions, dtype=jnp.int32)
+    real_mask = jnp.asarray(batch.real_row_mask)
+    return prepared, capacity, contexts, row_ids, labels, real_mask, explicit
+
+
+class CompiledTrainStep:
+    """Reusable fixed-shape compiled update for one static BC configuration.
+
+    The optimizer, task loss, support validation, gradient clipping, and AdamW
+    update are identical to :func:`train_step`; only the execution seam changes.
+    The value head remains outside the trainable mask, and an unsupported
+    teacher-forced action raises before the caller can observe the functional
+    update the compiled function computed.
+    """
+
+    def __init__(self, template_params: Mapping[str, Any],
+                 config: Stage25BCConfig | Stage25ModelConfig) -> None:
+        settings = _settings(config)
+        model = _model_config(config)
+        train_dropout = bool(settings.train_dropout)
+        optimizer = make_optimizer(template_params, settings)
+        self._model = model
+        self._train_dropout = train_dropout
+
+        def update(params, opt_state, key, prepared, capacity, contexts,
+                   row_ids, labels, real_mask, explicit):
+            key = _normal_key(key)
+
+            def objective(tree):
+                train_keys = jnp.broadcast_to(key, (labels.shape[0], 2))
+                output = _stage25_jit(
+                    tree, prepared, capacity, train_keys, labels, contexts,
+                    row_ids, model, "train" if train_dropout else "eval", explicit)
+                return _metrics_from_output(output, labels, real_mask)
+
+            (loss, metrics), grads = jax.value_and_grad(
+                objective, has_aux=True)(params)
+            updates, next_opt_state = optimizer.update(grads, opt_state, params)
+            next_params = optax.apply_updates(params, updates)
+            next_key = jax.random.split(key)[1]
+            metrics = dict(metrics)
+            metrics["loss"] = loss
+            metrics["step_loss"] = loss
+            return next_params, next_opt_state, next_key, metrics
+
+        self._update = jax.jit(update, static_argnames=("explicit",))
+
+    def __call__(self, params: Mapping[str, Any], opt_state: Any, rng: Any,
+                 batch: Stage25BCBatch):
+        if self._train_dropout and rng is None:
+            raise ValueError("training with nonzero dropout requires an explicit rng")
+        key = _normal_key(rng)
+        (prepared, capacity, contexts, row_ids, labels, real_mask,
+         explicit) = _prepared_arrays(batch, self._model)
+        next_params, next_state, next_key, metrics = self._update(
+            params, opt_state, key, prepared, capacity, contexts, row_ids,
+            labels, real_mask, explicit=explicit)
+        # A single compiled pass produces both the objective and the exact
+        # policy support; invalid real actions fail here, before the caller can
+        # commit the functional update or advance its RNG.
+        _ensure_supported(metrics, batch.actions, batch.real_row_mask)
+        reported = {name: np.asarray(value) for name, value in metrics.items()}
+        reported["loss"] = float(np.asarray(metrics["loss"]))
+        reported["step_loss"] = reported["loss"]
+        return next_params, next_state, next_key, reported
+
+
+def make_compiled_train_step(
+        template_params: Mapping[str, Any],
+        config: Stage25BCConfig | Stage25ModelConfig) -> CompiledTrainStep:
+    """Build one compiled BC update seam for a fixed configuration."""
+    return CompiledTrainStep(template_params, config)
+
+
+class CompiledEvalStep:
+    """Reusable fixed-shape compiled eval pass (no dropout, no optimizer)."""
+
+    def __init__(self, config: Stage25BCConfig | Stage25ModelConfig) -> None:
+        model = _model_config(config)
+        self._model = model
+
+        def evaluate(params, prepared, capacity, contexts, row_ids, labels,
+                     real_mask, explicit):
+            keys = jnp.zeros((labels.shape[0], 2), dtype=jnp.uint32)
+            output = _stage25_jit(
+                params, prepared, capacity, keys, labels, contexts, row_ids,
+                model, "eval", explicit)
+            return _metrics_from_output(output, labels, real_mask)
+
+        self._evaluate = jax.jit(evaluate, static_argnames=("explicit",))
+
+    def __call__(self, params: Mapping[str, Any],
+                 batch: Stage25BCBatch) -> dict[str, Any]:
+        (prepared, capacity, contexts, row_ids, labels, real_mask,
+         explicit) = _prepared_arrays(batch, self._model)
+        loss, metrics = self._evaluate(
+            params, prepared, capacity, contexts, row_ids, labels, real_mask,
+            explicit=explicit)
+        _ensure_supported(metrics, batch.actions, batch.real_row_mask)
+        reported = {name: np.asarray(value) for name, value in metrics.items()}
+        reported["loss"] = float(np.asarray(loss))
+        return reported
+
+
+def make_compiled_eval_step(
+        config: Stage25BCConfig | Stage25ModelConfig) -> CompiledEvalStep:
+    """Build one compiled evaluation seam for a fixed configuration."""
+    return CompiledEvalStep(config)
+
+
+def validation_metrics(
+        params: Mapping[str, Any], batches: Iterable[Stage25BCBatch],
+        config: Stage25BCConfig | Stage25ModelConfig | None = None, *,
+        eval_step: CompiledEvalStep | None = None,
+) -> dict[str, Any]:
+    """Aggregate eval-mode metrics over batches, weighted by real rows.
+
+    The final padded batch contributes only its real rows, and the returned
+    reductions match a single unpadded pass over the same examples.
+    """
+    if eval_step is None:
+        if config is None:
+            raise ValueError("config or eval_step is required for validation")
+        eval_step = CompiledEvalStep(config)
+    total_rows = 0.0
+    joint_sum = 0.0
+    step_nll_sum: np.ndarray | None = None
+    step_accuracy_sum: np.ndarray | None = None
+    for batch in batches:
+        metrics = eval_step(params, batch)
+        rows = float(np.asarray(metrics["valid_rows"]))
+        total_rows += rows
+        joint_sum += float(np.asarray(metrics["loss"])) * rows
+        step_nll = np.asarray(metrics["per_step_nll"], dtype=np.float64) * rows
+        step_accuracy = np.asarray(
+            metrics["per_step_accuracy"], dtype=np.float64) * rows
+        step_nll_sum = step_nll if step_nll_sum is None else step_nll_sum + step_nll
+        step_accuracy_sum = (step_accuracy if step_accuracy_sum is None
+                             else step_accuracy_sum + step_accuracy)
+    if total_rows <= 0.0:
+        raise ValueError("validation requires at least one real row")
+    return {
+        "joint_nll": joint_sum / total_rows,
+        "per_step_nll": step_nll_sum / total_rows,
+        "per_step_accuracy": step_accuracy_sum / total_rows,
+        "valid_rows": int(total_rows),
+    }
+
+
+def evaluate_dataset(
+        params: Mapping[str, Any], inputs: Mapping[str, Any], actions: Any,
+        config: Stage25BCConfig | Stage25ModelConfig, *, seed: int = 0,
+        row_ids: Any = None, eval_step: CompiledEvalStep | None = None,
+) -> dict[str, Any]:
+    """Evaluate one array dataset in deterministic (unshuffled) order."""
+    settings = _settings(config)
+    batches = iter_fixed_batches(
+        inputs, actions, settings.batch_size, seed=seed, epoch=0, shuffle=False,
+        row_ids=row_ids)
+    return validation_metrics(params, batches, config, eval_step=eval_step)
+
+
 def _path_part(part: Any) -> str:
     key = getattr(part, "key", None)
     if key is not None:
@@ -645,7 +810,10 @@ def load_array_dataset(path: str | Path) -> tuple[dict[str, np.ndarray], np.ndar
 
 __all__ = [
     "ACTION_COUNT", "ACTION_CLASS_COUNTS", "BC_CHECKPOINT_FORMAT",
-    "Stage25BCBatch", "Stage25BCConfig", "init_opt_state", "iter_fixed_batches",
-    "load_array_dataset", "load_checkpoint", "make_fixed_batch", "make_optimizer",
-    "loss_and_metrics", "save_checkpoint", "train_step", "import_encoder_checkpoint",
+    "CompiledEvalStep", "CompiledTrainStep", "Stage25BCBatch", "Stage25BCConfig",
+    "evaluate_dataset", "init_opt_state", "iter_fixed_batches",
+    "load_array_dataset", "load_checkpoint", "make_compiled_eval_step",
+    "make_compiled_train_step", "make_fixed_batch", "make_optimizer",
+    "loss_and_metrics", "save_checkpoint", "train_step",
+    "validation_metrics", "import_encoder_checkpoint",
 ]
