@@ -796,7 +796,8 @@ class SelfPlayRunner:
             if config.stage25_enabled:
                 from rl_manager.executor_factory import make_stage25_executor_factory
 
-                executor_factory = make_stage25_executor_factory()
+                executor_factory = make_stage25_executor_factory(
+                    low_telemetry=config.low_telemetry)
             elif config.low_telemetry:
                 from executor_v0.agent import AgentConfig
 
@@ -807,6 +808,10 @@ class SelfPlayRunner:
                 # Preserve the zero-argument factory seam used by callers and
                 # tests; the default factory already creates strict agents.
                 executor_factory = make_default_executor_factory()
+        configure_telemetry = getattr(
+            executor_factory, "with_low_telemetry", None)
+        if callable(configure_telemetry):
+            executor_factory = configure_telemetry(config.low_telemetry)
         self.executor_factory = executor_factory
         self.master_seed = master_seed
         self.timing_totals: dict[str, float] = {

@@ -76,34 +76,60 @@ class Stage25StripExecutorAgent:
     """
 
     def __init__(self, *, provider: Any, seat: int, strip_config: Any,
-                 profile: Mapping[str, Any]) -> None:
+                 profile: Mapping[str, Any],
+                 materialize_diagnostics: bool = True) -> None:
         from executor_v0.strip_executor import StripExecutorController
 
         self.provider = provider
         self.seat = int(seat)
+        self.materialize_diagnostics = bool(materialize_diagnostics)
         self.config = replace(strip_config, acting_seat=self.seat)
-        self.controller = StripExecutorController(config=self.config)
+        self.controller = StripExecutorController(
+            config=self.config,
+            materialize_diagnostics=self.materialize_diagnostics)
         self.effective_profile = copy.deepcopy(dict(profile))
         self._day: int | None = None
         self._plan: Any | None = None
         self._days: dict[str, dict[str, Any]] = {}
 
+    def _capture_current_day(self) -> None:
+        if self.materialize_diagnostics or self._day is None:
+            return
+        day = str(self._day)
+        if day not in self._days:
+            # ``controller.diagnostics`` constructs a fresh snapshot from the
+            # observation held for the last action of this day.  Capturing
+            # before the next day starts preserves the historical snapshot
+            # meaning without copying on every primitive turn.
+            self._days[day] = self.controller.diagnostics
+
     def __call__(self, obs: Mapping[str, Any]) -> dict[str, Any]:
         day = int(obs["day"])
         if self._day != day:
+            self._capture_current_day()
             self._plan = self.provider.daily_plan(obs, self.seat)
             self._day = day
         result = self.controller.act(obs, self._plan)
-        self._days[str(day)] = copy.deepcopy(result.diagnostics)
+        if self.materialize_diagnostics:
+            self._days[str(day)] = copy.deepcopy(result.diagnostics)
         return result.action_dict()
 
+    def finalize_diagnostics(self, obs: Mapping[str, Any], seat: int) -> None:
+        del obs, seat
+        self._capture_current_day()
+
     def diagnostics_json(self) -> dict[str, Any]:
+        days = copy.deepcopy(self._days)
+        if not self.materialize_diagnostics and self._day is not None:
+            day = str(self._day)
+            if day not in days:
+                days[day] = self.controller.diagnostics
         diagnostics = {
             "schema_version": 1,
             "seat": self.seat,
             "effective_profile": copy.deepcopy(self.effective_profile),
             "config": asdict(self.config),
-            "days": copy.deepcopy(self._days),
+            "days": days,
             "fallback_errors": [],
         }
         provider_diagnostics = getattr(self.provider, "diagnostics_json", None)
@@ -117,6 +143,7 @@ class Stage25ExecutorFactory:
     """Factory carrying the complete Stage 2.5 profile across rollouts."""
 
     profile: Stage25ExecutorProfile
+    materialize_diagnostics: bool = True
 
     @property
     def name(self) -> str:
@@ -139,6 +166,9 @@ class Stage25ExecutorFactory:
     def effective_profile(self) -> dict[str, Any]:
         return self.profile.to_json_dict()
 
+    def with_low_telemetry(self, enabled: bool) -> "Stage25ExecutorFactory":
+        return replace(self, materialize_diagnostics=not bool(enabled))
+
     def create(
         self,
         *,
@@ -152,11 +182,14 @@ class Stage25ExecutorFactory:
             provider=provider, seat=seat,
             strip_config=self.profile.strip_config,
             profile=self.profile.to_json_dict(),
+            materialize_diagnostics=self.materialize_diagnostics,
         )
 
 
 def make_stage25_executor_factory(
     strip_config: Any | None = None,
+    *,
+    low_telemetry: bool = False,
 ) -> RlExecutorFactory:
     """Build the explicit Stage 2.5 fixed-strip executor profile."""
     from executor_v0.strip_executor import StripExecutorConfig
@@ -165,7 +198,8 @@ def make_stage25_executor_factory(
         aggressive_sell_all=True)
     _validate_stage25_config(resolved_config, StripExecutorConfig)
     return Stage25ExecutorFactory(
-        profile=Stage25ExecutorProfile(strip_config=resolved_config))
+        profile=Stage25ExecutorProfile(strip_config=resolved_config),
+        materialize_diagnostics=not bool(low_telemetry))
 
 
 class RlExecutorFactory(Protocol):
