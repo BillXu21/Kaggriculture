@@ -84,6 +84,15 @@ def test_first_boundary_initializes_observed_k_and_lowers_plan() -> None:
     assert provider.diagnostics["requested_crop_goals"] == (1, 0, 0, 0, 0)
 
 
+def test_provider_rejects_illegal_action_even_when_parent_checks_are_none() -> None:
+    provider = Stage25PlanProvider(7, 0, 3)
+    illegal = HOLD[:-1] + (200,)
+    with pytest.raises(Stage25ProviderError):
+        provider.accept_classes(_obs(day=3), illegal)
+    assert provider.crop_capacity is None
+    assert provider.last_accepted_decision is None
+
+
 def test_same_day_reads_cache_but_duplicate_submission_is_rejected() -> None:
     native = _FakeNativePolicy()
     provider = Stage25PlanProvider(7, 0, 3, native_policy=native)

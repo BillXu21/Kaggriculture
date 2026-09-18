@@ -18,6 +18,7 @@ import dataclasses
 import hashlib
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 import jax
@@ -75,6 +76,24 @@ _OUTPUT_FLOAT_FIELDS = ("component_logprobs", "joint_logprob", "value")
 _AUDIT_ATOL = 1.0e-6
 _AUDIT_RTOL = 1.0e-6
 _ROW_FOLD_IN = jax.vmap(jax.random.fold_in, in_axes=(None, 0))
+_VALIDATION_MODES = frozenset({"strict", "fast", "none"})
+_INFERENCE_PHASES = (
+    "input_validation_seconds",
+    "host_input_prepare_seconds",
+    "context_validation_seconds",
+    "support_validation_seconds",
+    "row_rng_prepare_seconds",
+    "policy_call_seconds",
+    "output_conversion_seconds",
+    "adapter_total_seconds",
+)
+
+
+def _normalise_validation_mode(value: str) -> str:
+    if not isinstance(value, str) or value not in _VALIDATION_MODES:
+        raise ValueError(
+            "validation_mode must be 'strict', 'fast', or 'none'")
+    return value
 
 
 def _normalise_mode(mode: str, deterministic: bool) -> str:
@@ -222,13 +241,18 @@ def _validate_context_consistency(
 ) -> None:
     """Check that explicit physical payloads agree with canonical inputs.
 
+    This is a parent-side diagnostic cross-check.  The worker support payload
+    is not passed into sampling; the native policy rebuilds authoritative masks
+    from the immutable context and curriculum.
+
     Curriculum can remove physically supported classes, so supplied support
     masks are checked as subsets of the physical masks rather than compared
     for exact equality.
     """
     unlocked = np.asarray(inputs["unlocked"])
     board_animals = np.asarray(inputs["board_animal"])
-    capacities = np.asarray(crop_capacity).reshape(len(contexts), 5)
+    capacities = (None if supports is None else
+                  np.asarray(crop_capacity).reshape(len(contexts), 5))
     for row, context in enumerate(contexts):
         if check_observation:
             observed_land = int(np.count_nonzero(unlocked[row]))
@@ -260,6 +284,8 @@ def _validate_context_consistency(
         total_capacity = max(
             physical_crop_capacity(context, context.observed_land,
                                    context.placed_animals), 0)
+        if capacities is None:
+            raise ValueError("support validation requires crop capacities")
         for crop, goal in enumerate(capacities[row]):
             expected = crop_delta_support_mask(int(goal), total_capacity)
             actual = support["crops"][crop]
@@ -267,6 +293,34 @@ def _validate_context_consistency(
                    for index, value in enumerate(actual)):
                 raise ValueError(
                     f"physical support row {row} allows an infeasible crop delta")
+
+
+def _validate_support_shapes(supports: Sequence[Any], batch: int) -> None:
+    """Validate the diagnostic support wire shape without checking its values."""
+    if len(supports) != batch:
+        raise ValueError("supports must contain one row per input")
+    expected_lengths = (4, 101, 201)
+    for row, support in enumerate(supports):
+        if not isinstance(support, Mapping):
+            raise ValueError(f"support row {row} must be a mapping")
+        try:
+            land = np.asarray(support["land"])
+            animals = tuple(support["animals"])
+            crops = tuple(support["crops"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid support schema at row {row}") from exc
+        if land.shape != (expected_lengths[0],):
+            raise ValueError(f"support row {row} land mask must have 4 classes")
+        if len(animals) != 3 or any(
+                np.asarray(mask).shape != (expected_lengths[1],)
+                for mask in animals):
+            raise ValueError(
+                f"support row {row} animal masks must be three [101] arrays")
+        if len(crops) != 5 or any(
+                np.asarray(mask).shape != (expected_lengths[2],)
+                for mask in crops):
+            raise ValueError(
+                f"support row {row} crop masks must be five [201] arrays")
 
 
 def _row_token(value: Any) -> int:
@@ -344,6 +398,7 @@ class Stage25InferenceAdapter:
         seed: int | None = None,
         mode: str = "stochastic",
         deterministic: bool = False,
+        validation_mode: str = "strict",
     ) -> None:
         sources = [value is not None for value in
                    (checkpoint_or_params, checkpoint_path, params)]
@@ -383,6 +438,7 @@ class Stage25InferenceAdapter:
         self.config = config
         self.seed = int(metadata.get("seed", 0 if seed is None else seed))
         self._mode = _normalise_mode(mode, deterministic)
+        self.validation_mode = _normalise_validation_mode(validation_mode)
         checkpoint_curriculum = _as_curriculum(
             metadata.get("curriculum", config.curriculum))
         effective = checkpoint_curriculum if requested_curriculum is None \
@@ -427,6 +483,9 @@ class Stage25InferenceAdapter:
         )
         self.call_count = 0
         self.batch_size_history: list[int] = []
+        self.inference_phase_seconds = {
+            name: 0.0 for name in _INFERENCE_PHASES
+        }
 
     @property
     def policy_identity(self) -> Stage25BehaviorIdentity:
@@ -452,18 +511,43 @@ class Stage25InferenceAdapter:
         """Return the already-loaded config without a worker-side import."""
         return self.config
 
+    def _add_phase_seconds(self, phase_seconds: Mapping[str, float]) -> None:
+        for name, value in phase_seconds.items():
+            if name in self.inference_phase_seconds:
+                self.inference_phase_seconds[name] += max(float(value), 0.0)
+
+    @staticmethod
+    def _phase(phase_seconds: dict[str, float], name: str,
+               started: float) -> None:
+        phase_seconds[name] += max(time.perf_counter() - started, 0.0)
+
     def _prepare(
-        self, inputs: Mapping[str, Any], physical_contexts: Sequence[PhysicalContext] | None,
+        self, inputs: Mapping[str, Any],
+        physical_contexts: Sequence[PhysicalContext] | None,
+        *, validation_mode: str | None = None,
+        phase_seconds: dict[str, float] | None = None,
     ) -> tuple[int, dict[str, Any], jax.Array, tuple[PhysicalContext, ...] | None]:
+        mode = self.validation_mode if validation_mode is None else validation_mode
+        input_started = time.perf_counter()
         batch = _validate_inputs(inputs)
+        if phase_seconds is not None:
+            self._phase(phase_seconds, "input_validation_seconds", input_started)
+        host_started = time.perf_counter()
         prepared, capacity, policy_batch = _host_inputs(inputs, self.config)
+        if phase_seconds is not None:
+            self._phase(phase_seconds, "host_input_prepare_seconds", host_started)
         if policy_batch != batch:
             raise ValueError("policy input preparation changed the batch size")
         contexts = None
         if physical_contexts is not None:
+            context_started = time.perf_counter()
             contexts = _normalise_contexts(physical_contexts, batch)
-            _validate_context_consistency(
-                inputs, contexts, inputs["crop_capacity"])
+            if mode != "none":
+                _validate_context_consistency(
+                    inputs, contexts, inputs["crop_capacity"])
+            if phase_seconds is not None:
+                self._phase(phase_seconds, "context_validation_seconds",
+                            context_started)
         return batch, prepared, capacity, contexts
 
     def _outputs(self, result: Mapping[str, Any], batch: int) -> Stage25PolicyOutputs:
@@ -483,21 +567,44 @@ class Stage25InferenceAdapter:
         self, batch: int, prepared: Mapping[str, Any], capacity: jax.Array,
         contexts: tuple[PhysicalContext, ...] | None, ids: np.ndarray,
         prng_id: str,
+        *, phase_seconds: dict[str, float] | None = None,
     ) -> Stage25PolicyOutputs:
+        rng_started = time.perf_counter()
         if self.deterministic:
+            if phase_seconds is not None:
+                self._phase(phase_seconds, "row_rng_prepare_seconds", rng_started)
+            policy_started = time.perf_counter()
             result = _call_prepared_policy(
                 self.params, prepared, capacity, batch, self.config,
                 mode="greedy", physical_contexts=contexts, row_ids=ids)
+            jax.tree_util.tree_map(
+                lambda leaf: leaf.block_until_ready()
+                if hasattr(leaf, "block_until_ready") else leaf,
+                result)
+            if phase_seconds is not None:
+                self._phase(phase_seconds, "policy_call_seconds", policy_started)
         else:
             root = _root_key(prng_id, self.identity, self.seed)
             keys = _row_rng_keys(root, ids)
+            if phase_seconds is not None:
+                self._phase(phase_seconds, "row_rng_prepare_seconds", rng_started)
+            policy_started = time.perf_counter()
             result = _call_prepared_policy(
                 self.params, prepared, capacity, batch, self.config,
                 mode="sample", rng_keys=keys, physical_contexts=contexts,
                 row_ids=ids, reject_invalid=False)
+            jax.tree_util.tree_map(
+                lambda leaf: leaf.block_until_ready()
+                if hasattr(leaf, "block_until_ready") else leaf,
+                result)
+            if phase_seconds is not None:
+                self._phase(phase_seconds, "policy_call_seconds", policy_started)
+        output_started = time.perf_counter()
         output = self._outputs(result, batch)
         if not bool(np.all(output.valid)):
             raise ValueError("native stochastic inference produced unsupported physical actions")
+        if phase_seconds is not None:
+            self._phase(phase_seconds, "output_conversion_seconds", output_started)
         self.call_count += 1
         self.batch_size_history.append(batch)
         return output
@@ -529,37 +636,52 @@ class Stage25InferenceAdapter:
     ) -> Stage25PolicyOutputs:
         """Compatibility seam for runner callers carrying context separately.
 
-        ``supports`` is accepted only as a row-count contract.  The native
-        policy recomputes the support intersection from the immutable
-        physical contexts and bound curriculum; an external mask must never
-        silently change behavior identity or action likelihoods.
+        ``supports`` is diagnostic transport, never the authoritative sampling
+        mask.  ``strict`` performs the historical exhaustive subset check;
+        ``fast`` checks only its wire shape; ``none`` ignores it.  Every mode
+        passes immutable physical contexts to the native policy, which derives
+        the actual support intersection from context and bound curriculum.
         """
-        if not isinstance(inputs, Mapping):
-            raise ValueError("inputs must be a mapping")
-        merged = dict(inputs)
-        if crop_capacity is not None:
-            if "crop_capacity" in merged and not np.array_equal(
-                    np.asarray(merged["crop_capacity"]), np.asarray(crop_capacity)):
-                raise ValueError("crop_capacity disagrees between inputs and context")
-            merged["crop_capacity"] = crop_capacity
-        batch, prepared, capacity, contexts = self._prepare(
-            merged, physical_contexts)
-        support_rows = None if supports is None else tuple(supports)
-        if support_rows is not None:
-            if len(support_rows) != batch:
-                raise ValueError("supports must contain one row per input")
-            if contexts is not None:
-                _validate_context_consistency(
-                    merged, contexts, merged["crop_capacity"], support_rows,
-                    check_observation=False)
-        if prng_id is None:
-            raise ValueError("prng_id is required")
-        if row_ids is None:
-            ids = np.arange(batch, dtype=np.int32)
-        else:
-            ids = _normalise_row_ids(row_ids, batch)
-        return self._plan_prepared(
-            batch, prepared, capacity, contexts, ids, prng_id)
+        started = time.perf_counter()
+        phase_seconds = {name: 0.0 for name in _INFERENCE_PHASES[:-1]}
+        try:
+            input_started = time.perf_counter()
+            if not isinstance(inputs, Mapping):
+                raise ValueError("inputs must be a mapping")
+            merged = dict(inputs)
+            if crop_capacity is not None:
+                if "crop_capacity" in merged and not np.array_equal(
+                        np.asarray(merged["crop_capacity"]), np.asarray(crop_capacity)):
+                    raise ValueError("crop_capacity disagrees between inputs and context")
+                merged["crop_capacity"] = crop_capacity
+            phase_seconds["input_validation_seconds"] += (
+                time.perf_counter() - input_started)
+            batch, prepared, capacity, contexts = self._prepare(
+                merged, physical_contexts, phase_seconds=phase_seconds)
+            if supports is not None and self.validation_mode != "none":
+                support_started = time.perf_counter()
+                support_rows = tuple(supports)
+                _validate_support_shapes(support_rows, batch)
+                if self.validation_mode == "strict" and contexts is not None:
+                    # Worker support is a diagnostic transport cross-check;
+                    # the native policy samples from immutable context instead.
+                    _validate_context_consistency(
+                        merged, contexts, merged["crop_capacity"], support_rows,
+                        check_observation=False)
+                self._phase(phase_seconds, "support_validation_seconds",
+                            support_started)
+            if prng_id is None:
+                raise ValueError("prng_id is required")
+            row_started = time.perf_counter()
+            ids = (np.arange(batch, dtype=np.int32) if row_ids is None
+                   else _normalise_row_ids(row_ids, batch))
+            self._phase(phase_seconds, "row_rng_prepare_seconds", row_started)
+            return self._plan_prepared(
+                batch, prepared, capacity, contexts, ids, prng_id,
+                phase_seconds=phase_seconds)
+        finally:
+            phase_seconds["adapter_total_seconds"] = time.perf_counter() - started
+            self._add_phase_seconds(phase_seconds)
 
     stage25_infer_batch = infer_batch
     plan_batch_with_context = infer_batch
@@ -634,21 +756,43 @@ class Stage25InferenceAdapter:
         # that namespace, but accepting it preserves the Packet 5A transport
         # contract without accidentally sampling a replacement plan.
         del prng_id
-        merged = dict(inputs)
-        if crop_capacity is not None:
-            if "crop_capacity" in merged and not np.array_equal(
-                    np.asarray(merged["crop_capacity"]), np.asarray(crop_capacity)):
-                raise ValueError("crop_capacity disagrees between inputs and context")
-            merged["crop_capacity"] = crop_capacity
-        batch, prepared, capacity, contexts = self._prepare(merged, physical_contexts)
-        classes = np.zeros((batch, len(ACTION_CLASS_COUNTS)), dtype=np.int16)
-        ids = (np.arange(batch, dtype=np.int32) if row_ids is None
-               else _normalise_row_ids(row_ids, batch))
-        result = _call_prepared_policy(
-            self.params, prepared, capacity, batch, self.config,
-            mode="evaluate", actions=classes, physical_contexts=contexts,
-            row_ids=ids, reject_invalid=False)
-        return np.asarray(result["value"], dtype=np.float32)
+        started = time.perf_counter()
+        phase_seconds = {name: 0.0 for name in _INFERENCE_PHASES[:-1]}
+        try:
+            input_started = time.perf_counter()
+            merged = dict(inputs)
+            if crop_capacity is not None:
+                if "crop_capacity" in merged and not np.array_equal(
+                        np.asarray(merged["crop_capacity"]), np.asarray(crop_capacity)):
+                    raise ValueError("crop_capacity disagrees between inputs and context")
+                merged["crop_capacity"] = crop_capacity
+            self._phase(phase_seconds, "input_validation_seconds", input_started)
+            batch, prepared, capacity, contexts = self._prepare(
+                merged, physical_contexts, phase_seconds=phase_seconds)
+            classes = np.zeros((batch, len(ACTION_CLASS_COUNTS)), dtype=np.int16)
+            row_started = time.perf_counter()
+            ids = (np.arange(batch, dtype=np.int32) if row_ids is None
+                   else _normalise_row_ids(row_ids, batch))
+            self._phase(phase_seconds, "row_rng_prepare_seconds", row_started)
+            policy_started = time.perf_counter()
+            result = _call_prepared_policy(
+                self.params, prepared, capacity, batch, self.config,
+                mode="evaluate", actions=classes, physical_contexts=contexts,
+                row_ids=ids, reject_invalid=False)
+            jax.tree_util.tree_map(
+                lambda leaf: leaf.block_until_ready()
+                if hasattr(leaf, "block_until_ready") else leaf,
+                result)
+            self._phase(phase_seconds, "policy_call_seconds", policy_started)
+            output_started = time.perf_counter()
+            values = np.asarray(result["value"], dtype=np.float32)
+            if values.shape != (batch,) or not np.all(np.isfinite(values)):
+                raise ValueError("native bootstrap value must be finite float32 [B]")
+            self._phase(phase_seconds, "output_conversion_seconds", output_started)
+            return values
+        finally:
+            phase_seconds["adapter_total_seconds"] = time.perf_counter() - started
+            self._add_phase_seconds(phase_seconds)
 
     def audit_unchanged_weights(
         self, inputs: Mapping[str, Any] | Stage25PolicyOutputs,

@@ -53,6 +53,18 @@ def _context() -> PhysicalContext:
     return PhysicalContext(1, (25, 25, 25, 25), (0, 0, 0), 0, 0, (0, 0, 0))
 
 
+def _support(context: PhysicalContext) -> dict[str, object]:
+    capacity = max(physical_crop_capacity(
+        context, context.observed_land, context.placed_animals), 0)
+    return {
+        "land": list(land_target_support_mask(context.observed_land)),
+        "animals": [list(animal_target_support_mask(
+            context, context.observed_land, species,
+            context.placed_animals[:species])) for species in range(3)],
+        "crops": [list(crop_delta_support_mask(0, capacity)) for _ in range(5)],
+    }
+
+
 def _adapter(tmp_path: Path | None = None, *, curriculum=None):
     config = tiny_stage25_config(curriculum=curriculum or Stage25CurriculumConfig())
     params = init_stage25_params(config, seed=7)
@@ -88,6 +100,99 @@ def test_outputs_have_contract_dtypes_identity_and_one_batch_call():
     assert deterministic.deterministic is True
     assert deterministic.call_count == 1
     assert greedy.valid.all()
+
+
+def test_inference_phase_metrics_are_finite_and_reconcile():
+    adapter = _adapter()
+    adapter.infer_batch(
+        _inputs(2), physical_contexts=(_context(), _context()),
+        supports=(_support(_context()), _support(_context())),
+        row_ids=("timed-a", "timed-b"), prng_id="timed")
+
+    phases = adapter.inference_phase_seconds
+    assert set(phases) == {
+        "input_validation_seconds", "host_input_prepare_seconds",
+        "context_validation_seconds", "support_validation_seconds",
+        "row_rng_prepare_seconds", "policy_call_seconds",
+        "output_conversion_seconds", "adapter_total_seconds",
+    }
+    assert all(np.isfinite(value) and value >= 0.0
+               for value in phases.values())
+    measured = sum(value for name, value in phases.items()
+                   if name != "adapter_total_seconds")
+    assert measured <= phases["adapter_total_seconds"] * 1.5 + 1.0e-6
+    assert phases["policy_call_seconds"] > 0.0
+
+
+def test_fast_and_none_preserve_row_stable_policy_outputs():
+    config = tiny_stage25_config()
+    params = init_stage25_params(config, seed=19)
+    contexts = (_context(), _context())
+    inputs = _inputs(2)
+    supports = (_support(contexts[0]), _support(contexts[1]))
+    outputs = {}
+    for mode in ("strict", "fast", "none"):
+        adapter = Stage25InferenceAdapter(
+            params=params, config=config, validation_mode=mode,
+            seed=31)
+        outputs[mode] = adapter.infer_batch(
+            inputs, physical_contexts=contexts, supports=supports,
+            row_ids=("same-a", "same-b"), prng_id="same")
+    for name in ("classes", "component_logprobs", "joint_logprob",
+                 "value", "decoded_goals", "valid"):
+        np.testing.assert_array_equal(
+            getattr(outputs["fast"], name), getattr(outputs["strict"], name))
+        np.testing.assert_array_equal(
+            getattr(outputs["none"], name), getattr(outputs["strict"], name))
+
+
+def test_validation_modes_define_diagnostic_support_boundary():
+    config = tiny_stage25_config()
+    params = init_stage25_params(config, seed=23)
+    context = _context()
+    malformed = {"land": (), "animals": (), "crops": ()}
+    with pytest.raises(ValueError, match="support"):
+        Stage25InferenceAdapter(
+            params=params, config=config, validation_mode="strict").infer_batch(
+                _inputs(), physical_contexts=(context,), supports=(malformed,),
+                row_ids=("strict",), prng_id="mode")
+    # The payload is diagnostic transport only.  The native policy still gets
+    # the immutable context and constructs its authoritative masks.
+    for mode in ("none",):
+        output = Stage25InferenceAdapter(
+            params=params, config=config, validation_mode=mode).infer_batch(
+                _inputs(), physical_contexts=(context,), supports=(malformed,),
+                row_ids=(mode,), prng_id="mode")
+        assert output.valid.all()
+
+
+def test_fast_skips_diagnostic_support_value_cross_check():
+    config = tiny_stage25_config()
+    params = init_stage25_params(config, seed=37)
+    context = _context()
+    support = _support(context)
+    animals = [list(mask) for mask in support["animals"]]
+    invalid = animals[0].index(False)
+    animals[0][invalid] = True
+    malformed = {**support, "animals": animals}
+    with pytest.raises(ValueError, match="physical support"):
+        Stage25InferenceAdapter(
+            params=params, config=config, validation_mode="strict").infer_batch(
+                _inputs(), physical_contexts=(context,), supports=(malformed,),
+                row_ids=("strict-value",), prng_id="mode")
+    output = Stage25InferenceAdapter(
+        params=params, config=config, validation_mode="fast").infer_batch(
+            _inputs(), physical_contexts=(context,), supports=(malformed,),
+            row_ids=("strict-value",), prng_id="mode")
+    assert output.valid.all()
+
+
+def test_validation_mode_rejects_unknown_values():
+    config = tiny_stage25_config()
+    params = init_stage25_params(config, seed=29)
+    with pytest.raises(ValueError, match="validation_mode"):
+        Stage25InferenceAdapter(
+            params=params, config=config, validation_mode="disabled")
 
 
 def test_row_ids_make_sampling_stable_under_reorder_and_padding():

@@ -173,6 +173,7 @@ def test_rollout_control_defaults_preserve_runner_defaults() -> None:
     assert args.workers == 1
     assert args.envs_per_worker == 1
     assert args.batch_backend is False
+    assert args.stage25_inference_validation == "strict"
     assert args.inference_batch_wait_ms == 20.0
     assert runner_config.num_envs == 1
     assert runner_config.batch_backend is False

@@ -26,6 +26,13 @@ from rl_manager.runner import RunnerConfig, build_episode_spec
 from rl_manager.stage25_trajectory import Stage25TrajectoryBuffer
 from rl_manager.types import CANDIDATE_VS_FROZEN, CURRENT_VS_CURRENT_ECONOMIC
 
+_STAGE25_PHASE_METRICS = (
+    "input_validation_seconds", "host_input_prepare_seconds",
+    "context_validation_seconds", "support_validation_seconds",
+    "row_rng_prepare_seconds", "policy_call_seconds",
+    "output_conversion_seconds", "adapter_total_seconds",
+)
+
 if TYPE_CHECKING:
     from rl_manager.stage25_inference import Stage25InferenceAdapter
     from rl_manager.stage25_policy import Stage25ModelConfig
@@ -62,7 +69,7 @@ def _bank_statistics(final_banks: list[float]) -> dict[str, float | int]:
         }
     ordered = sorted(banks)
     bottom_count = math.ceil(len(ordered) * 0.10)
-    return {
+    summary = {
         "count": len(ordered),
         "mean": math.fsum(ordered) / len(ordered),
         "median": _percentile(ordered, 0.5),
@@ -75,6 +82,7 @@ def _bank_statistics(final_banks: list[float]) -> dict[str, float | int]:
         "max": ordered[-1],
         "zero_bank_fraction": sum(bank == 0.0 for bank in ordered) / len(ordered),
     }
+    return summary
 
 
 def _inference_summary(metrics: Mapping[str, Any]) -> dict[str, float | int]:
@@ -83,7 +91,7 @@ def _inference_summary(metrics: Mapping[str, Any]) -> dict[str, float | int]:
     padding_rows = int(metrics.get("padding_rows", 0))
     logical_requests = int(metrics.get(
         "logical_requests", metrics.get("real_requests", metrics.get("requests", 0))))
-    return {
+    summary = {
         "physical_calls": int(metrics.get(
             "physical_inference_calls", metrics.get("batches", 0))),
         "real_requests": int(metrics.get("real_requests", 0)),
@@ -103,6 +111,9 @@ def _inference_summary(metrics: Mapping[str, Any]) -> dict[str, float | int]:
         "aggregate_inference_seconds": float(metrics.get("inference_seconds", 0.0)),
         "aggregate_queue_wait_seconds": float(metrics.get("queue_wait_seconds", 0.0)),
     }
+    summary.update({name: float(metrics.get(name, 0.0))
+                    for name in _STAGE25_PHASE_METRICS})
+    return summary
 
 
 def _rate(numerator: float, seconds: float) -> float:
@@ -198,6 +209,16 @@ def _format_report(record: Mapping[str, Any]) -> str:
         line("aggregate inference", f"{inference['aggregate_inference_seconds']:.4f} s"),
         line("aggregate queue wait", f"{inference['aggregate_queue_wait_seconds']:.4f} s"),
         "",
+        "INFERENCE PHASES",
+        line("input validation", f"{inference.get('input_validation_seconds', 0.0):.4f} s"),
+        line("host input prepare", f"{inference.get('host_input_prepare_seconds', 0.0):.4f} s"),
+        line("context validation", f"{inference.get('context_validation_seconds', 0.0):.4f} s"),
+        line("support validation", f"{inference.get('support_validation_seconds', 0.0):.4f} s"),
+        line("row/RNG prepare", f"{inference.get('row_rng_prepare_seconds', 0.0):.4f} s"),
+        line("policy/device", f"{inference.get('policy_call_seconds', 0.0):.4f} s"),
+        line("output conversion", f"{inference.get('output_conversion_seconds', 0.0):.4f} s"),
+        line("adapter total", f"{inference.get('adapter_total_seconds', 0.0):.4f} s"),
+        "",
         "BANK",
         line("count", bank["count"]),
         line("mean", f"{bank['mean']:.2f}"),
@@ -283,6 +304,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-size", type=int, default=2)
     parser.add_argument("--max-turns", type=int, default=144)
     parser.add_argument("--physical-batch-size", type=int, default=2)
+    parser.add_argument(
+        "--stage25-inference-validation", choices=("strict", "fast", "none"),
+        default="strict",
+        help="parent Stage 2.5 diagnostic validation mode (default: strict)")
     parser.add_argument("--minibatch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -460,7 +485,8 @@ def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stag
     learner_identity = _identity_from_meta(meta, "behavior_identity")
     learner_adapter = Stage25InferenceAdapter(
         params=params, config=config.model, name=learner_identity.name,
-        version=learner_identity.version, seed=args.seed, mode="stochastic")
+        version=learner_identity.version, seed=args.seed, mode="stochastic",
+        validation_mode=args.stage25_inference_validation)
     if learner_adapter.identity != learner_identity:
         raise ValueError(
             "PPO checkpoint behavior identity does not match loaded parameters "
@@ -468,7 +494,8 @@ def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stag
     opponent_identity = _identity_from_meta(meta, "opponent_identity")
     opponent_adapter = Stage25InferenceAdapter(
         params=opponent_params, config=config.model, name=opponent_identity.name,
-        version=opponent_identity.version, seed=args.seed, mode="stochastic")
+        version=opponent_identity.version, seed=args.seed, mode="stochastic",
+        validation_mode=args.stage25_inference_validation)
     if opponent_adapter.identity != opponent_identity:
         raise ValueError(
             "PPO checkpoint opponent identity does not match loaded parameters "
@@ -502,7 +529,8 @@ def _collection(
     episode_spec_started = time.perf_counter()
     learner = Stage25InferenceAdapter(
         params=state.params, config=config.model, name="stage25_learner",
-        version="ppo-native-v1", seed=seed, mode="stochastic")
+        version="ppo-native-v1", seed=seed, mode="stochastic",
+        validation_mode=args.stage25_inference_validation)
     opponent = Stage25InferenceAdapter(
         params=(state.params if state.opponent_params is None else state.opponent_params),
         config=config.model,
@@ -510,7 +538,8 @@ def _collection(
               else state.opponent_identity.name),
         version=("frozen-v1" if state.opponent_identity is None
                  else state.opponent_identity.version),
-        seed=seed + 1, mode="stochastic")
+        seed=seed + 1, mode="stochastic",
+        validation_mode=args.stage25_inference_validation)
     if state.opponent_identity is not None and opponent.identity != state.opponent_identity:
         raise ValueError("restored opponent identity does not match its parameters")
     capacity = max(1, args.rollout_size * 2 * 26)
@@ -593,7 +622,8 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             initial_opponent = Stage25InferenceAdapter(
                 params=state.params, config=config.model,
                 name="stage25_opponent", version="frozen-v1",
-                seed=state.rollout_seed + 1, mode="stochastic")
+                seed=state.rollout_seed + 1, mode="stochastic",
+                validation_mode=args.stage25_inference_validation)
             state = replace(state, opponent_params=state.params,
                             opponent_identity=initial_opponent.identity)
         executor_provenance = rollout_stats.get("executor_provenance")
@@ -614,7 +644,8 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         next_opponent = Stage25InferenceAdapter(
             params=previous_learner_params, config=config.model,
             name="stage25_opponent", version="frozen-v1",
-            seed=state.rollout_seed + 1, mode="stochastic")
+            seed=state.rollout_seed + 1, mode="stochastic",
+            validation_mode=args.stage25_inference_validation)
         state = replace(state, opponent_params=previous_learner_params,
                         opponent_identity=next_opponent.identity)
         state = replace(state, rollout_seed=state.rollout_seed + args.rollout_size)

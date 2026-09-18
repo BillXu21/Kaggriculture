@@ -61,6 +61,25 @@ class ParallelRolloutError(RuntimeError):
 
 BatchKey = (PolicyIdentity | Stage25BehaviorIdentity |
             tuple[PolicyIdentity, int])
+_STAGE25_PHASE_METRICS = (
+    "input_validation_seconds", "host_input_prepare_seconds",
+    "context_validation_seconds", "support_validation_seconds",
+    "row_rng_prepare_seconds", "policy_call_seconds",
+    "output_conversion_seconds", "adapter_total_seconds",
+)
+
+
+def _policy_phase_snapshot(policy: Any) -> dict[str, float]:
+    phases = getattr(policy, "inference_phase_seconds", {})
+    return {name: float(phases.get(name, 0.0))
+            for name in _STAGE25_PHASE_METRICS}
+
+
+def _add_policy_phase_delta(metrics: dict[str, Any], policy: Any,
+                            before: Mapping[str, float]) -> None:
+    after = _policy_phase_snapshot(policy)
+    for name, value in after.items():
+        metrics[name] += max(value - before.get(name, 0.0), 0.0)
 
 
 def _batch_key_sort_key(key: BatchKey) -> tuple[str, int]:
@@ -321,6 +340,7 @@ class ParallelSelfPlayRunner:
             "animal_placement_classes": 0,
             "animal_placement_nonzero_classes": 0,
             "queue_wait_seconds": 0.0, "inference_seconds": 0.0,
+            **{name: 0.0 for name in _STAGE25_PHASE_METRICS},
         }
 
     def run(self, specs: Sequence[EpisodeSpec]) -> list[EpisodeResult]:
@@ -699,10 +719,12 @@ class ParallelSelfPlayRunner:
             f"/slot={slot}" for slot in range(padding_count))
         prng_id = stage25_rng_namespace(
             first.identity.behavior_identity, getattr(policy, "seed", 0))
+        phase_before = _policy_phase_snapshot(policy)
         t0 = time.perf_counter()
         outputs = SelfPlayRunner._stage25_policy_batch(
             policy, batch, capacities, contexts, supports, row_ids, prng_id)
         inference_seconds = time.perf_counter() - t0
+        _add_policy_phase_delta(self.inference_metrics, policy, phase_before)
         if outputs.batch_size != physical_count:
             raise ParallelRolloutError(
                 "Stage 2.5 owner returned an unexpected physical batch size")
@@ -793,10 +815,12 @@ class ParallelSelfPlayRunner:
         if not callable(value_fn):
             raise ParallelRolloutError(
                 "Stage 2.5 truncation requires parent value-only inference")
+        phase_before = _policy_phase_snapshot(policy)
         t0 = time.perf_counter()
         raw = value_fn(
             inputs=batch, crop_capacity=capacities,
             physical_contexts=contexts, row_ids=row_ids)
+        _add_policy_phase_delta(self.inference_metrics, policy, phase_before)
         values = np.asarray(raw, dtype=np.float32)
         if values.shape != (physical_count,) or not np.all(np.isfinite(values)):
             raise ParallelRolloutError(

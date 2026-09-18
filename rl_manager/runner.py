@@ -78,6 +78,26 @@ from rl_manager.types import (
     seat_policies,
 )
 
+_STAGE25_PHASE_METRICS = (
+    "input_validation_seconds", "host_input_prepare_seconds",
+    "context_validation_seconds", "support_validation_seconds",
+    "row_rng_prepare_seconds", "policy_call_seconds",
+    "output_conversion_seconds", "adapter_total_seconds",
+)
+
+
+def _policy_phase_snapshot(policy: Any) -> dict[str, float]:
+    phases = getattr(policy, "inference_phase_seconds", {})
+    return {name: float(phases.get(name, 0.0))
+            for name in _STAGE25_PHASE_METRICS}
+
+
+def _add_policy_phase_delta(metrics: dict[str, Any], policy: Any,
+                            before: Mapping[str, float]) -> None:
+    after = _policy_phase_snapshot(policy)
+    for name, value in after.items():
+        metrics[name] += max(value - before.get(name, 0.0), 0.0)
+
 MANAGER_START_DAY = 4
 TOTAL_MANAGER_DAYS = TOTAL_DAYS - MANAGER_START_DAY  # default d4..d29 horizon
 GAME_TURNS = 719  # post-reset primitive turns in one 720-step game
@@ -828,6 +848,7 @@ class SelfPlayRunner:
             "physical_inference_calls": 0, "batch_sizes": [],
             "real_batch_sizes": [], "physical_batch_sizes": [],
             "physical_rows": 0, "padding_rows": 0, "occupancy": 0.0,
+            **{name: 0.0 for name in _STAGE25_PHASE_METRICS},
         }
         self.provenance: dict[str, Any] = {
             "opening": _runner_opening_provenance(config),
@@ -1159,10 +1180,12 @@ class SelfPlayRunner:
             set_context = getattr(policy, "set_request_context", None)
             if callable(set_context):
                 set_context([item[3] for item in group])
+            phase_before = _policy_phase_snapshot(policy)
             outputs = self._stage25_policy_batch(
                 policy, inputs, capacities, contexts, supports, row_ids,
                 stage25_rng_namespace(
                     group[0][3].behavior_identity, getattr(policy, "seed", 0)))
+            _add_policy_phase_delta(self.inference_metrics, policy, phase_before)
             real_count = len(group)
             self.inference_metrics["requests"] += real_count
             self.inference_metrics["real_requests"] += real_count
@@ -1340,9 +1363,8 @@ class SelfPlayRunner:
             return append(row)
         raise TypeError("Stage 2.5 trajectory collector has no append hook")
 
-    @staticmethod
     def _stage25_bootstrap_value(
-        state: _EpisodeState, seat: int,
+        self, state: _EpisodeState, seat: int,
     ) -> float:
         """Read the critic at the final state without accepting a plan."""
         provider = state.providers[seat]
@@ -1356,6 +1378,7 @@ class SelfPlayRunner:
             raise ValueError(
                 "Stage 2.5 truncation requires a value-only parent inference "
                 "method; sampling a replacement plan is forbidden")
+        phase_before = _policy_phase_snapshot(policy)
         raw = value_fn(
             inputs=context.inputs,
             crop_capacity=np.asarray([context.crop_capacity], dtype=np.int16),
@@ -1363,6 +1386,7 @@ class SelfPlayRunner:
             row_ids=(context.request_id,),
             prng_id=stage25_rng_namespace(
                 context.behavior_identity, getattr(policy, "seed", 0)))
+        _add_policy_phase_delta(self.inference_metrics, policy, phase_before)
         if isinstance(raw, Mapping):
             raw = raw.get("value", raw.get("values"))
         values = np.asarray(raw, dtype=np.float32)
