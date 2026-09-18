@@ -422,7 +422,8 @@ def _identity_from_meta(meta: Mapping[str, Any], field: str) -> Stage25BehaviorI
 
 def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stage25PPOTrainState, dict[str, Any]]:
     from rl_manager.stage25_checkpoint import (
-        initialize_stage25_ppo_from_checkpoint, load_stage25_ppo_checkpoint)
+        _jsonable, initialize_stage25_ppo_from_checkpoint,
+        load_stage25_ppo_checkpoint)
     from rl_manager.stage25_ppo import init_stage25_ppo_state
     if args.scratch:
         from rl_manager.stage25_policy import init_stage25_params
@@ -453,7 +454,7 @@ def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stag
         raise ValueError(
             "PPO checkpoint training/reward contract does not match the "
             f"requested contract: {stored_contract!r} != {expected_contract!r}")
-    if meta.get("executor") != runtime_executor:
+    if _jsonable(meta.get("executor")) != _jsonable(runtime_executor):
         raise ValueError(
             "PPO checkpoint executor provenance does not match the configured "
             f"factory: {meta.get('executor')!r} != {runtime_executor!r}")

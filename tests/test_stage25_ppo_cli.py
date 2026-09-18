@@ -340,3 +340,79 @@ def test_candidate_collection_only_batches_learner_seat(monkeypatch):
     assert len(trajectory) == 2
     assert stats["learner_rows"] == 1
     assert [row.trainable for row in trajectory.rows] == [True, False]
+
+
+def _resume_ready_checkpoint(tmp_path, *, seed=7):
+    """Save a fresh PPO checkpoint whose executor settings carry tuples."""
+    args = cli._parser().parse_args([
+        "--resume", str(tmp_path / "latest.npz"), "--model-size", "tiny",
+        "--physical-batch-size", "1", "--minibatch-size", "1", "--epochs", "1",
+        "--seed", str(seed), "--output-dir", str(tmp_path)])
+    config = cli._config(args)
+    fresh = ppo.init_stage25_ppo_state(config, seed=seed)
+    learner = Stage25InferenceAdapter(
+        params=fresh.params, config=config.model, name="stage25_learner",
+        version="ppo-native-v1", seed=seed, mode="stochastic")
+    opponent = Stage25InferenceAdapter(
+        params=fresh.params, config=config.model, name="stage25_opponent",
+        version="frozen-v1", seed=seed + 1, mode="stochastic")
+    runtime_executor = _executor_factory_provenance(
+        make_stage25_executor_factory())
+    checkpoint.save_stage25_ppo_checkpoint(
+        args.resume, fresh.params, fresh.optimizer_state, fresh.rng,
+        config.model, seed=seed, update_counter=0, rollout_seed=seed,
+        ppo_config=config.to_dict(), optimizer_config=config.to_dict(),
+        curriculum=config.model.curriculum,
+        behavior_identity=learner.identity, opponent_params=fresh.params,
+        opponent_identity=opponent.identity,
+        physical_contract=cli._physical_contract(config),
+        executor=runtime_executor,
+        metadata={"training_contract": cli._training_contract(args)})
+    return args, config, learner, runtime_executor
+
+
+def test_ppo_resume_accepts_canonicalized_tuple_executor_provenance(
+        tmp_path) -> None:
+    args, config, learner, runtime_executor = _resume_ready_checkpoint(tmp_path)
+    work_config = (
+        runtime_executor["effective_profile"]["strip_config"]["work_config"])
+    assert work_config["wheat_fertilizer_ages"] == (2,)
+    assert work_config["strawberry_fertilizer_ages"] == (9, 11, 13, 15)
+    assert work_config["anchor"] == (4, 4)
+
+    with np.load(args.resume, allow_pickle=False) as archive:
+        stored_executor = json.loads(
+            archive["__meta__"].tobytes().decode("utf-8"))["executor"]
+    stored_work_config = (
+        stored_executor["effective_profile"]["strip_config"]["work_config"])
+    # Persisted JSON converts the runtime tuples into lists; raw dict equality
+    # would reject this semantically identical provenance.
+    assert stored_executor != runtime_executor
+    assert stored_work_config["wheat_fertilizer_ages"] == [2]
+    assert stored_work_config["strawberry_fertilizer_ages"] == [9, 11, 13, 15]
+    assert stored_work_config["anchor"] == [4, 4]
+
+    state, meta = cli._new_state(args, config)
+    assert state.behavior_identity == learner.identity
+    assert meta["update_counter"] == 0
+
+
+def test_ppo_resume_rejects_changed_executor_setting(
+        tmp_path, monkeypatch) -> None:
+    from dataclasses import replace
+
+    from executor_v0.strip_executor import StripExecutorConfig
+    from rl_manager.executor_factory import make_stage25_executor_factory
+
+    args, config, _, _ = _resume_ready_checkpoint(tmp_path)
+    base_config = StripExecutorConfig(aggressive_sell_all=True)
+    changed = replace(
+        base_config,
+        work_config=replace(base_config.work_config, anchor=(0, 0)))
+    changed_factory = make_stage25_executor_factory(strip_config=changed)
+    monkeypatch.setattr(
+        "rl_manager.executor_factory.make_stage25_executor_factory",
+        lambda *a, **k: changed_factory)
+
+    with pytest.raises(ValueError, match="executor provenance does not match"):
+        cli._new_state(args, config)
