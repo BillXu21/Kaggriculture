@@ -90,6 +90,11 @@ class StripRoute:
     # Tiles whose departure has been confirmed by a later observation, plus the
     # final tile once the route completes.  Used only for diagnostics.
     passed_tiles: set[tuple[int, int]] = field(default_factory=set)
+    # A bounded crop-chain obligation.  This is intentionally one-hop and
+    # route-local: only the immediately previous owned tile may be reopened.
+    continuation_item_id: str | None = None
+    continuation_tile: tuple[int, int] | None = None
+    continuation_next_kind: str | None = None
 
     def __post_init__(self) -> None:
         if not self.owned_tiles:
@@ -139,6 +144,18 @@ class StripRoute:
             ),
             "late_work_ids": sorted(self.late_work_ids),
             "passed_tiles": [list(tile) for tile in sorted(self.passed_tiles)],
+            "continuation": (
+                {
+                    "owner": self.owner.label,
+                    "tile": list(self.continuation_tile)
+                    if self.continuation_tile is not None
+                    else None,
+                    "completed_stage": self.continuation_item_id,
+                    "next_expected_stage": self.continuation_next_kind,
+                }
+                if self.continuation_item_id is not None
+                else None
+            ),
         }
 
 

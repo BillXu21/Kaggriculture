@@ -402,6 +402,187 @@ def test_work_appearing_before_confirmed_departure_is_executed():
     assert "WATER:0,0" not in route.late_work_ids
 
 
+def test_crop_chain_continuation_runs_before_departure():
+    """A newly ready local crop stage outranks advancing the frozen sweep."""
+
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        if hour == 0:
+            local = work_item("HARVEST", (0, 0), crop="WHEAT")
+        elif hour == 1:
+            local = work_item("PLANT", (0, 0), crop="TOMATO")
+        elif hour == 2:
+            local = work_item("WATER", (0, 0), crop="TOMATO")
+        else:
+            local = None
+        items = [work_item("WATER", (0, 4))]
+        if local is not None:
+            items.append(local)
+        return fake_plan(tuple(items))
+
+    controller = StripExecutorController(work_builder=builder)
+    route = None
+    for hour, expected in enumerate(("HARVEST", "PLANT", "WATER")):
+        result = controller.act(observation(hour=hour, farmer=(0, 0)), plan())
+        route = controller.routes[0]
+        assert result.farmer_action[0] == expected
+        assert route.cursor == 0
+        assert (0, 0) not in route.passed_tiles
+
+    result = controller.act(observation(hour=3, farmer=(0, 0)), plan())
+    assert result.farmer_action == ("EAST",)
+    assert route is not None
+    assert (0, 0) not in route.passed_tiles
+
+
+def test_late_crop_successor_reopens_only_the_previous_owned_tile():
+    harvest_id = "HARVEST:0,0"
+    plant_id = "PLANT:TOMATO:0,0"
+    water_id = "WATER:0,0"
+
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        if hour == 0:
+            items = (
+                work_item("HARVEST", (0, 0), crop="WHEAT", item_id=harvest_id),
+                work_item(
+                    "PLANT",
+                    (0, 0),
+                    crop="TOMATO",
+                    status=WorkStatus.BLOCKED,
+                    depends_on=(harvest_id,),
+                    block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                    item_id=plant_id,
+                ),
+            )
+        elif hour == 1:
+            items = (
+                work_item(
+                    "PLANT",
+                    (0, 0),
+                    crop="TOMATO",
+                    status=WorkStatus.BLOCKED,
+                    depends_on=(harvest_id,),
+                    block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                    item_id=plant_id,
+                ),
+            )
+        elif hour == 2:
+            items = (
+                work_item("PLANT", (0, 0), crop="TOMATO", item_id=plant_id),
+                work_item(
+                    "WATER",
+                    (0, 0),
+                    crop="TOMATO",
+                    status=WorkStatus.BLOCKED,
+                    depends_on=(plant_id,),
+                    block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                    item_id=water_id,
+                ),
+            )
+        else:
+            items = (work_item("WATER", (0, 0), crop="TOMATO", item_id=water_id),)
+        return fake_plan(items + (work_item("WATER", (0, 4)),))
+
+    controller = StripExecutorController(work_builder=builder)
+    controller.act(observation(hour=0, farmer=(0, 0)), plan())
+    departure = controller.act(observation(hour=1, farmer=(0, 0)), plan())
+    assert departure.farmer_action == ("EAST",)
+
+    reopened = controller.act(observation(hour=2, farmer=(1, 0)), plan())
+    route = controller.routes[0]
+    assert reopened.farmer_action == ("WEST",)
+    assert route.cursor == 0
+    assert (0, 0) not in route.passed_tiles
+    assert plant_id not in route.late_work_ids
+
+    continuation = controller.act(observation(hour=3, farmer=(0, 0)), plan())
+    assert continuation.farmer_action == ("WATER",)
+
+
+def test_dig_replacement_chain_progresses_to_plant_and_water():
+    dig_id = "DIG:0,0"
+    plant_id = "PLANT:WHEAT:0,0"
+    water_id = "WATER:0,0"
+
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        if hour == 0:
+            items = (
+                work_item("DIG", (0, 0), item_id=dig_id),
+                work_item(
+                    "PLANT",
+                    (0, 0),
+                    crop="WHEAT",
+                    status=WorkStatus.BLOCKED,
+                    depends_on=(dig_id,),
+                    block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                    item_id=plant_id,
+                ),
+            )
+        elif hour == 1:
+            items = (
+                work_item("PLANT", (0, 0), crop="WHEAT", item_id=plant_id),
+                work_item(
+                    "WATER",
+                    (0, 0),
+                    crop="WHEAT",
+                    status=WorkStatus.BLOCKED,
+                    depends_on=(plant_id,),
+                    block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                    item_id=water_id,
+                ),
+            )
+        else:
+            items = (work_item("WATER", (0, 0), crop="WHEAT", item_id=water_id),)
+        return fake_plan(items + (work_item("WATER", (0, 4)),))
+
+    controller = StripExecutorController(work_builder=builder)
+    for hour, expected in enumerate(("DIG", "PLANT", "WATER")):
+        result = controller.act(observation(hour=hour, farmer=(0, 0)), plan())
+        assert result.farmer_action == ((expected, "WHEAT") if expected == "PLANT" else (expected,))
+
+
+def test_crop_continuation_does_not_reopen_an_older_tile():
+    harvest_id = "HARVEST:0,0"
+    plant_id = "PLANT:TOMATO:0,0"
+
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        if int(obs["hour"]) == 0:
+            harvest = work_item("HARVEST", (0, 0), crop="WHEAT", item_id=harvest_id)
+        else:
+            harvest = work_item(
+                "PLANT",
+                (0, 0),
+                crop="TOMATO",
+                status=(
+                    WorkStatus.BLOCKED
+                    if int(obs["hour"]) < 3
+                    else WorkStatus.READY
+                ),
+                depends_on=(harvest_id,) if int(obs["hour"]) < 3 else (),
+                block_reason=(
+                    BlockReason.DEPENDENCY_BLOCKED
+                    if int(obs["hour"]) < 3
+                    else None
+                ),
+                item_id=plant_id,
+            )
+        return fake_plan((harvest, work_item("WATER", (0, 4))))
+
+    controller = StripExecutorController(work_builder=builder)
+    controller.act(observation(hour=0, farmer=(0, 0)), plan())
+    controller.act(observation(hour=1, farmer=(0, 0)), plan())
+    controller.act(observation(hour=2, farmer=(1, 0)), plan())
+    result = controller.act(observation(hour=3, farmer=(2, 0)), plan())
+    assert result.farmer_action == ("EAST",)
+    assert plant_id in controller.routes[0].late_work_ids
+
+
 def test_work_after_confirmed_departure_is_late_but_not_revisited():
     def builder(obs, plan, **kwargs):
         del plan, kwargs

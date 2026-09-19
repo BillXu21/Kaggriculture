@@ -139,6 +139,37 @@ def test_new_crop_water_waits_for_plant_but_chain_counts_both():
     assert chain.interaction_turns == 2
 
 
+def test_seed_observation_unlocks_only_the_affordable_crop_stage():
+    initial = build_strip_work_plan(
+        obs(money=16),
+        plan(crop_targets={"WHEAT": 1, "STRAWBERRY": 17}),
+    )
+    initial_plants = [item for item in initial.items if item.kind == "PLANT"]
+    assert len([item for item in initial_plants if item.crop == "WHEAT"]) == 1
+    assert len([item for item in initial_plants if item.crop == "STRAWBERRY"]) == 17
+    assert all(
+        item.status == WorkStatus.BLOCKED
+        and item.block_reason == BlockReason.MISSING_GLOBAL_RESOURCE
+        for item in initial_plants
+    )
+
+    refreshed = build_strip_work_plan(
+        obs(money=6, seeds={"WHEAT": 1}),
+        plan(crop_targets={"WHEAT": 1, "STRAWBERRY": 17}),
+    )
+    wheat = next(
+        item for item in refreshed.items if item.kind == "PLANT" and item.crop == "WHEAT"
+    )
+    strawberries = [
+        item
+        for item in refreshed.items
+        if item.kind == "PLANT" and item.crop == "STRAWBERRY"
+    ]
+    assert wheat.status == WorkStatus.READY
+    assert all(item.block_reason == BlockReason.MISSING_GLOBAL_RESOURCE for item in strawberries)
+    assert refreshed.diagnostics.represented_crop_delta_dict["STRAWBERRY"] == 17
+
+
 def test_replacement_has_harvest_plant_water_but_reduction_has_no_replacement():
     board = [[None] * 10 for _ in range(10)]
     board[0][0] = plant("WHEAT", planted_day=0, yield_units=3)

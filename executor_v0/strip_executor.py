@@ -591,6 +591,7 @@ class StripExecutorController:
         # Late-work observation runs every turn, including after DONE, so work
         # missed by the one-pass sweep stays visible without reopening the route.
         self._record_late_work(route, work_plan)
+        self._reopen_crop_continuation(route, position, work_plan)
         if route.phase == RoutePhase.DONE:
             route.pass_turns_after_completion += 1
             return ("PASS",)
@@ -620,6 +621,10 @@ class StripExecutorController:
             route.pending_cursor = None
             route.phase = RoutePhase.SWEEP
             self._mark_tile_passed(route, departing)
+
+        # Departure confirmation advances the cursor first; only then can the
+        # bounded one-hop repair inspect the immediately previous tile.
+        self._reopen_crop_continuation(route, position, work_plan)
 
         target = route.current_tile
         if route.phase == RoutePhase.TRAVEL_TO_ENTRY or position != target:
@@ -660,6 +665,59 @@ class StripExecutorController:
             "PASS",
         )
 
+    def _reopen_crop_continuation(
+        self,
+        route: StripRoute,
+        position: tuple[int, int],
+        work_plan: StripWorkPlan,
+    ) -> None:
+        """Reopen only an immediately previous tile for a crop successor.
+
+        A one-pass route remains the default.  Reopening is permitted only
+        when this worker performed DIG/HARVEST/PLANT, the next observation
+        makes its direct PLANT/WATER successor READY, and the worker is still
+        on the next tile of the same owned traversal.  This keeps late
+        unrelated work diagnostic-only and prevents arbitrary backtracking.
+        """
+        item_id = route.continuation_item_id
+        if item_id is None:
+            return
+        if route.phase == RoutePhase.DONE:
+            if (
+                route.continuation_tile is None
+                or position != route.current_tile
+                or route.continuation_tile != route.current_tile
+            ):
+                return
+            previous_tile = route.current_tile
+        else:
+            if route.phase != RoutePhase.SWEEP:
+                return
+            if route.pending_cursor is not None or route.cursor <= 0:
+                return
+            if position != route.current_tile:
+                return
+            previous_tile = route.traversal[route.cursor - 1]
+            if route.continuation_tile != previous_tile:
+                return
+            if previous_tile not in route.passed_tiles:
+                return
+        successors = tuple(
+            item
+            for item in work_plan.items
+            if item.tile == previous_tile
+            and item.status == WorkStatus.READY
+            and item.kind == route.continuation_next_kind
+        )
+        if not successors:
+            return
+        if route.phase != RoutePhase.DONE:
+            route.cursor -= 1
+        else:
+            route.phase = RoutePhase.SWEEP
+        route.passed_tiles.discard(previous_tile)
+        for successor in successors:
+            route.late_work_ids.discard(successor.id)
     def _prepare_supplies(
         self,
         route: StripRoute,
@@ -747,6 +805,19 @@ class StripExecutorController:
             route.actions_performed.get(item.kind, 0) + 1
         )
         route.interaction_turns += item.interaction_turns
+        successor = next(
+            (
+                candidate
+                for candidate in work_plan.items
+                if candidate.tile == tile
+                and item.id in candidate.depends_on
+                and _is_crop_continuation(item.kind, candidate.kind)
+            ),
+            None,
+        )
+        route.continuation_item_id = item.id if successor is not None else None
+        route.continuation_tile = tile if successor is not None else None
+        route.continuation_next_kind = successor.kind if successor is not None else None
         return action
 
     def _select_local_item(
@@ -959,6 +1030,14 @@ class StripExecutorController:
 
 def _supported_kind(kind: str) -> bool:
     return kind in _LOCAL_PRIORITY
+
+
+def _is_crop_continuation(completed: str | None, next_kind: str) -> bool:
+    return (completed, next_kind) in {
+        ("DIG", "PLANT"),
+        ("HARVEST", "PLANT"),
+        ("PLANT", "WATER"),
+    }
 
 
 def _has_worker_supplies(item: WorkItem, inventory: Mapping[str, int]) -> bool:

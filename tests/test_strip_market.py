@@ -17,7 +17,11 @@ from executor_v0.strip_work import (
 from replay_daily.constants import PRODUCTS
 
 
-def daily_plan(*, sells: dict[str, dict[int, int]] | None = None) -> DailyPlan:
+def daily_plan(
+    *,
+    sells: dict[str, dict[int, int]] | None = None,
+    crop_targets: dict[str, int] | None = None,
+) -> DailyPlan:
     quantities = {
         product: {anchor: 0 for anchor in (0, 4, 8, 12, 16, 20)}
         for product in PRODUCTS
@@ -25,7 +29,8 @@ def daily_plan(*, sells: dict[str, dict[int, int]] | None = None) -> DailyPlan:
     for product, bins in (sells or {}).items():
         quantities[product].update(bins)
     return DailyPlan.create(
-        crop_targets={crop: 0 for crop in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")},
+        crop_targets={crop: 0 for crop in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")}
+        | dict(crop_targets or {}),
         animal_targets={animal: 0 for animal in ("GOOSE", "COW", "SHEEP")},
         land_count=1,
         fertilizer_by_crop={crop: 0 for crop in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")},
@@ -251,6 +256,37 @@ def test_controller_keeps_workers_passed_until_animal_purchase_is_observed():
     assert second.market_actions == ()
     assert second.diagnostics["routes_finalized"] is True
     assert second.diagnostics["market_diagnostics"]["buy_observed"]["BUY_ANIMAL:COW"] == 1
+
+
+def test_controller_refreshes_blocked_plant_after_observed_seed_purchase():
+    targeted = daily_plan(crop_targets={"WHEAT": 1})
+    controller = StripExecutorController()
+    first = controller.act(observation(money=16, farmer=(4, 4)), targeted)
+    assert first.market_actions == (("BUY_SEED", "WHEAT", 1),)
+    assert first.farmer_action == ("PASS",)
+
+    second = controller.act(
+        observation(money=6, step=1, seeds={"WHEAT": 1}, farmer=(4, 4)), targeted
+    )
+    assert second.market_actions == ()
+    assert second.farmer_action == ("PLANT", "WHEAT")
+
+    planted = observation(money=6, step=2, seeds={"WHEAT": 0}, farmer=(4, 4))
+    planted["farms"][0]["tiles"][4][4] = {
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "planted_day": 1,
+        "yield_units": 0,
+        "watered_today": False,
+        "fertilized_until_day": -1,
+        "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    third = controller.act(
+        planted,
+        targeted,
+    )
+    assert third.farmer_action == ("WATER",)
 
 
 def test_controller_bounds_no_progress_market_retries_before_finalization():
