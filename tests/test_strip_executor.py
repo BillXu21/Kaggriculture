@@ -282,6 +282,40 @@ def test_useful_water_is_selected_before_harvest_on_same_tile():
     assert result.farmer_action == ("WATER",)
 
 
+def test_controller_executes_retained_routine_harvest():
+    obs = observation(day=8, farmer=(0, 0))
+    obs["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT",
+        "crop": "TOMATO",
+        "planted_day": 0,
+        "yield_units": 1,
+        "watered_today": True,
+        "fertilized_until_day": -1,
+        "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    retained_plan = DailyPlan.create(
+        crop_targets={crop: (1 if crop == "TOMATO" else 0) for crop in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS},
+        land_count=1,
+        fertilizer_by_crop={crop: 0 for crop in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={
+            product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)}
+            for product in PRODUCTS
+        },
+    )
+
+    controller = StripExecutorController()
+    result = controller.act(obs, retained_plan)
+
+    assert result.farmer_action == ("HARVEST",)
+    assert any(
+        item.id == "HARVEST:0,0" and item.source == "routine_harvest"
+        for item in controller._plan.items
+    )
+
+
 def test_missing_supply_does_not_pick_up_but_carried_supply_can_act():
     def builder(obs, plan, **kwargs):
         del obs, plan, kwargs

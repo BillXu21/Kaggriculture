@@ -1016,6 +1016,7 @@ def build_strip_work_plan(
         )
 
     represented_crops: Counter[str] = Counter()
+    replacement_harvest_coords: set[tuple[int, int]] = set()
     digs_by_coord = {d.coord: d for d in layouts.crops.digs}
     for intent in layouts.crops.plants:
         y, x = intent.coord
@@ -1031,6 +1032,7 @@ def build_strip_work_plan(
                     crop=old.get("crop"),
                     source="crop_replacement",
                 )
+                replacement_harvest_coords.add(intent.coord)
                 ids.append(harvest_id)
             elif intent.coord in digs_by_coord:
                 dig_id = f"DIG:{y},{x}"
@@ -1086,11 +1088,13 @@ def build_strip_work_plan(
     removal_coords = _excess_crop_coords(
         board, unlocked, target_crops, replacement_coords, cfg.anchor
     )
+    reduction_harvest_coords: set[tuple[int, int]] = set()
     for y, x in removal_coords:
         tile = board[y][x]
         crop = str(tile["crop"])
         if _tile_harvestable(tile, day, step):
             removal_id, removal_kind = f"HARVEST:{y},{x}", "HARVEST"
+            reduction_harvest_coords.add((y, x))
         else:
             removal_id, removal_kind = f"DIG:{y},{x}", "DIG"
         builder.add(
@@ -1108,6 +1112,28 @@ def build_strip_work_plan(
             crop=crop,
             source="crop_reduction",
         )
+
+    claimed_harvest_coords = replacement_harvest_coords | reduction_harvest_coords
+    allowed_quadrants = set(unlocked)
+    for y, row in enumerate(board):
+        for x, tile in enumerate(row):
+            coord = (y, x)
+            if quadrant_of(y, x) not in allowed_quadrants:
+                continue
+            if coord in claimed_harvest_coords:
+                continue
+            if not isinstance(tile, Mapping) or tile_role(tile) != "plant":
+                continue
+            crop = tile.get("crop")
+            if crop not in CROPS or not _tile_harvestable(tile, day, step):
+                continue
+            builder.add(
+                id=f"HARVEST:{y},{x}",
+                kind="HARVEST",
+                tile=coord,
+                crop=str(crop),
+                source="routine_harvest",
+            )
 
     unresolved_space_reason = (
         BlockReason.LOCKED_LAND
@@ -1130,7 +1156,6 @@ def build_strip_work_plan(
     # plan.care_by_animal counts are deliberately ignored.  An unfed animal
     # needs FEED (supply-checked) before CARE; an already-fed animal gets a
     # standalone READY CARE.  Already-cared or no-payoff animals get nothing.
-    allowed_quadrants = set(unlocked)
     for animal in ANIMAL_ORDER:
         for y, row in enumerate(board):
             for x, tile in enumerate(row):

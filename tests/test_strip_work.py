@@ -3,6 +3,8 @@
 import copy
 import json
 
+import pytest
+
 from executor_v0.plan import DailyPlan
 from executor_v0.strip_work import (
     BlockReason,
@@ -203,6 +205,113 @@ def test_replacement_has_harvest_plant_water_but_reduction_has_no_replacement():
         ("DIG", (0, 1))
     ]
     assert not [item for item in kinds(reduced, "WATER") if item.tile == (0, 1)]
+
+
+@pytest.mark.parametrize(
+    ("crop", "day"),
+    [("CARROT", 3), ("TOMATO", 8), ("STRAWBERRY", 10), ("MELON", 10)],
+)
+def test_retained_mature_non_wheat_crop_gets_one_routine_harvest(crop, day):
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant(crop, planted_day=0, yield_units=1)
+
+    result = build_strip_work_plan(
+        obs(board, day=day), plan(crop_targets={crop: 1})
+    )
+
+    harvests = kinds(result, "HARVEST")
+    assert [(item.id, item.tile, item.crop, item.source) for item in harvests] == [
+        ("HARVEST:0,0", (0, 0), crop, "routine_harvest")
+    ]
+
+
+def test_retained_immature_crop_does_not_get_routine_harvest():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("MELON", planted_day=2, yield_units=1)
+
+    result = build_strip_work_plan(
+        obs(board, day=3), plan(crop_targets={"MELON": 1})
+    )
+
+    assert not kinds(result, "HARVEST")
+
+
+def test_retained_wheat_uses_threshold_and_horizon_harvestability():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("WHEAT", planted_day=0, yield_units=2)
+    below_threshold = build_strip_work_plan(
+        obs(board, day=3, step=72), plan(crop_targets={"WHEAT": 1})
+    )
+    assert not kinds(below_threshold, "HARVEST")
+
+    board[0][0]["yield_units"] = 3
+    at_threshold = build_strip_work_plan(
+        obs(board, day=3, step=72), plan(crop_targets={"WHEAT": 1})
+    )
+    assert [item.source for item in kinds(at_threshold, "HARVEST")] == [
+        "routine_harvest"
+    ]
+
+    board[0][0]["yield_units"] = 0
+    terminal = build_strip_work_plan(
+        obs(board, day=29, step=718), plan(crop_targets={"WHEAT": 1})
+    )
+    assert [item.source for item in kinds(terminal, "HARVEST")] == [
+        "routine_harvest"
+    ]
+
+
+def test_replacement_and_reduction_harvests_are_not_duplicated_by_routine_scan():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("WHEAT", planted_day=0, yield_units=3)
+    for y in range(5):
+        for x in range(5):
+            if (y, x) != (0, 0):
+                board[y][x] = "LOCKED"
+    replacement = build_strip_work_plan(
+        obs(board, day=3, step=72, seeds={"TOMATO": 1}),
+        plan(crop_targets={"TOMATO": 1}),
+    )
+    replacement_harvests = kinds(replacement, "HARVEST")
+    assert len(replacement_harvests) == 1
+    assert replacement_harvests[0].source == "crop_replacement"
+
+    reduction = build_strip_work_plan(
+        obs(board, day=3, step=72), plan(crop_targets={"WHEAT": 0})
+    )
+    reduction_harvests = kinds(reduction, "HARVEST")
+    assert len(reduction_harvests) == 1
+    assert reduction_harvests[0].source == "crop_reduction"
+
+
+def test_routine_and_replacement_harvests_share_stable_unique_ids():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("WHEAT", planted_day=0, yield_units=3)
+    board[0][1] = plant("MELON", planted_day=0, yield_units=1)
+    for y in range(5):
+        for x in range(5):
+            if (y, x) not in {(0, 0), (0, 1)}:
+                board[y][x] = "LOCKED"
+    result = build_strip_work_plan(
+        obs(board, day=10, step=240, seeds={"TOMATO": 1}),
+        plan(crop_targets={"TOMATO": 1, "MELON": 1}),
+    )
+
+    harvests = {item.tile: item for item in kinds(result, "HARVEST")}
+    assert harvests[(0, 0)].source == "crop_replacement"
+    assert harvests[(0, 1)].source == "routine_harvest"
+    assert len({item.id for item in harvests.values()}) == len(harvests)
+
+
+def test_retained_harvest_output_is_deterministic():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("MELON", planted_day=0, yield_units=1)
+    observation = obs(board, day=10, step=240)
+    daily_plan = plan(crop_targets={"MELON": 1})
+
+    first = build_strip_work_plan(observation, daily_plan)
+    second = build_strip_work_plan(copy.deepcopy(observation), daily_plan)
+    assert first == second
 
 
 def test_animal_build_and_place_are_retained_when_purchase_is_missing():
