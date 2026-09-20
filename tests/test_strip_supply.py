@@ -198,7 +198,7 @@ def test_partial_observed_pickup_records_only_real_inventory_gain():
     assert state["failed_or_unfulfilled"] == {"WHEAT": 2}
 
 
-def test_unassigned_route_does_not_reserve_and_day_reset_rebuilds_ledger():
+def test_packed_route_reserves_chain_and_day_reset_rebuilds_ledger():
     current = work_plan(
         item("FEED", (0, 0), SupplyRequirement("WHEAT", 2)),
         item("FEED", (1, 0), SupplyRequirement("WHEAT", 2)),
@@ -215,7 +215,10 @@ def test_unassigned_route_does_not_reserve_and_day_reset_rebuilds_ledger():
     assert first.diagnostics["supply_diagnostics"]["total_reservations_by_item"] == {
         "WHEAT": 2
     }
-    assert first.diagnostics["unassigned_supply_demand"]
+    assert first.diagnostics["unassigned_supply_demand"] == {}
+    assert first.diagnostics["route_diagnostics"][0]["supply_plan"]["demand"] == {
+        "WHEAT": 4
+    }
 
     next_day = controller.act(
         observation(position=(0, 0), shed={}, day=4), plan()

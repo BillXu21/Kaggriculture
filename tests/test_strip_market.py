@@ -488,18 +488,18 @@ def test_aggressive_selling_ignores_manager_sell_quantity_and_uses_observed_shed
     assert result.diagnostics["aggressive_sell_submitted_this_turn"] == {"MILK": 5}
 
 
-def test_aggressive_mode_never_sells_wheat_even_when_feed_demand_exists():
+def test_aggressive_mode_sells_unreserved_wheat_even_when_feed_demand_exists():
     result = plan_market(
         observation(money=0, shed={"WHEAT": 5}, inventories=[{"WHEAT": 2}]),
         daily_plan(),
         work(item("FEED", supplies=(SupplyRequirement("WHEAT", 4, "inventory"),))),
         aggressive=True,
     )
-    assert result.orders == ()
+    assert result.orders == (("SELL", "WHEAT", 5),)
     assert result.diagnostics["aggressive_sell_observed"] == {"WHEAT": 5}
 
 
-def test_aggressive_mode_never_sells_fertilizer_even_with_route_reservation():
+def test_aggressive_mode_sells_excess_fertilizer_and_protects_reservation():
     fertilizer = plan_market(
         observation(money=0, shed={"FERTILIZER": 5}),
         daily_plan(),
@@ -507,7 +507,7 @@ def test_aggressive_mode_never_sells_fertilizer_even_with_route_reservation():
         protected={"FERTILIZER": 2},
         aggressive=True,
     )
-    assert fertilizer.orders == ()
+    assert fertilizer.orders == (("SELL", "FERTILIZER", 3),)
 
     wheat = plan_market(
         observation(money=0, shed={"WHEAT": 5}),
@@ -516,10 +516,10 @@ def test_aggressive_mode_never_sells_fertilizer_even_with_route_reservation():
         protected={"WHEAT": 3},
         aggressive=True,
     )
-    assert wheat.orders == ()
+    assert wheat.orders == (("SELL", "WHEAT", 2),)
 
 
-def test_aggressive_mode_sells_outputs_but_retains_wheat_and_fertilizer():
+def test_aggressive_mode_sells_all_canonical_products():
     result = plan_market(
         observation(
             money=0,
@@ -530,11 +530,12 @@ def test_aggressive_mode_sells_outputs_but_retains_wheat_and_fertilizer():
         aggressive=True,
     )
     assert result.orders == (
+        ("SELL", "WHEAT", 5),
         ("SELL", "CARROT", 2),
         ("SELL", "MELON", 4),
         ("SELL", "MILK", 1),
+        ("SELL", "FERTILIZER", 3),
     )
-    assert all(order[1] not in {"WHEAT", "FERTILIZER"} for order in result.orders)
 
 
 def test_aggressive_sell_proceeds_fund_buy_land_in_the_same_turn():
@@ -558,7 +559,7 @@ def test_aggressive_sales_and_purchases_respect_market_order_cap():
         aggressive=True,
     )
     assert len(result.orders) == 2
-    assert result.orders == (("SELL", "CARROT", 1), ("SELL", "MILK", 1))
+    assert result.orders == (("SELL", "WHEAT", 1), ("SELL", "CARROT", 1))
 
 
 def test_multiple_partial_observations_follow_current_stock_exactly():

@@ -432,6 +432,15 @@ def generate_tasks(
                     care_eligible[species].append(coord)
             elif tile.get("kind") == "PLANT":
                 urgency = _water_urgency(tile)
+                if tile.get("crop") == "WHEAT":
+                    from executor_v0.upkeep import wheat_harvest_eligibility
+                    current_step = int(obs.get(
+                        "step", int(obs["day"]) * _TURNS_PER_DAY
+                        + int(obs["hour"])))
+                    if wheat_harvest_eligibility(
+                        tile, int(obs["day"]), current_step
+                    )[0]:
+                        urgency = None
                 if urgency == "must":
                     water_must_targets.append(coord)
                 elif urgency == "yield":

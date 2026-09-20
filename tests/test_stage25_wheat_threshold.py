@@ -67,6 +67,9 @@ def test_threshold_wheat_is_ordinary_productive_harvest():
         harvest = next(t for t in result.tasks if t.kind == "HARVEST")
         assert harvest.priority == Priority.PRODUCTIVE
         assert harvest.source == "mechanical"
+        assert not any(
+            t.kind == "WATER" and t.tile == harvest.tile for t in result.tasks
+        )
         assert "wheat_harvest:0,0:eligible:threshold_met" in result.diagnostics
 
 
@@ -134,6 +137,35 @@ def test_eligibility_helper_distinguishes_yield_from_plant_age():
     assert wheat_harvest_eligibility(tile, 20, 480) == (False, "future_growth")
     tile["yield_units"] = 3
     assert wheat_harvest_eligibility(tile, 20, 480) == (True, "threshold_met")
+
+
+def test_eligibility_fast_and_canonical_tile_shapes_agree():
+    canonical = _plant_for_water("WHEAT", age_days=3, yield_units=2)
+    fast = {
+        "crop": "WHEAT",
+        "yield_units": 2,
+        "watered_today": False,
+        "derived": {"age_days": 3},
+        "max_lifespan_step": -1,
+    }
+    assert wheat_harvest_eligibility(canonical, 20, 480) == (
+        False,
+        "future_growth",
+    )
+    assert wheat_harvest_eligibility(fast, 20, 480) == (
+        False,
+        "future_growth",
+    )
+    canonical["yield_units"] = 3
+    fast["yield_units"] = 3
+    assert wheat_harvest_eligibility(canonical, 20, 480) == (
+        True,
+        "threshold_met",
+    )
+    assert wheat_harvest_eligibility(fast, 20, 480) == (
+        True,
+        "threshold_met",
+    )
 
 
 def test_fast_engine_scripted_wheat_lifecycle_threshold_crossing():

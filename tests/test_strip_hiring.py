@@ -155,11 +155,11 @@ def hiring_plan(
     )
 
 
-def test_three_useful_rows_hire_to_fixed_prefix():
+def test_three_useful_rows_fit_one_packed_worker():
     result = hiring_plan([item("WATER", 0), item("WATER", 1), item("WATER", 2)])
-    assert result.target_workers == 3
-    assert result.wanted_hires == result.submittable_hires == 2
-    assert result.orders == (("HIRE",), ("HIRE",))
+    assert result.target_workers == 1
+    assert result.wanted_hires == result.submittable_hires == 0
+    assert result.orders == ()
 
 
 def test_existing_coverage_needs_no_gratuitous_hire():
@@ -188,14 +188,14 @@ def test_fertilizer_tail_does_not_inflate_prefix_but_gap_does():
         item("FERTILIZE", 2, source="fertilizer_policy"),
         item("WATER", 2, source="fertilizer_linked_productive"),
     ])
-    assert tail.target_workers == 2
+    assert tail.target_workers == 1
     gap = hiring_plan([
         item("WATER", 0),
         item("FERTILIZE", 1, source="fertilizer_policy"),
         item("WATER", 1, source="fertilizer_linked_productive"),
         item("WATER", 2),
     ])
-    assert gap.target_workers == 3
+    assert gap.target_workers == 1
 
 
 def test_impossible_route_does_not_poison_later_useful_route():
@@ -203,7 +203,7 @@ def test_impossible_route_does_not_poison_later_useful_route():
         item("FEED", 0, status=WorkStatus.BLOCKED),
         item("WATER", 1),
     ])
-    assert result.target_workers == 2
+    assert result.target_workers == 1
     assert result.route_estimates[0].hire_driving is False
     assert result.route_estimates[1].hire_driving is True
 
@@ -225,22 +225,50 @@ def test_too_late_uncovered_route_does_not_drive_hiring():
 
 
 def test_sequential_fibonacci_affordability_and_no_economic_gate():
+    rows = [
+        item("WATER", row, x=x)
+        for row in range(4)
+        for x in range(5)
+    ] + [
+        item("WATER", row, x=0)
+        for row in range(4)
+        for _ in range(2)
+    ]
     result = hiring_plan(
-        [item("WATER", 0), item("WATER", 1), item("WATER", 2), item("WATER", 3)],
-        money=3,
+        rows,
+        money=2,
         hires_today=1,
     )
-    assert result.sequential_hire_costs == (1, 2, 3)
-    assert result.affordable_hires == result.submittable_hires == 2
+    assert result.target_workers == 3
+    assert result.wanted_hires == 2
+    assert result.sequential_hire_costs == (1, 2)
+    assert result.affordable_hires == result.submittable_hires == 1
     assert result.stop_reason.value == "CASH"
+
+
+def test_four_rows_three_workers_need_not_be_four_workers():
+    rows = [
+        item("WATER", row, x=x)
+        for row in range(4)
+        for x in range(5)
+    ] + [
+        item("WATER", row, x=0)
+        for row in range(4)
+        for _ in range(2)
+    ]
+    result = hiring_plan(rows)
+    assert result.target_workers == 3
+    assert result.wanted_hires == 2
+    assert result.hire_reason == "extra_worker_materially_completes_packed_work"
 
 
 def test_controller_observes_hires_before_finalizing_routes():
     forecast = work_plan(item("WATER", 0), item("WATER", 1), item("WATER", 2))
     controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: forecast)
     first = controller.act(observation(money=1000), daily_plan())
-    assert first.market_actions == (("HIRE",), ("HIRE",))
-    assert controller.routes == ()
+    assert first.market_actions == ()
+    assert first.diagnostics["routes_finalized"] is True
+    assert len(controller.routes) == 1
 
     confirmed = observation(
         hands=((4, 4), (5, 4)), money=998, hires_today=2, hour=1
@@ -248,7 +276,7 @@ def test_controller_observes_hires_before_finalizing_routes():
     second = controller.act(confirmed, daily_plan())
     assert second.market_actions == ()
     assert second.diagnostics["routes_finalized"] is True
-    assert len(controller.routes) == 3
+    assert len(controller.routes) == 1
     assert second.diagnostics["worker_count_final"] == 3
 
 
@@ -256,15 +284,11 @@ def test_controller_bounds_failed_hire_and_finalizes_with_real_workers():
     forecast = work_plan(item("WATER", 0), item("WATER", 1))
     controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: forecast)
     first = controller.act(observation(money=1000), daily_plan())
-    assert first.market_actions == (("HIRE",),)
+    assert first.market_actions == ()
     unchanged1 = observation(money=1000, hour=1)
     second = controller.act(unchanged1, daily_plan())
-    assert second.market_actions == (("HIRE",),)
-    unchanged2 = observation(money=1000, hour=2)
-    third = controller.act(unchanged2, daily_plan())
-    assert third.market_actions == ()
-    assert third.diagnostics["routes_finalized"] is True
-    assert third.diagnostics["hire_stop_reason"] == "FAILED"
+    assert second.market_actions == ()
+    assert second.diagnostics["routes_finalized"] is True
     assert len(controller.routes) == 1
 
 
@@ -297,19 +321,20 @@ def test_procurement_is_observed_before_hiring_uses_remaining_cash():
 
     observed = observation(money=1, hour=1, shed={"WHEAT": 1})
     second = controller.act(observed, daily_plan())
-    assert second.market_actions == (("HIRE",),)
+    assert second.market_actions == ()
+    assert second.diagnostics["routes_finalized"] is True
     assert second.diagnostics["hiring_diagnostics"]["cash_before_hiring"] == 1.0
 
 
 def test_partial_hire_realization_recomputes_target_without_phantom_worker():
     forecast = work_plan(item("WATER", 0), item("WATER", 1), item("WATER", 2))
     controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: forecast)
-    assert len(controller.act(observation(money=1000), daily_plan()).market_actions) == 2
+    assert len(controller.act(observation(money=1000), daily_plan()).market_actions) == 0
     partial = observation(hands=((4, 4),), money=999, hires_today=1, hour=1)
     second = controller.act(partial, daily_plan())
-    assert second.market_actions == (("HIRE",),)
-    assert second.diagnostics["hiring_diagnostics"]["current_workers"] == 2
-    assert controller.routes == ()
+    assert second.market_actions == ()
+    assert second.diagnostics["routes_finalized"] is True
+    assert len(controller.routes) == 1
 
 
 def test_confirmed_hire_uses_real_endpoint_and_packet3_supply_plan():
@@ -321,20 +346,14 @@ def test_confirmed_hire_uses_real_endpoint_and_packet3_supply_plan():
     first = controller.act(observation(money=1000), daily_plan())
     assert first.market_actions == (("BUY_PRODUCT", "WHEAT", 1),)
     purchased = observation(hour=1, money=975, shed={"WHEAT": 1})
-    assert controller.act(purchased, daily_plan()).market_actions == (("HIRE",),)
-    confirmed = observation(
-        hands=((9, 0),), money=974, hires_today=1, hour=2, shed={"WHEAT": 1}
-    )
-    second = controller.act(confirmed, daily_plan())
+    second = controller.act(purchased, daily_plan())
     assert second.diagnostics["routes_finalized"] is True
-    hand_route = next(route for route in controller.routes if route.owner == WorkerId(1))
-    assert hand_route.entry_tile == (1, 4)
-    hand_supply = next(
+    route_supply = next(
         value for value in second.diagnostics["route_diagnostics"]
-        if value["owner"] == "HAND:0"
+        if value["owner"] == "FARMER"
     )
-    assert hand_supply["supply_plan"]["demand"] == {"WHEAT": 1}
-    assert hand_supply["supply_plan"]["pickup_sequence"] == [
+    assert route_supply["supply_plan"]["demand"] == {"WHEAT": 1}
+    assert route_supply["supply_plan"]["pickup_sequence"] == [
         {"item": "WHEAT", "quantity": 1}
     ]
 
@@ -364,13 +383,14 @@ def test_preceding_fertilizer_delays_first_use_past_deadline():
     estimate = result.route_estimates[1]
     assert estimate.route_index == 1
     assert estimate.first_use_work_id == "WATER:0:0"
-    # entry (0,4) from predicted spawn (4,4): movement 4, sweep to (0,0) 4,
+    # The packed single-worker chain approaches the second segment from the
+    # first segment's endpoint: movement 13, sweep to (0,0) 4,
     # one batched FERTILIZER pickup, three fertilizer interactions, one water.
-    assert estimate.movement_turns == 4
+    assert estimate.movement_turns == 13
     assert estimate.preceding_interaction_turns == 3
     assert estimate.pickup_turns == 1
-    assert estimate.first_use_eta == 4 + 4 + 1 + 3 + 1
-    assert estimate.future_action_slots == 9
+    assert estimate.first_use_eta == 13 + 4 + 1 + 3 + 1
+    assert estimate.future_action_slots == 0
     assert estimate.useful_before_deadline is False
     # The late route must not independently raise the coverage target.
     assert result.target_workers == 1
@@ -439,16 +459,16 @@ def test_supplies_needed_after_first_driving_do_not_inflate_eta():
 # --- Packet 5B diagnostics cleanups -------------------------------------------
 
 
-def test_order_cap_reason_wins_when_cap_is_immediate_bound():
+def test_packed_capacity_avoids_order_cap_for_unneeded_workers():
     result = hiring_plan(
         [item("WATER", r) for r in range(10)],
         money=12,
         max_orders=3,
     )
-    assert result.wanted_hires == 9
-    assert result.affordable_hires == 5
-    assert result.submittable_hires == 3
-    assert result.stop_reason is HireStopReason.ORDER_CAP
+    assert result.wanted_hires == 1
+    assert result.affordable_hires == 1
+    assert result.submittable_hires == 1
+    assert result.stop_reason is HireStopReason.COVERED
 
 
 def test_controller_populates_top_level_stop_reason_for_covered_no_hire():

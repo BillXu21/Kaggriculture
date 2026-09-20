@@ -182,6 +182,7 @@ class StripExecutorController:
             "day": day,
             "assignment_hour": int(obs.get("hour", 0)),
             "active_routes": len(candidates),
+            "useful_row_count": len(candidates),
             "assigned_routes": len(assignment.routes),
             "unassigned_routes": len(assignment.unassigned),
             "workers": len(positions),
@@ -196,6 +197,18 @@ class StripExecutorController:
                 candidate.route_id: candidate.workload_interactions
                 for candidate in candidates
             },
+            "packed_rows_per_worker": {
+                route.owner.label: [segment.segment_id for segment in route.segments]
+                for route in assignment.routes
+            },
+            "rows_expected_complete_with_n_workers": (
+                self._hire_plan.rows_expected_complete_with_n_workers
+                if self._hire_plan else len(candidates)
+            ),
+            "rows_expected_complete_with_n_plus_one_workers": (
+                self._hire_plan.rows_expected_complete_with_n_plus_one_workers
+                if self._hire_plan else len(candidates)
+            ),
             "tileless_unresolved_work": [
                 item.id for item in work_plan.items if item.tile is None
             ],
@@ -593,8 +606,11 @@ class StripExecutorController:
         self._record_late_work(route, work_plan)
         self._reopen_crop_continuation(route, position, work_plan)
         if route.phase == RoutePhase.DONE:
-            route.pass_turns_after_completion += 1
-            return ("PASS",)
+            if self._help_untouched_segment(route, work_plan):
+                route.completion_hour = None
+            else:
+                route.pass_turns_after_completion += 1
+                return ("PASS",)
 
         if route.pending_cursor is not None:
             expected = route.traversal[route.pending_cursor]
@@ -784,6 +800,57 @@ class StripExecutorController:
             supply_state.pickup_turns += 1
             return ("PICKUP", batch.item, quantity)
 
+    def _help_untouched_segment(
+        self, route: StripRoute, work_plan: StripWorkPlan
+    ) -> bool:
+        """Append one safe untouched segment to a completed worker.
+
+        Helping is deliberately bounded: only a segment after another
+        worker's currently active segment is eligible, and only when it adds
+        no inventory-scoped demand.  This preserves frozen ownership and all
+        observation-confirmed shed reservations while preventing a completed
+        worker from idling beside useful work.
+        """
+
+        for donor in sorted(self._routes.values(), key=lambda value: value.owner):
+            if donor is route or donor.phase in (RoutePhase.DONE, RoutePhase.INVALID):
+                continue
+            current_index = next(
+                (
+                    index
+                    for index, segment in enumerate(donor.segments)
+                    if donor.current_tile in segment.traversal
+                ),
+                None,
+            )
+            if current_index is None:
+                continue
+            for segment_index in range(current_index + 1, len(donor.segments)):
+                segment = donor.segments[segment_index]
+                if segment.segment_id in donor.completed_segment_ids:
+                    continue
+                if any(tile in donor.passed_tiles for tile in segment.traversal):
+                    continue
+                if extract_tile_supply_demand(segment.traversal, work_plan):
+                    continue
+                remaining_segments = (
+                    donor.segments[:segment_index]
+                    + donor.segments[segment_index + 1:]
+                )
+                donor.traversal = tuple(
+                    tile for value in remaining_segments for tile in value.traversal
+                )
+                donor.owned_tiles = donor.traversal
+                donor.segments = remaining_segments
+                route.traversal = route.traversal + segment.traversal
+                route.owned_tiles = route.owned_tiles + segment.traversal
+                route.segments = route.segments + (segment,)
+                route.transferred_segment_ids.add(segment.segment_id)
+                route.phase = RoutePhase.SWEEP
+                route.pending_cursor = None
+                return True
+        return False
+
     def _try_local_action(
         self,
         route: StripRoute,
@@ -879,6 +946,9 @@ class StripExecutorController:
 
     def _mark_tile_passed(self, route: StripRoute, tile: tuple[int, int]) -> None:
         route.passed_tiles.add(tile)
+        for segment in route.segments:
+            if tile == segment.traversal[-1]:
+                route.completed_segment_ids.add(segment.segment_id)
 
     def _record_late_work(self, route: StripRoute, work_plan: StripWorkPlan) -> None:
         # Only confirmed-passed tiles can hold late work; the current tile and

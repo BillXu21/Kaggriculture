@@ -523,6 +523,8 @@ def _routine_water_source(
     if age_value is None:
         return None
     age = int(age_value)
+    if crop == "WHEAT" and wheat_harvest_eligibility(tile, day, step)[0]:
+        return None
     if age not in _ROUTINE_WATER_AGES[crop]:
         if crop == "TOMATO" and age >= CROPS[crop]["first_yield_day"]:
             held = int(tile.get("yield_units", 0) or 0)
@@ -534,9 +536,6 @@ def _routine_water_source(
     if age in (11, 12) and crop == "MELON" and not room:
         return None
     if crop == "WHEAT" and age == 4:
-        eligible, reason = wheat_harvest_eligibility(tile, day, step)
-        if eligible and reason == "threshold_met":
-            return None
         if not room:
             return None
     if age == 0:
@@ -1236,6 +1235,8 @@ def build_strip_work_plan(
                     and tile.get("kind") == "PLANT"
                     and tile.get("crop") == crop
                 ):
+                    continue
+                if crop == "WHEAT" and wheat_harvest_eligibility(tile, day, step)[0]:
                     continue
                 if int(tile.get("fertilized_until_day", -1) or -1) >= day:
                     continue

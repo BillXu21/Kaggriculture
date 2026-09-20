@@ -187,3 +187,28 @@ If the scratch run is healthy, it can continue as an experiment while the BC pip
 3. Launch the bounded scratch Stage 2.5 TPU/self-play experiment if the new architecture stack is ready.
 4. In parallel/later, finish outcome-proxy replay processing and BC setup for a stronger Stage 2.5 initialization.
 5. Return to executor refinement only when controlled diagnostics identify a mechanical bottleneck. The most likely open seams are product delivery/deposit, bootstrap timing/liquidity, and eventually route geometry; none should be redesigned speculatively.
+
+## Stage 2.5 executor mechanical repair — 2026-09-20
+
+The Stage 2.5 executor repair packet supersedes the temporary WHEAT/FERTILIZER
+sell exclusion and the one-row-per-worker assumption:
+
+- aggressive sell mode now considers every canonical `PRODUCTS` entry;
+  outstanding observation-confirmed route reservations still protect committed
+  shed stock;
+- wheat with observed `yield_units >= 3`, or with the existing expiry/horizon
+  exception, is harvested on that observation and does not receive competing
+  routine or fertilizer-linked WATER;
+- horizontal candidates are packed as ordered row segments per worker, with
+  deterministic nearest-endpoint traversal, segment-level diagnostics, and a
+  bounded no-new-supply helping handoff when a worker exhausts its chain;
+- hiring evaluates the same packed capacity model and only requests a worker
+  when the additional capacity completes additional useful work before the
+  day boundary.
+
+Focused executor/work/market/supply/hiring/integration validation passed 145
+tests. Official 1.32.7 deterministic parity for seed 41001 also passed 719
+turns in both seats with matching terminal status and reward. The requested
+epoch8-vs-epoch4 BC artifacts were not present in this checkout; the available
+repo-local BC checkpoint is `E_LEGACY` and is rejected by the current
+`E_CORRECTED_V1` runner, so no BC replay claim is made here.

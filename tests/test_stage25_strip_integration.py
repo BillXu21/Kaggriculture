@@ -105,14 +105,13 @@ assert not any(name == 'jax' or name.startswith('jax.') or
     assert result.returncode == 0, result.stderr
 
 
-def test_strip_aggressive_sale_profile_excludes_feed_and_fertilizer():
+def test_strip_aggressive_sale_profile_includes_all_sellable_products():
     assert make_stage25_executor_factory().strip_config.aggressive_sell_all
     # The product allow-list is owned by strip_market; this test exercises the
     # configured controller path without duplicating its implementation rules.
     from executor_v0.strip_market import _AGGRESSIVE_SELL_PRODUCTS
 
     assert set(_AGGRESSIVE_SELL_PRODUCTS) == {
-        "CARROT", "TOMATO", "STRAWBERRY", "MELON", "EGG", "MILK", "WOOL"
+        "WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON", "EGG", "MILK",
+        "WOOL", "FERTILIZER",
     }
-    assert "WHEAT" not in _AGGRESSIVE_SELL_PRODUCTS
-    assert "FERTILIZER" not in _AGGRESSIVE_SELL_PRODUCTS

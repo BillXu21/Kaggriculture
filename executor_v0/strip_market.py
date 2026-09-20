@@ -29,15 +29,7 @@ __all__ = [
     "sell_bin_anchor",
 ]
 
-_AGGRESSIVE_SELL_PRODUCTS = (
-    "CARROT",
-    "TOMATO",
-    "STRAWBERRY",
-    "MELON",
-    "EGG",
-    "MILK",
-    "WOOL",
-)
+_AGGRESSIVE_SELL_PRODUCTS = tuple(PRODUCTS)
 
 
 class MarketBlockReason(StrEnum):

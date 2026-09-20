@@ -185,9 +185,9 @@ def test_assignment_is_repeatable_and_dependency_blocked_rows_are_active():
     assert first.routes[0].to_json_dict() == second.routes[0].to_json_dict()
 
 
-def test_fixed_assignment_counts_excess_routes_and_workers():
+def test_packed_assignment_covers_excess_rows_without_extra_workers():
     work = fake_plan(
-        tuple(work_item("WATER", (row, 0)) for row in (0, 1, 2))
+        tuple(work_item("WATER", (row, 0)) for row in (0, 1, 2, 3))
     )
     candidates = generate_horizontal_route_candidates(work)
     assigned = assign_horizontal_routes(
@@ -196,7 +196,8 @@ def test_fixed_assignment_counts_excess_routes_and_workers():
         assignment_hour=0,
     )
     assert len(assigned.routes) == 2
-    assert [item.route_id for item in assigned.unassigned] == ["ROW:NW:2:0-4"]
+    assert not assigned.unassigned
+    assert sorted(len(route.segments) for route in assigned.routes) == [2, 2]
     work_one = fake_plan((work_item("WATER", (0, 0)),))
     assigned_one = assign_horizontal_routes(
         generate_horizontal_route_candidates(work_one),

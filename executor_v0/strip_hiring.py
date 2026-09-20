@@ -14,7 +14,11 @@ from typing import Any
 from replay_daily.constants import FARM_HAND_COST_MULT_DEFAULT, hire_cost
 
 from executor_v0.foreman import SHED_ACCESS_TILES
-from executor_v0.strip_routes import HorizontalRouteCandidate, WorkerId
+from executor_v0.strip_routes import (
+    HorizontalRouteCandidate,
+    WorkerId,
+    assign_horizontal_routes,
+)
 from executor_v0.strip_supply import LOCAL_ACTION_PRIORITY
 from executor_v0.strip_work import (
     BlockReason,
@@ -79,6 +83,9 @@ class StripHiringPlan:
     cash_before_hiring: float
     future_action_slots: int
     stop_reason: HireStopReason
+    hire_reason: str = ""
+    rows_expected_complete_with_n_workers: int = 0
+    rows_expected_complete_with_n_plus_one_workers: int = 0
 
     @property
     def orders(self) -> tuple[tuple[str], ...]:
@@ -379,6 +386,57 @@ def _estimate_route(
     )
 
 
+def _estimate_packed_workers(
+    candidates: Sequence[HorizontalRouteCandidate],
+    worker_positions: Mapping[WorkerId, tuple[int, int]],
+    worker_inventories: Mapping[WorkerId, Mapping[str, int]],
+    work_plan: StripWorkPlan,
+    *,
+    future_action_slots: int,
+    current_workers: int,
+    shed: Mapping[str, int],
+    seeds: Mapping[str, int],
+    fertilizer_item_ids: frozenset[str],
+) -> tuple[tuple[RouteLaborEstimate, ...], int, int]:
+    """Estimate candidate completion under one deterministic packed assignment."""
+
+    if not candidates or not worker_positions:
+        return (), 0, 0
+    assignment = assign_horizontal_routes(
+        candidates, worker_positions, assignment_hour=0
+    )
+    by_id = {candidate.route_id: candidate for candidate in candidates}
+    estimates: dict[str, RouteLaborEstimate] = {}
+    completed_driving = 0
+    driving_total = 0
+    ledger = _SupplyLedger(_positive_counts(shed), _positive_counts(seeds))
+    for route in assignment.routes:
+        position = worker_positions[route.owner]
+        carried = _positive_counts(worker_inventories.get(route.owner))
+        elapsed = 0
+        slots = future_action_slots + (1 if route.owner.index < current_workers else 0)
+        for segment in route.segments:
+            candidate = by_id[segment.segment_id]
+            estimate = _estimate_route(
+                candidate,
+                next(index for index, value in enumerate(candidates) if value.route_id == candidate.route_id),
+                position,
+                work_plan,
+                ledger,
+                carried,
+                max(0, slots - elapsed),
+                fertilizer_item_ids,
+            )
+            estimates[candidate.route_id] = estimate
+            driving_total += int(estimate.hire_driving)
+            elapsed += estimate.estimated_full_turns
+            if estimate.hire_driving and elapsed <= slots:
+                completed_driving += 1
+            position = segment.traversal[-1]
+    ordered = tuple(estimates[candidate.route_id] for candidate in candidates if candidate.route_id in estimates)
+    return ordered, completed_driving, driving_total
+
+
 def plan_strip_hiring(
     obs: Mapping[str, Any],
     work_plan: StripWorkPlan,
@@ -405,45 +463,56 @@ def plan_strip_hiring(
         max(0, len(candidates) - current_workers),
         board_size,
     )
-    ledger = _SupplyLedger(
-        _positive_counts(private.get("shed")), _positive_counts(private.get("seeds"))
-    )
     fertilizer_item_ids = frozenset(
         item_id
         for chain in work_plan.chains
         if chain.kind == "FERTILIZER_UPKEEP" or chain.source == "fertilizer_policy"
         for item_id in chain.item_ids
     )
-    estimates: list[RouteLaborEstimate] = []
-    for index, candidate in enumerate(candidates):
-        if index < current_workers:
-            worker = observed_workers[index]
-            position = worker_positions[worker]
-            inventory = worker_inventories.get(worker, {})
-            slots = future_slots + 1
-        else:
-            position = predicted_spawns[index - current_workers]
-            inventory = {}
-            slots = future_slots
-        estimates.append(
-            _estimate_route(
-                candidate,
-                index,
-                position,
-                work_plan,
-                ledger,
-                inventory,
-                slots,
-                fertilizer_item_ids,
-            )
+    max_workers = max(current_workers, len(candidates))
+    all_positions = dict(worker_positions)
+    all_positions.update(
+        {
+            WorkerId(current_workers + index): position
+            for index, position in enumerate(predicted_spawns)
+        }
+    )
+    packed_results: dict[int, tuple[tuple[RouteLaborEstimate, ...], int, int]] = {}
+    for worker_count in range(current_workers, max_workers + 1):
+        packed_results[worker_count] = _estimate_packed_workers(
+            candidates,
+            {worker: all_positions[worker] for worker in sorted(all_positions)[:worker_count]},
+            worker_inventories,
+            work_plan,
+            future_action_slots=future_slots,
+            current_workers=current_workers,
+            shed=private.get("shed"),
+            seeds=private.get("seeds"),
+            fertilizer_item_ids=fertilizer_item_ids,
         )
-
-    useful_indices = [
-        estimate.route_index
-        for estimate in estimates
-        if estimate.hire_driving and estimate.useful_before_deadline
-    ]
-    target_workers = useful_indices[-1] + 1 if useful_indices else 0
+    driving_total = max((result[2] for result in packed_results.values()), default=0)
+    target_workers = 0
+    hire_reason = "no_useful_work"
+    if driving_total:
+        current_completed = packed_results[current_workers][1]
+        target_workers = current_workers
+        if current_completed >= driving_total:
+            hire_reason = "covered_by_existing_packed_capacity"
+        else:
+            for worker_count in range(current_workers + 1, max_workers + 1):
+                completed = packed_results[worker_count][1]
+                if completed > current_completed:
+                    target_workers = worker_count
+                    hire_reason = "extra_worker_materially_completes_packed_work"
+                    break
+            else:
+                hire_reason = "no_extra_worker_useful_before_deadline"
+    final_estimates = packed_results.get(target_workers or current_workers, ((), 0, 0))[0]
+    estimates = list(final_estimates)
+    rows_with_n = packed_results.get(current_workers, ((), 0, 0))[1]
+    rows_with_n_plus_one = packed_results.get(
+        current_workers + 1, ((), rows_with_n, 0)
+    )[1]
     wanted = max(0, target_workers - current_workers)
     hires_today = max(0, int(farm.get("hires_today", 0)))
     costs = tuple(
@@ -460,10 +529,10 @@ def plan_strip_hiring(
         affordable += 1
     submittable = min(affordable, max(0, int(max_orders)))
 
-    if not any(estimate.hire_driving for estimate in estimates):
+    if not driving_total:
         stop = HireStopReason.NO_HIRE_DRIVING_WORK
     elif wanted == 0:
-        stop = HireStopReason.COVERED if useful_indices else HireStopReason.TIME
+        stop = HireStopReason.COVERED
     elif submittable < affordable:
         # The per-turn market-order cap, not cash, limits this submission.
         stop = HireStopReason.ORDER_CAP
@@ -478,9 +547,14 @@ def plan_strip_hiring(
         affordable_hires=affordable,
         submittable_hires=submittable,
         sequential_hire_costs=costs,
-        coverage_prefix=tuple(candidate.route_id for candidate in candidates[:target_workers]),
+        coverage_prefix=tuple(
+            estimate.route_id for estimate in estimates if estimate.hire_driving
+        ),
         route_estimates=tuple(estimates),
         cash_before_hiring=cash,
         future_action_slots=future_slots,
         stop_reason=stop,
+        hire_reason=hire_reason,
+        rows_expected_complete_with_n_workers=rows_with_n,
+        rows_expected_complete_with_n_plus_one_workers=rows_with_n_plus_one,
     )

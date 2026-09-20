@@ -524,6 +524,19 @@ def test_routine_watering_uses_default_ages_and_stable_reasons():
     assert ((1, 2), "survival_weed_prevention") in water
 
 
+def test_wheat_threshold_harvest_suppresses_same_turn_routine_water():
+    for age in (2, 3, 4):
+        board = [[None] * 10 for _ in range(10)]
+        board[0][0] = plant("WHEAT", planted_day=15 - age, yield_units=3)
+        result = build_strip_work_plan(
+            obs(board, day=15, step=360), plan(crop_targets={"WHEAT": 1})
+        )
+        assert [item.kind for item in kinds(result, "HARVEST") if item.tile == (0, 0)] == [
+            "HARVEST"
+        ]
+        assert not [item for item in kinds(result, "WATER") if item.tile == (0, 0)]
+
+
 def test_wheat_harvest_uses_authoritative_terminal_exception():
     board = [["LOCKED"] * 5 + [None] * 5 for _ in range(10)]
     board[0][0] = plant("WHEAT", planted_day=0, yield_units=0)

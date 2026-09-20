@@ -18,6 +18,7 @@ __all__ = [
     "HorizontalRouteCandidate",
     "RouteAssignment",
     "RoutePhase",
+    "RouteSegment",
     "StripRoute",
     "WorkerId",
     "assign_horizontal_routes",
@@ -63,6 +64,26 @@ class HorizontalRouteCandidate:
             raise ValueError("Packet 2 horizontal routes must own exactly five tiles")
 
 
+@dataclass(frozen=True)
+class RouteSegment:
+    """One deterministic horizontal row in a worker's day-local chain."""
+
+    segment_id: str
+    traversal: tuple[tuple[int, int], ...]
+    entry_tile: tuple[int, int]
+    entry_distance: int
+    source_shape: str = "horizontal_quadrant_row"
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "segment_id": self.segment_id,
+            "traversal": [list(tile) for tile in self.traversal],
+            "entry_tile": list(self.entry_tile),
+            "entry_distance": self.entry_distance,
+            "source_shape": self.source_shape,
+        }
+
+
 @dataclass
 class StripRoute:
     """One owned route and its small, day-local execution state."""
@@ -95,6 +116,9 @@ class StripRoute:
     continuation_item_id: str | None = None
     continuation_tile: tuple[int, int] | None = None
     continuation_next_kind: str | None = None
+    segments: tuple[RouteSegment, ...] = ()
+    completed_segment_ids: set[str] = field(default_factory=set)
+    transferred_segment_ids: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not self.owned_tiles:
@@ -109,6 +133,18 @@ class StripRoute:
             raise ValueError("entry_tile must be the first traversal tile")
         if not 0 <= self.cursor < len(self.traversal):
             raise ValueError("route cursor must address a traversal tile")
+        if not self.segments:
+            self.segments = (
+                RouteSegment(
+                    self.route_id,
+                    self.traversal,
+                    self.entry_tile,
+                    self.entry_distance,
+                    self.source_shape or "horizontal_quadrant_row",
+                ),
+            )
+        if len({segment.segment_id for segment in self.segments}) != len(self.segments):
+            raise ValueError("route segment ids must be unique")
 
     @property
     def completed(self) -> bool:
@@ -133,6 +169,10 @@ class StripRoute:
             "phase": self.phase.value,
             "completed": self.completed,
             "source_shape": self.source_shape,
+            "segments": [segment.to_json_dict() for segment in self.segments],
+            "assigned_segment_ids": [segment.segment_id for segment in self.segments],
+            "completed_segment_ids": sorted(self.completed_segment_ids),
+            "transferred_segment_ids": sorted(self.transferred_segment_ids),
             "workload_interactions": self.workload_interactions,
             "actions_performed": dict(sorted(self.actions_performed.items())),
             "movement_turns": self.movement_turns,
@@ -200,39 +240,80 @@ def assign_horizontal_routes(
     *,
     assignment_hour: int,
 ) -> RouteAssignment:
-    """Assign stable route[i] to worker[i], choosing the nearest endpoint.
+    """Pack sorted row segments into stable worker-owned chains.
 
-    Manhattan ties choose the left endpoint (the lower canonical x value).
+    Segment count is the primary load key, followed by travel from the
+    worker's current/last endpoint, then worker index.  Manhattan ties choose
+    the left endpoint (the lower canonical x value).
     """
 
     ordered_candidates = tuple(sorted(candidates, key=lambda item: item.row_key))
     ordered_workers = tuple(sorted(worker_positions))
+    grouped: dict[WorkerId, list[tuple[HorizontalRouteCandidate, RouteSegment]]] = {
+        worker: [] for worker in ordered_workers
+    }
+    endpoints = dict(worker_positions)
+    for candidate in ordered_candidates:
+        if not ordered_workers:
+            break
+        choices: list[tuple[int, int, int, WorkerId, RouteSegment]] = []
+        for worker in ordered_workers:
+            position = endpoints[worker]
+            left_to_right = candidate.owned_tiles
+            left, right = left_to_right[0], left_to_right[-1]
+            left_distance = abs(position[0] - left[0]) + abs(position[1] - left[1])
+            right_distance = abs(position[0] - right[0]) + abs(position[1] - right[1])
+            traversal = left_to_right if left_distance <= right_distance else tuple(
+                reversed(left_to_right)
+            )
+            segment = RouteSegment(
+                candidate.route_id,
+                traversal,
+                traversal[0],
+                min(left_distance, right_distance),
+                candidate.source_shape,
+            )
+            choices.append((len(grouped[worker]), segment.entry_distance, worker.index, worker, segment))
+        _, _, _, worker, segment = min(choices)
+        candidate = next(item for item in ordered_candidates if item.route_id == segment.segment_id)
+        grouped[worker].append((candidate, segment))
+        endpoints[worker] = segment.traversal[-1]
+
     routes: list[StripRoute] = []
-    for worker, candidate in zip(ordered_workers, ordered_candidates):
-        position = worker_positions[worker]
-        left_to_right = candidate.owned_tiles
-        left, right = left_to_right[0], left_to_right[-1]
-        left_distance = abs(position[0] - left[0]) + abs(position[1] - left[1])
-        right_distance = abs(position[0] - right[0]) + abs(position[1] - right[1])
-        traversal = left_to_right if left_distance <= right_distance else tuple(
-            reversed(left_to_right)
+    assigned_ids: set[str] = set()
+    for worker in ordered_workers:
+        assigned = tuple(grouped[worker])
+        if not assigned:
+            continue
+        segments = tuple(segment for _, segment in assigned)
+        traversal = tuple(tile for segment in segments for tile in segment.traversal)
+        owned_tiles = tuple(tile for candidate, _ in assigned for tile in candidate.owned_tiles)
+        route_id = segments[0].segment_id if len(segments) == 1 else (
+            f"CHAIN:{worker.label}:" + ",".join(segment.segment_id for segment in segments)
         )
+        assigned_ids.update(segment.segment_id for segment in segments)
         routes.append(
             StripRoute(
-                route_id=candidate.route_id,
-                owned_tiles=candidate.owned_tiles,
+                route_id=route_id,
+                owned_tiles=owned_tiles,
                 traversal=traversal,
                 owner=worker,
-                entry_tile=traversal[0],
-                entry_distance=min(left_distance, right_distance),
+                entry_tile=segments[0].entry_tile,
+                entry_distance=segments[0].entry_distance,
                 assignment_hour=assignment_hour,
-                workload_interactions=candidate.workload_interactions,
-                source_shape=candidate.source_shape,
+                workload_interactions=sum(
+                    candidate.workload_interactions for candidate, _ in assigned
+                ),
+                source_shape=segments[0].source_shape,
+                segments=segments,
             )
         )
-    assigned_count = len(routes)
     return RouteAssignment(
         routes=tuple(routes),
-        unassigned=ordered_candidates[assigned_count:],
-        idle_workers=ordered_workers[assigned_count:],
+        unassigned=tuple(
+            candidate
+            for candidate in ordered_candidates
+            if candidate.route_id not in assigned_ids
+        ),
+        idle_workers=tuple(worker for worker in ordered_workers if not grouped[worker]),
     )

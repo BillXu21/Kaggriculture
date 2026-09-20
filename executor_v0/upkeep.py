@@ -31,7 +31,17 @@ def wheat_harvest_eligibility(
         return True, "expiry"
 
     data = CROPS["WHEAT"]
-    age = day - int(tile["planted_day"])
+    planted_day = tile.get("planted_day")
+    if planted_day is not None:
+        age = day - int(planted_day)
+    else:
+        derived = tile.get("derived") or {}
+        age_value = derived.get("age_days")
+        if age_value is None:
+            age_value = tile.get("age")
+        if age_value is None:
+            return True, "no_further_growth"
+        age = int(age_value)
     room = held < data["max_yield"]
     useful_today = (
         room and tile.get("watered_today") is not True
