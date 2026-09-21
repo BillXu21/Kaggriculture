@@ -360,6 +360,7 @@ class StripExecutorController:
             protected_reservations=protected,
             purchases_enabled=False,
             retry_animal_purchases=True,
+            retry_replacement_seed_purchases=True,
             aggressive_sell_all=self.config.aggressive_sell_all,
         )
         self._market_state.latest_diagnostics = market_plan.diagnostics

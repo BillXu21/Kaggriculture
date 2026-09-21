@@ -153,6 +153,20 @@ def test_retained_crop_preferred_slot_is_reserved_without_duplicate_plant():
         "CARROT": (4, 4),
     }
     assert len({item.tile for item in plants}) == len(plants)
+    assert next(item for item in plants if item.crop == "WHEAT").source == (
+        "retained_crop_maintenance"
+    )
+
+
+def test_preferred_tomato_slot_does_not_get_retained_seed_retry_provenance():
+    result = build_strip_work_plan(
+        obs(seeds={"TOMATO": 1}),
+        plan(crop_targets={"TOMATO": 1}),
+        preferred_crop_slots={"TOMATO": ((0, 0),)},
+    )
+    planting = next(item for item in result.items if item.kind == "PLANT")
+    assert planting.tile == (0, 0)
+    assert planting.source == "crop_reconciliation"
 
 
 def test_seed_observation_unlocks_only_the_affordable_crop_stage():

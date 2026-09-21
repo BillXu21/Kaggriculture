@@ -39,9 +39,9 @@ ANIMALS = ("GOOSE", "COW", "SHEEP")
 PRODUCTS = (*CROPS, "EGG", "MILK", "WOOL", "FERTILIZER")
 
 
-def plan() -> DailyPlan:
+def plan(*, crop_targets=None) -> DailyPlan:
     return DailyPlan.create(
-        crop_targets={crop: 0 for crop in CROPS},
+        crop_targets={crop: 0 for crop in CROPS} | dict(crop_targets or {}),
         animal_targets={animal: 0 for animal in ANIMALS},
         land_count=1,
         fertilizer_by_crop={crop: 0 for crop in CROPS},
@@ -53,8 +53,18 @@ def plan() -> DailyPlan:
     )
 
 
-def observation(*, hour=0, farmer=(0, 0), hands=(), inventories=None, day=3):
+def observation(
+    *,
+    hour=0,
+    farmer=(0, 0),
+    hands=(),
+    inventories=None,
+    day=3,
+    money=0,
+    seeds=None,
+):
     farm = {
+        "money": money,
         "farmer": [farmer[0], farmer[1]],
         "hands": [[x, y] for x, y in hands],
         "tiles": [[None] * 10 for _ in range(10)],
@@ -68,7 +78,7 @@ def observation(*, hour=0, farmer=(0, 0), hands=(), inventories=None, day=3):
         "farms": [farm, copy.deepcopy(farm)],
         "private": {
             "shed": {},
-            "seeds": {"WHEAT": 10},
+            "seeds": seeds if seeds is not None else {"WHEAT": 10},
             "inventories": inventories if inventories is not None else [{}, {}],
         },
     }
@@ -986,6 +996,83 @@ def test_crop_chain_continuation_runs_before_departure():
     assert result.farmer_action == ("EAST",)
     assert route is not None
     assert (0, 0) not in route.passed_tiles
+
+
+@pytest.mark.parametrize("crop", ("WHEAT", "CARROT", "MELON"))
+def test_finalized_retained_harvest_retries_seed_before_plant_and_water(crop):
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        harvest_id = "HARVEST:0,0"
+        plant_id = f"PLANT:{crop}:0,0"
+        if hour == 0:
+            items = (work_item("HARVEST", (0, 0), crop=crop, source="routine_harvest"),)
+        elif hour < 3:
+            items = (
+                work_item(
+                    "PLANT",
+                    (0, 0),
+                    crop=crop,
+                    status=(
+                        WorkStatus.BLOCKED
+                        if hour == 1
+                        else WorkStatus.READY
+                    ),
+                    block_reason=(
+                        BlockReason.MISSING_GLOBAL_RESOURCE if hour == 1 else None
+                    ),
+                    required_supplies=(SupplyRequirement(crop, 1, "global_seed"),),
+                    depends_on=(harvest_id,) if hour == 1 else (),
+                    item_id=plant_id,
+                    source="retained_crop_maintenance",
+                ),
+                work_item(
+                    "WATER",
+                    (0, 0),
+                    crop=crop,
+                    status=(
+                        WorkStatus.BLOCKED
+                        if hour == 1 or hour == 2
+                        else WorkStatus.READY
+                    ),
+                    block_reason=(
+                        BlockReason.DEPENDENCY_BLOCKED
+                        if hour == 1 or hour == 2
+                        else None
+                    ),
+                    depends_on=(plant_id,),
+                    item_id="WATER:0,0",
+                ),
+            )
+        else:
+            items = (work_item("WATER", (0, 0), crop=crop, item_id="WATER:0,0"),)
+        return fake_plan(items)
+
+    target = plan(crop_targets={crop: 1})
+    seeds = {crop: 0}
+    controller = StripExecutorController(work_builder=builder)
+
+    harvested = controller.act(
+        observation(hour=0, money=1000, seeds=seeds, farmer=(0, 0)), target
+    )
+    assert harvested.farmer_action == ("HARVEST",)
+    assert harvested.market_actions == ()
+
+    purchased = controller.act(
+        observation(hour=1, money=1000, seeds=seeds, farmer=(0, 0)), target
+    )
+    assert purchased.farmer_action == ("PASS",)
+    assert purchased.market_actions == (("BUY_SEED", crop, 1),)
+
+    planted = controller.act(
+        observation(hour=2, money=1000, seeds={crop: 1}, farmer=(0, 0)), target
+    )
+    assert planted.farmer_action == ("PLANT", crop)
+
+    watered = controller.act(
+        observation(hour=3, money=1000, seeds={crop: 0}, farmer=(0, 0)), target
+    )
+    assert watered.farmer_action == ("WATER",)
 
 
 def test_late_crop_successor_reopens_only_the_previous_owned_tile():

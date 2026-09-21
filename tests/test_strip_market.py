@@ -67,7 +67,17 @@ def work(*items: WorkItem) -> StripWorkPlan:
     )
 
 
-def item(kind: str, *, crop=None, animal=None, product=None, quantity=1, supplies=(), tile=None):
+def item(
+    kind: str,
+    *,
+    crop=None,
+    animal=None,
+    product=None,
+    quantity=1,
+    supplies=(),
+    tile=None,
+    source="strip_forecast",
+):
     return WorkItem(
         id=f"{kind}:{crop or animal or product or quantity}",
         kind=kind,
@@ -77,6 +87,7 @@ def item(kind: str, *, crop=None, animal=None, product=None, quantity=1, supplie
         quantity=quantity,
         tile=tile,
         required_supplies=tuple(supplies),
+        source=source,
     )
 
 
@@ -117,6 +128,9 @@ def plan_market(
     max_orders=10,
     protected=None,
     aggressive=False,
+    purchases_enabled=True,
+    retry_animal_purchases=False,
+    retry_replacement_seed_purchases=False,
 ):
     return build_market_turn_plan(
         obs,
@@ -126,6 +140,9 @@ def plan_market(
         shed_capacity=capacity,
         max_orders=max_orders,
         protected_reservations=protected,
+        purchases_enabled=purchases_enabled,
+        retry_animal_purchases=retry_animal_purchases,
+        retry_replacement_seed_purchases=retry_replacement_seed_purchases,
         aggressive_sell_all=aggressive,
     )
 
@@ -500,6 +517,161 @@ def test_partial_seed_realization_keeps_remaining_plant_shortage_visible():
     )
     # 3 demand - 1 observed seed = 2, not 1.
     assert result.orders == (("BUY_SEED", "WHEAT", 2),)
+
+
+def test_finalized_retry_buys_only_marked_retained_plant_shortage():
+    result = plan_market(
+        observation(money=1000, seeds={"WHEAT": 0}),
+        daily_plan(),
+        work(
+            item(
+                "PLANT",
+                crop="WHEAT",
+                tile=(0, 0),
+                quantity=3,
+                supplies=(SupplyRequirement("WHEAT", 3, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+            item(
+                "PLANT",
+                crop="WHEAT",
+                tile=(0, 1),
+                supplies=(SupplyRequirement("WHEAT", 1, "global_seed"),),
+            ),
+        ),
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    assert result.orders == (("BUY_SEED", "WHEAT", 3),)
+    assert result.diagnostics["buy_demand"] == {"BUY_SEED:WHEAT": 3}
+
+
+def test_finalized_retry_uses_authoritative_seed_inventory_and_crop_order():
+    result = plan_market(
+        observation(
+            money=1000,
+            seeds={"WHEAT": 2, "MELON": 0},
+        ),
+        daily_plan(),
+        work(
+            item(
+                "PLANT",
+                crop="MELON",
+                tile=(0, 1),
+                quantity=2,
+                supplies=(SupplyRequirement("MELON", 2, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+            item(
+                "PLANT",
+                crop="WHEAT",
+                tile=(0, 0),
+                quantity=4,
+                supplies=(SupplyRequirement("WHEAT", 4, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+        ),
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    assert result.orders == (
+        ("BUY_SEED", "WHEAT", 2),
+        ("BUY_SEED", "MELON", 2),
+    )
+
+
+def test_finalized_seed_retry_respects_market_order_cap():
+    result = plan_market(
+        observation(money=1000),
+        daily_plan(),
+        work(
+            item(
+                "PLANT",
+                crop="WHEAT",
+                tile=(0, 0),
+                supplies=(SupplyRequirement("WHEAT", 1, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+            item(
+                "PLANT",
+                crop="MELON",
+                tile=(0, 1),
+                supplies=(SupplyRequirement("MELON", 1, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+        ),
+        max_orders=1,
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    assert result.orders == (("BUY_SEED", "WHEAT", 1),)
+    assert result.diagnostics["market_blocked"]["BUY_SEED:MELON"]["block_reason"] == "ORDER_CAP"
+
+
+def test_finalized_retry_excludes_unresolved_and_non_retained_crops():
+    result = plan_market(
+        observation(money=1000),
+        daily_plan(),
+        work(
+            item(
+                "PLANT",
+                crop="WHEAT",
+                supplies=(SupplyRequirement("WHEAT", 3, "global_seed"),),
+                source="crop_unresolved",
+            ),
+            item(
+                "PLANT",
+                crop="TOMATO",
+                tile=(0, 0),
+                supplies=(SupplyRequirement("TOMATO", 1, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+        ),
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    assert result.orders == ()
+    assert result.diagnostics["buy_demand"] == {}
+
+
+def test_finalized_seed_retry_is_bounded_when_cash_is_insufficient():
+    state = MarketBootstrapState()
+    forecast = work(
+        item(
+            "PLANT",
+            crop="WHEAT",
+            tile=(0, 0),
+            supplies=(SupplyRequirement("WHEAT", 1, "global_seed"),),
+            source="retained_crop_maintenance",
+        )
+    )
+    first = plan_market(
+        observation(money=0),
+        daily_plan(),
+        forecast,
+        state=state,
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    second = plan_market(
+        observation(money=0, step=1),
+        daily_plan(),
+        forecast,
+        state=state,
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    third = plan_market(
+        observation(money=0, step=2),
+        daily_plan(),
+        forecast,
+        state=state,
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    assert first.orders == second.orders == third.orders == ()
+    assert first.diagnostics["market_blocked"]["BUY_SEED:WHEAT"]["block_reason"] == "CASH"
+    assert third.diagnostics["market_blocked"]["BUY_SEED:WHEAT"]["block_reason"] == "FAILED"
 
 
 def test_fully_realized_purchase_produces_no_further_buy():

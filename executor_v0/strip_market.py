@@ -30,6 +30,7 @@ __all__ = [
 ]
 
 _AGGRESSIVE_SELL_PRODUCTS = tuple(PRODUCTS)
+_RETAINED_ONE_SHOT_CROPS = frozenset(("WHEAT", "CARROT", "MELON"))
 
 
 class MarketBlockReason(StrEnum):
@@ -146,6 +147,7 @@ def build_market_turn_plan(
     protected_reservations: Mapping[str, int] | None = None,
     purchases_enabled: bool = True,
     retry_animal_purchases: bool = False,
+    retry_replacement_seed_purchases: bool = False,
     aggressive_sell_all: bool = False,
 ) -> MarketTurnPlan:
     """Build one deterministic market prefix from the observed state.
@@ -239,6 +241,7 @@ def build_market_turn_plan(
         intents.append(MarketIntent("BUY_PRODUCT:WHEAT", "BUY_PRODUCT", "WHEAT", wheat_shortage))
 
     seed_demand = {crop: 0 for crop in CROP_ORDER}
+    replacement_seed_demand = {crop: 0 for crop in CROP_ORDER}
     for item in work_plan.items:
         # Tile-less unresolved crop targets intentionally carry no speculative
         # seed demand; only spatially represented PLANT work can trigger a
@@ -248,9 +251,19 @@ def build_market_turn_plan(
         for requirement in item.required_supplies:
             if requirement.scope == "global_seed" and requirement.item in seed_demand:
                 seed_demand[requirement.item] += requirement.quantity
+                if (
+                    item.source == "retained_crop_maintenance"
+                    and item.crop in _RETAINED_ONE_SHOT_CROPS
+                ):
+                    replacement_seed_demand[requirement.item] += requirement.quantity
     for crop in CROP_ORDER:
         # Observed seeds are authoritative and already include realized buys.
-        shortage = max(0, seed_demand[crop] - seeds.get(crop, 0))
+        demand = (
+            replacement_seed_demand[crop]
+            if not purchases_enabled and retry_replacement_seed_purchases
+            else seed_demand[crop]
+        )
+        shortage = max(0, demand - seeds.get(crop, 0))
         if shortage:
             intents.append(MarketIntent(f"BUY_SEED:{crop}", "BUY_SEED", crop, shortage))
 
@@ -309,13 +322,29 @@ def build_market_turn_plan(
             submitted_sell_by_product[intent.item or ""] = quantity
             continue
 
-        if not purchases_enabled and not (
+        retry_allowed = (
             retry_animal_purchases and intent.kind == "BUY_ANIMAL"
-        ):
+        ) or (
+            retry_replacement_seed_purchases and intent.kind == "BUY_SEED"
+        )
+        if not purchases_enabled and not retry_allowed:
             blocked[intent.key] = _blocked(MarketBlockReason.FAILED, intent.requested)
             continue
         quantity, reason = ledger.affordable_quantity(intent)
         if quantity <= 0:
+            if (
+                not purchases_enabled
+                and retry_replacement_seed_purchases
+                and intent.kind == "BUY_SEED"
+                and reason in {
+                    MarketBlockReason.CASH,
+                    MarketBlockReason.SHED_CAPACITY,
+                }
+            ):
+                attempts = state.no_progress_counts.get(intent.key, 0) + 1
+                state.no_progress_counts[intent.key] = attempts
+                if attempts >= 2:
+                    state.failed_intents.add(intent.key)
             blocked[intent.key] = _blocked(reason or MarketBlockReason.CASH, intent.requested)
             continue
         if intent.kind == "BUY_LAND":

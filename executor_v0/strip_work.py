@@ -70,6 +70,9 @@ __all__ = [
 ]
 
 
+_RETAINED_ONE_SHOT_CROPS = frozenset(("WHEAT", "CARROT", "MELON"))
+
+
 class WorkStatus(StrEnum):
     READY = "READY"
     BLOCKED = "BLOCKED"
@@ -870,6 +873,10 @@ def build_strip_work_plan(
     cfg = _as_config(config)
     chosen_seat = _seat_for(obs, cfg, acting_seat, seat)
     board, unlocked, supply, day, money = _state(obs, chosen_seat)
+    preferred_slots = {
+        str(crop): tuple((int(coord[0]), int(coord[1])) for coord in coords)
+        for crop, coords in (preferred_crop_slots or {}).items()
+    }
     step = resolve_observation_step(obs)
     current_crops, current_animals = _unlocked_counts(board, unlocked)
     target_crops, target_animals = plan.crop_targets_dict, plan.animal_targets_dict
@@ -883,7 +890,7 @@ def build_strip_work_plan(
         crop_targets=target_crops,
         animals_needed=animal_need,
         anchor=cfg.anchor,
-        preferred_crop_slots=preferred_crop_slots,
+        preferred_crop_slots=preferred_slots,
     )
     builder = _Builder(supply, cfg)
     current_land = len(unlocked)
@@ -1063,7 +1070,12 @@ def build_strip_work_plan(
             crop=intent.crop,
             depends_on=ids,
             requirements=(SupplyRequirement(intent.crop, 1, "global_seed"),),
-            source="crop_reconciliation",
+            source=(
+                "retained_crop_maintenance"
+                if intent.crop in _RETAINED_ONE_SHOT_CROPS
+                and intent.coord in preferred_slots.get(intent.crop, ())
+                else "crop_reconciliation"
+            ),
         )
         ids.append(plant_id)
         water_id = f"WATER:{y},{x}"
