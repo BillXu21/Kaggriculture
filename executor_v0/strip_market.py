@@ -145,6 +145,7 @@ def build_market_turn_plan(
     market_params: Mapping[str, Mapping[str, Any]] | None = None,
     protected_reservations: Mapping[str, int] | None = None,
     purchases_enabled: bool = True,
+    retry_animal_purchases: bool = False,
     aggressive_sell_all: bool = False,
 ) -> MarketTurnPlan:
     """Build one deterministic market prefix from the observed state.
@@ -308,7 +309,9 @@ def build_market_turn_plan(
             submitted_sell_by_product[intent.item or ""] = quantity
             continue
 
-        if not purchases_enabled:
+        if not purchases_enabled and not (
+            retry_animal_purchases and intent.kind == "BUY_ANIMAL"
+        ):
             blocked[intent.key] = _blocked(MarketBlockReason.FAILED, intent.requested)
             continue
         quantity, reason = ledger.affordable_quantity(intent)

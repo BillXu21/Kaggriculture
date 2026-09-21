@@ -612,6 +612,74 @@ def test_completed_route_passes_and_late_work_is_not_revisited():
     assert later.farmer_action == ("PASS",)
 
 
+def test_observed_animal_purchase_revisits_a_passed_place_once():
+    place_id = "PLACE:SHEEP:0,0"
+
+    def builder(obs, daily_plan, **kwargs):
+        del daily_plan, kwargs
+        private = obs.get("private") or {}
+        shed = private.get("shed") or {}
+        inventory = (private.get("inventories") or [{}])[0]
+        observed = bool(shed.get("SHEEP") or inventory.get("SHEEP"))
+        place = WorkItem(
+            id=place_id,
+            kind="PLACE",
+            animal="SHEEP",
+            tile=(0, 0),
+            row_key=row_key_for_tile((0, 0)),
+            required_supplies=((SupplyRequirement("SHEEP", 1),) if observed else ()),
+            status=WorkStatus.READY if observed else WorkStatus.BLOCKED,
+            block_reason=None if observed else BlockReason.MISSING_PURCHASE,
+        )
+        if observed:
+            return fake_plan((place,))
+        return fake_plan((
+            WorkItem(id="BUY_ANIMAL:SHEEP:1", kind="BUY_ANIMAL", animal="SHEEP"),
+            place,
+        ))
+
+    controller = StripExecutorController(work_builder=builder)
+    position = (0, 0)
+    shed: dict[str, int] = {}
+    inventory: dict[str, int] = {}
+    purchase_observed = False
+    saw_late_place = False
+    placed = False
+    for step in range(24):
+        current = observation(
+            hour=step,
+            farmer=(position[1], position[0]),
+            inventories=[inventory, {}],
+        )
+        current["farms"][0]["money"] = 0 if step == 0 else 500
+        current["private"]["shed"] = shed
+        result = controller.act(current, plan())
+        route = result.diagnostics["route_diagnostics"][0]
+        saw_late_place |= place_id in route["late_work_ids"]
+        if result.market_actions and not purchase_observed:
+            purchase_observed = True
+            shed = {"SHEEP": 1}
+        if result.farmer_action == ("PICKUP", "SHEEP", 1):
+            shed = {}
+            inventory = {"SHEEP": 1}
+        if result.farmer_action == ("PLACE", "SHEEP", 1):
+            placed = True
+            break
+        y, x = position
+        if result.farmer_action == ("NORTH",):
+            y -= 1
+        elif result.farmer_action == ("SOUTH",):
+            y += 1
+        elif result.farmer_action == ("EAST",):
+            x += 1
+        elif result.farmer_action == ("WEST",):
+            x -= 1
+        position = (y, x)
+
+    assert saw_late_place
+    assert placed
+
+
 def test_day_boundary_discards_old_cursor_and_assignment():
     def builder(obs, plan, **kwargs):
         del plan, kwargs

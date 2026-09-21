@@ -12,6 +12,7 @@ from executor_v0.strip_work import (
     WorkDiagnostics,
     WorkItem,
     RowSummary,
+    build_strip_work_plan,
     row_key_for_tile,
 )
 from replay_daily.constants import PRODUCTS
@@ -21,6 +22,7 @@ def daily_plan(
     *,
     sells: dict[str, dict[int, int]] | None = None,
     crop_targets: dict[str, int] | None = None,
+    animal_targets: dict[str, int] | None = None,
 ) -> DailyPlan:
     quantities = {
         product: {anchor: 0 for anchor in (0, 4, 8, 12, 16, 20)}
@@ -31,7 +33,8 @@ def daily_plan(
     return DailyPlan.create(
         crop_targets={crop: 0 for crop in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")}
         | dict(crop_targets or {}),
-        animal_targets={animal: 0 for animal in ("GOOSE", "COW", "SHEEP")},
+        animal_targets={animal: 0 for animal in ("GOOSE", "COW", "SHEEP")}
+        | dict(animal_targets or {}),
         land_count=1,
         fertilizer_by_crop={crop: 0 for crop in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")},
         care_by_animal={animal: 0 for animal in ("GOOSE", "COW", "SHEEP")},
@@ -77,7 +80,7 @@ def item(kind: str, *, crop=None, animal=None, product=None, quantity=1, supplie
     )
 
 
-def observation(*, money=0, hour=0, step=None, shed=None, seeds=None, inventories=None, capacity=100, farmer=(0, 0)):
+def observation(*, money=0, hour=0, step=None, day=1, shed=None, seeds=None, inventories=None, capacity=100, farmer=(0, 0), tiles=None):
     farm = {
         "money": money,
         "unlocked_quadrants": ["NW"],
@@ -85,10 +88,12 @@ def observation(*, money=0, hour=0, step=None, shed=None, seeds=None, inventorie
         "hands": [],
         "tiles": [[None] * 10 for _ in range(10)],
     }
+    for (y, x), tile in (tiles or {}).items():
+        farm["tiles"][y][x] = tile
     prices = {product: 25 for product in PRODUCTS}
     inventory = {product: 10000 for product in PRODUCTS}
     return {
-        "day": 1,
+        "day": day,
         "hour": hour,
         "step": hour if step is None else step,
         "farms": [farm, copy.deepcopy(farm)],
@@ -258,6 +263,53 @@ def test_controller_keeps_workers_passed_until_animal_purchase_is_observed():
     assert second.diagnostics["market_diagnostics"]["buy_observed"]["BUY_ANIMAL:COW"] == 1
 
 
+def test_escaped_sheep_reuses_empty_pasture_and_places_after_confirmed_pickup():
+    pasture = {(4, 4): {"kind": "PASTURE"}}
+    targeted = daily_plan(animal_targets={"SHEEP": 1})
+    controller = StripExecutorController()
+
+    initial = controller.act(
+        observation(money=0, farmer=(4, 4), step=0, tiles=pasture), targeted
+    )
+    assert initial.market_actions == ()
+    forecast = build_strip_work_plan(
+        observation(money=0, farmer=(4, 4), step=0, tiles=pasture), targeted
+    )
+    assert not any(item.kind.startswith("BUILD") for item in forecast.items)
+
+    affordable = controller.act(
+        observation(money=1000, farmer=(4, 4), step=1, tiles=pasture), targeted
+    )
+    assert affordable.market_actions == (("BUY_ANIMAL", "SHEEP", 1),)
+
+    observed_purchase = controller.act(
+        observation(
+            money=900,
+            shed={"SHEEP": 1},
+            farmer=(4, 4),
+            step=2,
+            tiles=pasture,
+        ),
+        targeted,
+    )
+    assert observed_purchase.farmer_action == ("PICKUP", "SHEEP", 1)
+    assert observed_purchase.diagnostics["route_diagnostics"][0]["supply_plan"][
+        "demand"
+    ] == {"SHEEP": 1}
+
+    placed = controller.act(
+        observation(
+            money=900,
+            farmer=(4, 4),
+            inventories=[{"SHEEP": 1}],
+            step=3,
+            tiles=pasture,
+        ),
+        targeted,
+    )
+    assert placed.farmer_action == ("PLACE", "SHEEP", 1)
+
+
 def test_controller_refreshes_blocked_plant_after_observed_seed_purchase():
     targeted = daily_plan(crop_targets={"WHEAT": 1})
     controller = StripExecutorController()
@@ -304,7 +356,7 @@ def test_controller_bounds_no_progress_market_retries_before_finalization():
     assert "BUY_LAND:NE" in third.diagnostics["market_diagnostics"]["market_no_progress_failures"]
 
 
-def test_later_sell_cash_does_not_reopen_procurement_after_finalization():
+def test_later_cash_retries_persistent_animal_deficit_after_finalization():
     def builder(obs, plan, **kwargs):
         del obs, plan, kwargs
         return work(WorkItem(id="BUY_ANIMAL:COW:1", kind="BUY_ANIMAL", animal="COW"))
@@ -314,7 +366,19 @@ def test_later_sell_cash_does_not_reopen_procurement_after_finalization():
     assert first.market_actions == ()
     assert first.diagnostics["routes_finalized"] is True
     later = controller.act(observation(money=500, step=1), daily_plan())
-    assert later.market_actions == ()
+    assert later.market_actions == (("BUY_ANIMAL", "COW", 1),)
+
+
+def test_failed_animal_purchase_does_not_poison_the_next_day():
+    def builder(obs, plan, **kwargs):
+        del obs, plan, kwargs
+        return work(WorkItem(id="BUY_ANIMAL:COW:1", kind="BUY_ANIMAL", animal="COW"))
+
+    controller = StripExecutorController(work_builder=builder)
+    first = controller.act(observation(day=1, money=0, step=0), daily_plan())
+    assert first.market_actions == ()
+    later = controller.act(observation(day=2, money=500, step=24), daily_plan())
+    assert later.market_actions == (("BUY_ANIMAL", "COW", 1),)
 
 
 def test_land_unlock_is_an_observation_barrier_before_ne_route_generation():

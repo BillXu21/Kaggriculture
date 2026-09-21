@@ -124,6 +124,7 @@ class StripExecutorController:
         self._hire_submitted = 0
         self._hire_observed = 0
         self._hire_failures = 0
+        self._animal_revisit_tiles: dict[str, tuple[int, int]] = {}
         self._observation_for_diagnostics: Mapping[str, Any] = {}
 
     @property
@@ -343,6 +344,7 @@ class StripExecutorController:
         else:
             # Already finalized: still reconcile each new observation exactly once.
             self._reconcile_market_observation(obs)
+            self._refresh_route_supply_plans(obs, work_plan)
         protected = self._observed_reservations(
             obs, self._outstanding_reservations()
         )
@@ -357,9 +359,15 @@ class StripExecutorController:
             market_params=self._market_params(obs),
             protected_reservations=protected,
             purchases_enabled=False,
+            retry_animal_purchases=True,
             aggressive_sell_all=self.config.aggressive_sell_all,
         )
         self._market_state.latest_diagnostics = market_plan.diagnostics
+
+        if any(order and str(order[0]).startswith("BUY_") for order in market_plan.orders):
+            # Wait for the authoritative purchase observation before allowing
+            # routes to consume a newly refreshed PLACE successor.
+            return self._bootstrap_pass_result(obs, market_plan.orders)
 
         positions = self._worker_positions(obs)
         self._latest_inventories = {
@@ -413,6 +421,7 @@ class StripExecutorController:
         self._hire_submitted = 0
         self._hire_observed = 0
         self._hire_failures = 0
+        self._animal_revisit_tiles = {}
         self._observation_for_diagnostics = obs
         self._daily = {"day": self._day, "assignment_hour": int(obs.get("hour", 0))}
 
@@ -626,6 +635,68 @@ class StripExecutorController:
             preferred_crop_slots=preferred_crop_slots,
         )
 
+    def _refresh_route_supply_plans(
+        self, obs: Mapping[str, Any], work_plan: StripWorkPlan
+    ) -> None:
+        """Refresh reservations when observation creates new inventory work.
+
+        A purchase is not part of the route forecast until it is observed in
+        the shed.  The corresponding PLACE then gains an inventory
+        requirement, so the frozen Packet 3 ledger must acquire that new
+        demand without discarding already confirmed pickup progress.
+        """
+        if not self._routes:
+            return
+        positions = self._worker_positions(obs)
+        inventories = {
+            worker: self._worker_inventory(obs, worker) for worker in positions
+        }
+        plans = build_route_supply_plans(
+            self._routes.values(),
+            work_plan,
+            inventories,
+            ((obs.get("private") or {}).get("shed") or {}),
+            positions,
+        )
+        for route, refreshed in zip(self._routes.values(), plans):
+            old = self._supply_plans.get(route.route_id)
+            old_demand = dict(old.demand) if old is not None else {}
+            new_demand = dict(refreshed.demand)
+            added = any(
+                new_demand.get(item, 0) > old_demand.get(item, 0)
+                for item in new_demand
+            )
+            self._supply_plans[route.route_id] = refreshed
+            if not added or not refreshed.requires_pickup:
+                continue
+            state = self._supply_states.setdefault(
+                route.route_id, RouteSupplyState()
+            )
+            if state.pending is None:
+                route.phase = RoutePhase.PREPARE_SUPPLIES
+                route.completion_hour = None
+
+    def _schedule_animal_revisit(
+        self, route: StripRoute, work_plan: StripWorkPlan
+    ) -> None:
+        """Schedule at most one bounded revisit for a late PLACE successor."""
+        if route.route_id in self._animal_revisit_tiles:
+            return
+        passed = self._passed_work.get(route.route_id, {})
+        ready = sorted(
+            (
+                item
+                for item in work_plan.items
+                if item.kind == "PLACE"
+                and item.status == WorkStatus.READY
+                and item.id in route.late_work_ids
+                and item.id in passed
+            ),
+            key=lambda item: item.id,
+        )
+        if ready:
+            self._animal_revisit_tiles[route.route_id] = ready[0].tile
+
     def _worker_positions(self, obs: Mapping[str, Any]) -> dict[WorkerId, tuple[int, int]]:
         farm = obs["farms"][self.config.acting_seat]
         raw_positions = [farm.get("farmer")]
@@ -674,6 +745,33 @@ class StripExecutorController:
         # Late-work observation runs every turn, including after DONE, so work
         # missed by the one-pass sweep stays visible without reopening the route.
         self._record_late_work(route, work_plan)
+        self._schedule_animal_revisit(route, work_plan)
+        revisit_tile = self._animal_revisit_tiles.get(route.route_id)
+        if revisit_tile is not None:
+            if position != revisit_tile:
+                movement = _vertical_first_step(position, revisit_tile)
+                if movement is not None:
+                    route.movement_turns += 1
+                    return movement
+                route.blocked_local_work["ANIMAL_REVISIT_BLOCKED"] = (
+                    route.blocked_local_work.get("ANIMAL_REVISIT_BLOCKED", 0) + 1
+                )
+                return ("PASS",)
+            action = self._try_local_action(route, revisit_tile, work_plan, obs)
+            if action is not None and action[0] == "PLACE":
+                route.late_work_ids.discard(
+                    next(
+                        item.id
+                        for item in work_plan.items
+                        if item.kind == "PLACE"
+                        and item.tile == revisit_tile
+                        and item.status == WorkStatus.READY
+                    )
+                )
+                self._animal_revisit_tiles.pop(route.route_id, None)
+                return action
+            if action is not None:
+                return action
         self._reopen_crop_continuation(route, position, work_plan)
         if route.phase == RoutePhase.DONE:
             if self._help_untouched_segment(route, work_plan):
@@ -866,7 +964,11 @@ class StripExecutorController:
                 None,
             )
             if batch is None:
-                route.phase = RoutePhase.TRAVEL_TO_ENTRY
+                route.phase = (
+                    RoutePhase.SWEEP
+                    if route.route_id in self._animal_revisit_tiles
+                    else RoutePhase.TRAVEL_TO_ENTRY
+                )
                 return None
             remaining = (
                 batch.quantity

@@ -612,6 +612,79 @@ def test_animal_purchase_is_blocked_by_authoritative_farm_money():
     assert place.block_reason == BlockReason.DEPENDENCY_BLOCKED
 
 
+def test_escaped_animal_deficit_reuses_empty_matching_structure():
+    board = [[None] * 10 for _ in range(10)]
+    board[4][4] = {"kind": "PASTURE"}
+    result = build_strip_work_plan(
+        obs(board, shed={}, money=1000), plan(animal_targets={"SHEEP": 1})
+    )
+    assert {item.kind for item in result.items} == {"BUY_ANIMAL", "PLACE"}
+    purchase = kinds(result, "BUY_ANIMAL")[0]
+    place = kinds(result, "PLACE")[0]
+    assert purchase.status == WorkStatus.READY
+    assert place.status == WorkStatus.BLOCKED
+    assert place.block_reason == BlockReason.MISSING_PURCHASE
+    assert place.tile == (4, 4)
+
+
+def test_observed_purchased_animal_makes_place_ready_without_duplicate_buy():
+    board = [[None] * 10 for _ in range(10)]
+    board[4][4] = {"kind": "PASTURE"}
+    result = build_strip_work_plan(
+        obs(board, shed={"SHEEP": 1}, money=1000),
+        plan(animal_targets={"SHEEP": 1}),
+    )
+    assert not kinds(result, "BUY_ANIMAL")
+    place = kinds(result, "PLACE")[0]
+    assert place.status == WorkStatus.READY
+    assert place.required_supply_dict == {"SHEEP": 1}
+
+
+def test_animal_target_counts_are_authoritative_and_structure_type_is_exact():
+    board = [[None] * 10 for _ in range(10)]
+    board[4][4] = {
+        "kind": "PASTURE", "animal": "SHEEP", "placed_day": 1,
+        "yield_units": 0, "fed_today": False, "cared_today": False,
+        "consecutive_unfed": 0,
+    }
+    retained = build_strip_work_plan(
+        obs(board, shed={"SHEEP": 1}, money=1000),
+        plan(animal_targets={"SHEEP": 1}),
+    )
+    assert not kinds(retained, "PLACE")
+    assert not kinds(retained, "BUY_ANIMAL")
+
+    wrong_structure = [[None] * 10 for _ in range(10)]
+    wrong_structure[4][4] = {"kind": "COOP"}
+    rebuilt = build_strip_work_plan(
+        obs(wrong_structure, shed={"SHEEP": 1}, money=1000),
+        plan(animal_targets={"SHEEP": 1}),
+    )
+    assert [item.kind for item in rebuilt.items] == ["BUILD_PASTURE", "PLACE"]
+
+
+def test_multiple_animal_deficits_use_canonical_deterministic_order():
+    board = [[None] * 10 for _ in range(10)]
+    board[4][4] = {"kind": "PASTURE"}
+    board[3][4] = {"kind": "PASTURE"}
+    result = build_strip_work_plan(
+        obs(board, shed={}, money=5000),
+        plan(animal_targets={"COW": 1, "SHEEP": 1}),
+    )
+    placements = [item for item in result.items if item.kind == "PLACE"]
+    assert [(item.animal, item.tile) for item in placements] == [
+        ("COW", (4, 4)), ("SHEEP", (3, 4))
+    ]
+
+
+def test_zero_animal_target_stops_replacement_attempts():
+    board = [[None] * 10 for _ in range(10)]
+    board[4][4] = {"kind": "PASTURE"}
+    result = build_strip_work_plan(obs(board, money=1000), plan())
+    assert not any(item.kind in {"BUY_ANIMAL", "PLACE", "BUILD_PASTURE"}
+                   for item in result.items)
+
+
 def test_coordinates_purity_determinism_and_json_safety():
     board = [[None] * 10 for _ in range(10)]
     board[6][3] = plant("WHEAT", planted_day=5)
