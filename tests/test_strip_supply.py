@@ -7,7 +7,11 @@ import copy
 from executor_v0.plan import DailyPlan
 from executor_v0.strip_executor import StripExecutorController
 from executor_v0.strip_routes import StripRoute, WorkerId
-from executor_v0.strip_supply import build_route_supply_plans, extract_route_supply_demand
+from executor_v0.strip_supply import (
+    RouteSupplyState,
+    build_route_supply_plans,
+    extract_route_supply_demand,
+)
 from executor_v0.strip_work import (
     RowKey,
     RowSummary,
@@ -127,22 +131,42 @@ def test_existing_inventory_is_worker_local_and_satisfies_first():
     assert plans[0].missing_stock == ()
 
 
+def test_late_observed_stock_is_reserved_from_route_demand():
+    current = work_plan(item("FEED", (0, 0), SupplyRequirement("WHEAT", 2)))
+    assigned = route("A", 0)
+    supply_plan = build_route_supply_plans(
+        [assigned],
+        current,
+        {WorkerId(0): {}},
+        {},
+        {WorkerId(0): (0, 0)},
+    )[0]
+    assert supply_plan.reserved_from_shed == ()
+    assert supply_plan.missing_stock == (("WHEAT", 2),)
+
+    controller = StripExecutorController()
+    controller._routes = {assigned.owner: assigned}
+    controller._supply_plans = {assigned.route_id: supply_plan}
+    controller._supply_states = {assigned.route_id: RouteSupplyState()}
+    assert controller._outstanding_reservations() == {"WHEAT": 2}
+
+
 def test_shared_shed_reservation_is_assignment_ordered_and_non_overbooked():
     current = work_plan(
-        item("FERTILIZE", (0, 0), SupplyRequirement("FERTILIZER", 2)),
-        item("FERTILIZE", (1, 0), SupplyRequirement("FERTILIZER", 2)),
+        item("FEED", (0, 0), SupplyRequirement("WHEAT", 2)),
+        item("FEED", (1, 0), SupplyRequirement("WHEAT", 2)),
     )
     plans = build_route_supply_plans(
         [route("A", 0, 0), route("B", 1, 1)],
         current,
         {WorkerId(0): {}, WorkerId(1): {}},
-        {"FERTILIZER": 3},
+        {"WHEAT": 3},
         {WorkerId(0): (0, 0), WorkerId(1): (1, 0)},
     )
-    assert plans[0].reserved_from_shed == (("FERTILIZER", 2),)
-    assert plans[1].reserved_from_shed == (("FERTILIZER", 1),)
-    assert plans[1].missing_stock == (("FERTILIZER", 1),)
-    assert sum(dict(plan.reserved_from_shed).get("FERTILIZER", 0) for plan in plans) == 3
+    assert plans[0].reserved_from_shed == (("WHEAT", 2),)
+    assert plans[1].reserved_from_shed == (("WHEAT", 1),)
+    assert plans[1].missing_stock == (("WHEAT", 1),)
+    assert sum(dict(plan.reserved_from_shed).get("WHEAT", 0) for plan in plans) == 3
 
 
 def test_pickup_order_is_first_use_and_seed_demand_never_reserves():
@@ -252,6 +276,7 @@ def test_batched_pickup_is_confirmed_before_route_entry():
     state = confirmed.diagnostics["route_diagnostics"][0]["supply_state"]
     assert state["acquired"] == {"WHEAT": 3}
     assert state["pickup_turns"] == 1
+    assert controller._outstanding_reservations() == {}
 
 
 def test_failed_pickup_has_no_phantom_acquisition_and_continues():
@@ -271,3 +296,4 @@ def test_failed_pickup_has_no_phantom_acquisition_and_continues():
     state = failed.diagnostics["route_diagnostics"][0]["supply_state"]
     assert state["acquired"] == {}
     assert state["failed_or_unfulfilled"] == {"WHEAT": 2}
+    assert controller._outstanding_reservations() == {}

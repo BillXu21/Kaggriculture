@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 
 from executor_v0.plan import DailyPlan
-from executor_v0.strip_executor import StripExecutorController
+from executor_v0.strip_executor import StripExecutorConfig, StripExecutorController
 from executor_v0.strip_market import MarketBootstrapState, build_market_turn_plan
 from executor_v0.strip_work import (
     StripWorkPlan,
@@ -486,6 +486,104 @@ def test_aggressive_selling_ignores_manager_sell_quantity_and_uses_observed_shed
     assert result.diagnostics["sell_mode"] == "aggressive_sell_all"
     assert result.diagnostics["aggressive_sell_observed"] == {"MILK": 5}
     assert result.diagnostics["aggressive_sell_submitted_this_turn"] == {"MILK": 5}
+
+
+def test_aggressive_sell_protects_observed_feed_purchase_until_pickup():
+    feed = work(
+        item(
+            "FEED",
+            tile=(4, 4),
+            supplies=(SupplyRequirement("WHEAT", 1, "inventory"),),
+        )
+    )
+
+    def builder(obs, plan, **kwargs):
+        del obs, plan, kwargs
+        return feed
+
+    controller = StripExecutorController(
+        config=StripExecutorConfig(aggressive_sell_all=True),
+        work_builder=builder,
+    )
+
+    purchase = controller.act(
+        observation(money=100, shed={}, farmer=(4, 4), hour=0),
+        daily_plan(),
+    )
+    assert purchase.market_actions == (("BUY_PRODUCT", "WHEAT", 1),)
+
+    observed = controller.act(
+        observation(money=75, shed={"WHEAT": 1}, farmer=(4, 4), hour=1),
+        daily_plan(),
+    )
+    assert observed.market_actions == ()
+    assert observed.farmer_action == ("PICKUP", "WHEAT", 1)
+
+    picked_up = controller.act(
+        observation(
+            money=75,
+            shed={},
+            inventories=[{"WHEAT": 1}],
+            farmer=(4, 4),
+            hour=2,
+        ),
+        daily_plan(),
+    )
+    assert picked_up.market_actions == ()
+    assert picked_up.farmer_action == ("FEED",)
+
+
+def test_bootstrap_protects_only_excess_over_feed_demand():
+    feed = work(
+        item(
+            "FEED",
+            tile=(4, 4),
+            supplies=(SupplyRequirement("WHEAT", 2, "inventory"),),
+        )
+    )
+
+    def builder(obs, plan, **kwargs):
+        del obs, plan, kwargs
+        return feed
+
+    result = StripExecutorController(
+        config=StripExecutorConfig(aggressive_sell_all=True),
+        work_builder=builder,
+    ).act(
+        observation(money=0, shed={"WHEAT": 5}, farmer=(4, 4)),
+        daily_plan(),
+    )
+    assert result.market_actions == (("SELL", "WHEAT", 3),)
+    assert result.diagnostics["market_diagnostics"]["aggressive_sell_protected"] == {
+        "WHEAT": 2
+    }
+
+
+def test_repeated_bootstrap_observations_do_not_grow_feed_reservation():
+    feed = work(
+        item(
+            "FEED",
+            tile=(4, 4),
+            supplies=(SupplyRequirement("WHEAT", 2, "inventory"),),
+        )
+    )
+
+    def builder(obs, plan, **kwargs):
+        del obs, plan, kwargs
+        return feed
+
+    controller = StripExecutorController(
+        config=StripExecutorConfig(aggressive_sell_all=True),
+        work_builder=builder,
+    )
+    for hour in (0, 1):
+        result = controller.act(
+            observation(money=0, shed={"WHEAT": 5}, farmer=(4, 4), hour=hour),
+            daily_plan(),
+        )
+        assert result.diagnostics["market_diagnostics"]["aggressive_sell_protected"] == {
+            "WHEAT": 2
+        }
 
 
 def test_aggressive_mode_sells_unreserved_wheat_even_when_feed_demand_exists():

@@ -273,6 +273,7 @@ class StripExecutorController:
         if not self._routes_finalized:
             self._reconcile_market_observation(obs)
             if self._bootstrap_stage == "PROCUREMENT":
+                protected = self._bootstrap_reservations(work_plan, obs)
                 market_plan = build_market_turn_plan(
                     obs,
                     active_plan,
@@ -282,6 +283,7 @@ class StripExecutorController:
                     shed_capacity=self._shed_capacity(obs),
                     max_orders=self._max_market_orders(obs),
                     market_params=self._market_params(obs),
+                    protected_reservations=protected,
                     aggressive_sell_all=self.config.aggressive_sell_all,
                 )
                 self._market_state.bootstrap_turns += bool(market_plan.orders)
@@ -338,7 +340,9 @@ class StripExecutorController:
         else:
             # Already finalized: still reconcile each new observation exactly once.
             self._reconcile_market_observation(obs)
-        protected = self._outstanding_reservations()
+        protected = self._observed_reservations(
+            obs, self._outstanding_reservations()
+        )
         market_plan = build_market_turn_plan(
             obs,
             active_plan,
@@ -532,14 +536,63 @@ class StripExecutorController:
                         supply_state.failed_or_unfulfilled.get(pending.item, 0) + remaining
                     )
 
+    def _bootstrap_reservations(
+        self, work_plan: StripWorkPlan, obs: Mapping[str, Any]
+    ) -> dict[str, int]:
+        """Protect committed inventory demand before routes are finalized.
+
+        Procurement can span observations.  Until the market order completes,
+        route plans do not exist yet, so the observed purchase would otherwise
+        be visible to aggressive selling without an owner.
+        """
+
+        required: dict[str, int] = {}
+        for work_item in work_plan.items:
+            for requirement in work_item.required_supplies:
+                if requirement.scope != "inventory" or requirement.quantity <= 0:
+                    continue
+                required[requirement.item] = (
+                    required.get(requirement.item, 0) + requirement.quantity
+                )
+        acquired: dict[str, int] = {}
+        for worker in self._worker_positions(obs):
+            for item, amount in self._worker_inventory(obs, worker).items():
+                acquired[item] = acquired.get(item, 0) + amount
+        return self._observed_reservations(
+            obs,
+            {
+                item: max(0, amount - acquired.get(item, 0))
+                for item, amount in required.items()
+            },
+        )
+
+    def _observed_reservations(
+        self, obs: Mapping[str, Any], reservations: Mapping[str, int]
+    ) -> dict[str, int]:
+        """Limit shed protection to stock observed on this observation."""
+
+        shed = ((obs.get("private") or {}).get("shed") or {})
+        protected: dict[str, int] = {}
+        for item, amount in reservations.items():
+            quantity = min(max(0, int(amount)), max(0, int(shed.get(item, 0))))
+            if quantity:
+                protected[item] = quantity
+        return protected
+
     def _outstanding_reservations(self) -> dict[str, int]:
         protected: dict[str, int] = {}
+        routes_by_id = {route.route_id: route for route in self._routes.values()}
         for route_id, plan in self._supply_plans.items():
+            route = routes_by_id.get(route_id)
+            if route is not None and route.phase == RoutePhase.INVALID:
+                continue
             state = self._supply_states.get(route_id, RouteSupplyState())
-            for item, reserved in plan.reserved_from_shed:
+            carried = dict(plan.already_carried)
+            for item, required in plan.demand:
                 outstanding = max(
                     0,
-                    reserved
+                    required
+                    - carried.get(item, 0)
                     - state.acquired.get(item, 0)
                     - state.failed_or_unfulfilled.get(item, 0),
                 )
