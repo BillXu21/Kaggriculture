@@ -23,6 +23,7 @@ __all__ = [
     "WorkerId",
     "assign_horizontal_routes",
     "generate_horizontal_route_candidates",
+    "route_cursor_invariants_hold",
 ]
 
 
@@ -204,6 +205,21 @@ class RouteAssignment:
     routes: tuple[StripRoute, ...]
     unassigned: tuple[HorizontalRouteCandidate, ...]
     idle_workers: tuple[WorkerId, ...]
+
+
+def route_cursor_invariants_hold(route: StripRoute) -> bool:
+    """True when ``route``'s cursor and pending cursor both address traversal.
+
+    Helping transfers rewrite ``traversal``/``segments``.  Any transfer that
+    leaves a cursor pointing past the end corrupts route state and would
+    otherwise surface later as a raw ``IndexError`` in ``_act_worker``.
+    """
+
+    if not 0 <= route.cursor < len(route.traversal):
+        return False
+    if route.pending_cursor is None:
+        return True
+    return 0 <= route.pending_cursor < len(route.traversal)
 
 
 def generate_horizontal_route_candidates(

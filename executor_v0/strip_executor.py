@@ -24,6 +24,7 @@ from executor_v0.strip_routes import (
     WorkerId,
     assign_horizontal_routes,
     generate_horizontal_route_candidates,
+    route_cursor_invariants_hold,
 )
 from executor_v0.strip_hiring import StripHiringPlan, plan_strip_hiring
 from executor_v0.strip_supply import (
@@ -825,11 +826,26 @@ class StripExecutorController:
             )
             if current_index is None:
                 continue
+            # A donor that has already emitted movement toward its next segment
+            # is no longer "untouched" from the executor-state perspective.
+            # Stealing that segment truncates ``donor.traversal`` while
+            # ``donor.pending_cursor`` still addresses a tile inside it, which
+            # later surfaces as an IndexError.  Resolve the pending target once
+            # and refuse to transfer the segment that owns it; ownership must
+            # remain with the donor until that transition resolves.
+            pending_tile = (
+                donor.traversal[donor.pending_cursor]
+                if donor.pending_cursor is not None
+                and 0 <= donor.pending_cursor < len(donor.traversal)
+                else None
+            )
             for segment_index in range(current_index + 1, len(donor.segments)):
                 segment = donor.segments[segment_index]
                 if segment.segment_id in donor.completed_segment_ids:
                     continue
                 if any(tile in donor.passed_tiles for tile in segment.traversal):
+                    continue
+                if pending_tile is not None and pending_tile in segment.traversal:
                     continue
                 if extract_tile_supply_demand(segment.traversal, work_plan):
                     continue
@@ -848,6 +864,12 @@ class StripExecutorController:
                 route.transferred_segment_ids.add(segment.segment_id)
                 route.phase = RoutePhase.SWEEP
                 route.pending_cursor = None
+                for mutated in (donor, route):
+                    if not route_cursor_invariants_hold(mutated):
+                        raise ValueError(
+                            "helping transfer violated route cursor invariants "
+                            f"for {mutated.owner.label}"
+                        )
                 return True
         return False
 

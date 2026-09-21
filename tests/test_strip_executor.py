@@ -8,10 +8,12 @@ from executor_v0.plan import DailyPlan
 from executor_v0.strip_executor import StripExecutorController
 from executor_v0.strip_routes import (
     RoutePhase,
+    RouteSegment,
     StripRoute,
     WorkerId,
     assign_horizontal_routes,
     generate_horizontal_route_candidates,
+    route_cursor_invariants_hold,
 )
 from executor_v0.strip_work import (
     BlockReason,
@@ -691,3 +693,126 @@ def test_post_completion_late_work_on_final_tile_is_recorded():
     assert later.farmer_action == ("PASS",)
     assert route.phase == RoutePhase.DONE
     assert "HARVEST:0,4" in route.late_work_ids
+
+
+def _row_segment(segment_id: str, row: int) -> RouteSegment:
+    traversal = tuple((row, col) for col in range(5))
+    return RouteSegment(segment_id, traversal, traversal[0], 0)
+
+
+def _chain_route(
+    route_id: str,
+    worker: WorkerId,
+    segments: tuple[RouteSegment, ...],
+    *,
+    cursor: int,
+    pending_cursor: int | None = None,
+    phase: RoutePhase = RoutePhase.SWEEP,
+) -> StripRoute:
+    traversal = tuple(tile for segment in segments for tile in segment.traversal)
+    return StripRoute(
+        route_id,
+        traversal,
+        traversal,
+        worker,
+        traversal[0],
+        0,
+        0,
+        cursor=cursor,
+        pending_cursor=pending_cursor,
+        phase=phase,
+        segments=tuple(segments),
+    )
+
+
+def _register_helping_routes(
+    controller: StripExecutorController, *routes: StripRoute
+) -> None:
+    controller._routes = {route.owner: route for route in routes}
+    controller._supply_plans = {}
+    controller._supply_states = {}
+
+
+def test_helping_never_steals_segment_a_donor_is_already_departing_toward():
+    """Regression: the official crash had donor.pending_cursor point into the
+    segment a completed neighbor stole, indexing past the shortened traversal."""
+
+    controller = StripExecutorController()
+    a = _row_segment("A", 0)
+    b = _row_segment("B", 1)
+    # Donor sits on A's final tile and has already emitted movement toward B.
+    donor = _chain_route(
+        "donor", WorkerId(0), (a, b), cursor=4, pending_cursor=5
+    )
+    own = _row_segment("OWN", 2)
+    receiver = _chain_route(
+        "receiver", WorkerId(1), (own,), cursor=4, phase=RoutePhase.DONE
+    )
+    _register_helping_routes(controller, donor, receiver)
+
+    result = controller._act_worker(
+        receiver,
+        own.traversal[-1],
+        fake_plan(()),
+        observation(hour=0, farmer=own.traversal[-1]),
+    )
+    assert result == ("PASS",)
+
+    # B was not transferred: the donor still owns it and both cursors are valid.
+    assert tuple(segment.segment_id for segment in donor.segments) == ("A", "B")
+    assert donor.traversal == a.traversal + b.traversal
+    assert donor.pending_cursor == 5
+    assert route_cursor_invariants_hold(donor)
+    assert not receiver.transferred_segment_ids
+
+    # The donor's next turn must not raise and must keep heading toward B.
+    follow = controller._act_worker(
+        donor,
+        a.traversal[-1],
+        fake_plan(()),
+        observation(hour=1, farmer=a.traversal[-1]),
+    )
+    assert follow == ("SOUTH",)
+    assert donor.pending_cursor == 5
+    assert route_cursor_invariants_hold(donor)
+
+
+def test_helping_takes_a_later_segment_the_donor_has_not_committed_to():
+    controller = StripExecutorController()
+    a = _row_segment("A", 0)
+    b = _row_segment("B", 1)
+    c = _row_segment("C", 2)
+    # pending_cursor points into B, so only the genuinely untouched C may move.
+    donor = _chain_route(
+        "donor", WorkerId(0), (a, b, c), cursor=4, pending_cursor=5
+    )
+    own = _row_segment("OWN", 3)
+    receiver = _chain_route(
+        "receiver", WorkerId(1), (own,), cursor=4, phase=RoutePhase.DONE
+    )
+    _register_helping_routes(controller, donor, receiver)
+
+    controller._act_worker(
+        receiver,
+        own.traversal[-1],
+        fake_plan(()),
+        observation(hour=0, farmer=own.traversal[-1]),
+    )
+
+    assert tuple(segment.segment_id for segment in donor.segments) == ("A", "B")
+    assert donor.traversal == a.traversal + b.traversal
+    assert donor.pending_cursor == 5
+    assert route_cursor_invariants_hold(donor)
+    assert "C" in receiver.transferred_segment_ids
+    assert c.traversal[0] in receiver.traversal
+    assert route_cursor_invariants_hold(receiver)
+
+
+def test_route_cursor_invariant_helper_flags_invalid_pending_cursor():
+    a = _row_segment("A", 0)
+    route = _chain_route("r", WorkerId(0), (a,), cursor=4)
+    assert route_cursor_invariants_hold(route)
+    route.pending_cursor = len(route.traversal)
+    assert not route_cursor_invariants_hold(route)
+    route.pending_cursor = -1
+    assert not route_cursor_invariants_hold(route)
