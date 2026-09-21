@@ -271,6 +271,24 @@ def _identity(meta: dict[str, Any]) -> Stage25BehaviorIdentity | None:
     return Stage25BehaviorIdentity(**{field: str(payload[field]) for field in fields})
 
 
+def _resolve_executor_factory(executor: str) -> Any:
+    from executor_v0.agent import AgentConfig
+    from rl_manager.executor_factory import (
+        make_default_executor_factory,
+        make_stage25_executor_factory,
+    )
+
+    if executor == "strip":
+        return make_stage25_executor_factory()
+    if executor == "legacy":
+        return make_default_executor_factory(AgentConfig(
+            strict=True,
+            optional_spare_watering=True,
+            record_turn_snapshot=False,
+        ))
+    raise ValueError(f"unsupported Stage 2.5 executor {executor!r}")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -286,6 +304,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-size", choices=("tiny", "small", "large"), default="tiny")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--engine", choices=("fast", "official"), default="fast")
+    parser.add_argument(
+        "--executor", choices=("strip", "legacy"), default="strip",
+        help="Stage 2.5 runtime executor (default: strip)")
     parser.add_argument(
         "--training-composition",
         choices=(CANDIDATE_VS_FROZEN, CURRENT_VS_CURRENT_ECONOMIC),
@@ -460,11 +481,11 @@ def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stag
         params, source_meta = initialize_stage25_ppo_from_checkpoint(
             args.init, config=config.model, seed=None)
         return init_stage25_ppo_state(config, seed=args.seed, params=params), source_meta
-    from rl_manager.executor_factory import make_stage25_executor_factory
     from rl_manager.runner import _executor_factory_provenance
     from rl_manager.stage25_inference import Stage25InferenceAdapter
     fresh = init_stage25_ppo_state(config, seed=args.seed)
-    runtime_executor = _executor_factory_provenance(make_stage25_executor_factory())
+    runtime_executor = _executor_factory_provenance(
+        _resolve_executor_factory(args.executor))
     expected_physical = _physical_contract(config)
     params, optimizer_state, rng, meta, opponent_params = load_stage25_ppo_checkpoint(
         args.resume, config=config.model, seed=None,
@@ -520,7 +541,6 @@ def _collection(
     Stage25PPOBatch,
     dict[str, Any],
 ]:
-    from rl_manager.executor_factory import make_stage25_executor_factory
     from rl_manager.runner import _executor_factory_provenance
     from rl_manager.stage25_inference import Stage25InferenceAdapter
     from rl_manager.stage25_ppo import build_stage25_ppo_batch
@@ -548,7 +568,7 @@ def _collection(
         args, seed=seed, reward_config=reward_config)
     runner = ParallelSelfPlayRunner(
         runner_config, num_workers=args.workers, master_seed=seed,
-        executor_factory=make_stage25_executor_factory(),
+        executor_factory=_resolve_executor_factory(args.executor),
         stage25_trajectory_buffer=trajectory)
     specs = tuple(build_episode_spec(
         index, seed + index, args.training_composition, learner, opponent)
@@ -590,7 +610,6 @@ def _collection(
 
 def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     from rl_manager.stage25_checkpoint import save_stage25_ppo_checkpoint
-    from rl_manager.executor_factory import make_stage25_executor_factory
     from rl_manager.runner import _executor_factory_provenance
     from rl_manager.stage25_ppo import ppo_update
     startup_started = time.perf_counter()
@@ -628,7 +647,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                             opponent_identity=initial_opponent.identity)
         executor_provenance = rollout_stats.get("executor_provenance")
         expected_executor = _executor_factory_provenance(
-            make_stage25_executor_factory())
+            _resolve_executor_factory(args.executor))
         if executor_provenance is None:
             # Unit-level collection doubles may omit runtime statistics; the
             # production collection always supplies this factory-derived
