@@ -29,7 +29,7 @@ crop and animal layouts can never reserve the same tile.
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from bc_manager.constants import ANIMAL_ORDER, CROP_ORDER
 from replay_daily.constants import ANIMALS
@@ -294,6 +294,7 @@ def reconcile_crops(
     crop_targets: Mapping[str, int],
     anchor: tuple[int, int],
     config: SacrificeConfig = SacrificeConfig(),
+    preferred_crop_slots: Mapping[str, Iterable[tuple[int, int]]] | None = None,
 ) -> CropReconciliationResult:
     """Reconcile current crops toward requested target counts. Pure.
 
@@ -339,6 +340,28 @@ def reconcile_crops(
     empty_tiles = _sorted_coords(empty_tiles, anchor)
     weed_tiles = _sorted_coords(weed_tiles, anchor)
 
+    # A retained one-shot harvest may ask reconciliation to preserve its
+    # freshly emptied tile.  Reserve only as many authoritative empty slots as
+    # the current manager target still needs; stale/reduced targets therefore
+    # cannot create an independent crop obligation.
+    preferred = preferred_crop_slots or {}
+    reserved_empty: dict[str, list[tuple[int, int]]] = {
+        crop: [] for crop in CROP_ORDER
+    }
+    available_empty = set(empty_tiles)
+    for crop in CROP_ORDER:
+        deficit = max(0, int(crop_targets.get(crop, 0)) - len(scored[crop]))
+        for raw_coord in preferred.get(crop, ()):
+            coord = (int(raw_coord[0]), int(raw_coord[1]))
+            if deficit <= 0:
+                break
+            if coord not in available_empty:
+                continue
+            reserved_empty[crop].append(coord)
+            available_empty.remove(coord)
+            deficit -= 1
+    empty_tiles = [coord for coord in empty_tiles if coord in available_empty]
+
     digs: list[DigIntent] = []
     plants: list[PlantIntent] = []
     empty_filled: dict[str, int] = {crop: 0 for crop in CROP_ORDER}
@@ -353,6 +376,11 @@ def reconcile_crops(
         for score_value, coord in entries[target:]:
             released.append((score_value, coord, crop))
         deficit = target - len(entries)
+        while deficit > 0 and reserved_empty[crop]:
+            coord = reserved_empty[crop].pop(0)
+            plants.append(PlantIntent(coord, crop))
+            empty_filled[crop] += 1
+            deficit -= 1
         while deficit > 0 and empty_tiles:
             coord = empty_tiles.pop(0)
             plants.append(PlantIntent(coord, crop))
@@ -406,6 +434,7 @@ def plan_day_layouts(
     animals_needed: Mapping[str, int],
     anchor: tuple[int, int] = SHED_HUB_ANCHOR,
     config: SacrificeConfig = SacrificeConfig(),
+    preferred_crop_slots: Mapping[str, Iterable[tuple[int, int]]] | None = None,
 ) -> DayLayoutResult:
     """Plan animal and crop layouts once over a shared set of tile claims.
 
@@ -426,7 +455,8 @@ def plan_day_layouts(
         return DayLayoutResult(
             crops=reconcile_crops(
                 board, unlocked_quadrants=unlocked_quadrants,
-                crop_targets=crop_targets, anchor=anchor, config=config),
+                crop_targets=crop_targets, anchor=anchor, config=config,
+                preferred_crop_slots=preferred_crop_slots),
             animals=animal_result)
 
     masked = [row[:] for row in board]
@@ -434,5 +464,6 @@ def plan_day_layouts(
         masked[y][x] = _CLAIMED  # tile_role -> "other": ignored by reconcile
     crop_result = reconcile_crops(
         masked, unlocked_quadrants=unlocked_quadrants,
-        crop_targets=crop_targets, anchor=anchor, config=config)
+        crop_targets=crop_targets, anchor=anchor, config=config,
+        preferred_crop_slots=preferred_crop_slots)
     return DayLayoutResult(crops=crop_result, animals=animal_result)

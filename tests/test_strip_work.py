@@ -141,6 +141,20 @@ def test_new_crop_water_waits_for_plant_but_chain_counts_both():
     assert chain.interaction_turns == 2
 
 
+def test_retained_crop_preferred_slot_is_reserved_without_duplicate_plant():
+    result = build_strip_work_plan(
+        obs(seeds={"WHEAT": 1, "CARROT": 1}),
+        plan(crop_targets={"WHEAT": 1, "CARROT": 1}),
+        preferred_crop_slots={"WHEAT": ((0, 0),), "CARROT": ((0, 0),)},
+    )
+    plants = [item for item in result.items if item.kind == "PLANT"]
+    assert {item.crop: item.tile for item in plants} == {
+        "WHEAT": (0, 0),
+        "CARROT": (4, 4),
+    }
+    assert len({item.tile for item in plants}) == len(plants)
+
+
 def test_seed_observation_unlocks_only_the_affordable_crop_stage():
     initial = build_strip_work_plan(
         obs(money=16),

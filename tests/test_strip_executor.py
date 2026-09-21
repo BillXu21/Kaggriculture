@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 
+import pytest
+
 from executor_v0.plan import DailyPlan
 from executor_v0.strip_executor import StripExecutorController
 from executor_v0.strip_routes import (
@@ -79,6 +81,7 @@ def work_item(
     depends_on=(),
     block_reason=None,
     item_id=None,
+    source="strip_forecast",
 ) -> WorkItem:
     return WorkItem(
         id=item_id or f"{kind}:{tile[0]},{tile[1]}",
@@ -90,6 +93,7 @@ def work_item(
         depends_on=tuple(depends_on),
         required_supplies=tuple(required_supplies),
         row_key=row_key_for_tile(tile),
+        source=source,
     )
 
 
@@ -317,6 +321,248 @@ def test_controller_executes_retained_routine_harvest():
         item.id == "HARVEST:0,0" and item.source == "routine_harvest"
         for item in controller._plan.items
     )
+
+
+@pytest.mark.parametrize("crop,day", [("WHEAT", 3), ("CARROT", 3), ("MELON", 10)])
+def test_retained_one_shot_harvest_replants_and_waters_same_day(crop, day):
+    initial = observation(day=day, farmer=(0, 0))
+    initial["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT",
+        "crop": crop,
+        "planted_day": 0,
+        "yield_units": 3 if crop == "WHEAT" else 1,
+        "watered_today": True,
+        "fertilized_until_day": -1,
+        "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    target = plan()
+    target = DailyPlan.create(
+        crop_targets={name: int(name == crop) for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS},
+        land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={
+            product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)}
+            for product in PRODUCTS
+        },
+    )
+    initial["private"]["seeds"] = {crop: 1}
+    controller = StripExecutorController()
+
+    assert controller.act(initial, target).farmer_action == ("HARVEST",)
+
+    after_harvest = copy.deepcopy(initial)
+    after_harvest["hour"] = 1
+    after_harvest["step"] += 1
+    after_harvest["farms"][0]["tiles"][0][0] = None
+    planted = controller.act(after_harvest, target)
+    assert planted.farmer_action == ("PLANT", crop)
+    assert planted.diagnostics["route_diagnostics"][0]["continuation"]["status"] == (
+        "SUCCESSOR_WATER"
+    )
+    assert planted.diagnostics["route_diagnostics"][0]["continuation"]["source"] == (
+        "retained_crop_maintenance"
+    )
+
+    after_plant = copy.deepcopy(after_harvest)
+    after_plant["hour"] = 2
+    after_plant["step"] += 1
+    after_plant["private"]["seeds"][crop] = 0
+    after_plant["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT",
+        "crop": crop,
+        "planted_day": day,
+        "yield_units": 0,
+        "watered_today": False,
+        "fertilized_until_day": -1,
+        "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    watered = controller.act(after_plant, target)
+    assert watered.farmer_action == ("WATER",)
+    assert watered.diagnostics["route_diagnostics"][0]["continuation"]["status"] == (
+        "COMPLETED"
+    )
+
+
+def test_retained_harvest_target_reduction_does_not_replant():
+    initial = observation(day=3, farmer=(0, 0))
+    initial["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+        "yield_units": 3, "watered_today": True,
+        "fertilized_until_day": -1, "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    retained = plan()
+    retained = DailyPlan.create(
+        crop_targets={name: int(name == "WHEAT") for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS}, land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)} for product in PRODUCTS},
+    )
+    reduced = DailyPlan.create(
+        crop_targets={name: 0 for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS}, land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)} for product in PRODUCTS},
+    )
+    controller = StripExecutorController()
+    assert controller.act(initial, retained).farmer_action == ("HARVEST",)
+    after = copy.deepcopy(initial)
+    after["day"] = 4
+    after["hour"] = 0
+    after["step"] += 24
+    after["farms"][0]["tiles"][0][0] = None
+    result = controller.act(after, reduced)
+    assert result.farmer_action != ("PLANT", "WHEAT")
+
+
+def test_retained_harvest_seed_block_resumes_after_observed_seed():
+    initial = observation(day=3, farmer=(0, 0))
+    initial["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+        "yield_units": 3, "watered_today": True,
+        "fertilized_until_day": -1, "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    target = DailyPlan.create(
+        crop_targets={name: int(name == "WHEAT") for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS}, land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)} for product in PRODUCTS},
+    )
+    initial["private"]["seeds"] = {"WHEAT": 0}
+    controller = StripExecutorController()
+    assert controller.act(initial, target).farmer_action == ("HARVEST",)
+
+    blocked = copy.deepcopy(initial)
+    blocked["hour"] = 1
+    blocked["step"] += 1
+    blocked["farms"][0]["tiles"][0][0] = None
+    controller.act(blocked, target)
+    assert controller.routes[0].continuation_blocked_reason == "MISSING_GLOBAL_RESOURCE"
+
+    observed_seed = copy.deepcopy(blocked)
+    observed_seed["hour"] = 2
+    observed_seed["step"] += 1
+    observed_seed["farmer"] = [1, 0]
+    observed_seed["farms"][0]["farmer"] = [1, 0]
+    observed_seed["private"]["seeds"] = {"WHEAT": 1}
+    assert controller.act(observed_seed, target).farmer_action == ("WEST",)
+
+    resumed = copy.deepcopy(observed_seed)
+    resumed["hour"] = 3
+    resumed["step"] += 1
+    resumed["farmer"] = [0, 0]
+    resumed["farms"][0]["farmer"] = [0, 0]
+    assert controller.act(resumed, target).farmer_action == ("PLANT", "WHEAT")
+
+
+def test_retained_harvest_does_not_start_two_step_chain_at_day_boundary():
+    initial = observation(day=3, hour=22, farmer=(0, 0))
+    initial["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+        "yield_units": 3, "watered_today": True,
+        "fertilized_until_day": -1, "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    initial["private"]["seeds"] = {"WHEAT": 1}
+    target = DailyPlan.create(
+        crop_targets={name: int(name == "WHEAT") for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS}, land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)} for product in PRODUCTS},
+    )
+    controller = StripExecutorController()
+    assert controller.act(initial, target).farmer_action == ("HARVEST",)
+
+    after = copy.deepcopy(initial)
+    after["hour"] = 23
+    after["step"] += 1
+    after["farms"][0]["tiles"][0][0] = None
+    result = controller.act(after, target)
+    assert result.farmer_action != ("PLANT", "WHEAT")
+    assert controller.routes[0].continuation_blocked_reason == "INSUFFICIENT_DAY_TIME"
+
+
+def test_retained_continuation_reopens_completed_final_tile():
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        if int(obs["hour"]) < 5:
+            return fake_plan(
+                (work_item("HARVEST", (0, 4), crop="WHEAT", source="routine_harvest"),)
+            )
+        if int(obs["hour"]) == 5:
+            return fake_plan((work_item(
+                "PLANT", (0, 4), crop="WHEAT",
+                status=WorkStatus.BLOCKED,
+                block_reason=BlockReason.DEPENDENCY_BLOCKED,
+            ),))
+        return fake_plan((work_item("PLANT", (0, 4), crop="WHEAT"),))
+
+    controller = StripExecutorController(work_builder=builder)
+    target = DailyPlan.create(
+        crop_targets={name: int(name == "WHEAT") for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS}, land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)} for product in PRODUCTS},
+    )
+    for hour in range(5):
+        position = (hour, 0)
+        result = controller.act(observation(hour=hour, farmer=position), target)
+    assert result.farmer_action == ("HARVEST",)
+
+    completed = controller.act(observation(hour=5, farmer=(4, 0)), target)
+    assert completed.farmer_action == ("PASS",)
+    assert controller.routes[0].phase == RoutePhase.DONE
+
+    reopened = controller.act(observation(hour=6, farmer=(4, 0)), target)
+    assert reopened.farmer_action == ("PLANT", "WHEAT")
+    assert controller.routes[0].phase == RoutePhase.SWEEP
+
+
+def test_retained_continuation_survives_worker_segment_change():
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        items = [work_item("WATER", (1, 0))]
+        if int(obs["hour"]) < 5:
+            items.append(
+                work_item(
+                    "HARVEST", (0, 4), crop="WHEAT", source="routine_harvest"
+                )
+            )
+        else:
+            items.append(work_item("PLANT", (0, 4), crop="WHEAT"))
+        return fake_plan(tuple(items))
+
+    controller = StripExecutorController(work_builder=builder)
+    for hour in range(5):
+        position = (hour, 0)
+        result = controller.act(observation(hour=hour, farmer=position), plan())
+    assert result.farmer_action == ("HARVEST",)
+
+    position = (4, 0)
+    for hour in range(5, 10):
+        result = controller.act(observation(hour=hour, farmer=position), plan())
+        if result.farmer_action == ("PLANT", "WHEAT"):
+            break
+        if result.farmer_action == ("WEST",):
+            position = (max(0, position[0] - 1), position[1])
+        elif result.farmer_action == ("SOUTH",):
+            position = (position[0], position[1] + 1)
+        elif result.farmer_action == ("NORTH",):
+            position = (position[0], position[1] - 1)
+        elif result.farmer_action == ("EAST",):
+            position = (position[0] + 1, position[1])
+    else:
+        pytest.fail("retained continuation was abandoned at a segment boundary")
 
 
 def test_missing_supply_does_not_pick_up_but_carried_supply_can_act():

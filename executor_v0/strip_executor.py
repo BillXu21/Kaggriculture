@@ -44,6 +44,9 @@ from executor_v0.strip_work import (
     build_strip_work_plan,
 )
 
+
+_RETAINED_ONE_SHOT_CROPS = frozenset(("WHEAT", "CARROT", "MELON"))
+
 __all__ = [
     "StripExecutorConfig",
     "StripExecutorController",
@@ -603,11 +606,24 @@ class StripExecutorController:
     def _build_work_plan(
         self, obs: Mapping[str, Any], plan: DailyPlan
     ) -> StripWorkPlan:
+        preferred_crop_slots: dict[str, tuple[tuple[int, int], ...]] = {}
+        for route in self._routes.values():
+            if (
+                route.continuation_source == "retained_crop_maintenance"
+                and route.continuation_crop in _RETAINED_ONE_SHOT_CROPS
+                and route.continuation_tile is not None
+                and route.continuation_next_kind == "PLANT"
+            ):
+                preferred_crop_slots.setdefault(route.continuation_crop, ())
+                preferred_crop_slots[route.continuation_crop] += (
+                    route.continuation_tile,
+                )
         return self._work_builder(
             obs,
             plan,
             config=self.config.work_config,
             acting_seat=self.config.acting_seat,
+            preferred_crop_slots=preferred_crop_slots,
         )
 
     def _worker_positions(self, obs: Mapping[str, Any]) -> dict[WorkerId, tuple[int, int]]:
@@ -663,6 +679,13 @@ class StripExecutorController:
             if self._help_untouched_segment(route, work_plan):
                 route.completion_hour = None
             else:
+                if (
+                    route.continuation_item_id is not None
+                    and route.continuation_tile == position == route.current_tile
+                ):
+                    action = self._try_local_action(route, position, work_plan, obs)
+                    if action is not None:
+                        return action
                 route.pass_turns_after_completion += 1
                 return ("PASS",)
 
@@ -776,17 +799,40 @@ class StripExecutorController:
             item
             for item in work_plan.items
             if item.tile == previous_tile
-            and item.status == WorkStatus.READY
             and item.kind == route.continuation_next_kind
         )
-        if not successors:
+        ready_successors = tuple(
+            item for item in successors if item.status == WorkStatus.READY
+        )
+        if not ready_successors:
+            if successors:
+                reason = successors[0].block_reason.value if successors[0].block_reason else successors[0].status.value
+                route.continuation_blocked_reason = reason
+                route.continuation_status = f"BLOCKED:{reason}"
+                route.blocked_local_work[f"CONTINUATION_BLOCKED:{reason}"] = (
+                    route.blocked_local_work.get(f"CONTINUATION_BLOCKED:{reason}", 0) + 1
+                )
+            elif route.continuation_status == "HARVEST_RETAINED":
+                requested = work_plan.diagnostics.requested_crop_delta_dict
+                if requested.get(route.continuation_crop or "", 0) <= 0:
+                    route.continuation_status = "TARGET_REDUCED"
+                    route.continuation_item_id = None
+                    route.continuation_tile = None
+                    route.continuation_next_kind = None
+                else:
+                    route.continuation_blocked_reason = "NO_LEGAL_SLOT"
+                    route.continuation_status = "BLOCKED:NO_LEGAL_SLOT"
+                    route.continuation_item_id = None
+                    route.continuation_next_kind = None
             return
         if route.phase != RoutePhase.DONE:
             route.cursor -= 1
         else:
             route.phase = RoutePhase.SWEEP
         route.passed_tiles.discard(previous_tile)
-        for successor in successors:
+        route.continuation_status = f"SUCCESSOR_{route.continuation_next_kind}"
+        route.continuation_blocked_reason = None
+        for successor in ready_successors:
             route.late_work_ids.discard(successor.id)
     def _prepare_supplies(
         self,
@@ -937,11 +983,56 @@ class StripExecutorController:
 
         inventory = self._worker_inventory(obs, route.owner)
         local_items = tuple(item for item in work_plan.items if item.tile == tile)
+        continuation_items = tuple(
+            item
+            for item in local_items
+            if item.kind == route.continuation_next_kind
+        ) if route.continuation_item_id is not None and route.continuation_tile == tile else ()
+        if route.continuation_item_id is not None and route.continuation_tile == tile:
+            if not continuation_items and route.continuation_status in {
+                "HARVEST_RETAINED",
+                "BLOCKED:MISSING_GLOBAL_RESOURCE",
+            }:
+                requested = work_plan.diagnostics.requested_crop_delta_dict
+                if requested.get(route.continuation_crop or "", 0) <= 0:
+                    route.continuation_status = "TARGET_REDUCED"
+                    route.continuation_item_id = None
+                    route.continuation_next_kind = None
+                else:
+                    route.continuation_blocked_reason = "NO_LEGAL_SLOT"
+                    route.continuation_status = "BLOCKED:NO_LEGAL_SLOT"
+                    route.continuation_item_id = None
+                    route.continuation_next_kind = None
+                    route.blocked_local_work["CONTINUATION_BLOCKED:NO_LEGAL_SLOT"] = (
+                        route.blocked_local_work.get(
+                            "CONTINUATION_BLOCKED:NO_LEGAL_SLOT", 0
+                        ) + 1
+                    )
+            elif continuation_items and not any(
+                item.status == WorkStatus.READY for item in continuation_items
+            ):
+                reason = continuation_items[0].block_reason.value if continuation_items[0].block_reason else continuation_items[0].status.value
+                route.continuation_blocked_reason = reason
+                route.continuation_status = f"BLOCKED:{reason}"
         item = self._select_local_item(local_items, inventory)
         if item is None:
             return None
         action = _interaction_action(item)
         if action is None:
+            return None
+        if (
+            item.kind == "PLANT"
+            and route.continuation_item_id is not None
+            and route.continuation_next_kind == "PLANT"
+            and int(obs.get("hour", 0)) >= 22
+        ):
+            route.continuation_blocked_reason = "INSUFFICIENT_DAY_TIME"
+            route.continuation_status = "BLOCKED:INSUFFICIENT_DAY_TIME"
+            route.blocked_local_work["CONTINUATION_BLOCKED:INSUFFICIENT_DAY_TIME"] = (
+                route.blocked_local_work.get(
+                    "CONTINUATION_BLOCKED:INSUFFICIENT_DAY_TIME", 0
+                ) + 1
+            )
             return None
         route.actions_performed[item.kind] = (
             route.actions_performed.get(item.kind, 0) + 1
@@ -957,9 +1048,40 @@ class StripExecutorController:
             ),
             None,
         )
-        route.continuation_item_id = item.id if successor is not None else None
-        route.continuation_tile = tile if successor is not None else None
-        route.continuation_next_kind = successor.kind if successor is not None else None
+        retained_harvest = (
+            item.kind == "HARVEST"
+            and item.source == "routine_harvest"
+            and item.crop in _RETAINED_ONE_SHOT_CROPS
+        )
+        if successor is not None or retained_harvest:
+            route.continuation_item_id = item.id
+            route.continuation_tile = tile
+            route.continuation_next_kind = (
+                successor.kind if successor is not None else "PLANT"
+            )
+            route.continuation_crop = item.crop
+            route.continuation_source = (
+                "retained_crop_maintenance"
+                if retained_harvest
+                else route.continuation_source or item.source
+            )
+            route.continuation_status = (
+                "HARVEST_RETAINED" if retained_harvest else f"SUCCESSOR_{successor.kind}"
+            )
+            route.continuation_blocked_reason = None
+        elif item.kind == "WATER" and route.continuation_next_kind == "WATER":
+            route.continuation_status = "COMPLETED"
+            route.continuation_blocked_reason = None
+            route.continuation_item_id = None
+            route.continuation_tile = None
+            route.continuation_next_kind = None
+        else:
+            route.continuation_item_id = None
+            route.continuation_tile = None
+            route.continuation_next_kind = None
+            route.continuation_crop = None
+            route.continuation_source = None
+            route.continuation_blocked_reason = None
         return action
 
     def _select_local_item(

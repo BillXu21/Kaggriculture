@@ -853,6 +853,7 @@ def build_strip_work_plan(
     *,
     acting_seat: int | None = None,
     seat: int | None = None,
+    preferred_crop_slots: Mapping[str, Iterable[tuple[int, int]]] | None = None,
 ) -> StripWorkPlan:
     """Build a deterministic pure work forecast for one acting seat.
 
@@ -882,6 +883,7 @@ def build_strip_work_plan(
         crop_targets=target_crops,
         animals_needed=animal_need,
         anchor=cfg.anchor,
+        preferred_crop_slots=preferred_crop_slots,
     )
     builder = _Builder(supply, cfg)
     current_land = len(unlocked)

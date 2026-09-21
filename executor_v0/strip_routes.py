@@ -117,6 +117,10 @@ class StripRoute:
     continuation_item_id: str | None = None
     continuation_tile: tuple[int, int] | None = None
     continuation_next_kind: str | None = None
+    continuation_crop: str | None = None
+    continuation_source: str | None = None
+    continuation_status: str | None = None
+    continuation_blocked_reason: str | None = None
     segments: tuple[RouteSegment, ...] = ()
     completed_segment_ids: set[str] = field(default_factory=set)
     transferred_segment_ids: set[str] = field(default_factory=set)
@@ -193,8 +197,13 @@ class StripRoute:
                     else None,
                     "completed_stage": self.continuation_item_id,
                     "next_expected_stage": self.continuation_next_kind,
+                    "crop": self.continuation_crop,
+                    "source": self.continuation_source,
+                    "status": self.continuation_status,
+                    "blocked_reason": self.continuation_blocked_reason,
                 }
                 if self.continuation_item_id is not None
+                or self.continuation_status is not None
                 else None
             ),
         }
