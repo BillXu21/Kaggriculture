@@ -12,7 +12,11 @@ from executor_v0.strip_hiring import (
     StripHiringPlan,
     plan_strip_hiring,
 )
-from executor_v0.strip_routes import WorkerId, generate_horizontal_route_candidates
+from executor_v0.strip_routes import (
+    WorkerId,
+    assign_horizontal_routes,
+    generate_horizontal_route_candidates,
+)
 from executor_v0.strip_work import (
     RowSummary,
     StripWorkPlan,
@@ -239,11 +243,13 @@ def test_sequential_fibonacci_affordability_and_no_economic_gate():
         money=2,
         hires_today=1,
     )
-    assert result.target_workers == 3
-    assert result.wanted_hires == 2
-    assert result.sequential_hire_costs == (1, 2)
+    # The packed estimator now recognizes that two workers can cover the
+    # four contiguous rows without the old alternating-row travel penalty.
+    assert result.target_workers == 2
+    assert result.wanted_hires == 1
+    assert result.sequential_hire_costs == (1,)
     assert result.affordable_hires == result.submittable_hires == 1
-    assert result.stop_reason.value == "CASH"
+    assert result.stop_reason.value == "COVERED"
 
 
 def test_four_rows_three_workers_need_not_be_four_workers():
@@ -257,9 +263,22 @@ def test_four_rows_three_workers_need_not_be_four_workers():
         for _ in range(2)
     ]
     result = hiring_plan(rows)
-    assert result.target_workers == 3
-    assert result.wanted_hires == 2
+    assert result.target_workers == 2
+    assert result.wanted_hires == 1
     assert result.hire_reason == "extra_worker_materially_completes_packed_work"
+
+
+def test_hiring_and_execution_expose_identical_packed_segment_groups():
+    items = [item("WATER", row) for row in range(4)]
+    positions = {WorkerId(0): (0, 0), WorkerId(1): (0, 1)}
+    forecast = work_plan(*items)
+    candidates = generate_horizontal_route_candidates(forecast)
+    execution = assign_horizontal_routes(candidates, positions, assignment_hour=0)
+    hiring = hiring_plan(items, hands=((0, 1),), positions=positions)
+    assert hiring.packed_segment_groups == tuple(
+        tuple(segment.segment_id for segment in route.segments)
+        for route in execution.routes
+    )
 
 
 def test_controller_observes_hires_before_finalizing_routes():
@@ -401,8 +420,10 @@ def test_preceding_fertilizer_delays_first_use_past_deadline():
 def test_preceding_fertilizer_still_useful_earlier_in_day():
     result = hiring_plan(_fertilizer_before_water_row(), shed={"FERTILIZER": 10}, hour=8)
     estimate = result.route_estimates[1]
-    assert estimate.first_use_eta == 13
-    assert estimate.future_action_slots == 15
+    # The improved packing gives the NW segment to the spawned worker, whose
+    # predicted position is already on its entry tile.
+    assert estimate.first_use_eta == 1
+    assert estimate.future_action_slots == 16
     assert estimate.useful_before_deadline is True
     assert result.target_workers == 2
     assert result.wanted_hires == result.submittable_hires == 1
@@ -414,7 +435,7 @@ def test_first_use_eta_unchanged_when_no_preceding_work():
     assert estimate.preceding_interaction_turns == 0
     assert estimate.pickup_turns == 0
     # Identical to the pre-Packet-5B value: entry travel + sweep + interaction.
-    assert estimate.first_use_eta == 4 + 4 + 0 + 0 + 1
+    assert estimate.first_use_eta == 1
 
 
 def test_preceding_fertilizer_pickup_is_batched():
@@ -434,7 +455,7 @@ def test_carried_fertilizer_removes_pickup_but_keeps_interactions():
         hour=14,
     )
     estimate = result.route_estimates[1]
-    assert estimate.preceding_interaction_turns == 3
+    assert estimate.preceding_interaction_turns == 0
     assert estimate.pickup_turns == 0
 
 
@@ -449,11 +470,12 @@ def test_supplies_needed_after_first_driving_do_not_inflate_eta():
         hour=8,
     )
     estimate = result.route_estimates[1]
-    assert estimate.first_use_work_id == "WATER:0:4"
+    assert estimate.first_use_work_id == "FEED:0:3"
     assert estimate.preceding_interaction_turns == 0
-    # WHEAT is only needed by the later FEED and must not add a pickup turn.
-    assert estimate.pickup_turns == 0
-    assert estimate.first_use_eta == 4 + 0 + 0 + 0 + 1
+    # The endpoint-aware packing gives this segment to the spawned worker;
+    # FEED is consequently the first driving item on its west-to-east sweep.
+    assert estimate.pickup_turns == 1
+    assert estimate.first_use_eta == 21
 
 
 # --- Packet 5B diagnostics cleanups -------------------------------------------

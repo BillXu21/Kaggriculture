@@ -216,6 +216,12 @@ class RouteAssignment:
     idle_workers: tuple[WorkerId, ...]
 
 
+def _manhattan_distance(left: tuple[int, int], right: tuple[int, int]) -> int:
+    """Return the deterministic movement-turn estimate between two tiles."""
+
+    return abs(left[0] - right[0]) + abs(left[1] - right[1])
+
+
 def route_cursor_invariants_hold(route: StripRoute) -> bool:
     """True when ``route``'s cursor and pending cursor both address traversal.
 
@@ -259,55 +265,253 @@ def generate_horizontal_route_candidates(
     return tuple(sorted(candidates, key=lambda candidate: candidate.row_key))
 
 
+@dataclass(frozen=True)
+class _ChainPlan:
+    movement_turns: int
+    completion_turns: int
+    assigned: tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]
+
+
+def _chain_plan_for_mask(
+    candidates: tuple[HorizontalRouteCandidate, ...],
+    worker_position: tuple[int, int],
+    mask: int,
+) -> _ChainPlan:
+    """Find the cheapest ordered/oriented chain for one candidate subset."""
+
+    if not mask:
+        return _ChainPlan(0, 0, ())
+
+    # State is (owned mask, last candidate index, endpoint side).  Side 0
+    # traverses left-to-right and side 1 right-to-left.  Keeping the path in
+    # the value makes equal-cost choices stable without relying on hash order.
+    states: dict[
+        tuple[int, int, int], tuple[int, tuple[tuple[int, int, int], ...]]
+    ] = {}
+    for index, candidate in enumerate(candidates):
+        bit = 1 << index
+        if not mask & bit:
+            continue
+        for side in (0, 1):
+            traversal = candidate.owned_tiles if side == 0 else tuple(reversed(candidate.owned_tiles))
+            distance = _manhattan_distance(worker_position, traversal[0])
+            states[(bit, index, side)] = (distance, ((index, side, distance),))
+
+    for owned in range(1, mask + 1):
+        if owned & ~mask:
+            continue
+        for (state_mask, last, side), (movement, path) in tuple(states.items()):
+            if state_mask != owned:
+                continue
+            previous = candidates[last].owned_tiles
+            previous_end = previous[-1] if side == 0 else previous[0]
+            for index, candidate in enumerate(candidates):
+                bit = 1 << index
+                if mask & bit == 0 or owned & bit:
+                    continue
+                for next_side in (0, 1):
+                    traversal = (
+                        candidate.owned_tiles
+                        if next_side == 0
+                        else tuple(reversed(candidate.owned_tiles))
+                    )
+                    distance = _manhattan_distance(previous_end, traversal[0])
+                    next_key = (owned | bit, index, next_side)
+                    next_value = (movement + distance, path + ((index, next_side, distance),))
+                    old_value = states.get(next_key)
+                    if old_value is None or (next_value[0], next_value[1]) < (old_value[0], old_value[1]):
+                        states[next_key] = next_value
+
+    indices = tuple(index for index in range(len(candidates)) if mask & (1 << index))
+    # Preserve the canonical west/east ordering for the two halves of one
+    # physical row.  Whole vertical chains may still run in either direction
+    # so workers starting at opposite ends get their nearest half.
+    allowed_orders = {indices}
+    if len({candidates[index].row_key.global_row for index in indices}) > 1:
+        allowed_orders.add(tuple(reversed(indices)))
+    choices = [
+        value
+        for (state_mask, _, _), value in states.items()
+        if state_mask == mask
+        and tuple(index for index, _, _ in value[1]) in allowed_orders
+    ]
+    movement, path = min(choices, key=lambda value: (value[0], value[1]))
+    assigned: list[tuple[HorizontalRouteCandidate, RouteSegment]] = []
+    interactions = 0
+    sweep = 0
+    for index, side, distance in path:
+        candidate = candidates[index]
+        traversal = candidate.owned_tiles if side == 0 else tuple(reversed(candidate.owned_tiles))
+        assigned.append(
+            (
+                candidate,
+                RouteSegment(
+                    candidate.route_id,
+                    traversal,
+                    traversal[0],
+                    distance,
+                    candidate.source_shape,
+                ),
+            )
+        )
+        interactions += candidate.workload_interactions
+        sweep += max(0, len(traversal) - 1)
+    return _ChainPlan(movement, movement + sweep + interactions, tuple(assigned))
+
+
+def _pareto_insert(
+    values: list[tuple[int, int, int, tuple[int, ...]]],
+    value: tuple[int, int, int, tuple[int, ...]],
+) -> None:
+    """Keep only packing states that can still win lexicographically."""
+
+    if any(
+        all(existing[index] <= value[index] for index in range(3))
+        and (
+            any(existing[index] < value[index] for index in range(3))
+            or existing[3] <= value[3]
+        )
+        for existing in values
+    ):
+        return
+    values[:] = [
+        existing
+        for existing in values
+        if not (
+            all(value[index] <= existing[index] for index in range(3))
+            and (
+                any(value[index] < existing[index] for index in range(3))
+                or value[3] <= existing[3]
+            )
+        )
+    ]
+    values.append(value)
+
+
+def _pack_small_route_sets(
+    candidates: tuple[HorizontalRouteCandidate, ...],
+    workers: tuple[WorkerId, ...],
+    positions: Mapping[WorkerId, tuple[int, int]],
+) -> dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]]:
+    """Pack at most eight rows while retaining exact load/travel tradeoffs."""
+
+    full_mask = (1 << len(candidates)) - 1
+    plans = {
+        worker: {
+            mask: _chain_plan_for_mask(candidates, positions[worker], mask)
+            for mask in range(full_mask + 1)
+        }
+        for worker in workers
+    }
+    states: dict[int, list[tuple[int, int, int, tuple[int, ...]]]] = {0: [(0, 0, 0, ())]}
+    for worker in workers:
+        next_states: dict[int, list[tuple[int, int, int, tuple[int, ...]]]] = {}
+        for covered, values in states.items():
+            remaining = full_mask ^ covered
+            subset = remaining
+            while True:
+                plan = plans[worker][subset]
+                for maximum, movement, total, signature in values:
+                    candidate_value = (
+                        max(maximum, plan.completion_turns),
+                        movement + plan.movement_turns,
+                        total + plan.completion_turns,
+                        signature + (subset,),
+                    )
+                    _pareto_insert(
+                        next_states.setdefault(covered | subset, []), candidate_value
+                    )
+                if subset == 0:
+                    break
+                subset = (subset - 1) & remaining
+        states = next_states
+
+    winning = min(states[full_mask], key=lambda value: value)
+    grouped: dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]] = {}
+    for worker, mask in zip(workers, winning[3]):
+        grouped[worker] = plans[worker][mask].assigned
+    return grouped
+
+
+def _pack_large_route_set(
+    candidates: tuple[HorizontalRouteCandidate, ...],
+    workers: tuple[WorkerId, ...],
+    positions: Mapping[WorkerId, tuple[int, int]],
+    ) -> dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]]:
+    """Bounded fallback for unusually dense forecasts."""
+
+    grouped: dict[WorkerId, list[tuple[HorizontalRouteCandidate, RouteSegment]]] = {
+        worker: [] for worker in workers
+    }
+    endpoints = dict(positions)
+    loads = {worker: 0 for worker in workers}
+    for candidate in candidates:
+        choices = []
+        for worker in workers:
+            position = endpoints[worker]
+            left = candidate.owned_tiles
+            right = tuple(reversed(left))
+            options = (
+                (position, left),
+                (position, right),
+            )
+            distance, traversal = min(
+                (_manhattan_distance(position, option[1][0]), option[1])
+                for option in options
+            )
+            projected = loads[worker] + distance + len(traversal) - 1 + candidate.workload_interactions
+            choices.append((projected, distance, len(grouped[worker]), worker.index, worker, traversal))
+        projected, distance, _, _, worker, traversal = min(choices)
+        del projected
+        grouped[worker].append(
+            (
+                candidate,
+                RouteSegment(candidate.route_id, traversal, traversal[0], distance, candidate.source_shape),
+            )
+        )
+        endpoints[worker] = traversal[-1]
+        loads[worker] = loads[worker] + distance + len(traversal) - 1 + candidate.workload_interactions
+    return {worker: tuple(value) for worker, value in grouped.items()}
+
+
 def assign_horizontal_routes(
     candidates: Iterable[HorizontalRouteCandidate],
     worker_positions: Mapping[WorkerId, tuple[int, int]],
     *,
     assignment_hour: int,
 ) -> RouteAssignment:
-    """Pack sorted row segments into stable worker-owned chains.
+    """Pack row segments into deterministic, travel-efficient worker chains.
 
-    Segment count is the primary load key, followed by travel from the
-    worker's current/last endpoint, then worker index.  Manhattan ties choose
-    the left endpoint (the lower canonical x value).
+    The small-board path evaluates all worker/segment subsets.  A subset's
+    best chain includes both segment order and endpoint orientation, and the
+    packing minimizes the largest estimated completion time before total
+    movement.  This makes adjacent rows stay together when workloads are
+    equal, while allowing a worker that starts near the other end to keep its
+    nearby cluster.  Larger inputs use a bounded nearest-endpoint fallback.
     """
 
-    ordered_candidates = tuple(sorted(candidates, key=lambda item: item.row_key))
+    ordered_candidates = tuple(
+        sorted(
+            candidates,
+            key=lambda item: (
+                item.row_key,
+            ),
+        )
+    )
     ordered_workers = tuple(sorted(worker_positions))
-    grouped: dict[WorkerId, list[tuple[HorizontalRouteCandidate, RouteSegment]]] = {
-        worker: [] for worker in ordered_workers
+    grouped: dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]] = {
+        worker: () for worker in ordered_workers
     }
-    endpoints = dict(worker_positions)
-    for candidate in ordered_candidates:
-        if not ordered_workers:
-            break
-        choices: list[tuple[int, int, int, WorkerId, RouteSegment]] = []
-        for worker in ordered_workers:
-            position = endpoints[worker]
-            left_to_right = candidate.owned_tiles
-            left, right = left_to_right[0], left_to_right[-1]
-            left_distance = abs(position[0] - left[0]) + abs(position[1] - left[1])
-            right_distance = abs(position[0] - right[0]) + abs(position[1] - right[1])
-            traversal = left_to_right if left_distance <= right_distance else tuple(
-                reversed(left_to_right)
-            )
-            segment = RouteSegment(
-                candidate.route_id,
-                traversal,
-                traversal[0],
-                min(left_distance, right_distance),
-                candidate.source_shape,
-            )
-            choices.append((len(grouped[worker]), segment.entry_distance, worker.index, worker, segment))
-        _, _, _, worker, segment = min(choices)
-        candidate = next(item for item in ordered_candidates if item.route_id == segment.segment_id)
-        grouped[worker].append((candidate, segment))
-        endpoints[worker] = segment.traversal[-1]
+
+    if ordered_workers and len(ordered_candidates) <= 8:
+        grouped = _pack_small_route_sets(ordered_candidates, ordered_workers, worker_positions)
+    elif ordered_workers:
+        grouped = _pack_large_route_set(ordered_candidates, ordered_workers, worker_positions)
 
     routes: list[StripRoute] = []
     assigned_ids: set[str] = set()
     for worker in ordered_workers:
-        assigned = tuple(grouped[worker])
+        assigned = grouped[worker]
         if not assigned:
             continue
         segments = tuple(segment for _, segment in assigned)

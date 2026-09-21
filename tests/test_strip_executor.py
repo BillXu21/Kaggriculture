@@ -9,6 +9,7 @@ import pytest
 from executor_v0.plan import DailyPlan
 from executor_v0.strip_executor import StripExecutorController
 from executor_v0.strip_routes import (
+    HorizontalRouteCandidate,
     RoutePhase,
     RouteSegment,
     StripRoute,
@@ -211,6 +212,83 @@ def test_packed_assignment_covers_excess_rows_without_extra_workers():
         assignment_hour=0,
     )
     assert [worker.label for worker in assigned_one.idle_workers] == ["HAND:0", "HAND:1"]
+
+
+def _mechanical_rows(workloads=(1, 1, 1, 1)):
+    return tuple(
+        HorizontalRouteCandidate(
+            f"ROW:{row}",
+            RowKey("NW", row, row, 0, 4),
+            tuple((row, x) for x in range(5)),
+            workload,
+            workload,
+            0,
+        )
+        for row, workload in enumerate(workloads)
+    )
+
+
+def _route_rows(route):
+    return tuple(segment.traversal[0][0] for segment in route.segments)
+
+
+def _route_movement(route):
+    return sum(
+        segment.entry_distance + len(segment.traversal) - 1
+        for segment in route.segments
+    )
+
+
+def test_four_adjacent_rows_pack_into_contiguous_two_row_chains():
+    assigned = assign_horizontal_routes(
+        _mechanical_rows(),
+        {WorkerId(0): (0, 0), WorkerId(1): (0, 1)},
+        assignment_hour=0,
+    )
+    assert sorted(_route_rows(route) for route in assigned.routes) == [(0, 1), (2, 3)]
+    assert sum(_route_movement(route) for route in assigned.routes) == 21
+
+
+def test_opposite_worker_ends_receive_their_nearest_row_halves():
+    assigned = assign_horizontal_routes(
+        _mechanical_rows(),
+        {WorkerId(0): (0, 0), WorkerId(1): (3, 0)},
+        assignment_hour=0,
+    )
+    by_worker = {route.owner.index: _route_rows(route) for route in assigned.routes}
+    assert by_worker == {0: (0, 1), 1: (3, 2)}
+
+
+def test_four_rows_and_three_workers_leave_one_neighboring_pair():
+    assigned = assign_horizontal_routes(
+        _mechanical_rows(),
+        {WorkerId(0): (0, 0), WorkerId(1): (0, 1), WorkerId(2): (0, 2)},
+        assignment_hour=0,
+    )
+    assert sorted(len(route.segments) for route in assigned.routes) == [1, 1, 2]
+    paired = next(route for route in assigned.routes if len(route.segments) == 2)
+    assert _route_rows(paired) in ((0, 1), (1, 2), (2, 3))
+
+
+def test_interaction_load_can_justify_longer_travel():
+    assigned = assign_horizontal_routes(
+        _mechanical_rows((8, 1, 1, 1)),
+        {WorkerId(0): (0, 0), WorkerId(1): (3, 0)},
+        assignment_hour=0,
+    )
+    by_worker = {route.owner.index: _route_rows(route) for route in assigned.routes}
+    assert by_worker[0] == (0,)
+    assert by_worker[1] == (3, 2, 1)
+
+
+def test_geometric_assignment_ties_are_repeatable():
+    candidates = _mechanical_rows()
+    positions = {WorkerId(0): (1, 2), WorkerId(1): (2, 2)}
+    first = assign_horizontal_routes(candidates, positions, assignment_hour=0)
+    second = assign_horizontal_routes(candidates, positions, assignment_hour=0)
+    assert [route.to_json_dict() for route in first.routes] == [
+        route.to_json_dict() for route in second.routes
+    ]
 
 
 def test_vertical_first_travel_then_monotonic_sweep():

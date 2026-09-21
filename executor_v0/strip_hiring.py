@@ -86,6 +86,7 @@ class StripHiringPlan:
     hire_reason: str = ""
     rows_expected_complete_with_n_workers: int = 0
     rows_expected_complete_with_n_plus_one_workers: int = 0
+    packed_segment_groups: tuple[tuple[str, ...], ...] = ()
 
     @property
     def orders(self) -> tuple[tuple[str], ...]:
@@ -540,6 +541,13 @@ def plan_strip_hiring(
         stop = HireStopReason.CASH
     else:
         stop = HireStopReason.COVERED
+    final_worker_positions = {
+        worker: all_positions[worker]
+        for worker in sorted(all_positions)[: target_workers or current_workers]
+    }
+    final_assignment = assign_horizontal_routes(
+        candidates, final_worker_positions, assignment_hour=0
+    )
     return StripHiringPlan(
         current_workers=current_workers,
         target_workers=target_workers,
@@ -557,4 +565,8 @@ def plan_strip_hiring(
         hire_reason=hire_reason,
         rows_expected_complete_with_n_workers=rows_with_n,
         rows_expected_complete_with_n_plus_one_workers=rows_with_n_plus_one,
+        packed_segment_groups=tuple(
+            tuple(segment.segment_id for segment in route.segments)
+            for route in final_assignment.routes
+        ),
     )
