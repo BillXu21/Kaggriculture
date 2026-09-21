@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from itertools import product
 
 import pytest
 
@@ -14,6 +15,7 @@ from executor_v0.strip_routes import (
     RouteSegment,
     StripRoute,
     WorkerId,
+    _chain_plan_for_mask,
     assign_horizontal_routes,
     generate_horizontal_route_candidates,
     route_cursor_invariants_hold,
@@ -237,6 +239,127 @@ def _route_movement(route):
         segment.entry_distance + len(segment.traversal) - 1
         for segment in route.segments
     )
+
+
+def _oracle_chain_plan(candidates, position, mask):
+    indices = tuple(index for index in range(len(candidates)) if mask & (1 << index))
+    orders = [indices]
+    if len({candidates[index].row_key.global_row for index in indices}) > 1:
+        orders.append(tuple(reversed(indices)))
+    best = None
+    for order in orders:
+        for orientations in product((0, 1), repeat=len(order)):
+            movement = 0
+            path = []
+            previous_end = position
+            for index, side in zip(order, orientations):
+                candidate = candidates[index]
+                traversal = (
+                    candidate.owned_tiles
+                    if side == 0
+                    else tuple(reversed(candidate.owned_tiles))
+                )
+                distance = abs(previous_end[0] - traversal[0][0]) + abs(
+                    previous_end[1] - traversal[0][1]
+                )
+                movement += distance
+                path.append((index, side, distance))
+                previous_end = traversal[-1]
+            key = (movement, tuple(path))
+            if best is None or key < best[0]:
+                best = (key, movement, tuple(path))
+    assert best is not None
+    movement, path = best[1:]
+    interactions = sum(candidates[index].workload_interactions for index, _, _ in path)
+    sweep = sum(len(candidates[index].owned_tiles) - 1 for index, _, _ in path)
+    return movement, movement + sweep + interactions, path
+
+
+def test_chain_plan_matches_allowed_order_orientation_oracle_for_all_small_masks():
+    candidates = tuple(
+        sorted(
+            (
+                HorizontalRouteCandidate(
+                    route_id,
+                    RowKey(quadrant, row % 5, row, x_start, x_start + 4),
+                    tuple((row, x) for x in range(x_start, x_start + 5)),
+                    workload,
+                    workload,
+                    0,
+                )
+                for route_id, quadrant, row, x_start, workload in (
+                    ("NW2", "NW", 2, 0, 2),
+                    ("NW3", "NW", 3, 0, 1),
+                    ("NE2", "NE", 2, 5, 3),
+                    ("NE3", "NE", 3, 5, 2),
+                    ("SW7", "SW", 7, 0, 1),
+                )
+            ),
+            key=lambda candidate: candidate.row_key,
+        )
+    )
+    for position in ((0, 0), (4, 4), (5, 5), (9, 9), (4, 7)):
+        for mask in range(1, 1 << len(candidates)):
+            production = _chain_plan_for_mask(candidates, position, mask)
+            movement, completion, path = _oracle_chain_plan(candidates, position, mask)
+            assert (production.movement_turns, production.completion_turns) == (
+                movement,
+                completion,
+            )
+            assert tuple(
+                (candidates.index(candidate), 0 if segment.traversal == candidate.owned_tiles else 1, segment.entry_distance)
+                for candidate, segment in production.assigned
+            ) == path
+
+
+def test_four_candidate_route_packer_fixture_is_complete_and_repeatable():
+    candidates = (
+        HorizontalRouteCandidate(
+            "NE3",
+            RowKey("NE", 3, 3, 5, 9),
+            tuple((3, x) for x in range(5, 10)),
+            2,
+            2,
+            0,
+        ),
+        HorizontalRouteCandidate(
+            "NE4",
+            RowKey("NE", 4, 4, 5, 9),
+            tuple((4, x) for x in range(5, 10)),
+            1,
+            1,
+            0,
+        ),
+        HorizontalRouteCandidate(
+            "NW2",
+            RowKey("NW", 2, 2, 0, 4),
+            tuple((2, x) for x in range(5)),
+            2,
+            2,
+            0,
+        ),
+        HorizontalRouteCandidate(
+            "NW3",
+            RowKey("NW", 3, 3, 0, 4),
+            tuple((3, x) for x in range(5)),
+            3,
+            3,
+            0,
+        ),
+    )
+    positions = {WorkerId(0): (4, 4)}
+    first = assign_horizontal_routes(candidates, positions, assignment_hour=0)
+    second = assign_horizontal_routes(candidates, positions, assignment_hour=0)
+    assigned = [segment for route in first.routes for segment in route.segments]
+    assert len(assigned) == len(candidates)
+    assert {segment.segment_id for segment in assigned} == {
+        candidate.route_id for candidate in candidates
+    }
+    assert first.unassigned == ()
+    assert all(route_cursor_invariants_hold(route) for route in first.routes)
+    assert [route.to_json_dict() for route in first.routes] == [
+        route.to_json_dict() for route in second.routes
+    ]
 
 
 def test_four_adjacent_rows_pack_into_contiguous_two_row_chains():

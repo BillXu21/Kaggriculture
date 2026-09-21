@@ -282,59 +282,56 @@ def _chain_plan_for_mask(
     if not mask:
         return _ChainPlan(0, 0, ())
 
-    # State is (owned mask, last candidate index, endpoint side).  Side 0
-    # traverses left-to-right and side 1 right-to-left.  Keeping the path in
-    # the value makes equal-cost choices stable without relying on hash order.
-    states: dict[
-        tuple[int, int, int], tuple[int, tuple[tuple[int, int, int], ...]]
-    ] = {}
-    for index, candidate in enumerate(candidates):
-        bit = 1 << index
-        if not mask & bit:
-            continue
-        for side in (0, 1):
-            traversal = candidate.owned_tiles if side == 0 else tuple(reversed(candidate.owned_tiles))
-            distance = _manhattan_distance(worker_position, traversal[0])
-            states[(bit, index, side)] = (distance, ((index, side, distance),))
-
-    for owned in range(1, mask + 1):
-        if owned & ~mask:
-            continue
-        for (state_mask, last, side), (movement, path) in tuple(states.items()):
-            if state_mask != owned:
-                continue
-            previous = candidates[last].owned_tiles
-            previous_end = previous[-1] if side == 0 else previous[0]
-            for index, candidate in enumerate(candidates):
-                bit = 1 << index
-                if mask & bit == 0 or owned & bit:
-                    continue
-                for next_side in (0, 1):
-                    traversal = (
-                        candidate.owned_tiles
-                        if next_side == 0
-                        else tuple(reversed(candidate.owned_tiles))
-                    )
-                    distance = _manhattan_distance(previous_end, traversal[0])
-                    next_key = (owned | bit, index, next_side)
-                    next_value = (movement + distance, path + ((index, next_side, distance),))
-                    old_value = states.get(next_key)
-                    if old_value is None or (next_value[0], next_value[1]) < (old_value[0], old_value[1]):
-                        states[next_key] = next_value
-
     indices = tuple(index for index in range(len(candidates)) if mask & (1 << index))
     # Preserve the canonical west/east ordering for the two halves of one
     # physical row.  Whole vertical chains may still run in either direction
     # so workers starting at opposite ends get their nearest half.
-    allowed_orders = {indices}
+    allowed_orders = [indices]
     if len({candidates[index].row_key.global_row for index in indices}) > 1:
-        allowed_orders.add(tuple(reversed(indices)))
-    choices = [
-        value
-        for (state_mask, _, _), value in states.items()
-        if state_mask == mask
-        and tuple(index for index, _, _ in value[1]) in allowed_orders
-    ]
+        allowed_orders.append(tuple(reversed(indices)))
+
+    choices: list[tuple[int, tuple[tuple[int, int, int], ...]]] = []
+    for order in allowed_orders:
+        first = order[0]
+        states: dict[int, tuple[int, tuple[tuple[int, int, int], ...]]] = {}
+        for side in (0, 1):
+            traversal = (
+                candidates[first].owned_tiles
+                if side == 0
+                else tuple(reversed(candidates[first].owned_tiles))
+            )
+            distance = _manhattan_distance(worker_position, traversal[0])
+            states[side] = (distance, ((first, side, distance),))
+
+        for previous_index, index in zip(order, order[1:]):
+            next_states: dict[
+                int, tuple[int, tuple[tuple[int, int, int], ...]]
+            ] = {}
+            for next_side in (0, 1):
+                traversal = (
+                    candidates[index].owned_tiles
+                    if next_side == 0
+                    else tuple(reversed(candidates[index].owned_tiles))
+                )
+                transitions = []
+                for previous_side, (movement, path) in states.items():
+                    previous = candidates[previous_index].owned_tiles
+                    previous_end = (
+                        previous[-1] if previous_side == 0 else previous[0]
+                    )
+                    distance = _manhattan_distance(previous_end, traversal[0])
+                    transitions.append(
+                        (
+                            movement + distance,
+                            path + ((index, next_side, distance),),
+                        )
+                    )
+                next_states[next_side] = min(
+                    transitions, key=lambda value: (value[0], value[1])
+                )
+            states = next_states
+        choices.extend(states.values())
+
     movement, path = min(choices, key=lambda value: (value[0], value[1]))
     assigned: list[tuple[HorizontalRouteCandidate, RouteSegment]] = []
     interactions = 0
