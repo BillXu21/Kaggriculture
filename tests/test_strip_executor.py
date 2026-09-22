@@ -18,6 +18,7 @@ from executor_v0.strip_routes import (
     _chain_plan_for_mask,
     assign_horizontal_routes,
     generate_horizontal_route_candidates,
+    remaining_day_action_slots,
     route_cursor_invariants_hold,
 )
 from executor_v0.strip_work import (
@@ -422,6 +423,161 @@ def test_geometric_assignment_ties_are_repeatable():
     assert [route.to_json_dict() for route in first.routes] == [
         route.to_json_dict() for route in second.routes
     ]
+
+
+def test_remaining_day_slots_match_engine_terminal_boundary():
+    obs = observation(hour=22)
+    assert remaining_day_action_slots(obs) == 2
+    assert remaining_day_action_slots(obs, include_current_turn=False) == 1
+    terminal = observation(hour=23)
+    assert remaining_day_action_slots(terminal) == 1
+    assert remaining_day_action_slots(terminal, include_current_turn=False) == 0
+
+
+def test_deadline_order_prefers_useful_first_segment():
+    candidates = (
+        HorizontalRouteCandidate(
+            "R0", RowKey("NW", 0, 0, 0, 4), tuple((0, x) for x in range(5)),
+            1, 1, 0, tile_interactions=(1, 0, 0, 0, 0),
+        ),
+        HorizontalRouteCandidate(
+            "R3", RowKey("NW", 3, 3, 0, 4), tuple((3, x) for x in range(5)),
+            1, 1, 0, tile_interactions=(1, 0, 0, 0, 0),
+        ),
+    )
+    plan = _chain_plan_for_mask(candidates, (0, 0), 0b11, 7)
+    assert tuple(segment.segment_id for _, segment in plan.assigned) == ("R0", "R3")
+    assert plan.useful_interactions == 1
+
+
+def test_late_deadline_plan_completes_more_interactions_than_unbounded_plan():
+    candidates = tuple(
+        HorizontalRouteCandidate(
+            f"R{row}",
+            RowKey("NW", row, row, 0, 4),
+            tuple((row, x) for x in range(5)),
+            workload,
+            workload,
+            0,
+            tile_interactions=counts,
+        )
+        for row, (workload, counts) in enumerate(
+            (
+                (2, (2, 0, 0, 0, 0)),
+                (2, (0, 0, 0, 2, 0)),
+                (1, (1, 0, 0, 0, 0)),
+                (1, (0, 0, 0, 1, 0)),
+                (3, (3, 0, 0, 0, 0)),
+                (3, (3, 0, 0, 0, 0)),
+            )
+        )
+    )
+    positions = {WorkerId(0): (1, 0), WorkerId(1): (0, 0)}
+    before = assign_horizontal_routes(candidates, positions, assignment_hour=0)
+    after = assign_horizontal_routes(
+        candidates,
+        positions,
+        assignment_hour=14,
+        remaining_action_slots=3,
+    )
+
+    def useful(assignment):
+        by_id = {candidate.route_id: candidate for candidate in candidates}
+        completed = 0
+        for route in assignment.routes:
+            elapsed = 0
+            previous = positions[route.owner]
+            for segment in route.segments:
+                candidate = by_id[segment.segment_id]
+                elapsed += abs(previous[0] - segment.entry_tile[0]) + abs(
+                    previous[1] - segment.entry_tile[1]
+                )
+                counts = candidate.tile_interactions
+                if segment.traversal == tuple(reversed(candidate.owned_tiles)):
+                    counts = tuple(reversed(counts))
+                for index, count in enumerate(counts):
+                    if index:
+                        elapsed += 1
+                    completed += max(0, min(count, 3 - elapsed))
+                    elapsed += count
+                previous = segment.traversal[-1]
+        return completed
+
+    assert useful(after) > useful(before)
+
+
+def test_no_futile_final_hour_departure():
+    work = fake_plan((work_item("WATER", (3, 0)),))
+    controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: work)
+    result = controller.act(observation(hour=23, farmer=(0, 0)), plan())
+    assert result.farmer_action == ("PASS",)
+    assert result.diagnostics["actual_final_movement_only_turns"] == 0
+    segment = result.diagnostics["deadline_route_diagnostics"]["FARMER"][0]
+    assert {
+        "segment_id",
+        "estimated_arrival_turn",
+        "estimated_completion_turn",
+        "expected_useful_interactions_completed_before_deadline",
+        "expected_useful_interactions_left_after_deadline",
+    } <= segment.keys()
+    assert result.diagnostics["route_diagnostics"][0]["blocked_local_work"][
+        "DEADLINE_UNREACHABLE"
+    ] == 1
+
+
+def test_optional_tail_work_yields_to_feasible_feed():
+    work = fake_plan(
+        (
+            work_item("WATER", (0, 0), source="optional_deferrable"),
+            work_item(
+                "FEED",
+                (0, 4),
+                required_supplies=(SupplyRequirement("WHEAT", 1),),
+            ),
+        )
+    )
+    controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: work)
+    position = (0, 0)
+    actions = []
+    for hour in range(19, 24):
+        result = controller.act(
+            observation(
+                hour=hour,
+                farmer=(position[1], position[0]),
+                inventories=[{"WHEAT": 1}, {}],
+            ),
+            plan(),
+        )
+        actions.append(result.farmer_action)
+        if result.farmer_action == ("EAST",):
+            position = (position[0], position[1] + 1)
+    assert ("FEED",) in actions
+    assert ("WATER",) not in actions
+
+
+def test_optional_tail_work_yields_to_feasible_care():
+    work = fake_plan(
+        (
+            work_item("WATER", (0, 0), source="optional_deferrable"),
+            work_item("CARE", (0, 3), source="strip_care"),
+        )
+    )
+    controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: work)
+    position = (0, 0)
+    actions = []
+    for hour in range(20, 24):
+        result = controller.act(
+            observation(
+                hour=hour,
+                farmer=(position[1], position[0]),
+            ),
+            plan(),
+        )
+        actions.append(result.farmer_action)
+        if result.farmer_action == ("EAST",):
+            position = (position[0], position[1] + 1)
+    assert ("CARE",) in actions
+    assert ("WATER",) not in actions
 
 
 def test_vertical_first_travel_then_monotonic_sweep():

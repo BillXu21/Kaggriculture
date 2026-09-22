@@ -24,6 +24,7 @@ from executor_v0.strip_routes import (
     WorkerId,
     assign_horizontal_routes,
     generate_horizontal_route_candidates,
+    remaining_day_action_slots,
     route_cursor_invariants_hold,
 )
 from executor_v0.strip_hiring import StripHiringPlan, plan_strip_hiring
@@ -148,6 +149,7 @@ class StripExecutorController:
             candidates,
             positions,
             assignment_hour=int(obs.get("hour", 0)),
+            remaining_action_slots=remaining_day_action_slots(obs),
         )
         self._day = day
         self._plan = work_plan
@@ -186,6 +188,7 @@ class StripExecutorController:
         self._daily = {
             "day": day,
             "assignment_hour": int(obs.get("hour", 0)),
+            "remaining_slots_at_assignment": remaining_day_action_slots(obs),
             "active_routes": len(candidates),
             "useful_row_count": len(candidates),
             "assigned_routes": len(assignment.routes),
@@ -221,6 +224,14 @@ class StripExecutorController:
                 self._initial_shed
             ),
         }
+        self._daily.update(
+            self._deadline_assignment_diagnostics(
+                assignment,
+                candidates,
+                positions,
+                obs,
+            )
+        )
         if bootstrap_diagnostics is not None:
             self._daily["hiring_diagnostics"] = bootstrap_diagnostics
         if hire_stop_reason is not None:
@@ -245,6 +256,81 @@ class StripExecutorController:
             and estimates[candidate.route_id].fertilizer_only
         ]
         return work_plan
+
+    def _deadline_assignment_diagnostics(
+        self,
+        assignment: RouteAssignment,
+        candidates,
+        positions: Mapping[WorkerId, tuple[int, int]],
+        obs: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        slots = remaining_day_action_slots(obs)
+        start_hour = int(obs.get("hour", 0))
+        by_id = {candidate.route_id: candidate for candidate in candidates}
+        per_worker: dict[str, list[dict[str, Any]]] = {}
+        complete_segments = 0
+        useful_completed = 0
+        useful_total = sum(candidate.workload_interactions for candidate in candidates)
+        for route in assignment.routes:
+            elapsed = 0
+            previous = positions[route.owner]
+            entries: list[dict[str, Any]] = []
+            for segment in route.segments:
+                candidate = by_id.get(segment.segment_id)
+                if candidate is None:
+                    continue
+                elapsed += abs(previous[0] - segment.entry_tile[0]) + abs(
+                    previous[1] - segment.entry_tile[1]
+                )
+                arrival = elapsed
+                counts = candidate.tile_interactions
+                if len(counts) != len(candidate.owned_tiles):
+                    counts = (0,) * (len(candidate.owned_tiles) - 1) + (
+                        candidate.workload_interactions,
+                    )
+                if segment.traversal == tuple(reversed(candidate.owned_tiles)):
+                    counts = tuple(reversed(counts))
+                completed = 0
+                for index, count in enumerate(counts):
+                    if index:
+                        elapsed += 1
+                    available = max(0, slots - elapsed)
+                    completed += min(max(0, int(count)), available)
+                    elapsed += max(0, int(count))
+                segment_complete = elapsed <= slots
+                complete_segments += int(segment_complete)
+                useful_completed += completed
+                entries.append(
+                    {
+                        "segment_id": segment.segment_id,
+                        "estimated_arrival_turn": start_hour + arrival,
+                        "estimated_completion_turn": start_hour + elapsed,
+                        "expected_useful_interactions_completed_before_deadline": completed,
+                        "expected_useful_interactions_left_after_deadline": max(
+                            0, int(candidate.workload_interactions) - completed
+                        ),
+                        "expected_complete_before_deadline": segment_complete,
+                    }
+                )
+                previous = segment.traversal[-1]
+            per_worker[route.owner.label] = entries
+        useful_missed = max(0, useful_total - useful_completed)
+        return {
+            "deadline_route_diagnostics": per_worker,
+            "per_worker_segment_sequence": {
+                worker: [entry["segment_id"] for entry in entries]
+                for worker, entries in per_worker.items()
+            },
+            "estimated_segment_completion_turns": {
+                worker: [entry["estimated_completion_turn"] for entry in entries]
+                for worker, entries in per_worker.items()
+            },
+            "segments_expected_complete_before_deadline": complete_segments,
+            "useful_interactions_expected_complete_before_deadline": useful_completed,
+            "useful_interactions_expected_missed": useful_missed,
+            "expected_useful_interactions_completed": useful_completed,
+            "expected_useful_interactions_missed": useful_missed,
+        }
 
     def reset_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
         """Begin a two-phase day and return its preliminary Packet 1 forecast.
@@ -752,7 +838,7 @@ class StripExecutorController:
             if position != revisit_tile:
                 movement = _vertical_first_step(position, revisit_tile)
                 if movement is not None:
-                    route.movement_turns += 1
+                    self._record_movement(route, obs)
                     return movement
                 route.blocked_local_work["ANIMAL_REVISIT_BLOCKED"] = (
                     route.blocked_local_work.get("ANIMAL_REVISIT_BLOCKED", 0) + 1
@@ -775,7 +861,9 @@ class StripExecutorController:
                 return action
         self._reopen_crop_continuation(route, position, work_plan)
         if route.phase == RoutePhase.DONE:
-            if self._help_untouched_segment(route, work_plan):
+            if self._help_untouched_segment(
+                route, work_plan, position=position, obs=obs
+            ):
                 route.completion_hour = None
             else:
                 if (
@@ -806,7 +894,14 @@ class StripExecutorController:
                         route.blocked_local_work.get("ROUTE_BLOCKED", 0) + 1
                     )
                     return ("PASS",)
-                route.movement_turns += 1
+                if not self._route_can_reach_useful_action(
+                    route, position, work_plan, obs, expected
+                ):
+                    route.blocked_local_work["DEADLINE_UNREACHABLE"] = (
+                        route.blocked_local_work.get("DEADLINE_UNREACHABLE", 0) + 1
+                    )
+                    return ("PASS",)
+                self._record_movement(route, obs)
                 return movement
             departing = route.current_tile
             route.cursor = route.pending_cursor
@@ -829,7 +924,14 @@ class StripExecutorController:
                         route.blocked_local_work.get("ROUTE_BLOCKED", 0) + 1
                     )
                     return ("PASS",)
-                route.movement_turns += 1
+                if not self._route_can_reach_useful_action(
+                    route, position, work_plan, obs, target
+                ):
+                    route.blocked_local_work["DEADLINE_UNREACHABLE"] = (
+                        route.blocked_local_work.get("DEADLINE_UNREACHABLE", 0) + 1
+                    )
+                    return ("PASS",)
+                self._record_movement(route, obs)
                 return movement
 
         action = self._try_local_action(route, target, work_plan, obs)
@@ -983,7 +1085,22 @@ class StripExecutorController:
                     supply_state.failed_or_unfulfilled.get(batch.item, 0) + remaining
                 )
                 continue
+            slots = remaining_day_action_slots(obs)
             if position != supply_plan.pickup_tile:
+                setup = (
+                    abs(position[0] - supply_plan.pickup_tile[0])
+                    + abs(position[1] - supply_plan.pickup_tile[1])
+                    + 1
+                    + abs(supply_plan.pickup_tile[0] - route.entry_tile[0])
+                    + abs(supply_plan.pickup_tile[1] - route.entry_tile[1])
+                    + max(0, len(route.traversal) - 1)
+                    + 1
+                )
+                if setup > slots:
+                    route.blocked_local_work["DEADLINE_UNREACHABLE"] = (
+                        route.blocked_local_work.get("DEADLINE_UNREACHABLE", 0) + 1
+                    )
+                    return ("PASS",)
                 movement = _vertical_first_step(position, supply_plan.pickup_tile)
                 if movement is None:
                     route.blocked_local_work["SUPPLY_ROUTE_BLOCKED"] = (
@@ -995,6 +1112,18 @@ class StripExecutorController:
                     continue
                 supply_state.travel_turns += 1
                 return movement
+            setup = (
+                1
+                + abs(supply_plan.pickup_tile[0] - route.entry_tile[0])
+                + abs(supply_plan.pickup_tile[1] - route.entry_tile[1])
+                + max(0, len(route.traversal) - 1)
+                + 1
+            )
+            if setup > slots:
+                route.blocked_local_work["DEADLINE_UNREACHABLE"] = (
+                    route.blocked_local_work.get("DEADLINE_UNREACHABLE", 0) + 1
+                )
+                return ("PASS",)
             quantity = min(remaining, available)
             supply_state.pending = PendingPickup(
                 batch.item, quantity, max(0, int(inventory.get(batch.item, 0)))
@@ -1003,8 +1132,78 @@ class StripExecutorController:
             supply_state.pickup_turns += 1
             return ("PICKUP", batch.item, quantity)
 
+    def _record_movement(
+        self, route: StripRoute, obs: Mapping[str, Any]
+    ) -> None:
+        route.movement_turns += 1
+        last_action = route.last_useful_action_step
+        if last_action is not None and int(obs.get("step", 0)) > last_action:
+            route.movement_only_turns += 1
+
+    def _segment_can_reach_useful_action(
+        self,
+        segment,
+        position: tuple[int, int],
+        work_plan: StripWorkPlan,
+        obs: Mapping[str, Any],
+    ) -> bool:
+        slots = remaining_day_action_slots(obs)
+        if slots <= 0:
+            return False
+        has_work = False
+        for tile in segment.traversal:
+            items = tuple(
+                item
+                for item in work_plan.items
+                if item.tile == tile
+                and item.kind in _LOCAL_PRIORITY
+                and item.status == WorkStatus.READY
+            )
+            if not items:
+                continue
+            has_work = True
+            distance = abs(position[0] - tile[0]) + abs(position[1] - tile[1])
+            if distance + 1 <= slots:
+                return True
+        return not has_work
+
+    def _route_can_reach_useful_action(
+        self,
+        route: StripRoute,
+        position: tuple[int, int],
+        work_plan: StripWorkPlan,
+        obs: Mapping[str, Any],
+        target: tuple[int, int],
+    ) -> bool:
+        slots = remaining_day_action_slots(obs)
+        if slots <= 0:
+            return False
+        feasible_distances: list[int] = []
+        for tile in route.traversal[route.cursor:]:
+            items = tuple(
+                item
+                for item in work_plan.items
+                if item.tile == tile
+                and item.kind in _LOCAL_PRIORITY
+                and item.status == WorkStatus.READY
+            )
+            if not items:
+                continue
+            distance = abs(position[0] - tile[0]) + abs(position[1] - tile[1])
+            feasible_distances.append(distance)
+        if feasible_distances:
+            return min(feasible_distances) + 1 <= slots
+        # A target with no currently READY item may be a continuation that the
+        # next observation makes actionable; one arrival turn is still useful.
+        return abs(position[0] - target[0]) + abs(position[1] - target[1]) + 1 <= slots
+
     def _help_untouched_segment(
-        self, route: StripRoute, work_plan: StripWorkPlan
+        self,
+        route: StripRoute,
+        work_plan: StripWorkPlan,
+        *,
+        position: tuple[int, int] | None = None,
+        obs: Mapping[str, Any] | None = None,
     ) -> bool:
         """Append one safe untouched segment to a completed worker.
 
@@ -1050,6 +1249,14 @@ class StripExecutorController:
                 if pending_tile is not None and pending_tile in segment.traversal:
                     continue
                 if extract_tile_supply_demand(segment.traversal, work_plan):
+                    continue
+                if (
+                    position is not None
+                    and obs is not None
+                    and not self._segment_can_reach_useful_action(
+                        segment, position, work_plan, obs
+                    )
+                ):
                     continue
                 remaining_segments = (
                     donor.segments[:segment_index]
@@ -1120,6 +1327,13 @@ class StripExecutorController:
         item = self._select_local_item(local_items, inventory)
         if item is None:
             return None
+        if item.source == "optional_deferrable" and self._optional_would_starve_tail(
+            route, tile, work_plan, obs
+        ):
+            route.blocked_local_work["OPTIONAL_DEFERRED_DEADLINE"] = (
+                route.blocked_local_work.get("OPTIONAL_DEFERRED_DEADLINE", 0) + 1
+            )
+            return None
         action = _interaction_action(item)
         if action is None:
             return None
@@ -1141,6 +1355,7 @@ class StripExecutorController:
             route.actions_performed.get(item.kind, 0) + 1
         )
         route.interaction_turns += item.interaction_turns
+        route.last_useful_action_step = int(obs.get("step", 0))
         successor = next(
             (
                 candidate
@@ -1186,6 +1401,37 @@ class StripExecutorController:
             route.continuation_source = None
             route.continuation_blocked_reason = None
         return action
+
+    def _optional_would_starve_tail(
+        self,
+        route: StripRoute,
+        tile: tuple[int, int],
+        work_plan: StripWorkPlan,
+        obs: Mapping[str, Any],
+    ) -> bool:
+        """Defer optional work when it makes required tail work unreachable."""
+
+        slots = remaining_day_action_slots(obs)
+        if slots <= 0:
+            return True
+        try:
+            current_index = route.traversal.index(tile, route.cursor)
+        except ValueError:
+            return False
+        for future_tile in route.traversal[current_index + 1 :]:
+            required = any(
+                item.tile == future_tile
+                and item.kind in _LOCAL_PRIORITY
+                and item.status == WorkStatus.READY
+                and item.source != "optional_deferrable"
+                for item in work_plan.items
+            )
+            if not required:
+                continue
+            distance = abs(tile[0] - future_tile[0]) + abs(tile[1] - future_tile[1])
+            if 1 + distance + 1 > slots:
+                return True
+        return False
 
     def _select_local_item(
         self, items: tuple[WorkItem, ...], inventory: Mapping[str, int]
@@ -1348,6 +1594,24 @@ class StripExecutorController:
                 ],
                 "actual_interactions_completed": sum(
                     route.interaction_turns for route in routes
+                ),
+                "actual_final_movement_only_turns": sum(
+                    route.movement_only_turns for route in routes
+                ),
+                "actual_pass_tail_turns": sum(
+                    route.pass_turns_after_completion for route in routes
+                ),
+                "unfinished_useful_work": (
+                    sum(
+                        max(0, route.workload_interactions - route.interaction_turns)
+                        for route in routes
+                    )
+                    + sum(
+                        candidate.workload_interactions
+                        for candidate in assignment.unassigned
+                    )
+                    if assignment
+                    else 0
                 ),
                 "workload_from_packet1": {
                     route_id: workload

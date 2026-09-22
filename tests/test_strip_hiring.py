@@ -16,6 +16,7 @@ from executor_v0.strip_routes import (
     WorkerId,
     assign_horizontal_routes,
     generate_horizontal_route_candidates,
+    remaining_day_action_slots,
 )
 from executor_v0.strip_work import (
     RowSummary,
@@ -278,6 +279,21 @@ def test_hiring_and_execution_expose_identical_packed_segment_groups():
     assert hiring.packed_segment_groups == tuple(
         tuple(segment.segment_id for segment in route.segments)
         for route in execution.routes
+    )
+
+
+def test_hiring_uses_shared_deadline_slots_and_exposes_segment_estimates():
+    result = hiring_plan([item("WATER", row) for row in range(4)], hour=22)
+    expected = remaining_day_action_slots(observation(hour=22), include_current_turn=False)
+    assert result.future_action_slots == expected
+    assert result.route_estimates
+    estimate = result.route_estimates[0]
+    assert estimate.estimated_arrival_turn >= 0
+    assert estimate.estimated_completion_turn >= estimate.estimated_arrival_turn
+    assert (
+        estimate.expected_useful_interactions_completed_before_deadline
+        + estimate.expected_useful_interactions_left_after_deadline
+        >= 1
     )
 
 

@@ -366,7 +366,7 @@ def test_workers_never_act_outside_their_owned_route():
     assert violations == [], violations
 
 
-def test_unassigned_routes_stay_unassigned_and_idle_workers_pass():
+def test_deadline_feasible_rows_stay_assigned_to_packed_worker():
     rows = (
         work_item("WATER", (0, 0)),
         work_item("WATER", (1, 0)),
@@ -389,7 +389,10 @@ def test_unassigned_routes_stay_unassigned_and_idle_workers_pass():
         on_turn=capture,
         money=0.0,
     )
-    assert observed and len(observed[0]) == 2
+    # The deadline-aware multi-row route can finish all three one-action rows
+    # before day end, so none is discarded merely because only one worker is
+    # present.
+    assert observed and all(not value for value in observed)
     assert len(set(observed)) == 1, "unassigned routes changed mid-day"
 
     overstaffed = StripExecutorController(

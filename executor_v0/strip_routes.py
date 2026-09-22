@@ -23,6 +23,7 @@ __all__ = [
     "WorkerId",
     "assign_horizontal_routes",
     "generate_horizontal_route_candidates",
+    "remaining_day_action_slots",
     "route_cursor_invariants_hold",
 ]
 
@@ -59,6 +60,10 @@ class HorizontalRouteCandidate:
     ready_interactions: int
     future_interactions: int
     source_shape: str = "horizontal_quadrant_row"
+    # Interaction counts in owned-tile order.  Older callers construct
+    # candidates directly, so an empty value retains the conservative
+    # whole-segment completion estimate.
+    tile_interactions: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.owned_tiles) != 5:
@@ -104,7 +109,9 @@ class StripRoute:
     completion_hour: int | None = None
     actions_performed: dict[str, int] = field(default_factory=dict)
     movement_turns: int = 0
+    movement_only_turns: int = 0
     interaction_turns: int = 0
+    last_useful_action_step: int | None = None
     pass_turns_after_completion: int = 0
     blocked_local_work: dict[str, int] = field(default_factory=dict)
     unavailable_supply_work: dict[str, int] = field(default_factory=dict)
@@ -181,7 +188,9 @@ class StripRoute:
             "workload_interactions": self.workload_interactions,
             "actions_performed": dict(sorted(self.actions_performed.items())),
             "movement_turns": self.movement_turns,
+            "movement_only_turns": self.movement_only_turns,
             "interaction_turns": self.interaction_turns,
+            "last_useful_action_step": self.last_useful_action_step,
             "pass_turns_after_completion": self.pass_turns_after_completion,
             "blocked_local_work": dict(sorted(self.blocked_local_work.items())),
             "unavailable_supply_work": dict(
@@ -222,6 +231,28 @@ def _manhattan_distance(left: tuple[int, int], right: tuple[int, int]) -> int:
     return abs(left[0] - right[0]) + abs(left[1] - right[1])
 
 
+def remaining_day_action_slots(
+    obs: Mapping[str, Any], *, include_current_turn: bool = True
+) -> int:
+    """Return actionable worker turns before the next day/terminal boundary.
+
+    Existing workers can act on the observation being assigned, while a hand
+    submitted by a HIRE order first acts on the following observation.  The
+    terminal observation itself is never actionable.
+    """
+
+    day = int(obs.get("day", 0))
+    hour = int(obs.get("hour", 0))
+    configuration = obs.get("configuration")
+    config = configuration if isinstance(configuration, Mapping) else {}
+    turns_per_day = max(1, int(config.get("turnsPerDay", 24)))
+    episode_steps = max(1, int(config.get("episodeSteps", 720)))
+    step = int(obs.get("step", day * turns_per_day + hour))
+    next_boundary = min((day + 1) * turns_per_day, episode_steps - 1)
+    slots = max(0, next_boundary - step)
+    return slots if include_current_turn else max(0, slots - 1)
+
+
 def route_cursor_invariants_hold(route: StripRoute) -> bool:
     """True when ``route``'s cursor and pending cursor both address traversal.
 
@@ -260,6 +291,18 @@ def generate_horizontal_route_candidates(
                 workload_interactions=interactions,
                 ready_interactions=summary.ready_interactions,
                 future_interactions=summary.future_interactions,
+                tile_interactions=tuple(
+                    sum(
+                        item.interaction_turns
+                        for item in work_plan.items
+                        if item.tile == tile and item.kind in {
+                            "WATER", "HARVEST", "DIG", "BUILD_COOP",
+                            "BUILD_PASTURE", "FEED", "CARE", "FERTILIZE",
+                            "COLLECT_FERTILIZER", "PLANT", "PLACE",
+                        }
+                    )
+                    for tile in tiles
+                ),
             )
         )
     return tuple(sorted(candidates, key=lambda candidate: candidate.row_key))
@@ -269,6 +312,8 @@ def generate_horizontal_route_candidates(
 class _ChainPlan:
     movement_turns: int
     completion_turns: int
+    useful_interactions: int
+    useful_segments: int
     assigned: tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]
 
 
@@ -276,11 +321,12 @@ def _chain_plan_for_mask(
     candidates: tuple[HorizontalRouteCandidate, ...],
     worker_position: tuple[int, int],
     mask: int,
+    remaining_action_slots: int | None = None,
 ) -> _ChainPlan:
     """Find the cheapest ordered/oriented chain for one candidate subset."""
 
     if not mask:
-        return _ChainPlan(0, 0, ())
+        return _ChainPlan(0, 0, 0, 0, ())
 
     indices = tuple(index for index in range(len(candidates)) if mask & (1 << index))
     # Preserve the canonical west/east ordering for the two halves of one
@@ -332,7 +378,55 @@ def _chain_plan_for_mask(
             states = next_states
         choices.extend(states.values())
 
-    movement, path = min(choices, key=lambda value: (value[0], value[1]))
+    def path_metrics(path_value):
+        elapsed = 0
+        useful = 0
+        useful_segments = 0
+        for index, side, distance in path_value:
+            candidate = candidates[index]
+            elapsed += distance
+            tile_counts = candidate.tile_interactions
+            if len(tile_counts) != len(candidate.owned_tiles):
+                tile_counts = ()
+            elif side:
+                tile_counts = tuple(reversed(tile_counts))
+            for tile_index in range(len(candidate.owned_tiles)):
+                if tile_index:
+                    elapsed += 1
+                count = (
+                    tile_counts[tile_index]
+                    if tile_counts
+                    else candidate.workload_interactions
+                    if tile_index == len(candidate.owned_tiles) - 1
+                    else 0
+                )
+                for _ in range(max(0, count)):
+                    elapsed += 1
+                    if (
+                        remaining_action_slots is None
+                        or elapsed <= remaining_action_slots
+                    ):
+                        useful += 1
+            if (
+                remaining_action_slots is None
+                or elapsed <= remaining_action_slots
+            ):
+                useful_segments += 1
+        return elapsed, useful, useful_segments
+
+    if remaining_action_slots is None:
+        movement, path = min(choices, key=lambda value: (value[0], value[1]))
+    else:
+        movement, path = min(
+            choices,
+            key=lambda value: (
+                -path_metrics(value[1])[1],
+                -path_metrics(value[1])[2],
+                path_metrics(value[1])[0],
+                value[0],
+                value[1],
+            ),
+        )
     assigned: list[tuple[HorizontalRouteCandidate, RouteSegment]] = []
     interactions = 0
     sweep = 0
@@ -353,20 +447,32 @@ def _chain_plan_for_mask(
         )
         interactions += candidate.workload_interactions
         sweep += max(0, len(traversal) - 1)
-    return _ChainPlan(movement, movement + sweep + interactions, tuple(assigned))
+    completion = movement + sweep + interactions
+    if remaining_action_slots is None:
+        useful_interactions = interactions
+        useful_segments = len(assigned)
+    else:
+        completion, useful_interactions, useful_segments = path_metrics(path)
+    return _ChainPlan(
+        movement,
+        completion,
+        useful_interactions,
+        useful_segments,
+        tuple(assigned),
+    )
 
 
 def _pareto_insert(
-    values: list[tuple[int, int, int, tuple[int, ...]]],
-    value: tuple[int, int, int, tuple[int, ...]],
+    values: list[tuple[int, int, int, int, int, int, tuple[int, ...]]],
+    value: tuple[int, int, int, int, int, int, tuple[int, ...]],
 ) -> None:
     """Keep only packing states that can still win lexicographically."""
 
     if any(
-        all(existing[index] <= value[index] for index in range(3))
+        all(existing[index] <= value[index] for index in range(6))
         and (
-            any(existing[index] < value[index] for index in range(3))
-            or existing[3] <= value[3]
+            any(existing[index] < value[index] for index in range(6))
+            or existing[6] <= value[6]
         )
         for existing in values
     ):
@@ -375,10 +481,10 @@ def _pareto_insert(
         existing
         for existing in values
         if not (
-            all(value[index] <= existing[index] for index in range(3))
+            all(value[index] <= existing[index] for index in range(6))
             and (
-                any(value[index] < existing[index] for index in range(3))
-                or value[3] <= existing[3]
+                any(value[index] < existing[index] for index in range(6))
+                or value[6] <= existing[6]
             )
         )
     ]
@@ -389,32 +495,61 @@ def _pack_small_route_sets(
     candidates: tuple[HorizontalRouteCandidate, ...],
     workers: tuple[WorkerId, ...],
     positions: Mapping[WorkerId, tuple[int, int]],
+    worker_action_slots: Mapping[WorkerId, int] | None = None,
 ) -> dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]]:
     """Pack at most eight rows while retaining exact load/travel tradeoffs."""
 
     full_mask = (1 << len(candidates)) - 1
     plans = {
         worker: {
-            mask: _chain_plan_for_mask(candidates, positions[worker], mask)
+            mask: _chain_plan_for_mask(
+                candidates,
+                positions[worker],
+                mask,
+                None if worker_action_slots is None else worker_action_slots[worker],
+            )
             for mask in range(full_mask + 1)
         }
         for worker in workers
     }
-    states: dict[int, list[tuple[int, int, int, tuple[int, ...]]]] = {0: [(0, 0, 0, ())]}
+    states: dict[int, list[tuple[int, int, int, int, int, int, tuple[int, ...]]]] = {
+        0: [(0, 0, 0, 0, 0, 0, ())]
+    }
     for worker in workers:
-        next_states: dict[int, list[tuple[int, int, int, tuple[int, ...]]]] = {}
+        next_states: dict[
+            int, list[tuple[int, int, int, int, int, int, tuple[int, ...]]]
+        ] = {}
         for covered, values in states.items():
             remaining = full_mask ^ covered
             subset = remaining
             while True:
                 plan = plans[worker][subset]
-                for maximum, movement, total, signature in values:
-                    candidate_value = (
-                        max(maximum, plan.completion_turns),
-                        movement + plan.movement_turns,
-                        total + plan.completion_turns,
-                        signature + (subset,),
-                    )
+                for useful, segments, unfinished, maximum, movement, total, signature in values:
+                    if worker_action_slots is None:
+                        candidate_value = (
+                            0,
+                            0,
+                            0,
+                            max(maximum, plan.completion_turns),
+                            movement + plan.movement_turns,
+                            total + plan.completion_turns,
+                            signature + (subset,),
+                        )
+                    else:
+                        candidate_value = (
+                            useful - plan.useful_interactions,
+                            segments - plan.useful_segments,
+                            unfinished
+                            + sum(
+                                candidate.workload_interactions
+                                for candidate, _ in plan.assigned
+                            )
+                            - plan.useful_interactions,
+                            max(maximum, plan.completion_turns),
+                            movement + plan.movement_turns,
+                            0,
+                            signature + (subset,),
+                        )
                     _pareto_insert(
                         next_states.setdefault(covered | subset, []), candidate_value
                     )
@@ -423,9 +558,12 @@ def _pack_small_route_sets(
                 subset = (subset - 1) & remaining
         states = next_states
 
-    winning = min(states[full_mask], key=lambda value: value)
+    if worker_action_slots is None:
+        winning = min(states[full_mask], key=lambda value: value[3:])
+    else:
+        winning = min(states[full_mask])
     grouped: dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]] = {}
-    for worker, mask in zip(workers, winning[3]):
+    for worker, mask in zip(workers, winning[6]):
         grouped[worker] = plans[worker][mask].assigned
     return grouped
 
@@ -434,41 +572,59 @@ def _pack_large_route_set(
     candidates: tuple[HorizontalRouteCandidate, ...],
     workers: tuple[WorkerId, ...],
     positions: Mapping[WorkerId, tuple[int, int]],
+    worker_action_slots: Mapping[WorkerId, int] | None = None,
     ) -> dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]]:
     """Bounded fallback for unusually dense forecasts."""
 
-    grouped: dict[WorkerId, list[tuple[HorizontalRouteCandidate, RouteSegment]]] = {
-        worker: [] for worker in workers
-    }
-    endpoints = dict(positions)
-    loads = {worker: 0 for worker in workers}
-    for candidate in candidates:
+    masks = {worker: 0 for worker in workers}
+    for index, candidate in enumerate(candidates):
         choices = []
         for worker in workers:
-            position = endpoints[worker]
-            left = candidate.owned_tiles
-            right = tuple(reversed(left))
-            options = (
-                (position, left),
-                (position, right),
+            mask = masks[worker] | (1 << index)
+            base = _chain_plan_for_mask(
+                candidates,
+                positions[worker],
+                masks[worker],
+                None if worker_action_slots is None else worker_action_slots[worker],
             )
-            distance, traversal = min(
-                (_manhattan_distance(position, option[1][0]), option[1])
-                for option in options
+            plan = _chain_plan_for_mask(
+                candidates,
+                positions[worker],
+                mask,
+                None if worker_action_slots is None else worker_action_slots[worker],
             )
-            projected = loads[worker] + distance + len(traversal) - 1 + candidate.workload_interactions
-            choices.append((projected, distance, len(grouped[worker]), worker.index, worker, traversal))
-        projected, distance, _, _, worker, traversal = min(choices)
-        del projected
-        grouped[worker].append(
-            (
-                candidate,
-                RouteSegment(candidate.route_id, traversal, traversal[0], distance, candidate.source_shape),
+            assigned_work = sum(
+                value.workload_interactions for value, _ in plan.assigned
             )
-        )
-        endpoints[worker] = traversal[-1]
-        loads[worker] = loads[worker] + distance + len(traversal) - 1 + candidate.workload_interactions
-    return {worker: tuple(value) for worker, value in grouped.items()}
+            unfinished = max(0, assigned_work - plan.useful_interactions)
+            choices.append(
+                (
+                    -(
+                        plan.useful_interactions - base.useful_interactions
+                    ) if worker_action_slots is not None else 0,
+                    -(
+                        plan.useful_segments - base.useful_segments
+                    ) if worker_action_slots is not None else 0,
+                    -plan.useful_interactions if worker_action_slots is not None else 0,
+                    -plan.useful_segments if worker_action_slots is not None else 0,
+                    unfinished,
+                    plan.completion_turns,
+                    plan.movement_turns,
+                    worker.index,
+                    worker,
+                )
+            )
+        worker = min(choices)[-1]
+        masks[worker] |= 1 << index
+    return {
+        worker: _chain_plan_for_mask(
+            candidates,
+            positions[worker],
+            masks[worker],
+            None if worker_action_slots is None else worker_action_slots[worker],
+        ).assigned
+        for worker in workers
+    }
 
 
 def assign_horizontal_routes(
@@ -476,15 +632,16 @@ def assign_horizontal_routes(
     worker_positions: Mapping[WorkerId, tuple[int, int]],
     *,
     assignment_hour: int,
+    remaining_action_slots: int | None = None,
+    worker_action_slots: Mapping[WorkerId, int] | None = None,
 ) -> RouteAssignment:
-    """Pack row segments into deterministic, travel-efficient worker chains.
+    """Pack row segments into deterministic, deadline-aware worker chains.
 
-    The small-board path evaluates all worker/segment subsets.  A subset's
-    best chain includes both segment order and endpoint orientation, and the
-    packing minimizes the largest estimated completion time before total
-    movement.  This makes adjacent rows stay together when workloads are
-    equal, while allowing a worker that starts near the other end to keep its
-    nearby cluster.  Larger inputs use a bounded nearest-endpoint fallback.
+    With a remaining-day budget, the exact small-board path scores useful
+    interactions, useful completed segments, unfinished interactions, maximum
+    completion, movement, and the stable subset signature.  Without a budget
+    it preserves the historical makespan/movement score.  Larger inputs use a
+    bounded marginal-gain approximation of the same objective.
     """
 
     ordered_candidates = tuple(
@@ -501,9 +658,19 @@ def assign_horizontal_routes(
     }
 
     if ordered_workers and len(ordered_candidates) <= 8:
-        grouped = _pack_small_route_sets(ordered_candidates, ordered_workers, worker_positions)
+        slots = worker_action_slots
+        if slots is None and remaining_action_slots is not None:
+            slots = {worker: remaining_action_slots for worker in ordered_workers}
+        grouped = _pack_small_route_sets(
+            ordered_candidates, ordered_workers, worker_positions, slots
+        )
     elif ordered_workers:
-        grouped = _pack_large_route_set(ordered_candidates, ordered_workers, worker_positions)
+        slots = worker_action_slots
+        if slots is None and remaining_action_slots is not None:
+            slots = {worker: remaining_action_slots for worker in ordered_workers}
+        grouped = _pack_large_route_set(
+            ordered_candidates, ordered_workers, worker_positions, slots
+        )
 
     routes: list[StripRoute] = []
     assigned_ids: set[str] = set()

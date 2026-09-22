@@ -7,7 +7,7 @@ directly.  It has no dependency on the legacy task scheduler or hiring policy.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -18,6 +18,7 @@ from executor_v0.strip_routes import (
     HorizontalRouteCandidate,
     WorkerId,
     assign_horizontal_routes,
+    remaining_day_action_slots,
 )
 from executor_v0.strip_supply import LOCAL_ACTION_PRIORITY
 from executor_v0.strip_work import (
@@ -65,6 +66,10 @@ class RouteLaborEstimate:
     movement_turns: int = 0
     pickup_turns: int = 0
     preceding_interaction_turns: int = 0
+    estimated_arrival_turn: int = 0
+    estimated_completion_turn: int = 0
+    expected_useful_interactions_completed_before_deadline: int = 0
+    expected_useful_interactions_left_after_deadline: int = 0
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -123,18 +128,9 @@ def _positive_counts(value: Any) -> dict[str, int]:
 
 
 def _future_worker_actions(obs: Mapping[str, Any]) -> int:
-    day = int(obs.get("day", 0))
-    hour = int(obs.get("hour", 0))
-    configuration = obs.get("configuration")
-    config = configuration if isinstance(configuration, Mapping) else {}
-    turns_per_day = max(1, int(config.get("turnsPerDay", 24)))
-    episode_steps = max(1, int(config.get("episodeSteps", 720)))
-    step = int(obs.get("step", day * turns_per_day + hour))
-    # A HIRE is processed after this turn's unit actions.  The terminal state
-    # is not actionable, so only turns strictly after this one and before the
-    # next reset/terminal boundary are available to the new hand.
-    next_boundary = min((day + 1) * turns_per_day, episode_steps - 1)
-    return max(0, next_boundary - step - 1)
+    # A HIRE is processed after this turn's unit actions, so the new worker
+    # receives the shared horizon with the current turn excluded.
+    return remaining_day_action_slots(obs, include_current_turn=False)
 
 
 def _spawn_positions(
@@ -184,14 +180,18 @@ def _ordered_route_items(
     candidate: HorizontalRouteCandidate,
     work_plan: StripWorkPlan,
     position: tuple[int, int],
+    traversal: tuple[tuple[int, int], ...] | None = None,
 ) -> tuple[tuple[tuple[int, int], ...], tuple[WorkItem, ...]]:
-    left_to_right = candidate.owned_tiles
-    left, right = left_to_right[0], left_to_right[-1]
-    left_distance = abs(position[0] - left[0]) + abs(position[1] - left[1])
-    right_distance = abs(position[0] - right[0]) + abs(position[1] - right[1])
-    traversal = (
-        left_to_right if left_distance <= right_distance else tuple(reversed(left_to_right))
-    )
+    if traversal is None:
+        left_to_right = candidate.owned_tiles
+        left, right = left_to_right[0], left_to_right[-1]
+        left_distance = abs(position[0] - left[0]) + abs(position[1] - left[1])
+        right_distance = abs(position[0] - right[0]) + abs(position[1] - right[1])
+        traversal = (
+            left_to_right
+            if left_distance <= right_distance
+            else tuple(reversed(left_to_right))
+        )
     tile_rank = {tile: index for index, tile in enumerate(traversal)}
     items = tuple(
         sorted(
@@ -280,8 +280,9 @@ def _estimate_route(
     carried: Mapping[str, int],
     action_slots: int,
     fertilizer_item_ids: frozenset[str],
+    traversal: tuple[tuple[int, int], ...] | None = None,
 ) -> RouteLaborEstimate:
-    traversal, items = _ordered_route_items(candidate, work_plan, position)
+    traversal, items = _ordered_route_items(candidate, work_plan, position, traversal)
     original_carried = _positive_counts(carried)
     route_carried = dict(original_carried)
     feasible_ids: set[str] = set()
@@ -362,6 +363,16 @@ def _estimate_route(
         entry_travel + max(0, len(traversal) - 1) + len(items) + len(inventory_items)
     )
     useful = first_use_eta is not None and first_use_eta <= action_slots
+    expected_useful = min(
+        len(driving),
+        max(
+            0,
+            action_slots
+            - movement_turns
+            - pickup_turns
+            - max(0, len(traversal) - 1),
+        ),
+    )
     reasons: list[str] = []
     if not represented_driving:
         reasons.append("FERTILIZER_ONLY" if fertilizer_only else "NO_HIRE_DRIVING_WORK")
@@ -384,6 +395,12 @@ def _estimate_route(
         movement_turns=movement_turns,
         pickup_turns=pickup_turns,
         preceding_interaction_turns=preceding_interaction_turns,
+        estimated_arrival_turn=movement_turns,
+        estimated_completion_turn=estimated_full_turns,
+        expected_useful_interactions_completed_before_deadline=expected_useful,
+        expected_useful_interactions_left_after_deadline=max(
+            0, len(driving) - expected_useful
+        ),
     )
 
 
@@ -404,7 +421,14 @@ def _estimate_packed_workers(
     if not candidates or not worker_positions:
         return (), 0, 0
     assignment = assign_horizontal_routes(
-        candidates, worker_positions, assignment_hour=0
+        candidates,
+        worker_positions,
+        assignment_hour=0,
+        worker_action_slots={
+            worker: future_action_slots
+            + int(worker.index < current_workers)
+            for worker in worker_positions
+        },
     )
     by_id = {candidate.route_id: candidate for candidate in candidates}
     estimates: dict[str, RouteLaborEstimate] = {}
@@ -427,6 +451,20 @@ def _estimate_packed_workers(
                 carried,
                 max(0, slots - elapsed),
                 fertilizer_item_ids,
+                segment.traversal,
+            )
+            estimate = replace(
+                estimate,
+                estimated_arrival_turn=elapsed + estimate.movement_turns,
+                estimated_completion_turn=elapsed + estimate.estimated_full_turns,
+                expected_useful_interactions_completed_before_deadline=(
+                    estimate.expected_useful_interactions_completed_before_deadline
+                ),
+                expected_useful_interactions_left_after_deadline=max(
+                    0,
+                    int(estimate.hire_driving)
+                    - estimate.expected_useful_interactions_completed_before_deadline,
+                ),
             )
             estimates[candidate.route_id] = estimate
             driving_total += int(estimate.hire_driving)
@@ -546,7 +584,17 @@ def plan_strip_hiring(
         for worker in sorted(all_positions)[: target_workers or current_workers]
     }
     final_assignment = assign_horizontal_routes(
-        candidates, final_worker_positions, assignment_hour=0
+        candidates,
+        final_worker_positions,
+        assignment_hour=0,
+        worker_action_slots={
+            worker: (
+                remaining_day_action_slots(obs)
+                if target_workers == current_workers
+                else future_slots
+            )
+            for worker in final_worker_positions
+        },
     )
     return StripHiringPlan(
         current_workers=current_workers,
