@@ -31,6 +31,7 @@ class EpisodeAssignment:
     # infer curriculum contents from a hash.
     stage25_curricula: tuple[Mapping[str, Any] | None,
                              Mapping[str, Any] | None] = (None, None)
+    stage25_validation_modes: tuple[str, str] = ("strict", "strict")
 
 
 @dataclass(frozen=True)
@@ -61,9 +62,6 @@ class Stage25RequestIdentity:
     seat: int
     day: int
     behavior_identity: Stage25BehaviorIdentity
-    crop_capacity: tuple[int, ...] | None = None
-    physical_context: Any = None
-    support: Any = None
 
     def __post_init__(self) -> None:
         for name in ("episode_index", "seat", "day"):
@@ -76,12 +74,6 @@ class Stage25RequestIdentity:
             raise ValueError("seat must be 0 or 1")
         if not isinstance(self.behavior_identity, Stage25BehaviorIdentity):
             raise TypeError("behavior_identity must be Stage25BehaviorIdentity")
-        if self.crop_capacity is not None:
-            capacity = tuple(int(value) for value in self.crop_capacity)
-            if len(capacity) != 5 or any(value < 0 or value > 100
-                                        for value in capacity):
-                raise ValueError("crop_capacity must contain five values in [0, 100]")
-            object.__setattr__(self, "crop_capacity", capacity)
 
     @property
     def request_id(self) -> str:
@@ -109,25 +101,18 @@ class Stage25InferenceRequest:
     inputs: Mapping[str, np.ndarray]
     crop_capacity: np.ndarray
     physical_context: Any
-    support: Any
     queued_at: float
+    support: Any | None = None
     seed: int = 0
 
     def __post_init__(self) -> None:
+        if "crop_capacity" in self.inputs:
+            raise ValueError(
+                "Stage 2.5 request inputs must not duplicate crop_capacity")
         capacity = np.asarray(self.crop_capacity)
         if capacity.shape not in ((5,), (1, 5)) or not np.issubdtype(
                 capacity.dtype, np.integer):
             raise ValueError("crop_capacity must be an integer [5] or [1, 5] array")
-        if self.identity.crop_capacity is not None and tuple(
-                int(value) for value in capacity.reshape(-1)) != \
-                self.identity.crop_capacity:
-            raise ValueError("request crop_capacity disagrees with identity")
-        if (self.identity.physical_context is not None and
-                self.identity.physical_context != self.physical_context):
-            raise ValueError("request physical_context disagrees with identity")
-        if (self.identity.support is not None and
-                self.identity.support != self.support):
-            raise ValueError("request support disagrees with identity")
         copied = np.array(capacity, dtype=np.int16, copy=True)
         copied.setflags(write=False)
         object.__setattr__(self, "crop_capacity", copied)
@@ -162,17 +147,16 @@ class Stage25BootstrapRequest:
     inputs: Mapping[str, np.ndarray]
     crop_capacity: np.ndarray
     physical_context: Any
-    support: Any
     queued_at: float
 
     def __post_init__(self) -> None:
+        if "crop_capacity" in self.inputs:
+            raise ValueError(
+                "Stage 2.5 bootstrap inputs must not duplicate crop_capacity")
         capacity = np.asarray(self.crop_capacity)
         if capacity.shape not in ((5,), (1, 5)) or not np.issubdtype(
                 capacity.dtype, np.integer):
             raise ValueError("bootstrap crop_capacity must be an integer [5] or [1, 5] array")
-        if self.identity.crop_capacity is not None and tuple(
-                int(value) for value in capacity.reshape(-1)) != self.identity.crop_capacity:
-            raise ValueError("bootstrap crop_capacity disagrees with identity")
         copied = np.array(capacity, dtype=np.int16, copy=True)
         copied.setflags(write=False)
         object.__setattr__(self, "crop_capacity", copied)

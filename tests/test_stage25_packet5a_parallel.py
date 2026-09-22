@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 from queue import Queue
 import subprocess
 import sys
@@ -13,9 +13,11 @@ import pytest
 from importlib.util import find_spec
 
 from rl_manager.parallel import ParallelSelfPlayRunner
+from rl_manager.parallel_worker import RemotePlanPolicy
 from rl_manager.parallel_protocol import (
     Stage25BootstrapRequest,
     Stage25InferenceRequest,
+    Stage25InferenceResponse,
     Stage25RequestIdentity,
 )
 from rl_manager.runner import RunnerConfig
@@ -82,7 +84,8 @@ def _request(index: int, day: int = 4) -> Stage25InferenceRequest:
     identity = Stage25RequestIdentity(index, 0, day, IDENTITY)
     return Stage25InferenceRequest(
         identity=identity, worker_id=0, prng_id="test-prng",
-        inputs=prepared.inputs,
+        inputs={name: value for name, value in prepared.inputs.items()
+                if name != "crop_capacity"},
         crop_capacity=np.asarray([prepared.crop_capacity], dtype=np.int16),
         physical_context=prepared.physical_context, support=prepared.support,
         queued_at=0.0)
@@ -94,15 +97,113 @@ def _bootstrap_request(index: int, day: int = 4) -> Stage25BootstrapRequest:
     prepared = provider.prepare_bootstrap_context(_obs(day=day))
     identity = Stage25RequestIdentity(index, 0, day, IDENTITY)
     return Stage25BootstrapRequest(
-        identity=identity, worker_id=0, inputs=prepared.inputs,
+        identity=identity, worker_id=0,
+        inputs={name: value for name, value in prepared.inputs.items()
+                if name != "crop_capacity"},
         crop_capacity=np.asarray([prepared.crop_capacity], dtype=np.int16),
-        physical_context=prepared.physical_context, support=None, queued_at=0.0)
+        physical_context=prepared.physical_context, queued_at=0.0)
 
 
 def _runner(size: int = 4) -> ParallelSelfPlayRunner:
     return ParallelSelfPlayRunner(
         RunnerConfig(stage25_enabled=True,
                      stage25_fixed_inference_batch_size=size), num_workers=1)
+
+
+def test_stage25_wire_identity_is_routing_only_and_request_has_one_payload_copy():
+    request = _request(17)
+    assert {field.name for field in fields(Stage25RequestIdentity)} == {
+        "episode_index", "seat", "day", "behavior_identity"}
+    assert "crop_capacity" not in request.inputs
+    assert request.identity.behavior_identity == IDENTITY
+    assert request.crop_capacity.shape == (1, 5)
+    assert request.physical_context is not None
+    assert request.support is not None
+
+
+def test_stage25_response_routes_without_echoing_physical_payload():
+    request = _request(18)
+    output = _Stage25Policy().infer_batch(
+        inputs=request.inputs, crop_capacity=request.crop_capacity,
+        physical_contexts=(request.physical_context,),
+        supports=(request.support,), row_ids=(request.request_id,),
+        prng_id=request.prng_id)
+    response = Stage25InferenceResponse(
+        request.request_id, request.identity, output)
+    assert {field.name for field in fields(response)} == {
+        "request_id", "identity", "outputs"}
+    assert not hasattr(response.identity, "physical_context")
+    assert not hasattr(response.identity, "crop_capacity")
+    assert not hasattr(response.identity, "support")
+    wrong = replace(output, policy_identity=replace(
+        IDENTITY, name="wrong-policy"))
+    with pytest.raises(ValueError, match="behavior identity"):
+        Stage25InferenceResponse(request.request_id, request.identity, wrong)
+
+
+def test_stage25_provider_materializes_support_only_in_strict(monkeypatch):
+    calls = []
+    for mode in ("strict", "fast", "none"):
+        provider = Stage25PlanProvider(
+            19, 0, 4, behavior_identity=IDENTITY,
+            validation_mode=mode)
+        original = provider._support_payload
+
+        def counted(context, initial, *, _original=original):
+            calls.append(mode)
+            return _original(context, initial)
+
+        monkeypatch.setattr(provider, "_support_payload", counted)
+        context = provider.prepare_inference_context(
+            _obs(day=4), behavior_identity=IDENTITY)
+        assert (context.support is not None) is (mode == "strict")
+    assert calls == ["strict"]
+
+
+@pytest.mark.parametrize("mode", ("fast", "none"))
+def test_stage25_compact_worker_request_omits_support_and_capacity_from_inputs(mode):
+    provider = Stage25PlanProvider(
+        21, 0, 4, behavior_identity=IDENTITY, validation_mode=mode)
+    context = provider.prepare_inference_context(
+        _obs(day=4), behavior_identity=IDENTITY)
+
+    class RequestQueue:
+        def __init__(self):
+            self.message = None
+
+        def put(self, message):
+            self.message = message
+
+    request_queue = RequestQueue()
+
+    class ResponseQueue:
+        def get(self):
+            request = request_queue.message
+            output = _Stage25Policy().infer_batch(
+                inputs=request.inputs, crop_capacity=request.crop_capacity,
+                physical_contexts=(request.physical_context,), supports=None,
+                row_ids=(request.request_id,), prng_id=request.prng_id)
+            return Stage25InferenceResponse(
+                request.request_id, request.identity, output)
+
+    response_queue = ResponseQueue()
+    policy = RemotePlanPolicy(
+        IDENTITY, request_queue, response_queue, 0,
+        validation_mode=mode)
+    policy.set_request_context([context])
+    policy._stage25_plan_batch(context.inputs, "compact", [context])
+    assert request_queue.message.support is None
+    assert "crop_capacity" not in request_queue.message.inputs
+
+
+def test_stage25_bootstrap_never_materializes_support(monkeypatch):
+    provider = Stage25PlanProvider(
+        20, 0, 4, behavior_identity=IDENTITY, validation_mode="strict")
+    monkeypatch.setattr(
+        provider, "_support_payload",
+        lambda *_args: pytest.fail("bootstrap constructed diagnostic support"))
+    context = provider.prepare_bootstrap_context(_obs(day=4))
+    assert context.support is None
 
 
 def test_stage25_parent_padding_has_no_extra_responses_and_stable_rows():

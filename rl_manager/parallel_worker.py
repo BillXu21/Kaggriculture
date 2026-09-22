@@ -60,9 +60,11 @@ class RemotePlanPolicy:
 
     def __init__(self, identity: PolicyIdentity, request_queue: Any,
                  response_queue: Any, worker_id: int,
-                 *, curriculum: Stage25CurriculumConfig | None = None) -> None:
+                 *, curriculum: Stage25CurriculumConfig | None = None,
+                 validation_mode: str = "strict") -> None:
         self.identity = identity
         self.curriculum = curriculum
+        self.validation_mode = validation_mode
         self._request_queue = request_queue
         self._response_queue = response_queue
         self._worker_id = int(worker_id)
@@ -141,13 +143,11 @@ class RemotePlanPolicy:
                 context.decision_key.episode_id if isinstance(
                     context.decision_key.episode_id, int) else row,
                 context.decision_key.seat, context.decision_key.day,
-                context.behavior_identity,
-                crop_capacity=context.crop_capacity,
-                physical_context=context.physical_context,
-                support=context.support)
+                context.behavior_identity)
             row_inputs = {
                 key: np.ascontiguousarray(np.asarray(value[row:row + 1]))
                 for key, value in inputs.items()}
+            row_inputs.pop("crop_capacity", None)
             requests.append(Stage25InferenceRequest(
                 identity=identity, worker_id=self._worker_id,
                 prng_id=str(prng_id), inputs=row_inputs,
@@ -204,16 +204,14 @@ class RemotePlanPolicy:
             raise ValueError(
                 f"bootstrap row id is not a manager identity: {row_id!r}") from exc
         identity = Stage25RequestIdentity(
-            episode_id, seat, day, self.identity,
-            crop_capacity=tuple(int(value) for value in np.asarray(
-                crop_capacity).reshape(-1)),
-            physical_context=context)
+            episode_id, seat, day, self.identity)
         request = Stage25BootstrapRequest(
             identity=identity, worker_id=self._worker_id,
             inputs={name: np.ascontiguousarray(np.asarray(value))
-                    for name, value in inputs.items()},
+                    for name, value in inputs.items()
+                    if name != "crop_capacity"},
             crop_capacity=np.asarray(crop_capacity, dtype=np.int16),
-            physical_context=context, support=None,
+            physical_context=context,
             queued_at=time.perf_counter())
         self._request_queue.put(request)
         response = self._response_queue.get()
@@ -308,7 +306,9 @@ def _assignment_specs(
                     curriculum = Stage25CurriculumConfig(**dict(curriculum))
                 policy = RemotePlanPolicy(
                     identity, request_queue, response_queue, worker_id,
-                    curriculum=curriculum)
+                    curriculum=curriculum,
+                    validation_mode=assignment.stage25_validation_modes[
+                        len(seat_policies)])
                 policies[identity] = policy
             seat_policies.append(policy)
         specs.append(EpisodeSpec(

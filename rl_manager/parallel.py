@@ -67,6 +67,7 @@ _STAGE25_PHASE_METRICS = (
     "row_rng_prepare_seconds", "policy_call_seconds",
     "output_conversion_seconds", "adapter_total_seconds",
 )
+_STAGE25_SUPPORT_ENTRIES = 1312
 
 
 def _policy_phase_snapshot(policy: Any) -> dict[str, float]:
@@ -146,7 +147,13 @@ def _factory_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
 
 def _assignment(spec: EpisodeSpec) -> EpisodeAssignment:
     curricula = []
+    validation_modes = []
     for policy in spec.policies:
+        validation_mode = getattr(policy, "validation_mode", "strict")
+        if validation_mode not in ("strict", "fast", "none"):
+            raise ValueError(
+                "Stage 2.5 policy validation_mode must be 'strict', 'fast', or 'none'")
+        validation_modes.append(validation_mode)
         curriculum = getattr(policy, "curriculum", None)
         if curriculum is None:
             curriculum = getattr(getattr(policy, "config", None),
@@ -170,7 +177,8 @@ def _assignment(spec: EpisodeSpec) -> EpisodeAssignment:
         trainable_seats=tuple(int(seat) for seat in spec.trainable_seats),
         controlled_seat=(None if spec.controlled_seat is None
                          else int(spec.controlled_seat)),
-        stage25_curricula=(curricula[0], curricula[1]))
+        stage25_curricula=(curricula[0], curricula[1]),
+        stage25_validation_modes=(validation_modes[0], validation_modes[1]))
 
 
 def _slice_outputs(outputs: PolicyOutputs, row: int) -> PolicyOutputs:
@@ -330,6 +338,10 @@ class ParallelSelfPlayRunner:
         self.inference_metrics: dict[str, Any] = {
             "requests": 0, "real_requests": 0, "logical_requests": 0,
             "bootstrap_requests": 0,
+            "support_rows_materialized": 0,
+            "support_entries_materialized": 0,
+            "strict_request_rows": 0,
+            "compact_request_rows": 0,
             "mixed_request_batches": 0,
             "batches": 0, "physical_inference_calls": 0,
             "batch_sizes": [], "real_batch_sizes": [],
@@ -708,7 +720,9 @@ class ParallelSelfPlayRunner:
             np.asarray(request.crop_capacity, dtype=np.int16)
             for request in physical_requests], axis=0)
         contexts = [request.physical_context for request in physical_requests]
-        supports = [request.support for request in physical_requests]
+        supports = ([request.support for request in physical_requests]
+                    if any(request.support is not None for request in physical_requests)
+                    else None)
         # The request identity is authoritative. The explicit rollout seed
         # is already part of the shared namespace; appending it here would
         # diverge from SelfPlayRunner's local row token.
@@ -741,6 +755,12 @@ class ParallelSelfPlayRunner:
         self.inference_metrics["real_batch_sizes"].append(real_count)
         self.inference_metrics["physical_batch_sizes"].append(physical_count)
         self.inference_metrics["physical_rows"] += physical_count
+        strict_rows = sum(request.support is not None for request in requests)
+        self.inference_metrics["support_rows_materialized"] += strict_rows
+        self.inference_metrics["support_entries_materialized"] += (
+            strict_rows * _STAGE25_SUPPORT_ENTRIES)
+        self.inference_metrics["strict_request_rows"] += strict_rows
+        self.inference_metrics["compact_request_rows"] += real_count - strict_rows
         self.inference_metrics["padding_rows"] += padding_count
         real_classes = np.asarray(outputs.classes[:real_count])
         self.inference_metrics["animal_placement_rows"] += real_count

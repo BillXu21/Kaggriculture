@@ -84,6 +84,7 @@ _STAGE25_PHASE_METRICS = (
     "row_rng_prepare_seconds", "policy_call_seconds",
     "output_conversion_seconds", "adapter_total_seconds",
 )
+_STAGE25_SUPPORT_ENTRIES = 1312
 
 
 def _policy_phase_snapshot(policy: Any) -> dict[str, float]:
@@ -520,6 +521,7 @@ class _EpisodeState:
                     spec.episode_index, seat, config.manager_start_day,
                     mode=config.stage25_mode,
                     seed=spec.seed,
+                    validation_mode=getattr(policy, "validation_mode", "strict"),
                     curriculum=curriculum,
                     behavior_identity=identity))
             self.providers = stage25_providers
@@ -845,6 +847,10 @@ class SelfPlayRunner:
         self.inference_metrics: dict[str, Any] = {
             "requests": 0, "real_requests": 0, "logical_requests": 0,
             "bootstrap_requests": 0, "batches": 0,
+            "support_rows_materialized": 0,
+            "support_entries_materialized": 0,
+            "strict_request_rows": 0,
+            "compact_request_rows": 0,
             "physical_inference_calls": 0, "batch_sizes": [],
             "real_batch_sizes": [], "physical_batch_sizes": [],
             "physical_rows": 0, "padding_rows": 0, "occupancy": 0.0,
@@ -1173,7 +1179,16 @@ class SelfPlayRunner:
                                      axis=0)
                 for key in sorted(group[0][3].inputs)}
             contexts = [item[3].physical_context for item in group]
-            supports = [item[3].support for item in group]
+            supports = ([item[3].support for item in group]
+                        if any(item[3].support is not None for item in group)
+                        else None)
+            strict_rows = sum(item[3].support is not None for item in group)
+            self.inference_metrics["support_rows_materialized"] += strict_rows
+            self.inference_metrics["support_entries_materialized"] += (
+                strict_rows * _STAGE25_SUPPORT_ENTRIES)
+            self.inference_metrics["strict_request_rows"] += strict_rows
+            self.inference_metrics["compact_request_rows"] += (
+                len(group) - strict_rows)
             capacities = np.asarray(
                 [item[3].crop_capacity for item in group], dtype=np.int16)
             row_ids = [item[3].request_id for item in group]
@@ -1241,7 +1256,7 @@ class SelfPlayRunner:
     def _stage25_policy_batch(
         policy: Any, inputs: Mapping[str, np.ndarray],
         crop_capacity: np.ndarray, contexts: Sequence[Any],
-        supports: Sequence[Any], row_ids: Sequence[str], prng_id: str,
+        supports: Sequence[Any] | None, row_ids: Sequence[str], prng_id: str,
     ) -> Stage25PolicyOutputs:
         """Call the parent Stage 2.5 owner through compatible method seams."""
         infer = (getattr(policy, "infer_batch", None) or

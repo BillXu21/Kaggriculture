@@ -113,10 +113,10 @@ class Stage25InferenceContext:
     inputs: Mapping[str, np.ndarray]
     crop_capacity: tuple[int, ...]
     physical_context: PhysicalContext
-    support: Mapping[str, Any]
     daily_start: tuple[int, float]
     curriculum: Stage25CurriculumConfig
     seed: int = 0
+    support: Mapping[str, Any] | None = None
 
     @property
     def request_id(self) -> str:
@@ -529,6 +529,7 @@ class Stage25PlanProvider:
         native_policy: Stage25NativePolicy | Any | None = None,
         policy: Stage25NativePolicy | Any | None = None,
         mode: DecisionMode = "deterministic", seed: int = 0,
+        validation_mode: str = "strict",
         curriculum: Stage25CurriculumConfig | None = None,
         source_history_version: str | None = None,
         behavior_identity: Stage25BehaviorIdentity | None = None,
@@ -541,6 +542,10 @@ class Stage25PlanProvider:
             manager_start_day, "manager_start_day")
         self.mode = _mode(mode)
         self.seed = _scalar_int(seed, "seed")
+        if validation_mode not in ("strict", "fast", "none"):
+            raise ValueError(
+                "validation_mode must be 'strict', 'fast', or 'none'")
+        self.validation_mode = validation_mode
         if curriculum is not None and not isinstance(
                 curriculum, Stage25CurriculumConfig):
             raise TypeError("curriculum must be Stage25CurriculumConfig")
@@ -820,11 +825,12 @@ class Stage25PlanProvider:
             inputs=_FrozenMapping(tuple(frozen_inputs.items())),
             crop_capacity=tuple(initial),
             physical_context=context,
-            support=_FrozenMapping(tuple(
-                self._support_payload(context, initial).items())),
             daily_start=(day, float(obs["farms"][self.seat]["money"])),
             curriculum=curriculum,
             seed=self.seed,
+            support=(None if self.validation_mode != "strict" else
+                     _FrozenMapping(tuple(
+                         self._support_payload(context, initial).items()))),
         )
         self._pending_context = prepared
         return prepared
@@ -861,11 +867,10 @@ class Stage25PlanProvider:
             inputs=_FrozenMapping(tuple(frozen_inputs.items())),
             crop_capacity=tuple(initial),
             physical_context=context,
-            support=_FrozenMapping(tuple(
-                self._support_payload(context, initial).items())),
             daily_start=(day, float(obs["farms"][self.seat]["money"])),
             curriculum=self.effective_curriculum(),
             seed=self.seed,
+            support=None,
         )
 
     def accept_inference_response(
