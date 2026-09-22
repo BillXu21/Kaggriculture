@@ -98,6 +98,7 @@ class Stage25InferenceRequest:
     identity: Stage25RequestIdentity
     worker_id: int
     prng_id: str
+    row_token: int
     inputs: Mapping[str, np.ndarray]
     crop_capacity: np.ndarray
     physical_context: Any
@@ -106,6 +107,10 @@ class Stage25InferenceRequest:
     seed: int = 0
 
     def __post_init__(self) -> None:
+        if (isinstance(self.row_token, (bool, np.bool_)) or
+                not isinstance(self.row_token, (int, np.integer)) or
+                not 0 <= int(self.row_token) < 2**31 - 1):
+            raise ValueError("row_token must be a canonical Stage 2.5 token")
         if "crop_capacity" in self.inputs:
             raise ValueError(
                 "Stage 2.5 request inputs must not duplicate crop_capacity")

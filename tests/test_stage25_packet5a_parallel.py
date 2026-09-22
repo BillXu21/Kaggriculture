@@ -29,7 +29,9 @@ from rl_manager.stage25_provider import (
     Stage25ProviderError,
     Stage25TerminalError,
 )
-from rl_manager.stage25_types import Stage25BehaviorIdentity, Stage25PolicyOutputs
+from rl_manager.stage25_types import (
+    Stage25BehaviorIdentity, Stage25PolicyOutputs, stage25_row_token,
+)
 from rl_manager.stage25_trajectory import Stage25TrajectoryBuffer
 
 from test_stage25_provider import HOLD, _obs
@@ -48,12 +50,15 @@ class _Stage25Policy:
 
     def __init__(self) -> None:
         self.row_ids: list[list[str]] = []
+        self.row_tokens: list[list[int]] = []
         self.prng_ids: list[str] = []
+        self.supports_precomputed_row_tokens = True
 
     def infer_batch(self, *, inputs, crop_capacity, physical_contexts,
-                    supports, row_ids, prng_id):
+                    supports, row_ids, prng_id, row_tokens=None):
         del inputs, supports
         self.row_ids.append(list(row_ids))
+        self.row_tokens.append(list(row_tokens) if row_tokens is not None else [])
         self.prng_ids.append(prng_id)
         batch = len(row_ids)
         classes = np.zeros((batch, 9), dtype=np.int16)
@@ -84,6 +89,7 @@ def _request(index: int, day: int = 4) -> Stage25InferenceRequest:
     identity = Stage25RequestIdentity(index, 0, day, IDENTITY)
     return Stage25InferenceRequest(
         identity=identity, worker_id=0, prng_id="test-prng",
+        row_token=stage25_row_token(identity.request_id),
         inputs={name: value for name, value in prepared.inputs.items()
                 if name != "crop_capacity"},
         crop_capacity=np.asarray([prepared.crop_capacity], dtype=np.int16),
@@ -193,6 +199,8 @@ def test_stage25_compact_worker_request_omits_support_and_capacity_from_inputs(m
     policy.set_request_context([context])
     policy._stage25_plan_batch(context.inputs, "compact", [context])
     assert request_queue.message.support is None
+    assert request_queue.message.row_token == stage25_row_token(
+        request_queue.message.request_id)
     assert "crop_capacity" not in request_queue.message.inputs
 
 
@@ -224,6 +232,9 @@ def test_stage25_parent_padding_has_no_extra_responses_and_stable_rows():
     assert policy.row_ids[0][0] == requests[1].request_id
     assert policy.row_ids[0][1] == requests[0].request_id
     assert policy.row_ids[0][2].startswith("padding/")
+    assert policy.row_tokens[0] == [
+        requests[1].row_token, requests[0].row_token, requests[1].row_token,
+        requests[1].row_token]
     assert len([queue.get_nowait() for _ in range(2)]) == 2
     assert runner.inference_metrics["real_requests"] == 2
     assert runner.inference_metrics["padding_rows"] == 2

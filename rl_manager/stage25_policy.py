@@ -569,6 +569,8 @@ def _policy_core(
         rng_keys: jax.Array, supplied_actions: jax.Array,
         context_values: tuple[jax.Array, ...], row_ids: jax.Array,
         config: Stage25ModelConfig, mode: str, use_explicit_context: bool,
+        use_root_rng: bool = False,
+        rng_root: jax.Array = jnp.zeros((2,), dtype=jnp.uint32),
 ) -> dict[str, jax.Array | dict[str, jax.Array]]:
     """One jitted core shared by stochastic, greedy, and evaluation paths.
 
@@ -576,6 +578,9 @@ def _policy_core(
     capacity ``C`` is derived here from the decoded context after the land and
     animal steps; it is never supplied by the caller.
     """
+    if use_root_rng:
+        rng_keys = jax.vmap(
+            jax.random.fold_in, in_axes=(None, 0))(rng_root, row_ids)
     dropout_rng = None
     if mode == "train":
         # Training is the only path that enables the existing corrected-E
@@ -760,7 +765,8 @@ def _policy_core(
 
 _stage25_jit = jax.jit(
     _policy_core,
-    static_argnames=("config", "mode", "use_explicit_context"))
+    static_argnames=("config", "mode", "use_explicit_context",
+                     "use_root_rng"))
 
 
 def _call_policy(
@@ -784,6 +790,7 @@ def _call_prepared_policy(
         params: Mapping[str, Any], prepared: Mapping[str, jax.Array],
         capacity: jax.Array, batch: int, config: Stage25ModelConfig, *,
         mode: str, rng_keys: Any = None, actions: Any = None,
+        rng_root: Any = None,
         physical_contexts: Any = None, row_ids: Any = None,
         reject_invalid: bool = True,
 ) -> dict[str, Any]:
@@ -792,12 +799,21 @@ def _call_prepared_policy(
     The parent-owned inference adapter uses this seam so its host validation
     and encoder conversion are not repeated by a public policy wrapper.
     """
+    if rng_keys is not None and rng_root is not None:
+        raise ValueError("provide rng_keys or rng_root, not both")
+    use_root_rng = rng_root is not None
     if rng_keys is None:
         keys = jnp.zeros((batch, 2), dtype=jnp.uint32)
     else:
         keys = jnp.asarray(rng_keys, dtype=jnp.uint32)
         if tuple(keys.shape) != (batch, 2):
             raise ValueError("rng_keys must have shape [B, 2]")
+    if rng_root is None:
+        root = jnp.zeros((2,), dtype=jnp.uint32)
+    else:
+        root = jnp.asarray(rng_root, dtype=jnp.uint32)
+        if tuple(root.shape) != (2,):
+            raise ValueError("rng_root must have shape [2]")
     context_values = _host_contexts(physical_contexts, batch)
     use_explicit_context = context_values is not None
     if context_values is None:
@@ -827,9 +843,10 @@ def _call_prepared_policy(
                                np.any(supplied_array >=
                                       np.asarray(ACTION_CLASS_COUNTS))):
             raise ValueError("actions contain a class outside its vocabulary")
-    result = _stage25_jit(params, prepared, capacity, keys, supplied,
-                          context_values, row_id_array, config, mode,
-                          use_explicit_context)
+    result = _stage25_jit(
+        params, prepared, capacity, keys, supplied, context_values,
+        row_id_array, config, mode, use_explicit_context, use_root_rng,
+        root)
     if actions is not None and reject_invalid:
         if not bool(np.all(np.asarray(result["validity"]))):
             raise ValueError(

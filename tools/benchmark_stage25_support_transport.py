@@ -26,7 +26,7 @@ from rl_manager.stage25_inference import (
 )
 from rl_manager.stage25_mechanics import PhysicalContext
 from rl_manager.stage25_provider import Stage25PlanProvider
-from rl_manager.stage25_types import Stage25BehaviorIdentity
+from rl_manager.stage25_types import Stage25BehaviorIdentity, stage25_row_token
 
 
 SUPPORT_ENTRIES_PER_ROW = 4 + 3 * 101 + 5 * 201
@@ -74,7 +74,10 @@ def _requests(batch_size: int, mode: str) -> tuple[tuple[Stage25InferenceRequest
         row_support = supports[row]
         requests.append(Stage25InferenceRequest(
             identity=Stage25RequestIdentity(row, 0, 4, identity),
-            worker_id=0, prng_id="benchmark", inputs={
+            worker_id=0, prng_id="benchmark",
+            row_token=stage25_row_token(
+                Stage25RequestIdentity(row, 0, 4, identity).request_id),
+            inputs={
                 "unlocked": _inputs(1)["unlocked"],
                 "board_animal": _inputs(1)["board_animal"],
             }, crop_capacity=np.asarray([capacity], dtype=np.int16),

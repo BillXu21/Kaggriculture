@@ -31,6 +31,7 @@ from rl_manager.parallel_protocol import (
     policy_row_request_id,
 )
 from rl_manager.runner import EpisodeSpec, SelfPlayRunner
+from rl_manager.stage25_types import stage25_row_token
 from rl_manager.stage25_provider import Stage25InferenceContext
 from rl_manager.stage25_config import Stage25CurriculumConfig
 from rl_manager.stage25_types import Stage25PolicyOutputs
@@ -148,9 +149,14 @@ class RemotePlanPolicy:
                 key: np.ascontiguousarray(np.asarray(value[row:row + 1]))
                 for key, value in inputs.items()}
             row_inputs.pop("crop_capacity", None)
+            row_token = context.row_token
+            if row_token is None or context.request_id != identity.request_id:
+                row_token = stage25_row_token(identity.request_id)
             requests.append(Stage25InferenceRequest(
                 identity=identity, worker_id=self._worker_id,
-                prng_id=str(prng_id), inputs=row_inputs,
+                prng_id=str(prng_id),
+                row_token=row_token,
+                inputs=row_inputs,
                 crop_capacity=np.asarray([context.crop_capacity], dtype=np.int16),
                 physical_context=context.physical_context,
                 support=context.support, queued_at=time.perf_counter(),

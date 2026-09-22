@@ -342,6 +342,26 @@ def _normalise_row_ids(row_ids: Sequence[Any], batch: int) -> np.ndarray:
     return tokens
 
 
+def _normalise_row_tokens(row_tokens: Sequence[Any], batch: int) -> np.ndarray:
+    """Validate worker-supplied canonical tokens without re-hashing IDs."""
+    if isinstance(row_tokens, (str, bytes)):
+        raise ValueError("row_tokens must be a sequence, not one scalar")
+    try:
+        values = tuple(row_tokens)
+    except TypeError as exc:
+        raise ValueError("row_tokens must be a sequence") from exc
+    if len(values) != batch:
+        raise ValueError(f"row_tokens has {len(values)} rows, expected {batch}")
+    normalised: list[int] = []
+    for value in values:
+        if (isinstance(value, (bool, np.bool_)) or
+                not isinstance(value, (int, np.integer)) or
+                not 0 <= int(value) < 2**31 - 1):
+            raise ValueError("row_tokens must contain canonical Stage 2.5 tokens")
+        normalised.append(int(value))
+    return np.asarray(normalised, dtype=np.int32)
+
+
 def _canonical_prng_id(prng_id: str, identity: Stage25BehaviorIdentity,
                        seed: int = 0) -> str:
     if not isinstance(prng_id, str) or not prng_id:
@@ -373,6 +393,8 @@ def _row_rng_keys(root: jax.Array, row_ids: np.ndarray) -> jax.Array:
 
 class Stage25InferenceAdapter:
     """Immutable parent-side owner of one exact native Stage 2.5 snapshot."""
+
+    supports_precomputed_row_tokens = True
 
     @classmethod
     def from_checkpoint(cls, path: str | Path, **kwargs: Any) -> "Stage25InferenceAdapter":
@@ -486,6 +508,7 @@ class Stage25InferenceAdapter:
         self.inference_phase_seconds = {
             name: 0.0 for name in _INFERENCE_PHASES
         }
+        self._root_key_cache: dict[str, jax.Array] = {}
 
     @property
     def policy_identity(self) -> Stage25BehaviorIdentity:
@@ -563,6 +586,14 @@ class Stage25InferenceAdapter:
                                       batch_size=batch)
         return output
 
+    def _cached_root_key(self, prng_id: str) -> jax.Array:
+        canonical = _canonical_prng_id(prng_id, self.identity, self.seed)
+        root = self._root_key_cache.get(canonical)
+        if root is None:
+            root = _root_key(canonical, self.identity, self.seed)
+            self._root_key_cache[canonical] = root
+        return root
+
     def _plan_prepared(
         self, batch: int, prepared: Mapping[str, Any], capacity: jax.Array,
         contexts: tuple[PhysicalContext, ...] | None, ids: np.ndarray,
@@ -584,14 +615,13 @@ class Stage25InferenceAdapter:
             if phase_seconds is not None:
                 self._phase(phase_seconds, "policy_call_seconds", policy_started)
         else:
-            root = _root_key(prng_id, self.identity, self.seed)
-            keys = _row_rng_keys(root, ids)
+            root = self._cached_root_key(prng_id)
             if phase_seconds is not None:
                 self._phase(phase_seconds, "row_rng_prepare_seconds", rng_started)
             policy_started = time.perf_counter()
             result = _call_prepared_policy(
                 self.params, prepared, capacity, batch, self.config,
-                mode="sample", rng_keys=keys, physical_contexts=contexts,
+                mode="sample", rng_root=root, physical_contexts=contexts,
                 row_ids=ids, reject_invalid=False)
             jax.tree_util.tree_map(
                 lambda leaf: leaf.block_until_ready()
@@ -621,10 +651,16 @@ class Stage25InferenceAdapter:
         self, inputs: Mapping[str, Any], row_ids: Sequence[Any] | None,
         prng_id: str,
         *, physical_contexts: Sequence[PhysicalContext] | None = None,
+        row_tokens: Sequence[Any] | None = None,
     ) -> Stage25PolicyOutputs:
         batch, prepared, capacity, contexts = self._prepare(inputs, physical_contexts)
-        ids = (np.arange(batch, dtype=np.int32) if row_ids is None
-               else _normalise_row_ids(row_ids, batch))
+        if self.deterministic:
+            ids = np.arange(batch, dtype=np.int32)
+        elif row_tokens is not None:
+            ids = _normalise_row_tokens(row_tokens, batch)
+        else:
+            ids = (np.arange(batch, dtype=np.int32) if row_ids is None
+                   else _normalise_row_ids(row_ids, batch))
         return self._plan_prepared(
             batch, prepared, capacity, contexts, ids, prng_id)
 
@@ -633,6 +669,7 @@ class Stage25InferenceAdapter:
         physical_contexts: Sequence[PhysicalContext] | None = None,
         supports: Sequence[Any] | None = None,
         row_ids: Sequence[Any] | None = None, prng_id: str | None = None,
+        row_tokens: Sequence[Any] | None = None,
     ) -> Stage25PolicyOutputs:
         """Compatibility seam for runner callers carrying context separately.
 
@@ -673,8 +710,13 @@ class Stage25InferenceAdapter:
             if prng_id is None:
                 raise ValueError("prng_id is required")
             row_started = time.perf_counter()
-            ids = (np.arange(batch, dtype=np.int32) if row_ids is None
-                   else _normalise_row_ids(row_ids, batch))
+            if self.deterministic:
+                ids = np.arange(batch, dtype=np.int32)
+            elif row_tokens is not None:
+                ids = _normalise_row_tokens(row_tokens, batch)
+            else:
+                ids = (np.arange(batch, dtype=np.int32) if row_ids is None
+                       else _normalise_row_ids(row_ids, batch))
             self._phase(phase_seconds, "row_rng_prepare_seconds", row_started)
             return self._plan_prepared(
                 batch, prepared, capacity, contexts, ids, prng_id,
@@ -770,10 +812,7 @@ class Stage25InferenceAdapter:
             batch, prepared, capacity, contexts = self._prepare(
                 merged, physical_contexts, phase_seconds=phase_seconds)
             classes = np.zeros((batch, len(ACTION_CLASS_COUNTS)), dtype=np.int16)
-            row_started = time.perf_counter()
-            ids = (np.arange(batch, dtype=np.int32) if row_ids is None
-                   else _normalise_row_ids(row_ids, batch))
-            self._phase(phase_seconds, "row_rng_prepare_seconds", row_started)
+            ids = np.arange(batch, dtype=np.int32)
             policy_started = time.perf_counter()
             result = _call_prepared_policy(
                 self.params, prepared, capacity, batch, self.config,

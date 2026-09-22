@@ -727,16 +727,16 @@ class ParallelSelfPlayRunner:
         # is already part of the shared namespace; appending it here would
         # diverge from SelfPlayRunner's local row token.
         row_ids = [request.request_id for request in requests]
-        row_ids.extend(
-            f"padding/behavior={first.identity.behavior_identity.identity_id()}"
-            f"/batch={'|'.join(request.request_id for request in requests)}"
-            f"/slot={slot}" for slot in range(padding_count))
+        row_ids.extend(f"padding/slot={slot}" for slot in range(padding_count))
+        row_tokens = [request.row_token for request in requests]
+        row_tokens.extend(first.row_token for _ in range(padding_count))
         prng_id = stage25_rng_namespace(
             first.identity.behavior_identity, getattr(policy, "seed", 0))
         phase_before = _policy_phase_snapshot(policy)
         t0 = time.perf_counter()
         outputs = SelfPlayRunner._stage25_policy_batch(
-            policy, batch, capacities, contexts, supports, row_ids, prng_id)
+            policy, batch, capacities, contexts, supports, row_ids, prng_id,
+            row_tokens=row_tokens)
         inference_seconds = time.perf_counter() - t0
         _add_policy_phase_delta(self.inference_metrics, policy, phase_before)
         if outputs.batch_size != physical_count:

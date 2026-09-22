@@ -7,6 +7,7 @@ it must not import JAX, torch, executors, or environment backends.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 import hashlib
 import json
 from typing import Mapping
@@ -79,7 +80,7 @@ class Stage25BehaviorIdentity:
             if not str(getattr(self, field_name)):
                 raise ValueError(f"{field_name} must be non-empty")
 
-    @property
+    @cached_property
     def fingerprint(self) -> str:
         payload = json.dumps(
             self.to_json_dict(include_identity=False),

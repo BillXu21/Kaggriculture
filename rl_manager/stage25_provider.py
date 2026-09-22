@@ -56,7 +56,7 @@ from .stage25_mechanics import (
     initialize_crop_ledger,
     unplaced_animal_counts,
 )
-from .stage25_types import Stage25BehaviorIdentity
+from .stage25_types import Stage25BehaviorIdentity, stage25_row_token
 
 STATE_VERSION = "stage25_provider_state_v2"
 SOURCE_TRANSFER = "encoder_only"
@@ -117,6 +117,7 @@ class Stage25InferenceContext:
     curriculum: Stage25CurriculumConfig
     seed: int = 0
     support: Mapping[str, Any] | None = None
+    row_token: int | None = None
 
     @property
     def request_id(self) -> str:
@@ -831,6 +832,9 @@ class Stage25PlanProvider:
             support=(None if self.validation_mode != "strict" else
                      _FrozenMapping(tuple(
                          self._support_payload(context, initial).items()))),
+            row_token=stage25_row_token(
+                f"episode={key.episode_id}/seat={key.seat}/day={key.day}"
+                f"/behavior={identity.identity_id()}"),
         )
         self._pending_context = prepared
         return prepared

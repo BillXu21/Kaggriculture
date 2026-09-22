@@ -12,7 +12,8 @@ import pytest
 from rl_manager.stage25_checkpoint import save_stage25_inference_checkpoint
 from rl_manager.stage25_config import Stage25CurriculumConfig
 from rl_manager.stage25_inference import (
-    Stage25InferenceAdapter, _normalise_row_ids, _root_key, _row_rng_keys,
+    Stage25InferenceAdapter, _normalise_row_ids, _normalise_row_tokens,
+    _root_key, _row_rng_keys,
 )
 from rl_manager.stage25_mechanics import (
     PhysicalContext, animal_target_support_mask, crop_delta_support_mask,
@@ -21,7 +22,7 @@ from rl_manager.stage25_mechanics import (
 from rl_manager.stage25_policy import (
     greedy_act, init_stage25_params, stochastic_act, tiny_stage25_config,
 )
-from rl_manager.stage25_types import Stage25PolicyOutputs
+from rl_manager.stage25_types import Stage25PolicyOutputs, stage25_row_token
 
 
 def _inputs(batch: int = 1) -> dict[str, np.ndarray]:
@@ -229,6 +230,42 @@ def test_optimized_row_keys_are_exactly_the_legacy_fold_sequence():
     ]), dtype=np.uint32)
     optimized = np.asarray(_row_rng_keys(root, ids), dtype=np.uint32)
     np.testing.assert_array_equal(optimized, legacy)
+
+
+def test_precomputed_tokens_match_the_canonical_request_hash():
+    row_ids = (
+        "episode=1/seat=0/day=4/behavior=a@v:111111111111",
+        "episode=1/seat=1/day=12/behavior=b@v:222222222222",
+        "episode=9/seat=0/day=20/behavior=c@v:333333333333",
+        17,
+    )
+    expected = np.asarray([stage25_row_token(row_id) for row_id in row_ids],
+                          dtype=np.int32)
+    np.testing.assert_array_equal(
+        _normalise_row_tokens(expected.tolist(), len(row_ids)), expected)
+
+
+def test_precomputed_root_path_matches_legacy_policy_outputs_exactly():
+    adapter = _adapter()
+    inputs = _inputs(3)
+    contexts = (_context(),) * 3
+    row_ids = ("precomputed-a", "precomputed-b", "precomputed-c")
+    tokens = _normalise_row_ids(row_ids, 3)
+    output = adapter.infer_batch(
+        inputs, physical_contexts=contexts, row_ids=row_ids,
+        row_tokens=tokens, prng_id="same-day")
+    root = _root_key("same-day", adapter.identity, adapter.seed)
+    legacy = stochastic_act(
+        adapter.params, inputs, adapter.config,
+        rng_keys=np.asarray(jnp.stack([
+            jax.random.fold_in(root, int(row_id)) for row_id in tokens
+        ]), dtype=np.uint32), physical_contexts=contexts, row_ids=tokens,
+        reject_invalid=False)
+    for name in ("classes", "component_logprobs", "joint_logprob", "value",
+                 "decoded_goals", "valid"):
+        np.testing.assert_array_equal(getattr(output, name),
+                                      np.asarray(legacy[name]))
+    assert list(adapter._root_key_cache) == ["same-day"]
 
 
 def test_optimized_adapter_matches_legacy_policy_outputs_exactly():

@@ -1192,6 +1192,9 @@ class SelfPlayRunner:
             capacities = np.asarray(
                 [item[3].crop_capacity for item in group], dtype=np.int16)
             row_ids = [item[3].request_id for item in group]
+            row_tokens = [item[3].row_token for item in group]
+            if any(token is None for token in row_tokens):
+                raise ValueError("Stage 2.5 inference context has no row token")
             set_context = getattr(policy, "set_request_context", None)
             if callable(set_context):
                 set_context([item[3] for item in group])
@@ -1199,7 +1202,8 @@ class SelfPlayRunner:
             outputs = self._stage25_policy_batch(
                 policy, inputs, capacities, contexts, supports, row_ids,
                 stage25_rng_namespace(
-                    group[0][3].behavior_identity, getattr(policy, "seed", 0)))
+                    group[0][3].behavior_identity, getattr(policy, "seed", 0)),
+                row_tokens=row_tokens)
             _add_policy_phase_delta(self.inference_metrics, policy, phase_before)
             real_count = len(group)
             self.inference_metrics["requests"] += real_count
@@ -1257,16 +1261,21 @@ class SelfPlayRunner:
         policy: Any, inputs: Mapping[str, np.ndarray],
         crop_capacity: np.ndarray, contexts: Sequence[Any],
         supports: Sequence[Any] | None, row_ids: Sequence[str], prng_id: str,
+        *, row_tokens: Sequence[int] | None = None,
     ) -> Stage25PolicyOutputs:
         """Call the parent Stage 2.5 owner through compatible method seams."""
         infer = (getattr(policy, "infer_batch", None) or
                  getattr(policy, "stage25_infer_batch", None) or
                  getattr(policy, "plan_batch_with_context", None))
         if callable(infer):
-            raw = infer(
+            kwargs = dict(
                 inputs=inputs, crop_capacity=crop_capacity,
                 physical_contexts=contexts, supports=supports,
                 row_ids=row_ids, prng_id=prng_id)
+            if row_tokens is not None and getattr(
+                    policy, "supports_precomputed_row_tokens", False):
+                kwargs["row_tokens"] = row_tokens
+            raw = infer(**kwargs)
         else:
             raw = policy.plan_batch(inputs, prng_id)
         if isinstance(raw, Stage25PolicyOutputs):
