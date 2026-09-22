@@ -43,9 +43,12 @@ from rl_manager.stage25_mechanics import (
     physical_crop_capacity,
 )
 from rl_manager.stage25_policy import (
+    _PreparedPhysicalContexts,
     Stage25ModelConfig,
-    _host_inputs,
+    _host_contexts,
     _call_prepared_policy,
+    _prepare_stage25_inputs_validated,
+    _validate_stage25_inputs,
 )
 from rl_manager.stage25_types import (
     STAGE25_PHYSICAL_SUPPORT_VERSION,
@@ -549,25 +552,30 @@ class Stage25InferenceAdapter:
         physical_contexts: Sequence[PhysicalContext] | None,
         *, validation_mode: str | None = None,
         phase_seconds: dict[str, float] | None = None,
-    ) -> tuple[int, dict[str, Any], jax.Array, tuple[PhysicalContext, ...] | None]:
+    ) -> tuple[int, dict[str, Any], jax.Array,
+               tuple[PhysicalContext, ...] | _PreparedPhysicalContexts | None]:
         mode = self.validation_mode if validation_mode is None else validation_mode
         input_started = time.perf_counter()
-        batch = _validate_inputs(inputs)
+        validated = _validate_stage25_inputs(inputs, self.config)
         if phase_seconds is not None:
             self._phase(phase_seconds, "input_validation_seconds", input_started)
         host_started = time.perf_counter()
-        prepared, capacity, policy_batch = _host_inputs(inputs, self.config)
+        prepared, capacity, policy_batch = _prepare_stage25_inputs_validated(validated)
         if phase_seconds is not None:
             self._phase(phase_seconds, "host_input_prepare_seconds", host_started)
+        batch = validated.batch
         if policy_batch != batch:
             raise ValueError("policy input preparation changed the batch size")
         contexts = None
         if physical_contexts is not None:
             context_started = time.perf_counter()
-            contexts = _normalise_contexts(physical_contexts, batch)
+            normalised_contexts = _normalise_contexts(physical_contexts, batch)
             if mode != "none":
                 _validate_context_consistency(
-                    inputs, contexts, inputs["crop_capacity"])
+                    inputs, normalised_contexts, inputs["crop_capacity"])
+            contexts = _PreparedPhysicalContexts(
+                normalised_contexts,
+                _host_contexts(normalised_contexts, batch) or ())
             if phase_seconds is not None:
                 self._phase(phase_seconds, "context_validation_seconds",
                             context_started)

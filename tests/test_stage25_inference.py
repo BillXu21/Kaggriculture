@@ -20,6 +20,7 @@ from rl_manager.stage25_mechanics import (
     land_target_support_mask, physical_crop_capacity,
 )
 from rl_manager.stage25_policy import (
+    _validate_stage25_inputs,
     greedy_act, init_stage25_params, stochastic_act, tiny_stage25_config,
 )
 from rl_manager.stage25_types import Stage25PolicyOutputs, stage25_row_token
@@ -194,6 +195,73 @@ def test_validation_mode_rejects_unknown_values():
     with pytest.raises(ValueError, match="validation_mode"):
         Stage25InferenceAdapter(
             params=params, config=config, validation_mode="disabled")
+
+
+@pytest.mark.parametrize(
+    ("name", "mutate", "message"),
+    (
+        ("missing required field", lambda values: values.pop("scalars"),
+         "missing required"),
+        ("unknown field", lambda values: values.update(extra=np.zeros((1,))),
+         "unknown"),
+        ("wrong batch length", lambda values: values.update(
+            day=np.zeros((2,), dtype=np.int16)), "rows"),
+        ("wrong board_kind shape", lambda values: values.update(
+            board_kind=np.zeros((1, 99), dtype=np.int16)), "shape"),
+        ("wrong board_mask shape", lambda values: values.update(
+            board_mask=np.zeros((1, 100, 3), dtype=np.uint8)), "shape"),
+        ("wrong economic_context shape", lambda values: values.update(
+            economic_context=np.zeros((1, 13), dtype=np.float32)), "shape"),
+        ("non-finite economic_context", lambda values: values.update(
+            economic_context=np.full((1, 14), np.nan, dtype=np.float32)),
+            "non-finite"),
+        ("wrong crop ledger shape", lambda values: values.update(
+            crop_capacity=np.zeros((1, 4), dtype=np.int16)), "shape"),
+        ("crop ledger below zero", lambda values: values.update(
+            crop_capacity=np.full((1, 5), -1, dtype=np.int16)), r"\[0, 100\]"),
+        ("crop ledger above 100", lambda values: values.update(
+            crop_capacity=np.full((1, 5), 101, dtype=np.int16)), r"\[0, 100\]"),
+        ("nonintegral crop ledger", lambda values: values.update(
+            crop_capacity=np.full((1, 5), 1.5, dtype=np.float32)), "integers"),
+        ("wrong unlocked shape", lambda values: values.update(
+            unlocked=np.zeros((1, 3), dtype=np.uint8)), "shape"),
+        ("non-prefix unlocked", lambda values: values.update(
+            unlocked=np.array([[1, 0, 1, 0]], dtype=np.uint8)), "prefix"),
+        ("zero unlocked land", lambda values: values.update(
+            unlocked=np.zeros((1, 4), dtype=np.uint8)), "NW quadrant"),
+        ("object dtype", lambda values: values.update(
+            board_kind=np.zeros((1, 100), dtype=object)), "dtype"),
+        ("forbidden non-finite float", lambda values: values.update(
+            scalars=np.full((1, 4), np.inf, dtype=np.float32)), "non-finite"),
+    ),
+)
+def test_fast_rollout_validation_rejects_p2_malformed_inputs(
+        name, mutate, message):
+    del name
+    config = tiny_stage25_config()
+    params = init_stage25_params(config, seed=211)
+    values = {key: value.copy() for key, value in _inputs().items()}
+    mutate(values)
+    adapter = Stage25InferenceAdapter(
+        params=params, config=config, validation_mode="fast")
+    with pytest.raises(ValueError, match=message):
+        adapter.infer_batch(values, row_ids=("invalid",), prng_id="validation")
+
+
+def test_board_numeric_nullable_nan_and_canonical_arrays_preserve_contract():
+    config = tiny_stage25_config()
+    values = _inputs()
+    values["board_numeric"][0, 0, 0] = np.nan
+    validated = _validate_stage25_inputs(values, config)
+    assert np.isnan(validated.inputs["board_numeric"][0, 0, 0])
+    assert validated.inputs["board_numeric"].dtype == np.float32
+    assert validated.inputs["shed_counts"].dtype == np.int32
+    assert np.shares_memory(validated.inputs["board_numeric"],
+                            values["board_numeric"])
+    assert np.shares_memory(validated.inputs["shed_counts"],
+                            values["shed_counts"])
+    assert not np.shares_memory(validated.inputs["board_kind"],
+                                values["board_kind"])
 
 
 def test_row_ids_make_sampling_stable_under_reorder_and_padding():

@@ -29,7 +29,6 @@ from bc_manager_jax.model import (
     empty_params as _empty_encoder_params,
     init_train_params as _init_encoder_train_params,
     tiny_manager_config,
-    validate_inputs as _validate_encoder_inputs,
 )
 from rl_manager.stage25_config import Stage25CurriculumConfig
 from rl_manager.stage25_mechanics import (
@@ -61,6 +60,31 @@ _KIND_COOP = TILE_KIND_IDS["COOP"]
 _KIND_PASTURE = TILE_KIND_IDS["PASTURE"]
 _KIND_WEED = TILE_KIND_IDS["WEED"]
 _KIND_LOCKED = TILE_KIND_IDS["LOCKED"]
+
+_STAGE25_INTEGER_INPUTS = frozenset({
+    "board_kind", "board_crop", "board_animal", "board_mask", "shed_counts",
+    "seed_counts", "carried_counts", "unlocked", "market_inventory",
+    "shop_counts", "day", "days_remaining",
+})
+_STAGE25_INPUT_SHAPES = {
+    "board_kind": (100,),
+    "board_crop": (100,),
+    "board_animal": (100,),
+    "board_numeric": (100, 11),
+    "board_bool": (100, 8),
+    "board_mask": (100, 4),
+    "scalars": (4,),
+    "shed_counts": (12,),
+    "seed_counts": (5,),
+    "carried_counts": (12,),
+    "unlocked": (4,),
+    "market_inventory": (9,),
+    "market_prices": (9,),
+    "shop_counts": (9,),
+    "day": (),
+    "days_remaining": (),
+    "economic_context": (14,),
+}
 
 
 class _ShapeSpec:
@@ -352,54 +376,85 @@ def init_stage25_params(
     return params
 
 
-def _host_inputs(
+@dataclass(frozen=True, slots=True)
+class _ValidatedStage25Inputs:
+    """Private adapter-owned boundary between validation and JAX preparation."""
+
+    inputs: dict[str, np.ndarray]
+    crop_capacity: np.ndarray
+    batch: int
+
+
+def _validate_stage25_inputs(
         inputs: Mapping[str, Any], config: Stage25ModelConfig,
         crop_capacity: Any = None,
-) -> tuple[dict[str, jax.Array], jax.Array, int]:
-    """Prepare encoder inputs and the persistent crop-goal ledger ``K``.
-
-    ``crop_capacity`` is the pre-decision persistent goal ledger ``K`` of
-    shape ``[B, 5]`` with integer entries in ``[0, 100]``.  It conditions the
-    encoder/decoder and supplies each crop head's delta base; it never supplies
-    the physical capacity ``C``, which is derived from the decoded physical
-    context after the land and animal decisions.
-    """
-    if not isinstance(inputs, Mapping):
-        raise ValueError("inputs must be a mapping")
+) -> _ValidatedStage25Inputs:
+    """Validate and canonicalize the complete Stage 2.5 host contract once."""
+    if not isinstance(inputs, Mapping) or not inputs:
+        raise ValueError("inputs must be a non-empty mapping of batched arrays")
+    unknown = sorted(set(inputs) - set(_STAGE25_INPUT_SHAPES)
+                     - {"crop_capacity", "row_ids"})
+    if unknown:
+        raise ValueError(f"inputs contain unknown keys {unknown}")
+    missing = sorted(set(_STAGE25_INPUT_SHAPES) - set(inputs))
+    if missing:
+        raise ValueError(f"inputs are missing required arrays {missing}")
     ledger = (crop_capacity if crop_capacity is not None
               else inputs.get("crop_capacity"))
     if ledger is None:
         raise ValueError(
             "inputs must contain crop_capacity (persistent goal ledger K [B,5])")
-    base = {key: value for key, value in inputs.items()
-            if key not in ("crop_capacity", "row_ids")}
-    _validate_encoder_inputs(base, config.manager_config, model_variant="E")
-    # Economics are allowed as encoder context, but never enter the physical
-    # support equations below.  This preserves the corrected-E representation
-    # while keeping permanent feasibility independent of prices or money.
-    board = np.asarray(base["board_kind"])
-    b = int(board.shape[0])
-    if tuple(board.shape) != (b, BOARD_SIZE):
-        raise ValueError("board_kind must have shape [B, 100]")
-    if tuple(np.asarray(base["board_animal"]).shape) != tuple(board.shape):
-        raise ValueError("board_animal must match board_kind")
-    if tuple(np.asarray(base["board_mask"]).shape) != (b, BOARD_SIZE, 4):
-        raise ValueError("board_mask must have shape [B, 100, 4]")
-    unlocked = np.asarray(base["unlocked"])
-    if unlocked.shape != (b, _N_LAND) or not np.all(np.isin(unlocked, (0, 1))):
-        raise ValueError("unlocked must have shape [B, 4] and contain 0/1")
-    prefix = np.asarray(unlocked, dtype=np.int32)
-    if np.any(prefix[:, 1:] > prefix[:, :-1]):
+
+    arrays: dict[str, np.ndarray] = {}
+    batch: int | None = None
+    for name, expected_tail in _STAGE25_INPUT_SHAPES.items():
+        array = np.asarray(inputs[name])
+        if array.ndim == 0:
+            raise ValueError(f"input {name!r} must be batched, got scalar")
+        if batch is None:
+            batch = int(array.shape[0])
+        elif int(array.shape[0]) != batch:
+            raise ValueError(
+                f"input {name!r} has {array.shape[0]} rows, expected {batch}")
+        if tuple(array.shape[1:]) != expected_tail:
+            raise ValueError(
+                f"input {name!r} must have shape {(batch, *expected_tail)}; "
+                f"got {tuple(array.shape)}")
+        if name in _STAGE25_INTEGER_INPUTS:
+            valid_dtype = np.issubdtype(array.dtype, np.integer)
+            target_dtype = np.int32
+        elif name == "board_bool":
+            valid_dtype = np.issubdtype(array.dtype, np.bool_)
+            target_dtype = np.float32
+        else:
+            valid_dtype = np.issubdtype(array.dtype, np.floating)
+            target_dtype = np.float32
+        if array.dtype.hasobject or not valid_dtype:
+            expected = ("an integer" if name in _STAGE25_INTEGER_INPUTS
+                        else "a boolean" if name == "board_bool" else "a float")
+            raise ValueError(f"input {name!r} must have {expected} dtype")
+        # board_numeric intentionally carries the established nullable-NaN
+        # sentinel. Every other float field is required to be finite.
+        if (name != "board_numeric" and
+                np.issubdtype(array.dtype, np.floating) and
+                not np.all(np.isfinite(array))):
+            raise ValueError(f"input {name!r} contains non-finite values")
+        arrays[name] = array if array.dtype == target_dtype else array.astype(
+            target_dtype, copy=False)
+
+    unlocked = arrays["unlocked"]
+    if np.any(unlocked[:, 1:] > unlocked[:, :-1]):
         raise ValueError("unlocked must be a canonical land prefix")
-    if np.any(prefix.sum(axis=1) < 1):
+    if np.any(unlocked.sum(axis=1) < 1):
         raise ValueError("unlocked must contain at least the NW quadrant")
 
     ledger_array = np.asarray(ledger)
-    if ledger_array.shape != (b, _N_CROPS):
+    if ledger_array.shape != (batch, _N_CROPS):
         raise ValueError(
             "crop_capacity (persistent goal ledger K) must have shape [B, 5]; "
             "a scalar or omitted ledger is not accepted")
-    if not np.issubdtype(ledger_array.dtype, np.integer):
+    if ledger_array.dtype.hasobject or not np.issubdtype(
+            ledger_array.dtype, np.integer):
         integral_float = (
             np.issubdtype(ledger_array.dtype, np.floating)
             and np.all(np.isfinite(ledger_array))
@@ -411,31 +466,62 @@ def _host_inputs(
         raise ValueError(
             "crop_capacity (persistent goal ledger K) entries must lie in "
             "[0, 100]")
-    prepared = {
-        key: (jnp.asarray(value, dtype=jnp.int32)
-              if key in {"board_kind", "board_crop", "board_animal",
-                         "board_mask", "shed_counts", "carried_counts",
-                         "unlocked", "seed_counts", "market_inventory",
-                         "shop_counts", "day", "days_remaining"}
-              else jnp.asarray(value, dtype=jnp.float32))
-        for key, value in base.items()
-    }
-    return prepared, jnp.asarray(ledger_array.astype(np.int32)), b
+    canonical_ledger = (ledger_array if ledger_array.dtype == np.int32
+                        else ledger_array.astype(np.int32, copy=False))
+    return _ValidatedStage25Inputs(arrays, canonical_ledger, int(batch))
+
+
+def _prepare_stage25_inputs_validated(
+        validated: _ValidatedStage25Inputs,
+) -> tuple[dict[str, jax.Array], jax.Array, int]:
+    """Perform the one eager NumPy-to-JAX preparation after validation."""
+    prepared = {key: jnp.asarray(value) for key, value in validated.inputs.items()}
+    return prepared, jnp.asarray(validated.crop_capacity), validated.batch
+
+
+def _host_inputs(
+        inputs: Mapping[str, Any], config: Stage25ModelConfig,
+        crop_capacity: Any = None,
+) -> tuple[dict[str, jax.Array], jax.Array, int]:
+    """Public policy boundary: validate once, then prepare canonical inputs."""
+    validated = _validate_stage25_inputs(inputs, config, crop_capacity)
+    return _prepare_stage25_inputs_validated(validated)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPhysicalContexts:
+    source: tuple[Any, ...]
+    values: tuple[jax.Array, ...]
+
+    def __len__(self) -> int:
+        return len(self.source)
+
+    def __iter__(self):
+        return iter(self.source)
 
 
 def _host_contexts(contexts: Any, batch: int) -> tuple[jax.Array, ...] | None:
     if contexts is None:
         return None
+    if isinstance(contexts, _PreparedPhysicalContexts):
+        return contexts.values
     if len(contexts) != batch:
         raise ValueError("physical_contexts must contain one context per row")
-    fields = ("observed_land", "crop_build_cells_by_land", "placed_animals",
-              "reusable_empty_coops", "reusable_empty_pastures",
-              "unplaced_animals")
-    values = [
-        np.asarray([getattr(context, field_name) for context in contexts],
-                   dtype=np.int32)
-        for field_name in fields
-    ]
+    values = (
+        np.empty((batch,), dtype=np.int32),
+        np.empty((batch, _N_LAND), dtype=np.int32),
+        np.empty((batch, _N_ANIMALS), dtype=np.int32),
+        np.empty((batch,), dtype=np.int32),
+        np.empty((batch,), dtype=np.int32),
+        np.empty((batch, _N_ANIMALS), dtype=np.int32),
+    )
+    for row, context in enumerate(contexts):
+        values[0][row] = context.observed_land
+        values[1][row] = context.crop_build_cells_by_land
+        values[2][row] = context.placed_animals
+        values[3][row] = context.reusable_empty_coops
+        values[4][row] = context.reusable_empty_pastures
+        values[5][row] = context.unplaced_animals
     observed_land = values[0]
     cells = values[1]
     if np.any(observed_land < 1) or np.any(observed_land > _N_LAND):
