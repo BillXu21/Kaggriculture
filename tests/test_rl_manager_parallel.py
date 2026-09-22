@@ -42,6 +42,7 @@ def _spawn_factory_config_probe(wire, queue):
         "strict": config.strict,
         "record_turn_snapshot": config.record_turn_snapshot,
         "optional_spare_watering": config.optional_spare_watering,
+        "aggressive_sell_all": config.aggressive_sell_all,
         "max_carried_item_types": config.foreman.max_carried_item_types,
     })
 
@@ -174,7 +175,7 @@ def test_default_factory_enables_pass_only_preventive_watering():
 def test_default_factory_wire_preserves_config_in_spawned_worker():
     config = AgentConfig(
         tasks_per_worker=3, hire_cost_mult=2, shed_capacity=17,
-        strict=True, record_turn_snapshot=False)
+        strict=True, record_turn_snapshot=False, aggressive_sell_all=True)
     wire = _factory_wire(make_default_executor_factory(config))
     context = mp.get_context("spawn")
     result = context.Queue()
@@ -188,6 +189,7 @@ def test_default_factory_wire_preserves_config_in_spawned_worker():
         "strict": True,
         "record_turn_snapshot": False,
         "optional_spare_watering": False,
+        "aggressive_sell_all": True,
         "max_carried_item_types": 2,
     }
     process.join(timeout=10)

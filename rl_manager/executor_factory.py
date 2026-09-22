@@ -236,6 +236,15 @@ def make_default_executor_factory(
         version = EXECUTOR_FACTORY_VERSION
         agent_config = resolved_config
 
+        @property
+        def effective_profile(self) -> dict[str, Any]:
+            return {
+                "name": self.name,
+                "version": self.version,
+                "controller": "executor_v0.agent.ExecutorAgent",
+                "agent_config": asdict(self.agent_config),
+            }
+
         def create(
             self,
             *,

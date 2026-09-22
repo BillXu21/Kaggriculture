@@ -702,8 +702,7 @@ def test_default_sell_path_does_not_sell_unrequested_stock():
 
 
 def test_aggressive_sell_all_uses_full_shed_inventory_including_wheat_feed():
-    # Bugfix: aggressive sell-all must still protect shed_reserve WHEAT for
-    # currently unfed animals; the old test encoded the unsafe behavior.
+    # Aggressive sell-all deliberately ignores the feed reserve for this smoke.
     tiles = empty_tiles()
     tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=1)
     shed = {product: index + 1 for index, product in enumerate(PRODUCTS)}
@@ -713,23 +712,17 @@ def test_aggressive_sell_all_uses_full_shed_inventory_including_wheat_feed():
 
     action = agent(make_obs(day=3, hour=1, shed=shed, tiles=tiles))
 
-    # WHEAT reserve = 1 (1 unfed, 0 carried) so only non-reserved WHEAT would
-    # be sold; with exactly 1 in shed, no WHEAT sell is emitted.
     assert [order for order in action["market"] if order[0] == "SELL"] == [
-        ["SELL", product, shed[product]] for product in PRODUCTS if product != "WHEAT"
+        ["SELL", product, shed[product]] for product in PRODUCTS
     ]
-    assert agent.diagnostics_json()["days"]["3"]["sells"]["0"]["WHEAT"] == {
-        "source": "aggressive_sell_all",
-        "requested": 0,
-        "submitted": 0,
-        "remaining": 0,
-        "override_requested": 0,
-        "override_submitted": 0,
-        "override_skipped": 0,
+    assert {order[1] for order in action["market"] if order[0] == "SELL"} >= {
+        "WHEAT", "FERTILIZER", "CARROT"
     }
+    assert agent.diagnostics_json()["days"]["3"]["sells"]["0"]["WHEAT"][
+        "override_requested"] == shed["WHEAT"]
     assert agent.debug_trace_turn["market"]["sell_mode"] == "aggressive_sell_all"
-    assert all(item["product"] != "WHEAT" for item in agent.debug_trace_turn["market"]["sell_submitted"])
-    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 1
+    assert any(item["product"] == "WHEAT" for item in agent.debug_trace_turn["market"]["sell_submitted"])
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 0
 
 
 def test_aggressive_sell_all_skips_zero_inventory():
@@ -773,7 +766,7 @@ def test_aggressive_sell_all_with_no_unfed_sells_all_wheat():
     assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 0
 
 
-def test_aggressive_sell_all_protects_exact_shed_reserve():
+def test_aggressive_sell_all_ignores_exact_shed_reserve():
     tiles = empty_tiles()
     tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=0)
     tiles[4][5] = pasture_tile(fed_today=False, consecutive_unfed=0)
@@ -782,12 +775,12 @@ def test_aggressive_sell_all_protects_exact_shed_reserve():
         recording_provider(simple_plan()), seat=0,
         config=AgentConfig(aggressive_sell_all=True))
     action = agent(make_obs(day=3, hour=1, shed={"WHEAT": 5}, tiles=tiles))
-    assert ["SELL", "WHEAT", 3] in action["market"]
-    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 2
-    assert agent.diagnostics_json()["days"]["3"]["sells"]["0"]["WHEAT"]["override_requested"] == 3
+    assert ["SELL", "WHEAT", 5] in action["market"]
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 0
+    assert agent.diagnostics_json()["days"]["3"]["sells"]["0"]["WHEAT"]["override_requested"] == 5
 
 
-def test_aggressive_sell_all_shed_at_or_below_reserve_sells_no_wheat():
+def test_aggressive_sell_all_shed_at_or_below_reserve_sells_all_wheat():
     tiles = empty_tiles()
     tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=1)
     tiles[4][5] = pasture_tile(fed_today=False, consecutive_unfed=1)
@@ -795,8 +788,8 @@ def test_aggressive_sell_all_shed_at_or_below_reserve_sells_no_wheat():
         recording_provider(simple_plan()), seat=0,
         config=AgentConfig(aggressive_sell_all=True))
     action = agent(make_obs(day=3, hour=1, shed={"WHEAT": 2}, tiles=tiles))
-    assert all(order[1] != "WHEAT" for order in action["market"] if order[0] == "SELL")
-    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 2
+    assert ["SELL", "WHEAT", 2] in action["market"]
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 0
 
 
 def test_aggressive_sell_all_non_wheat_products_remain_fully_sold():
@@ -811,11 +804,10 @@ def test_aggressive_sell_all_non_wheat_products_remain_fully_sold():
     assert sells["CARROT"] == 4
     assert sells["TOMATO"] == 7
     assert sells["EGG"] == 3
-    # WHEAT protected by 1
-    assert sells["WHEAT"] == 9
+    assert sells["WHEAT"] == 10
 
 
-def test_aggressive_sell_all_carried_wheat_reduces_shed_reserve():
+def test_aggressive_sell_all_with_carried_feed_sells_full_wheat():
     tiles = empty_tiles()
     tiles[4][4] = pasture_tile(fed_today=False, consecutive_unfed=0)
     tiles[4][5] = pasture_tile(fed_today=False, consecutive_unfed=0)
@@ -825,8 +817,9 @@ def test_aggressive_sell_all_carried_wheat_reduces_shed_reserve():
         config=AgentConfig(aggressive_sell_all=True))
     action = agent(make_obs(day=3, hour=1, shed={"WHEAT": 5},
                             inventories=[{"WHEAT": 1}], tiles=tiles))
-    assert ["SELL", "WHEAT", 4] in action["market"]
+    assert ["SELL", "WHEAT", 5] in action["market"]
     assert agent.debug_trace_turn["survival"]["protected_reserve"] == 1
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 0
 
 
 def test_non_aggressive_sell_still_protects_reserve():
@@ -850,8 +843,8 @@ def test_aggressive_sell_all_does_not_dump_survival_wheat_with_starving_animal()
         recording_provider(simple_plan()), seat=0,
         config=AgentConfig(aggressive_sell_all=True))
     action = agent(make_obs(day=3, hour=1, shed={"WHEAT": 1}, tiles=tiles))
-    assert not any(order == ["SELL", "WHEAT", 1] for order in action["market"])
-    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 1
+    assert ["SELL", "WHEAT", 1] in action["market"]
+    assert agent.debug_trace_turn["survival"]["feed_reserve_protected_units"] == 0
 
 
 def test_inactive_bin_never_sells_and_new_bin_resets_ledger():

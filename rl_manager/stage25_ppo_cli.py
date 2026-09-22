@@ -285,6 +285,7 @@ def _resolve_executor_factory(executor: str) -> Any:
             strict=True,
             optional_spare_watering=True,
             record_turn_snapshot=False,
+            aggressive_sell_all=True,
         ))
     raise ValueError(f"unsupported Stage 2.5 executor {executor!r}")
 
