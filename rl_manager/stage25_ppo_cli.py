@@ -244,7 +244,65 @@ def _format_report(record: Mapping[str, Any]) -> str:
         f"checkpoint: {record['checkpoint']}",
         "=" * 64,
     ]
-    return "\n".join(lines)
+    report = "\n".join(lines)
+    profile = record.get("rollout_profile")
+    if not isinstance(profile, Mapping):
+        return report
+    worker = profile.get("worker", {})
+    stats = worker.get("statistics", {})
+    parent = profile.get("parent", {})
+    summed = worker.get("summed_seconds", {})
+    counts = profile.get("counts", {})
+    normalized = profile.get("normalized", {})
+
+    def worker_stat(name: str) -> str:
+        values = stats.get(name, {})
+        return (f"median={float(values.get('median', 0.0)):.4f}s "
+                f"max={float(values.get('max', 0.0)):.4f}s")
+
+    profile_lines = [
+        "",
+        "ROLLOUT PROFILE",
+        "worker critical path",
+        line("worker wall", worker_stat("worker_wall_seconds")),
+        line("worker CPU", worker_stat("worker_process_cpu_seconds")),
+        line("CPU/wall", worker_stat("worker_cpu_wall_ratio")),
+        line("manager boundary", worker_stat("manager_boundary_seconds")),
+        line("response wait summed", f"{float(summed.get('remote_response_wait_seconds', 0.0)):.4f} s"),
+        line("agent actions", worker_stat("agent_actions_seconds")),
+        line("environment", worker_stat("environment_seconds")),
+        line("finalization", worker_stat("finalization_seconds")),
+        line("residual", worker_stat("unclassified_residual_seconds")),
+        line("slowest / fastest", f"{worker.get('slowest_worker_id', -1)} / {worker.get('fastest_worker_id', -1)}"),
+        "manager detail",
+        line("provider prepare", f"{float(summed.get('stage25_provider_prepare_seconds', 0.0)):.4f} s"),
+        line("request build", f"{float(summed.get('remote_request_build_seconds', 0.0)):.4f} s"),
+        line("queue put", f"{float(summed.get('remote_request_queue_put_seconds', 0.0)):.4f} s"),
+        line("response wait", f"{float(summed.get('remote_response_wait_seconds', 0.0)):.4f} s"),
+        line("response stack", f"{float(summed.get('remote_response_validate_stack_seconds', 0.0)):.4f} s"),
+        "environment detail",
+        line("native batch.step", f"{float(summed.get('fast_batch_step_seconds', 0.0)):.4f} s"),
+        line("slot update", f"{float(summed.get('backend_slot_update_seconds', 0.0)):.4f} s"),
+        line("observation adapt", f"{float(summed.get('observation_adapt_seconds', 0.0)):.4f} s"),
+        line("land tracking", f"{float(summed.get('observed_land_tracking_seconds', 0.0)):.4f} s"),
+        "parent dispatch",
+        line("concatenate", f"{float(parent.get('parent_input_concat_seconds', 0.0)):.4f} s"),
+        line("padding", f"{float(parent.get('parent_padding_seconds', 0.0)):.4f} s"),
+        line("capacity/context", f"{float(parent.get('parent_capacity_context_build_seconds', 0.0)):.4f} s"),
+        line("adapter", f"{float(parent.get('parent_policy_adapter_seconds', 0.0)):.4f} s"),
+        line("output slicing", f"{float(parent.get('parent_output_slice_seconds', 0.0)):.4f} s"),
+        line("response queue put", f"{float(parent.get('parent_response_queue_put_seconds', 0.0)):.4f} s"),
+        "normalization",
+        line("active env-turns", counts.get("active_env_turns", 0)),
+        line("executor calls", counts.get("executor_action_agent_calls", 0)),
+        line("manager rows", counts.get("manager_rows", 0)),
+        line("remote policy batches", counts.get("remote_policy_batches", 0)),
+        line("us / active env-turn", f"{float(normalized.get('microseconds_per_active_env_turn', 0.0)):.2f}"),
+        line("ms / executor call", f"{float(normalized.get('milliseconds_per_executor_call', 0.0)):.4f}"),
+        line("ms / batch.step", f"{float(normalized.get('milliseconds_per_batch_step', 0.0)):.4f}"),
+        line("ms / manager row", f"{float(normalized.get('milliseconds_per_manager_row', 0.0)):.4f}"),
+    ]
+    return report + "\n" + "\n".join(profile_lines)
 
 
 def _model(name: str) -> Stage25ModelConfig:
@@ -322,6 +380,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--envs-per-worker", type=int, default=1)
     parser.add_argument("--batch-backend", action="store_true")
+    parser.add_argument(
+        "--stage25-rollout-profile", action="store_true",
+        help="Collect detailed aggregate Stage 2.5 rollout timings.")
     parser.add_argument("--inference-batch-wait-ms", type=float, default=20.0)
     parser.add_argument("--rollout-size", type=int, default=2)
     parser.add_argument("--max-turns", type=int, default=144)
@@ -400,6 +461,7 @@ def _runner_config(
         batch_backend=args.batch_backend,
         inference_batch_wait_seconds=args.inference_batch_wait_ms / 1000.0,
         max_turns=args.max_turns, low_telemetry=True, stage25_enabled=True,
+        stage25_rollout_profile=getattr(args, "stage25_rollout_profile", False),
         stage25_mode="stochastic",
         stage25_fixed_inference_batch_size=args.physical_batch_size,
         reward_config=reward_config, opening=args.opening)
@@ -605,6 +667,8 @@ def _collection(
             "collection_seconds": collection_seconds,
         },
     }
+    if getattr(args, "stage25_rollout_profile", False):
+        stats["rollout_profile"] = getattr(runner, "rollout_profile", None)
     trajectory.validate_executor_provenance(stats["executor_provenance"])
     return trajectory, learner, batch, stats
 

@@ -7,7 +7,7 @@ only pickle-stable scalar values, NumPy arrays, and small dataclasses.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import numpy as np
@@ -217,6 +217,7 @@ class WorkerFinished:
     worker_id: int
     results: tuple[Any, ...]
     trajectory: Any | None
+    timing_metrics: Mapping[str, float | int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

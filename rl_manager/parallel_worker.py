@@ -62,7 +62,8 @@ class RemotePlanPolicy:
     def __init__(self, identity: PolicyIdentity, request_queue: Any,
                  response_queue: Any, worker_id: int,
                  *, curriculum: Stage25CurriculumConfig | None = None,
-                 validation_mode: str = "strict") -> None:
+                 validation_mode: str = "strict",
+                 profile_metrics: dict[str, float | int] | None = None) -> None:
         self.identity = identity
         self.curriculum = curriculum
         self.validation_mode = validation_mode
@@ -70,6 +71,7 @@ class RemotePlanPolicy:
         self._response_queue = response_queue
         self._worker_id = int(worker_id)
         self._request_context: list[Any] | None = None
+        self._profile_metrics = profile_metrics
 
     def set_request_context(
             self, rows: Sequence[Any]) -> None:
@@ -94,6 +96,7 @@ class RemotePlanPolicy:
         if rows and isinstance(rows[0], Stage25InferenceContext):
             return self._stage25_plan_batch(inputs, prng_id, rows)
         requests: list[InferenceRequest] = []
+        request_started = time.perf_counter() if self._profile_metrics is not None else 0.0
         for row, (episode_index, seat, day) in enumerate(rows):
             request_id = policy_row_request_id(
                 episode_index, seat, day, self.identity)
@@ -110,14 +113,29 @@ class RemotePlanPolicy:
                 prng_id=str(prng_id),
                 inputs=row_inputs,
                 queued_at=time.perf_counter()))
+        if self._profile_metrics is not None:
+            self._profile_metrics["remote_request_build_seconds"] += (
+                time.perf_counter() - request_started)
+            self._profile_metrics["remote_requests"] += len(requests)
+            self._profile_metrics["remote_policy_batches"] += 1
+            self._profile_metrics["remote_policy_rows"] += len(requests)
+        queue_started = time.perf_counter() if self._profile_metrics is not None else 0.0
         for request in requests:
             self._request_queue.put(request)
+        if self._profile_metrics is not None:
+            self._profile_metrics["remote_request_queue_put_seconds"] += (
+                time.perf_counter() - queue_started)
 
         row_outputs: list[PolicyOutputs] = []
         expected = {request.request_id for request in requests}
         received: dict[str, PolicyOutputs] = {}
         while expected - received.keys():
+            wait_started = time.perf_counter() if self._profile_metrics is not None else 0.0
             response = self._response_queue.get()
+            if self._profile_metrics is not None:
+                self._profile_metrics["remote_response_wait_seconds"] += (
+                    time.perf_counter() - wait_started)
+            validate_started = time.perf_counter() if self._profile_metrics is not None else 0.0
             if isinstance(response, WorkerFailed):
                 raise RuntimeError(
                     f"inference owner failure: {response.error_message}")
@@ -130,8 +148,15 @@ class RemotePlanPolicy:
                     f"worker {self._worker_id} received response for unknown "
                     f"request {response.request_id!r}")
             received[response.request_id] = response.outputs
+            if self._profile_metrics is not None:
+                self._profile_metrics["remote_response_validate_stack_seconds"] += (
+                    time.perf_counter() - validate_started)
+        stack_started = time.perf_counter() if self._profile_metrics is not None else 0.0
         for request in requests:
             row_outputs.append(received[request.request_id])
+        if self._profile_metrics is not None:
+            self._profile_metrics["remote_response_validate_stack_seconds"] += (
+                time.perf_counter() - stack_started)
         return _stack_row_outputs(row_outputs)
 
     def _stage25_plan_batch(
@@ -139,6 +164,7 @@ class RemotePlanPolicy:
         rows: Sequence[Stage25InferenceContext],
     ) -> Stage25PolicyOutputs:
         requests: list[Stage25InferenceRequest] = []
+        request_started = time.perf_counter() if self._profile_metrics is not None else 0.0
         for row, context in enumerate(rows):
             identity = Stage25RequestIdentity(
                 context.decision_key.episode_id if isinstance(
@@ -161,12 +187,27 @@ class RemotePlanPolicy:
                 physical_context=context.physical_context,
                 support=context.support, queued_at=time.perf_counter(),
                 seed=context.seed))
+        if self._profile_metrics is not None:
+            self._profile_metrics["remote_request_build_seconds"] += (
+                time.perf_counter() - request_started)
+            self._profile_metrics["remote_requests"] += len(requests)
+            self._profile_metrics["remote_policy_batches"] += 1
+            self._profile_metrics["remote_policy_rows"] += len(requests)
+        queue_started = time.perf_counter() if self._profile_metrics is not None else 0.0
         for request in requests:
             self._request_queue.put(request)
+        if self._profile_metrics is not None:
+            self._profile_metrics["remote_request_queue_put_seconds"] += (
+                time.perf_counter() - queue_started)
         expected = {request.request_id for request in requests}
         received: dict[str, Stage25PolicyOutputs] = {}
         while expected - received.keys():
+            wait_started = time.perf_counter() if self._profile_metrics is not None else 0.0
             response = self._response_queue.get()
+            if self._profile_metrics is not None:
+                self._profile_metrics["remote_response_wait_seconds"] += (
+                    time.perf_counter() - wait_started)
+            validate_started = time.perf_counter() if self._profile_metrics is not None else 0.0
             if isinstance(response, WorkerFailed):
                 raise RuntimeError(
                     f"inference owner failure: {response.error_message}")
@@ -182,8 +223,16 @@ class RemotePlanPolicy:
                 raise RuntimeError(
                     f"worker {self._worker_id} received mismatched Stage 2.5 response")
             received[response.request_id] = response.outputs
-        return _stack_stage25_row_outputs([
+            if self._profile_metrics is not None:
+                self._profile_metrics["remote_response_validate_stack_seconds"] += (
+                    time.perf_counter() - validate_started)
+        stack_started = time.perf_counter() if self._profile_metrics is not None else 0.0
+        outputs = _stack_stage25_row_outputs([
             received[request.request_id] for request in requests])
+        if self._profile_metrics is not None:
+            self._profile_metrics["remote_response_validate_stack_seconds"] += (
+                time.perf_counter() - stack_started)
+        return outputs
 
     def bootstrap_value(
         self, *, inputs: Mapping[str, np.ndarray], crop_capacity: Any,
@@ -298,7 +347,9 @@ def _factory_from_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
 
 def _assignment_specs(
         assignments: Sequence[EpisodeAssignment], request_queue: Any,
-        response_queue: Any, worker_id: int) -> list[EpisodeSpec]:
+        response_queue: Any, worker_id: int,
+        profile_metrics: dict[str, float | int] | None = None,
+        ) -> list[EpisodeSpec]:
     policies: dict[PolicyIdentity, RemotePlanPolicy] = {}
     specs = []
     for assignment in assignments:
@@ -314,7 +365,7 @@ def _assignment_specs(
                     identity, request_queue, response_queue, worker_id,
                     curriculum=curriculum,
                     validation_mode=assignment.stage25_validation_modes[
-                        len(seat_policies)])
+                        len(seat_policies)], profile_metrics=profile_metrics)
                 policies[identity] = policy
             seat_policies.append(policy)
         specs.append(EpisodeSpec(
@@ -331,11 +382,20 @@ def worker_main(task_queue: Any, request_queue: Any, response_queue: Any,
                 result_queue: Any) -> None:
     """Top-level ``spawn`` target; every exception becomes a failure message."""
     task: WorkerTask | None = None
+    worker_wall_started = time.perf_counter()
+    worker_cpu_started = time.process_time()
     try:
         task = task_queue.get()
         assert_cpu_worker_imports(task.owner_pid)
+        profile_metrics = None
+        if task.runner_config.stage25_rollout_profile:
+            from rl_manager.rollout_profile import new_worker_metrics
+            profile_metrics = new_worker_metrics()
+            profile_metrics["worker_id"] = int(task.worker_id)
+            profile_metrics["episodes_assigned"] = len(task.episodes)
         specs = _assignment_specs(
-            task.episodes, request_queue, response_queue, task.worker_id)
+            task.episodes, request_queue, response_queue, task.worker_id,
+            profile_metrics)
         trajectory = None
         if task.trajectory_capacity is not None:
             from rl_manager.trajectory import TrajectoryBuffer, e_input_spec
@@ -354,10 +414,30 @@ def worker_main(task_queue: Any, request_queue: Any, response_queue: Any,
                 low_telemetry=task.runner_config.low_telemetry),
             master_seed=task.master_seed,
             stage25_trajectory=stage25_trajectory)
+        if profile_metrics is not None:
+            profile_metrics["worker_setup_seconds"] = (
+                time.perf_counter() - worker_wall_started)
+            runner.rollout_profile = profile_metrics
         results = tuple(runner.run(specs))
+        if profile_metrics is not None:
+            worker_wall = time.perf_counter() - worker_wall_started
+            worker_cpu = time.process_time() - worker_cpu_started
+            profile_metrics["worker_wall_seconds"] = worker_wall
+            profile_metrics["worker_process_cpu_seconds"] = worker_cpu
+            profile_metrics["worker_cpu_wall_ratio"] = (
+                worker_cpu / worker_wall if worker_wall > 0.0 else 0.0)
+            accounted = sum(
+                float(profile_metrics[name])
+                for name in ("worker_setup_seconds", "reset_setup_seconds",
+                             "manager_boundary_seconds", "agent_actions_seconds",
+                             "environment_seconds", "post_step_seconds",
+                             "finalization_seconds"))
+            profile_metrics["unclassified_residual_seconds"] = (
+                worker_wall - accounted)
         result_queue.put(WorkerFinished(
             task.worker_id, results,
-            stage25_trajectory if stage25_trajectory is not None else trajectory))
+            stage25_trajectory if stage25_trajectory is not None else trajectory,
+            {} if profile_metrics is None else profile_metrics))
     except BaseException as exc:  # noqa: BLE001 - transport all worker errors
         worker_id = int(task.worker_id) if task is not None else -1
         result_queue.put(WorkerFailed(

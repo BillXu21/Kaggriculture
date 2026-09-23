@@ -66,6 +66,7 @@ from rl_manager.stage25_provider import (
 from rl_manager.stage25_types import (
     Stage25BehaviorIdentity, Stage25PolicyOutputs, stage25_rng_namespace)
 from rl_manager.reward import RewardConfig, TERMINAL_OWN_BANK, terminal_rewards
+from rl_manager.rollout_profile import new_worker_metrics
 from rl_manager.trajectory import TrajectoryBuffer, Transition, \
     TransitionMetadata
 from rl_manager.types import (
@@ -176,6 +177,7 @@ class RunnerConfig:
     stage25_mode: Literal["deterministic", "stochastic"] = "deterministic"
     stage25_fixed_inference_batch_size: int | None = 16
     stage25_curriculum: Any | None = None
+    stage25_rollout_profile: bool = False
 
     def __post_init__(self) -> None:
         if (isinstance(self.manager_start_day, bool)
@@ -573,6 +575,7 @@ class _EpisodeState:
         self.rollout = RolloutRecord(
             seed=spec.seed, backend_name=config.backend_name,
             composition=spec.composition) if config.record_rollout else None
+        self.profile_metrics: dict[str, float | int] | None = None
 
     def observe_reset(self) -> None:
         self.obs = self._adapt_observations(self.backend.reset())
@@ -591,17 +594,30 @@ class _EpisodeState:
         reach the executor or the live encoder. The backend snapshot is read
         immediately after reset/step, so it describes exactly these
         observations; no private oracle helper is imported here."""
+        profile = self.profile_metrics
         observations_are_canonical = getattr(
             self.backend, "observations_are_canonical", False)
         canonical = None
         if self.trace_recorder is not None or not observations_are_canonical:
+            canonical_started = time.perf_counter() if profile is not None else 0.0
             canonical = self.backend.canonical_state()
+            if profile is not None:
+                profile["canonical_state_seconds"] += (
+                    time.perf_counter() - canonical_started)
             if self.trace_recorder is not None:
                 self.current_canonical_state = canonical
+        adapt_started = time.perf_counter() if profile is not None else 0.0
         adapted = canonical_observations(
             self.backend, observations, canonical_state=canonical)
+        if profile is not None:
+            profile["canonical_observations_seconds"] += (
+                time.perf_counter() - adapt_started)
         if self.config.read_only_agent_observations:
+            readonly_started = time.perf_counter()
             self.agent_obs = [_readonly_observation(view) for view in adapted]
+            if profile is not None:
+                profile["readonly_wrap_seconds"] += (
+                    time.perf_counter() - readonly_started)
         return adapted
 
     def _executor_debug_for_turn(
@@ -841,6 +857,8 @@ class SelfPlayRunner:
             executor_factory = configure_telemetry(config.low_telemetry)
         self.executor_factory = executor_factory
         self.master_seed = master_seed
+        self.rollout_profile = (new_worker_metrics()
+                                if config.stage25_rollout_profile else None)
         self.timing_totals: dict[str, float] = {
             "manager_inference": 0.0, "agent_actions": 0.0,
             "env_step": 0.0, "orchestration": 0.0}
@@ -899,10 +917,18 @@ class SelfPlayRunner:
     def _run_chunk(self, specs: list[EpisodeSpec]) -> list[EpisodeResult]:
         if self.config.batch_backend:
             return self._run_chunk_batched(specs)
+        profile = self.rollout_profile
+        if profile is not None:
+            profile["runner_chunks"] += 1
+        reset_started = time.perf_counter() if profile is not None else 0.0
         states = [_EpisodeState(spec, self.config, self.provenance)
                   for spec in specs]
         for state in states:
+            state.profile_metrics = profile
+        for state in states:
             state.observe_reset()
+        if profile is not None:
+            profile["reset_setup_seconds"] += time.perf_counter() - reset_started
         results: list[EpisodeResult] = []
 
         for _turn in range(self.config.max_turns):
@@ -913,25 +939,48 @@ class SelfPlayRunner:
             t0 = time.perf_counter()
             self._collect_and_apply_decisions(active)
             t1 = time.perf_counter()
+            if profile is not None:
+                profile["manager_boundary_seconds"] += t1 - t0
 
             per_state_actions: list[list[Mapping[str, Any]]] = []
             for state in active:
+                observation_started = time.perf_counter() if profile is not None else 0.0
                 observations = (
                     state.agent_obs if state.config.read_only_agent_observations
                     else [copy.deepcopy(view) for view in state.obs])
+                if profile is not None:
+                    profile["observation_prepare_seconds"] += (
+                        time.perf_counter() - observation_started)
+                call_started = time.perf_counter() if profile is not None else 0.0
                 actions = [state.action_agents[seat](observations[seat])
                            for seat in range(2)]
+                if profile is not None:
+                    profile["action_agent_call_seconds"] += (
+                        time.perf_counter() - call_started)
                 day = int(state.obs[0]["day"])
                 hour = int(state.obs[0]["hour"])
+                hash_started = time.perf_counter() if profile is not None else 0.0
                 state.hash_joint_action(day, hour, actions)
+                if profile is not None:
+                    profile["action_hash_seconds"] += (
+                        time.perf_counter() - hash_started)
+                trace_started = time.perf_counter() if profile is not None else 0.0
                 if state.rollout is not None:
                     state.rollout.joint_actions.append((
                         int(state.obs[0]["step"]), day, hour,
                         copy.deepcopy(dict(actions[0])),
                         copy.deepcopy(dict(actions[1]))))
                 state.record_decision_trace(actions)
+                if profile is not None:
+                    profile["action_trace_or_rollout_record_seconds"] += (
+                        time.perf_counter() - trace_started)
                 per_state_actions.append(actions)
             t2 = time.perf_counter()
+            if profile is not None:
+                profile["agent_actions_seconds"] += t2 - t1
+                profile["active_env_turns"] += len(active)
+                profile["primitive_turns_processed"] += len(active)
+                profile["executor_action_agent_calls"] += len(active) * 2
 
             for state, actions in zip(active, per_state_actions):
                 previous_obs = state.obs
@@ -942,14 +991,26 @@ class SelfPlayRunner:
                 state.record_observed_land_transition(
                     previous_obs, day=causal_day, hour=causal_hour)
             t3 = time.perf_counter()
+            if profile is not None:
+                profile["environment_seconds"] += t3 - t2
 
             newly_done: list[_EpisodeState] = []
             for state in active:
+                track_started = time.perf_counter() if profile is not None else 0.0
                 state.track_post_step()
+                if profile is not None:
+                    profile["track_post_step_seconds"] += (
+                        time.perf_counter() - track_started)
+                status_started = time.perf_counter() if profile is not None else 0.0
                 if state.backend.statuses == ["DONE", "DONE"]:
                     state.done = True
                     newly_done.append(state)
+                if profile is not None:
+                    profile["done_status_check_seconds"] += (
+                        time.perf_counter() - status_started)
             t4 = time.perf_counter()
+            if profile is not None:
+                profile["post_step_seconds"] += t4 - t3
 
             self.timing_totals["manager_inference"] += t1 - t0
             self.timing_totals["agent_actions"] += t2 - t1
@@ -957,13 +1018,23 @@ class SelfPlayRunner:
             self.timing_totals["orchestration"] += (t4 - t3)
 
             for state in newly_done:
+                finalize_started = time.perf_counter() if profile is not None else 0.0
                 results.append(self._finalize(state))
+                if profile is not None:
+                    elapsed = time.perf_counter() - finalize_started
+                    profile["finalization_seconds"] += elapsed
+                    profile["finalize_total_seconds"] += elapsed
 
         # Turn budget exhausted without terminal status: truncate remaining.
         for state in states:
             if not state.finalized:
                 state.truncated = True
+                finalize_started = time.perf_counter() if profile is not None else 0.0
                 results.append(self._finalize(state))
+                if profile is not None:
+                    elapsed = time.perf_counter() - finalize_started
+                    profile["finalization_seconds"] += elapsed
+                    profile["finalize_total_seconds"] += elapsed
         return results
 
     def _run_chunk_batched(self, specs: list[EpisodeSpec]) -> list[EpisodeResult]:
@@ -974,6 +1045,10 @@ class SelfPlayRunner:
         Done slots receive PASS rows so a shorter episode cannot shift rows for
         the still-active slots.
         """
+        profile = self.rollout_profile
+        if profile is not None:
+            profile["runner_chunks"] += 1
+        reset_started = time.perf_counter() if profile is not None else 0.0
         batch: BatchedEngineBackend = make_batched_backend(
             self.config.backend_name, len(specs), self.config.backend_configuration
         )
@@ -981,6 +1056,7 @@ class SelfPlayRunner:
         for index, spec in enumerate(specs):
             slot = _BatchedSlotBackend(batch, index)
             states.append(_EpisodeState(spec, self.config, self.provenance, slot))
+            states[-1].profile_metrics = profile
         observations = batch.reset([state.spec.seed for state in states])
         for index, (state, observation) in enumerate(zip(states, observations)):
             state.backend.update(observation, batch.rewards(index),
@@ -990,6 +1066,8 @@ class SelfPlayRunner:
                 state._note_day_start(seat)
                 state._unlocked_quadrants_seen[seat] = set(
                     state.obs[seat]["farms"][seat]["unlocked_quadrants"])
+        if profile is not None:
+            profile["reset_setup_seconds"] += time.perf_counter() - reset_started
 
         results: list[EpisodeResult] = []
         pass_pair = [
@@ -1004,61 +1082,122 @@ class SelfPlayRunner:
             t0 = time.perf_counter()
             self._collect_and_apply_decisions(active)
             t1 = time.perf_counter()
+            if profile is not None:
+                profile["manager_boundary_seconds"] += t1 - t0
 
             batch_actions = [pass_pair for _ in states]
             for index, state in enumerate(states):
                 if state.done:
                     continue
+                observation_started = time.perf_counter() if profile is not None else 0.0
                 observations = (
                     state.agent_obs
                     if state.config.read_only_agent_observations
                     else [copy.deepcopy(view) for view in state.obs])
+                if profile is not None:
+                    profile["observation_prepare_seconds"] += (
+                        time.perf_counter() - observation_started)
+                call_started = time.perf_counter() if profile is not None else 0.0
                 actions = [state.action_agents[seat](observations[seat])
                            for seat in range(2)]
+                if profile is not None:
+                    profile["action_agent_call_seconds"] += (
+                        time.perf_counter() - call_started)
                 day = int(state.obs[0]["day"])
                 hour = int(state.obs[0]["hour"])
+                hash_started = time.perf_counter() if profile is not None else 0.0
                 state.hash_joint_action(day, hour, actions)
+                if profile is not None:
+                    profile["action_hash_seconds"] += (
+                        time.perf_counter() - hash_started)
+                trace_started = time.perf_counter() if profile is not None else 0.0
                 if state.rollout is not None:
                     state.rollout.joint_actions.append((
                         int(state.obs[0]["step"]), day, hour,
                         copy.deepcopy(dict(actions[0])),
                         copy.deepcopy(dict(actions[1]))))
                 state.record_decision_trace(actions)
+                if profile is not None:
+                    profile["action_trace_or_rollout_record_seconds"] += (
+                        time.perf_counter() - trace_started)
                 batch_actions[index] = actions
             t2 = time.perf_counter()
+            if profile is not None:
+                profile["agent_actions_seconds"] += t2 - t1
+                profile["active_env_turns"] += len(active)
+                profile["primitive_turns_processed"] += len(active)
+                profile["executor_action_agent_calls"] += len(active) * 2
 
+            step_started = time.perf_counter() if profile is not None else 0.0
             observations, _rewards, _statuses = batch.step(batch_actions)
+            if profile is not None:
+                profile["fast_batch_step_seconds"] += time.perf_counter() - step_started
+                profile["native_batch_step_calls"] += 1
             for index, state in enumerate(states):
                 previous_obs = state.obs
                 causal_day = int(state.obs[0]["day"])
                 causal_hour = int(state.obs[0]["hour"])
+                update_started = time.perf_counter() if profile is not None else 0.0
                 state.backend.update(observations[index], batch.rewards(index),
                                      batch.statuses(index))
+                if profile is not None:
+                    profile["backend_slot_update_seconds"] += (
+                        time.perf_counter() - update_started)
                 if not state.done:
+                    adapt_started = time.perf_counter() if profile is not None else 0.0
                     state.obs = state._adapt_observations(observations[index])
+                    if profile is not None:
+                        profile["observation_adapt_seconds"] += (
+                            time.perf_counter() - adapt_started)
+                    land_started = time.perf_counter() if profile is not None else 0.0
                     state.record_observed_land_transition(
                         previous_obs, day=causal_day, hour=causal_hour)
+                    if profile is not None:
+                        profile["observed_land_tracking_seconds"] += (
+                            time.perf_counter() - land_started)
             t3 = time.perf_counter()
+            if profile is not None:
+                profile["environment_seconds"] += t3 - t2
 
             newly_done: list[_EpisodeState] = []
             for state in active:
+                track_started = time.perf_counter() if profile is not None else 0.0
                 state.track_post_step()
+                if profile is not None:
+                    profile["track_post_step_seconds"] += (
+                        time.perf_counter() - track_started)
+                status_started = time.perf_counter() if profile is not None else 0.0
                 if state.backend.statuses == ["DONE", "DONE"]:
                     state.done = True
                     newly_done.append(state)
+                if profile is not None:
+                    profile["done_status_check_seconds"] += (
+                        time.perf_counter() - status_started)
             t4 = time.perf_counter()
+            if profile is not None:
+                profile["post_step_seconds"] += t4 - t3
 
             self.timing_totals["manager_inference"] += t1 - t0
             self.timing_totals["agent_actions"] += t2 - t1
             self.timing_totals["env_step"] += t3 - t2
             self.timing_totals["orchestration"] += t4 - t3
             for state in newly_done:
+                finalize_started = time.perf_counter() if profile is not None else 0.0
                 results.append(self._finalize(state))
+                if profile is not None:
+                    elapsed = time.perf_counter() - finalize_started
+                    profile["finalization_seconds"] += elapsed
+                    profile["finalize_total_seconds"] += elapsed
 
         for state in states:
             if not state.finalized:
                 state.truncated = True
+                finalize_started = time.perf_counter() if profile is not None else 0.0
                 results.append(self._finalize(state))
+                if profile is not None:
+                    elapsed = time.perf_counter() - finalize_started
+                    profile["finalization_seconds"] += elapsed
+                    profile["finalize_total_seconds"] += elapsed
         return results
 
     # ------------------------------------------------- batched manager day
@@ -1141,25 +1280,38 @@ class SelfPlayRunner:
         self, active: list[_EpisodeState],
     ) -> None:
         """Collect one immutable Stage 2.5 request per seat/day boundary."""
+        profile = self.rollout_profile
         start_day = self.config.manager_start_day
         requests: list[tuple[_EpisodeState, int, int, Stage25InferenceContext]] = []
         for state in active:
+            identity_started = time.perf_counter() if profile is not None else 0.0
             state.ensure_policy_identity()
+            if profile is not None:
+                profile["stage25_identity_check_seconds"] += (
+                    time.perf_counter() - identity_started)
             day = int(state.obs[0]["day"])
             hour = int(state.obs[0]["hour"])
             if hour != 0 or day < start_day:
                 continue
+            daily_started = time.perf_counter() if profile is not None else 0.0
             state.record_daily_utilization(day)
+            if profile is not None:
+                profile["stage25_daily_utilization_seconds"] += (
+                    time.perf_counter() - daily_started)
             for seat in range(2):
                 if day in state.planned_days[seat]:
                     continue
                 provider = state.providers[seat]
+                provider_started = time.perf_counter() if profile is not None else 0.0
                 context = provider.prepare_inference_context(
                     state.obs[seat], state.previous_execution[seat],
                     decision_id=(
                         f"episode={state.spec.episode_index}/seat={seat}/"
                         f"day={day}"),
                     behavior_identity=provider.expected_behavior_identity)
+                if profile is not None:
+                    profile["stage25_provider_prepare_seconds"] += (
+                        time.perf_counter() - provider_started)
                 requests.append((state, seat, day, context))
         if not requests:
             return
@@ -1170,6 +1322,7 @@ class SelfPlayRunner:
             identity = item[3].behavior_identity.identity_id()
             groups.setdefault(identity, []).append(item)
         for identity_id, group in sorted(groups.items()):
+            batch_started = time.perf_counter() if profile is not None else 0.0
             group.sort(key=lambda item: (
                 item[0].spec.episode_index, item[1], item[2],
                 item[3].request_id))
@@ -1198,6 +1351,9 @@ class SelfPlayRunner:
             set_context = getattr(policy, "set_request_context", None)
             if callable(set_context):
                 set_context([item[3] for item in group])
+            if profile is not None:
+                profile["stage25_manager_batch_build_seconds"] += (
+                    time.perf_counter() - batch_started)
             phase_before = _policy_phase_snapshot(policy)
             outputs = self._stage25_policy_batch(
                 policy, inputs, capacities, contexts, supports, row_ids,
@@ -1226,18 +1382,30 @@ class SelfPlayRunner:
                 if outputs.policy_identity != context.behavior_identity:
                     raise ValueError(
                         f"Stage 2.5 response identity mismatch for {context.request_id}")
+                accept_started = time.perf_counter() if profile is not None else 0.0
                 self._close_stage25_outgoing(
                     state, seat, day, context.inputs,
                     next_crop_capacity=context.crop_capacity)
                 state.providers[seat].accept_inference_response(
                     context, classes[row].tolist(),
                     behavior_identity=context.behavior_identity)
+                if profile is not None:
+                    profile["stage25_provider_accept_seconds"] += (
+                        time.perf_counter() - accept_started)
                 # Stage 2.5 rows are owned by the dedicated collector (when
                 # enabled), but result accounting still records exactly one
                 # transition for this seat/day boundary.
                 state.planned_days[seat].add(day)
+                record_started = time.perf_counter() if profile is not None else 0.0
                 state.transition_index[(seat, day)] = self._record_stage25_transition(
                     state, seat, day, policy, outputs, row, context)
+                if profile is not None:
+                    profile["stage25_trajectory_record_seconds"] += (
+                        time.perf_counter() - record_started)
+        if profile is not None:
+            profile["manager_rows"] += len(requests)
+            profile["manager_boundaries"] += len({
+                (id(state), day) for state, _seat, day, _context in requests})
 
     def _close_stage25_outgoing(
         self, state: _EpisodeState, seat: int, day: int,

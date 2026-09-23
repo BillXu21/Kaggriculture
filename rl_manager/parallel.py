@@ -42,6 +42,8 @@ from rl_manager.parallel_protocol import (
 from rl_manager.parallel_worker import worker_main
 from bc_manager.constants import TOTAL_DAYS
 from rl_manager.provenance import backend_provenance, opening_provenance
+from rl_manager.rollout_profile import (
+    build_rollout_profile, new_parent_metrics, normalize_worker_metrics)
 from rl_manager.runner import (
     EpisodeResult,
     EpisodeSpec,
@@ -286,6 +288,9 @@ class ParallelSelfPlayRunner:
         self.num_workers = int(num_workers)
         self.buffer = trajectory_buffer
         self.stage25_trajectory = stage25_trajectory_buffer
+        self.rollout_profile: dict[str, Any] | None = None
+        self._parent_profile_metrics = (
+            new_parent_metrics() if config.stage25_rollout_profile else None)
         if executor_factory is None:
             if config.stage25_enabled:
                 from rl_manager.executor_factory import make_stage25_executor_factory
@@ -358,7 +363,10 @@ class ParallelSelfPlayRunner:
     def run(self, specs: Sequence[EpisodeSpec]) -> list[EpisodeResult]:
         if not specs:
             return []
+        parallel_started = time.perf_counter() if self._parent_profile_metrics is not None else 0.0
         if self.num_workers == 1:
+            worker_started = time.perf_counter() if self._parent_profile_metrics is not None else 0.0
+            worker_cpu_started = time.process_time() if self._parent_profile_metrics is not None else 0.0
             runner = SelfPlayRunner(
                 self.config, trajectory_buffer=self.buffer,
                 executor_factory=self.executor_factory,
@@ -367,6 +375,34 @@ class ParallelSelfPlayRunner:
             self.provenance = runner.provenance
             results = runner.run(specs)
             self.inference_metrics.update(runner.inference_metrics)
+            if self._parent_profile_metrics is not None:
+                record = dict(runner.rollout_profile or {})
+                record["worker_id"] = 0
+                record["episodes_assigned"] = len(specs)
+                record["worker_setup_seconds"] = max(
+                    0.0, worker_started - parallel_started)
+                worker_wall = time.perf_counter() - worker_started
+                worker_cpu = time.process_time() - worker_cpu_started
+                record["worker_wall_seconds"] = worker_wall
+                record["worker_process_cpu_seconds"] = worker_cpu
+                record["worker_cpu_wall_ratio"] = (
+                    worker_cpu / worker_wall if worker_wall > 0.0 else 0.0)
+                accounted = sum(float(record.get(name, 0.0)) for name in (
+                    "worker_setup_seconds", "reset_setup_seconds",
+                    "manager_boundary_seconds", "agent_actions_seconds",
+                    "environment_seconds", "post_step_seconds",
+                    "finalization_seconds"))
+                record["unclassified_residual_seconds"] = (
+                    worker_wall - accounted)
+                self._parent_profile_metrics["parallel_run_wall_seconds"] = (
+                    time.perf_counter() - parallel_started)
+                self._parent_profile_metrics["parent_dispatch_total_seconds"] = 0.0
+                self._parent_profile_metrics["num_workers"] = 1
+                self._parent_profile_metrics["envs_per_worker"] = int(
+                    self.config.num_envs)
+                self._parent_profile_metrics["games_per_update"] = len(specs)
+                self.rollout_profile = build_rollout_profile(
+                    [record], self._parent_profile_metrics)
             return results
 
         if ((self.buffer is not None and len(self.buffer)) or
@@ -393,6 +429,7 @@ class ParallelSelfPlayRunner:
         processes = []
         shards: list[TrajectoryBuffer | None] = [None] * self.num_workers
         results_by_worker: dict[int, tuple[EpisodeResult, ...]] = {}
+        timing_by_worker: dict[int, Mapping[str, Any]] = {}
         groups: dict[int, list[EpisodeAssignment]] = defaultdict(list)
         for position, assignment in enumerate(assignments):
             groups[position % self.num_workers].append(assignment)
@@ -409,6 +446,10 @@ class ParallelSelfPlayRunner:
                 * (TOTAL_DAYS - self.config.manager_start_day)
                 for worker in range(self.num_workers)))
         owner_pid = mp.current_process().pid
+        if self._parent_profile_metrics is not None:
+            self._parent_profile_metrics["num_workers"] = self.num_workers
+            self._parent_profile_metrics["envs_per_worker"] = int(self.config.num_envs)
+            self._parent_profile_metrics["games_per_update"] = len(specs)
         for worker_id in range(self.num_workers):
             task = WorkerTask(
                 worker_id=worker_id,
@@ -437,10 +478,16 @@ class ParallelSelfPlayRunner:
         request_ids_seen: set[str] = set()
         try:
             while len(results_by_worker) < self.num_workers:
+                request_wait_started = (
+                    time.perf_counter()
+                    if self._parent_profile_metrics is not None else 0.0)
                 try:
                     message = request_queue.get(timeout=0.01)
                 except Empty:
                     message = None
+                if self._parent_profile_metrics is not None:
+                    self._parent_profile_metrics["owner_idle_request_wait_seconds"] += (
+                        time.perf_counter() - request_wait_started)
                 if isinstance(message, InferenceRequest):
                     if message.request_id in request_ids_seen:
                         raise ParallelRolloutError(
@@ -481,10 +528,19 @@ class ParallelSelfPlayRunner:
                     if (now - pending_since[key] >= self.batch_wait
                             or (self.max_batch is not None
                                 and len(pending[key]) >= self.max_batch)):
+                        dispatch_started = (
+                            time.perf_counter()
+                            if self._parent_profile_metrics is not None else 0.0)
                         self._dispatch(key, pending.pop(key),
                                        pending_since.pop(key), policy_by_identity,
                                        response_queues)
+                        if self._parent_profile_metrics is not None:
+                            self._parent_profile_metrics["parent_dispatch_wall_seconds"] += (
+                                time.perf_counter() - dispatch_started)
 
+                merge_started = (
+                    time.perf_counter()
+                    if self._parent_profile_metrics is not None else 0.0)
                 while True:
                     try:
                         result_message = result_queue.get_nowait()
@@ -506,6 +562,12 @@ class ParallelSelfPlayRunner:
                     results_by_worker[result_message.worker_id] = \
                         result_message.results
                     shards[result_message.worker_id] = result_message.trajectory
+                    if self._parent_profile_metrics is not None:
+                        timing_by_worker[result_message.worker_id] = (
+                            result_message.timing_metrics)
+                if self._parent_profile_metrics is not None:
+                    self._parent_profile_metrics["parent_result_merge_seconds"] += (
+                        time.perf_counter() - merge_started)
 
                 for worker_id, process in enumerate(processes):
                     if not process.is_alive() and process.exitcode not in (0, None) \
@@ -518,8 +580,14 @@ class ParallelSelfPlayRunner:
             # request, but force-drain defensively to make protocol failures
             # explicit instead of silently dropping a row.
             for key in list(pending):
+                dispatch_started = (
+                    time.perf_counter()
+                    if self._parent_profile_metrics is not None else 0.0)
                 self._dispatch(key, pending.pop(key), pending_since.pop(key),
                                policy_by_identity, response_queues)
+                if self._parent_profile_metrics is not None:
+                    self._parent_profile_metrics["parent_dispatch_wall_seconds"] += (
+                        time.perf_counter() - dispatch_started)
             if pending:
                 raise ParallelRolloutError("inference requests remained pending")
         finally:
@@ -559,6 +627,15 @@ class ParallelSelfPlayRunner:
             raise ParallelRolloutError(
                 f"episode result set mismatch: expected {sorted(expected)}, "
                 f"received {sorted(by_index)}")
+        if self._parent_profile_metrics is not None:
+            records = [normalize_worker_metrics(timing_by_worker[worker_id])
+                       for worker_id in sorted(timing_by_worker)]
+            self._parent_profile_metrics["parallel_run_wall_seconds"] = (
+                time.perf_counter() - parallel_started)
+            self._parent_profile_metrics["parent_dispatch_total_seconds"] = (
+                self._parent_profile_metrics["parent_dispatch_wall_seconds"])
+            self.rollout_profile = build_rollout_profile(
+                records, self._parent_profile_metrics)
         return [by_index[index] for index in sorted(by_index)]
 
     def _dispatch(
@@ -680,9 +757,14 @@ class ParallelSelfPlayRunner:
         response_queues: Sequence[Any],
     ) -> None:
         """Batch Stage 2.5 rows while preserving each row's K/support payload."""
+        profile = self._parent_profile_metrics
+        sort_started = time.perf_counter() if profile is not None else 0.0
         requests = sorted(requests, key=lambda request: (
             request.identity.episode_index, request.identity.seat,
             request.identity.day, request.request_id))
+        if profile is not None:
+            profile["parent_request_sort_seconds"] += (
+                time.perf_counter() - sort_started)
         if self.max_batch is not None and len(requests) > self.max_batch:
             for start in range(0, len(requests), self.max_batch):
                 self._dispatch_stage25(
@@ -708,14 +790,23 @@ class ParallelSelfPlayRunner:
             raise ParallelRolloutError(
                 f"fixed inference batch size {physical_count} is smaller than "
                 f"real request batch {real_count}")
+        concat_started = time.perf_counter() if profile is not None else 0.0
         keys = sorted(requests[0].inputs)
         batch = {name: np.concatenate(
             [np.asarray(request.inputs[name]) for request in requests], axis=0)
                  for name in keys}
+        if profile is not None:
+            profile["parent_input_concat_seconds"] += (
+                time.perf_counter() - concat_started)
+        padding_started = time.perf_counter() if profile is not None else 0.0
         batch, padding_count = pad_batch_to_physical(batch, physical_count)
+        if profile is not None:
+            profile["parent_padding_seconds"] += (
+                time.perf_counter() - padding_started)
         first = requests[0]
         padded = [first] * padding_count
         physical_requests = requests + padded
+        capacity_started = time.perf_counter() if profile is not None else 0.0
         capacities = np.concatenate([
             np.asarray(request.crop_capacity, dtype=np.int16)
             for request in physical_requests], axis=0)
@@ -730,13 +821,20 @@ class ParallelSelfPlayRunner:
         row_ids.extend(f"padding/slot={slot}" for slot in range(padding_count))
         row_tokens = [request.row_token for request in requests]
         row_tokens.extend(first.row_token for _ in range(padding_count))
+        if profile is not None:
+            profile["parent_capacity_context_build_seconds"] += (
+                time.perf_counter() - capacity_started)
         prng_id = stage25_rng_namespace(
             first.identity.behavior_identity, getattr(policy, "seed", 0))
         phase_before = _policy_phase_snapshot(policy)
         t0 = time.perf_counter()
+        adapter_started = time.perf_counter() if profile is not None else 0.0
         outputs = SelfPlayRunner._stage25_policy_batch(
             policy, batch, capacities, contexts, supports, row_ids, prng_id,
             row_tokens=row_tokens)
+        if profile is not None:
+            profile["parent_policy_adapter_seconds"] += (
+                time.perf_counter() - adapter_started)
         inference_seconds = time.perf_counter() - t0
         _add_policy_phase_delta(self.inference_metrics, policy, phase_before)
         if outputs.batch_size != physical_count:
@@ -777,11 +875,22 @@ class ParallelSelfPlayRunner:
         self.inference_metrics["queue_wait_seconds"] += sum(
             max(0.0, time.perf_counter() - request.queued_at)
             for request in requests)
+        slice_started = time.perf_counter() if profile is not None else 0.0
+        sliced_outputs = [
+            _slice_stage25_outputs(outputs, row)
+            for row in range(real_count)]
+        if profile is not None:
+            profile["parent_output_slice_seconds"] += (
+                time.perf_counter() - slice_started)
+        put_started = time.perf_counter() if profile is not None else 0.0
         for row, request in enumerate(requests):
             response_queues[request.worker_id].put(
                 Stage25InferenceResponse(
                     request.request_id, request.identity,
-                    _slice_stage25_outputs(outputs, row)))
+                    sliced_outputs[row]))
+        if profile is not None:
+            profile["parent_response_queue_put_seconds"] += (
+                time.perf_counter() - put_started)
 
     def _dispatch_stage25_bootstrap(
         self,
