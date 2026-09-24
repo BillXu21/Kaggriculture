@@ -81,16 +81,22 @@ def test_subthreshold_wheat_is_allowed_when_no_growth_remains():
 
 
 def test_expiry_and_terminal_boundaries_are_inclusive_exceptions():
+    # Hold WHEAT at one so this isolates the boundary helper; an all-zero
+    # target is now a clean future WATER -> HARVEST contraction (the planner
+    # represents removals that become legal later in the day).
+    hold = make_plan(crop_targets={"WHEAT": 1})
     before = _result(age=3, yield_units=1, step=98,
-                     max_lifespan_step=100)
+                     max_lifespan_step=100, plan=hold)
     at_boundary = _result(age=3, yield_units=1, step=99,
-                          max_lifespan_step=100)
+                          max_lifespan_step=100, plan=hold)
     assert not any(t.kind == "HARVEST" for t in before.tasks)
     assert any(t.kind == "HARVEST" for t in at_boundary.tasks)
     assert "wheat_harvest:0,0:eligible:expiry" in at_boundary.diagnostics
 
-    terminal_before = _result(age=3, yield_units=1, step=FINAL_ACTIONABLE_STEP - 1)
-    terminal = _result(age=3, yield_units=1, step=FINAL_ACTIONABLE_STEP)
+    terminal_before = _result(age=3, yield_units=1,
+                              step=FINAL_ACTIONABLE_STEP - 1, plan=hold)
+    terminal = _result(age=3, yield_units=1, step=FINAL_ACTIONABLE_STEP,
+                       plan=hold)
     assert not any(t.kind == "HARVEST" for t in terminal_before.tasks)
     assert any(t.kind == "HARVEST" for t in terminal.tasks)
     assert "wheat_harvest:0,0:eligible:terminal_horizon" in terminal.diagnostics

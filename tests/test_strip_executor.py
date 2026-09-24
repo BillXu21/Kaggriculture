@@ -1574,3 +1574,54 @@ def test_route_cursor_invariant_helper_flags_invalid_pending_cursor():
     assert not route_cursor_invariants_hold(route)
     route.pending_cursor = -1
     assert not route_cursor_invariants_hold(route)
+
+
+def test_preparatory_water_harvest_replacement_chain_executes_on_tile():
+    """A not-yet-harvestable one-shot crop still yields a same-tile chain.
+
+    The shared lifecycle helper represents WATER -> HARVEST -> PLANT -> WATER
+    at day start; the controller executes it, resuming the tile after the
+    preparatory WATER.
+    """
+
+    target = plan(crop_targets={"WHEAT": 0, "TOMATO": 1})
+
+    def locked_observation(hour, tile):
+        obs = observation(hour=hour, farmer=(0, 0), seeds={"TOMATO": 10})
+        obs["farms"][0]["tiles"] = [["LOCKED"] * 10 for _ in range(10)]
+        obs["farms"][0]["tiles"][0][0] = tile
+        obs["farms"][1] = copy.deepcopy(obs["farms"][0])
+        return obs
+
+    def wheat(yield_units, watered):
+        return {
+            "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+            "yield_units": yield_units, "watered_today": watered,
+            "consecutive_unwatered": 0, "fertilized_until_day": -1,
+            "max_lifespan_step": -1,
+        }
+
+    tomato = {
+        "kind": "PLANT", "crop": "TOMATO", "planted_day": 3,
+        "yield_units": 0, "watered_today": False,
+        "consecutive_unwatered": 0, "fertilized_until_day": -1,
+        "max_lifespan_step": -1,
+    }
+
+    controller = StripExecutorController()
+    # h0: ordinary preparatory WATER (engine applies it immediately).
+    assert controller.act(
+        locked_observation(0, wheat(2, False)), target
+    ).farmer_action == ("WATER",)
+    # h1: the same tile is now harvest-ready.
+    assert controller.act(
+        locked_observation(1, wheat(3, True)), target
+    ).farmer_action == ("HARVEST",)
+    # h2: tile empty, requested replacement is planted.
+    assert controller.act(
+        locked_observation(2, None), target
+    ).farmer_action == ("PLANT", "TOMATO")
+    # h3: replacement receives its WATER.
+    assert controller.act(
+        locked_observation(3, tomato), target
+    ).farmer_action == ("WATER",)

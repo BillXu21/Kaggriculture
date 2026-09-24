@@ -501,6 +501,23 @@ _ROUTINE_WATER_AGES: dict[str, frozenset[int]] = {
 }
 
 
+def _removal_action_id(action: str, coord: tuple[int, int]) -> str:
+    """Stable id for one crop-removal lifecycle action on ``coord``.
+
+    A preparatory WATER that makes a not-yet-harvestable crop harvestable and
+    the later replacement WATER on the same tile are two distinct operations,
+    so the removal-owned WATER must not share the coordinate-only
+    ``WATER:y,x`` id used by routine upkeep and the planting continuation:
+    sharing it would merge the two into a single item and form a dependency
+    cycle (WATER depends on PLANT while PLANT depends on WATER).  Every other
+    removal action keeps the coordinate id so it dedupes with routine harvest
+    work exactly as before.
+    """
+    if action == "WATER":
+        return f"REMOVAL_WATER:{coord[0]},{coord[1]}"
+    return f"{action}:{coord[0]},{coord[1]}"
+
+
 def _routine_water_source(
     tile: Mapping[str, Any], crop: str, day: int, step: int
 ) -> str | None:
@@ -928,7 +945,7 @@ def build_strip_work_plan(
                 )
                 previous: tuple[str, ...] = ()
                 for action in removal_actions:
-                    removal_id = f"{action}:{y},{x}"
+                    removal_id = _removal_action_id(action, slot.coord)
                     builder.add(
                         id=removal_id,
                         kind=action,
@@ -1043,7 +1060,7 @@ def build_strip_work_plan(
         ids: list[str] = []
         previous: tuple[str, ...] = ()
         for action in actions:
-            action_id = f"{action}:{coord[0]},{coord[1]}"
+            action_id = _removal_action_id(action, coord)
             builder.add(
                 id=action_id,
                 kind=action,
@@ -1266,6 +1283,11 @@ def build_strip_work_plan(
         for y, row in enumerate(board):
             for x, tile in enumerate(row):
                 if quadrant_of(y, x) not in allowed_quadrants:
+                    continue
+                if (y, x) in removal_coords:
+                    # The removal chain already owns this tile (and any
+                    # preparatory WATER); do not fertilize or water a crop
+                    # that is being released today.
                     continue
                 if not (
                     isinstance(tile, Mapping)

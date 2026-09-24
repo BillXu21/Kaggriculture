@@ -1675,6 +1675,7 @@ def _supported_kind(kind: str) -> bool:
 
 def _is_crop_continuation(completed: str | None, next_kind: str) -> bool:
     return (completed, next_kind) in {
+        ("WATER", "HARVEST"),
         ("DIG", "PLANT"),
         ("HARVEST", "PLANT"),
         ("PLANT", "WATER"),

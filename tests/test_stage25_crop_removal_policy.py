@@ -8,6 +8,7 @@ from executor_v0.plan import DailyPlan
 from executor_v0.layout import SacrificeConfig, plan_animal_layout
 from executor_v0.strip_executor import StripExecutorConfig
 from executor_v0.strip_work import build_strip_work_plan
+from replay_daily.lifecycle import canonical_board, replaceable_today
 from rl_manager.executor_factory import make_stage25_executor_factory
 
 
@@ -257,3 +258,134 @@ def test_executor_flags_are_false_and_recorded_in_stage25_profile():
     assert enabled_config["allow_live_crop_sacrifice"] is True
     assert enabled_config["allow_productive_recurring_crop_sacrifice"] is True
     assert enabled_config["allow_older_crop_sacrifice"] is True
+
+
+# ---------------------------------------------------------------------------
+# replaceable_today / day-start planner alignment for future-in-the-day
+# one-shot removals.  A crop that becomes harvestable through one ordinary
+# WATER must be representable by reconcile_crops/strip_work, not just counted
+# by replaceable_today.
+
+def _obs_two(
+    day: int, hour: int, first: dict, second: dict, *, seeds=(),
+) -> dict:
+    board = [["LOCKED"] * 10 for _ in range(10)]
+    board[0][0] = first
+    board[0][1] = second
+    farm = {
+        "farmer": [0, 0], "hands": [], "hires_today": 0, "money": 3000.0,
+        "tiles": board, "unlocked_quadrants": ["NW"],
+    }
+    return {
+        "day": day, "hour": hour, "step": day * 24 + hour, "player": 0,
+        "farms": [farm, {**farm, "tiles": [row[:] for row in board]}],
+        "market": {"inventory": {}, "prices": {}},
+        "town": {"unlocked_shops": []},
+        "private": {"shed": {}, "seeds": {c: 10 for c in seeds},
+                    "inventories": [{}]},
+    }
+
+
+def test_future_water_harvest_replacement_is_represented():
+    """Test 1: exact validation reproduction."""
+    tile = _plant("WHEAT", planted_day=0, yield_units=2, watered_today=False)
+    obs = _obs(3, 0, tile, seeds=("TOMATO",))
+    board = canonical_board(obs["farms"][0]["tiles"], 3, 0)
+    assert replaceable_today(board, 3)[0] == 1
+
+    result = build_strip_work_plan(obs, _plan(WHEAT=0, TOMATO=1))
+    assert _kinds(result, "CROP_GROWTH") == [
+        "WATER", "HARVEST", "PLANT", "WATER"
+    ]
+    assert result.diagnostics.unresolved_crop_delta_dict.get("WHEAT", 0) == 0
+    assert result.diagnostics.unresolved_crop_delta_dict.get("TOMATO", 0) == 0
+
+
+def test_future_water_harvest_pure_contraction_without_replanting():
+    """Test 2: harvest-only contraction via preparatory WATER."""
+    obs = _obs(3, 0, _plant("WHEAT", planted_day=0, yield_units=2,
+                            watered_today=False))
+    result = build_strip_work_plan(obs, _plan(WHEAT=0))
+    assert _kinds(result, "CROP_REMOVAL") == ["WATER", "HARVEST"]
+    assert not any(item.kind == "PLANT" for item in result.items)
+    assert result.diagnostics.unresolved_crop_delta_dict.get("WHEAT", 0) == 0
+
+
+def test_ready_wheat_replacement_has_no_prerequisite_water():
+    """Test 3: already-ready crop keeps HARVEST -> PLANT -> WATER."""
+    obs = _obs(3, 0, _plant("WHEAT", planted_day=0, yield_units=3,
+                            watered_today=False), seeds=("TOMATO",))
+    result = build_strip_work_plan(obs, _plan(WHEAT=0, TOMATO=1))
+    assert _kinds(result, "CROP_GROWTH") == ["HARVEST", "PLANT", "WATER"]
+    waters = [item for item in result.items if item.kind == "WATER"]
+    assert [item.id for item in waters] == ["WATER:0,0"]
+
+
+def test_young_one_shot_that_cannot_become_ready_stays_unresolved():
+    """Test 4: no DIG and no fake future HARVEST."""
+    obs = _obs(3, 0, _plant("WHEAT", planted_day=3, yield_units=0,
+                            watered_today=False))
+    result = build_strip_work_plan(obs, _plan(WHEAT=0))
+    assert not any(item.kind == "DIG" for item in result.items)
+    assert not any(item.kind == "HARVEST" for item in result.items)
+    assert result.diagnostics.unresolved_crop_delta_dict.get("WHEAT", 0) == -1
+
+
+def test_late_hour_water_reachable_replacement_respects_horizon():
+    """Test 5: h20 fits WATER->HARVEST->PLANT->WATER; h21 does not."""
+    at_h20 = build_strip_work_plan(
+        _obs(3, 20, _plant("WHEAT", planted_day=0, yield_units=2,
+                           watered_today=False), seeds=("TOMATO",)),
+        _plan(WHEAT=0, TOMATO=1))
+    assert _kinds(at_h20, "CROP_GROWTH") == ["WATER", "HARVEST", "PLANT", "WATER"]
+
+    at_h21 = build_strip_work_plan(
+        _obs(3, 21, _plant("WHEAT", planted_day=0, yield_units=2,
+                           watered_today=False), seeds=("TOMATO",)),
+        _plan(WHEAT=0, TOMATO=1))
+    assert not any(chain.kind == "CROP_GROWTH" for chain in at_h21.chains)
+    assert not any(
+        item.kind == "PLANT" and item.crop == "TOMATO"
+        and item.source == "crop_reconciliation"
+        for item in at_h21.items
+    )
+    # Harvest-only contraction still fits at h21 (WATER -> HARVEST).
+    assert _kinds(at_h21, "CROP_REMOVAL") == ["WATER", "HARVEST"]
+
+    at_h23 = build_strip_work_plan(
+        _obs(3, 23, _plant("WHEAT", planted_day=0, yield_units=2,
+                           watered_today=False), seeds=("TOMATO",)),
+        _plan(WHEAT=0, TOMATO=1))
+    assert not any(chain.kind == "CROP_GROWTH" for chain in at_h23.chains)
+    assert not any(chain.kind == "CROP_REMOVAL" for chain in at_h23.chains)
+
+
+def test_preparatory_water_is_not_duplicated_by_routine_upkeep():
+    """Test 6: one prerequisite WATER plus one replacement WATER."""
+    obs = _obs(3, 0, _plant("WHEAT", planted_day=0, yield_units=2,
+                            watered_today=False), seeds=("TOMATO",))
+    result = build_strip_work_plan(obs, _plan(WHEAT=0, TOMATO=1))
+    waters = {item.id: item for item in result.items if item.kind == "WATER"}
+    assert set(waters) == {"REMOVAL_WATER:0,0", "WATER:0,0"}
+    assert waters["REMOVAL_WATER:0,0"].depends_on == ()
+    assert waters["WATER:0,0"].depends_on == ("PLANT:TOMATO:0,0",)
+    # No routine upkeep WATER item was added on top of the removal chain.
+    assert not any(item.source.startswith("routine") for item in waters.values())
+
+
+def test_clean_future_removal_is_preferred_over_premature_sacrifice():
+    """Test 7: clean lifecycle removal beats destructive sacrifice."""
+    clean = _plant("WHEAT", planted_day=0, yield_units=2, watered_today=False)
+    # Age 1 is below WHEAT's first yield day, is not in the routine water ages,
+    # and is watered today, so it is a premature-sacrifice-only candidate.
+    premature = _plant("WHEAT", planted_day=2, yield_units=0, watered_today=True)
+    obs = _obs_two(3, 0, clean, premature)
+    result = build_strip_work_plan(
+        obs, _plan(WHEAT=1),
+        allow_live_crop_sacrifice=True,
+        allow_older_crop_sacrifice=True,
+        allow_productive_recurring_crop_sacrifice=True,
+    )
+    assert not any(item.kind == "DIG" for item in result.items)
+    assert [item.tile for item in result.items if item.kind == "WATER"] == [(0, 0)]
+    assert result.diagnostics.unresolved_crop_delta_dict.get("WHEAT", 0) == 0

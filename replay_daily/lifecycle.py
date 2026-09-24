@@ -212,10 +212,19 @@ def clean_crop_removal_actions(
 ) -> tuple[str, ...]:
     """Return the ordered clean lifecycle actions that clear one plant.
 
-    An empty tuple means the crop must remain in place.  A crop-to-crop
-    replacement reserves two tail actions for PLANT -> WATER, yielding the
-    ordinary h21 one-shot and h20 recurring start cutoffs.  TOMATO retirement
-    is mechanics-derived because no useful Tetsuya removal sample exists.
+    An empty tuple means the crop must remain in place.  Both modes admit the
+    same ordinary lifecycle sequence, including one preparatory WATER when the
+    crop is not yet harvest-ready but one ordinary water would make it so; a
+    crop-to-crop replacement additionally reserves two tail actions for
+    PLANT -> WATER, yielding the ordinary h21 one-shot and h20 recurring start
+    cutoffs.  ``for_replacement`` therefore only controls that tail horizon,
+    never whether the preparatory WATER is represented.  TOMATO retirement is
+    mechanics-derived because no useful Tetsuya removal sample exists.
+
+    This is the single authority behind both ``replaceable_today`` (which calls
+    it with ``for_replacement=True``) and day-start crop reconciliation, so the
+    manager forecast and the planner can never disagree about which ordinary
+    same-day sequences clear a tile.
     """
     crop = tile.get("crop")
     data = CROPS.get(crop)
@@ -248,7 +257,10 @@ def clean_crop_removal_actions(
             if eligible:
                 actions = ("HARVEST",)
 
-        if not actions and for_replacement:
+        if not actions:
+            # Not harvest-ready yet, but one ordinary WATER may still make it
+            # cleanly harvestable later today.  The same forecast serves both
+            # pure contraction (no tail) and replacement (PLANT->WATER tail).
             forecast_yield = _yield_after_ordinary_water(tile, current_day, age)
             if forecast_yield > held:
                 forecast = dict(
