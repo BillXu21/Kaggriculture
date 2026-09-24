@@ -40,6 +40,9 @@ WORKER_DETAIL_SECONDS = (
     "action_hash_seconds",
     "action_trace_or_rollout_record_seconds",
     "fast_batch_step_seconds",
+    "fast_action_encode_seconds",
+    "fast_native_step_seconds",
+    "fast_observation_decode_seconds",
     "backend_slot_update_seconds",
     "observation_adapt_seconds",
     "canonical_state_seconds",
@@ -49,6 +52,48 @@ WORKER_DETAIL_SECONDS = (
     "track_post_step_seconds",
     "done_status_check_seconds",
     "finalize_total_seconds",
+    # Stage 2.5 provider preparation subphases. These partition the existing
+    # `stage25_provider_prepare_seconds` aggregate; they are only ever touched
+    # when the rollout profiler is enabled.
+    "stage25_provider_prelude_seconds",
+    "stage25_provider_step_resolution_seconds",
+    "stage25_provider_previous_execution_validation_seconds",
+    "stage25_provider_encode_live_inputs_seconds",
+    "stage25_provider_crop_count_seconds",
+    "stage25_provider_unplaced_animals_seconds",
+    "stage25_provider_canonical_board_seconds",
+    "stage25_provider_physical_context_seconds",
+    "stage25_provider_input_freeze_copy_seconds",
+    "stage25_provider_support_payload_seconds",
+    "stage25_provider_row_token_seconds",
+    "stage25_provider_context_object_build_seconds",
+    "stage25_provider_accept_input_copy_seconds",
+    "stage25_provider_bootstrap_seconds",
+)
+
+# FastEnv subphases that must reconcile to `fast_batch_step_seconds`.
+FAST_STEP_SUBPHASES = (
+    "fast_action_encode_seconds",
+    "fast_native_step_seconds",
+    "fast_observation_decode_seconds",
+)
+
+# Provider preparation subphases that must reconcile to
+# `stage25_provider_prepare_seconds` (the accept-side input copy is excluded;
+# it belongs to the accept phase).
+PROVIDER_PREPARE_SUBPHASES = (
+    "stage25_provider_prelude_seconds",
+    "stage25_provider_step_resolution_seconds",
+    "stage25_provider_previous_execution_validation_seconds",
+    "stage25_provider_encode_live_inputs_seconds",
+    "stage25_provider_crop_count_seconds",
+    "stage25_provider_unplaced_animals_seconds",
+    "stage25_provider_canonical_board_seconds",
+    "stage25_provider_physical_context_seconds",
+    "stage25_provider_input_freeze_copy_seconds",
+    "stage25_provider_support_payload_seconds",
+    "stage25_provider_row_token_seconds",
+    "stage25_provider_context_object_build_seconds",
 )
 
 WORKER_COUNTS = (
@@ -63,6 +108,10 @@ WORKER_COUNTS = (
     "remote_requests",
     "remote_policy_batches",
     "remote_policy_rows",
+    # Bytes defensively copied into (and back out of) a manager request. Both
+    # are only accumulated when the rollout profiler is enabled.
+    "stage25_provider_input_freeze_bytes",
+    "stage25_provider_accept_copy_bytes",
 )
 
 PARENT_SECONDS = (
@@ -215,6 +264,82 @@ def build_rollout_profile(
         "milliseconds_per_remote_policy_batch": per_count(
             summed["remote_response_wait_seconds"],
             "remote_policy_batches"),
+        # FastEnv subphase normalization. `per_count` returns 0 when the
+        # denominator is absent, so these stay well-defined for scalar runs.
+        "microseconds_per_active_env_turn_fast_action_encode": per_count(
+            summed["fast_action_encode_seconds"], "active_env_turns",
+            1_000_000.0),
+        "microseconds_per_active_env_turn_fast_native_step": per_count(
+            summed["fast_native_step_seconds"], "active_env_turns",
+            1_000_000.0),
+        "microseconds_per_active_env_turn_fast_observation_decode": per_count(
+            summed["fast_observation_decode_seconds"], "active_env_turns",
+            1_000_000.0),
+        "milliseconds_per_batch_step_fast_action_encode": per_count(
+            summed["fast_action_encode_seconds"], "native_batch_step_calls"),
+        "milliseconds_per_batch_step_fast_native_step": per_count(
+            summed["fast_native_step_seconds"], "native_batch_step_calls"),
+        "milliseconds_per_batch_step_fast_observation_decode": per_count(
+            summed["fast_observation_decode_seconds"], "native_batch_step_calls"),
+        # Provider preparation normalization.
+        "milliseconds_per_manager_row_provider_encode_live_inputs": per_count(
+            summed["stage25_provider_encode_live_inputs_seconds"], "manager_rows"),
+        "milliseconds_per_manager_row_provider_canonical_board": per_count(
+            summed["stage25_provider_canonical_board_seconds"], "manager_rows"),
+        "milliseconds_per_manager_row_provider_physical_context": per_count(
+            summed["stage25_provider_physical_context_seconds"], "manager_rows"),
+        "milliseconds_per_manager_row_provider_input_freeze": per_count(
+            summed["stage25_provider_input_freeze_copy_seconds"], "manager_rows"),
+        "milliseconds_per_manager_row_provider_support_payload": per_count(
+            summed["stage25_provider_support_payload_seconds"], "manager_rows"),
+        "kilobytes_per_manager_row_provider_input_freeze": per_count(
+            float(counts["stage25_provider_input_freeze_bytes"]),
+            "manager_rows", 1.0 / 1024.0),
+        "kilobytes_per_manager_row_provider_accept_copy": per_count(
+            float(counts["stage25_provider_accept_copy_bytes"]),
+            "manager_rows", 1.0 / 1024.0),
+    }
+    fast_subphase_sum = math.fsum(
+        summed[name] for name in FAST_STEP_SUBPHASES)
+    provider_subphase_sum = math.fsum(
+        summed[name] for name in PROVIDER_PREPARE_SUBPHASES)
+    total_worker_wall = math.fsum(
+        float(record["worker_wall_seconds"]) for record in records)
+
+    def share_of_wall(seconds: float) -> float:
+        return seconds / total_worker_wall if total_worker_wall > 0.0 else 0.0
+
+    # Reconciliation and Amdahl-style fractions. These are aggregate ratios
+    # over all workers and stay well-defined (0.0) on empty runs.
+    derived = {
+        "fast_subphase_sum_seconds": fast_subphase_sum,
+        "fast_step_unattributed_seconds": max(
+            0.0, summed["fast_batch_step_seconds"] - fast_subphase_sum),
+        "fast_action_encode_fraction": (
+            summed["fast_action_encode_seconds"] /
+            summed["fast_batch_step_seconds"]
+            if summed["fast_batch_step_seconds"] > 0.0 else 0.0),
+        "fast_native_step_fraction": (
+            summed["fast_native_step_seconds"] /
+            summed["fast_batch_step_seconds"]
+            if summed["fast_batch_step_seconds"] > 0.0 else 0.0),
+        "fast_observation_decode_fraction": (
+            summed["fast_observation_decode_seconds"] /
+            summed["fast_batch_step_seconds"]
+            if summed["fast_batch_step_seconds"] > 0.0 else 0.0),
+        "provider_prepare_subphase_sum_seconds": provider_subphase_sum,
+        "provider_prepare_unattributed_seconds": max(
+            0.0, summed["stage25_provider_prepare_seconds"] - provider_subphase_sum),
+        "environment_share_of_worker_wall": share_of_wall(
+            summed["environment_seconds"]),
+        "fast_batch_step_share_of_worker_wall": share_of_wall(
+            summed["fast_batch_step_seconds"]),
+        "provider_prepare_share_of_worker_wall": share_of_wall(
+            summed["stage25_provider_prepare_seconds"]),
+        "provider_input_freeze_total_bytes": int(
+            counts["stage25_provider_input_freeze_bytes"]),
+        "provider_accept_copy_total_bytes": int(
+            counts["stage25_provider_accept_copy_bytes"]),
     }
     if records:
         slowest = max(records, key=lambda record: float(record["worker_wall_seconds"]))
@@ -249,4 +374,5 @@ def build_rollout_profile(
         "parent": parent,
         "counts": counts,
         "normalized": normalized,
+        "derived": derived,
     }

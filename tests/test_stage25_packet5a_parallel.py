@@ -408,10 +408,10 @@ def test_stage25_acceptance_reuses_one_frozen_prepared_context(monkeypatch):
     calls = 0
     original = provider._stage_observation
 
-    def counted(observation, previous_execution):
+    def counted(observation, previous_execution, *, profile=None):
         nonlocal calls
         calls += 1
-        return original(observation, previous_execution)
+        return original(observation, previous_execution, profile=profile)
 
     monkeypatch.setattr(provider, "_stage_observation", counted)
     prepared = provider.prepare_inference_context(obs, behavior_identity=IDENTITY)

@@ -18,6 +18,7 @@ import json
 import math
 from numbers import Integral
 from pathlib import Path
+import time
 from typing import Any, Literal
 
 import numpy as np
@@ -736,6 +737,7 @@ class Stage25PlanProvider:
 
     def _stage_observation(
         self, obs: Mapping[str, Any], previous_execution: Mapping[str, int] | None,
+        *, profile: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, np.ndarray], PhysicalContext, tuple[int, ...]]:
         if not isinstance(obs, Mapping):
             raise Stage25ProviderError("obs must be a mapping")
@@ -744,28 +746,87 @@ class Stage25PlanProvider:
         # One resolved absolute step feeds the live encoder and the physical
         # context, so both consumers share lifecycle timing. The caller's
         # observation is not mutated.
+        #
+        # Subphase timers are guarded so the profile-OFF path performs no
+        # timing calls; when `profile` is None the body is unchanged.
+        timer = time.perf_counter
+        if profile is not None:
+            phase_started = timer()
         step = resolve_observation_step(obs)
+        if profile is not None:
+            profile["stage25_provider_step_resolution_seconds"] += (
+                timer() - phase_started)
+            phase_started = timer()
         previous = validate_previous_execution(previous_execution)
+        if profile is not None:
+            profile["stage25_provider_previous_execution_validation_seconds"] += (
+                timer() - phase_started)
+            phase_started = timer()
         inputs = encode_live_inputs(
             obs, self.seat, previous, step=step,
             economic_prev_start=self._e_history,
             e_history_version=self.e_history_version,
         )
+        if profile is not None:
+            profile["stage25_provider_encode_live_inputs_seconds"] += (
+                timer() - phase_started)
+            phase_started = timer()
         observed = tuple(int(value) for value in current_crop_counts(
             inputs["board_crop"])[0])
         initial = initialize_crop_ledger(observed) if self._crop_capacity is None \
             else self._crop_capacity
         inputs["crop_capacity"] = np.asarray([initial], dtype=np.int16)
+        if profile is not None:
+            profile["stage25_provider_crop_count_seconds"] += (
+                timer() - phase_started)
+            phase_started = timer()
         farm = obs["farms"][self.seat]
         private = obs.get("private") or {}
         unplaced = unplaced_animal_counts(
             private.get("shed") or {}, private.get("inventories") or ())
+        if profile is not None:
+            profile["stage25_provider_unplaced_animals_seconds"] += (
+                timer() - phase_started)
+            phase_started = timer()
         board = canonical_board(farm["tiles"], int(obs["day"]), step)
+        if profile is not None:
+            profile["stage25_provider_canonical_board_seconds"] += (
+                timer() - phase_started)
+            phase_started = timer()
         context = physical_context_from_board(
             board, farm["unlocked_quadrants"],
             unplaced_animals=unplaced,
         )
+        if profile is not None:
+            profile["stage25_provider_physical_context_seconds"] += (
+                timer() - phase_started)
         return inputs, context, initial
+
+    @staticmethod
+    def _freeze_inputs(
+        inputs: Mapping[str, np.ndarray],
+        profile: Mapping[str, Any] | None,
+    ) -> dict[str, np.ndarray]:
+        """Defensively copy inputs to immutable arrays.
+
+        When `profile` is None this is exactly the historical copy loop with no
+        timing calls or extra allocations beyond the required copies.
+        """
+        frozen_inputs: dict[str, np.ndarray] = {}
+        if profile is not None:
+            copy_started = time.perf_counter()
+            copied_bytes = 0
+        for name, value in inputs.items():
+            copied = np.array(value, copy=True)
+            copied.setflags(write=False)
+            frozen_inputs[name] = copied
+            if profile is not None:
+                copied_bytes += int(copied.nbytes)
+        if profile is not None:
+            profile["stage25_provider_input_freeze_copy_seconds"] += (
+                time.perf_counter() - copy_started)
+            profile["stage25_provider_input_freeze_bytes"] += copied_bytes
+        return frozen_inputs
 
     def _support_payload(
         self, context: PhysicalContext, initial: tuple[int, ...]
@@ -795,8 +856,12 @@ class Stage25PlanProvider:
         decision_key: Stage25DecisionKey | None = None,
         decision_id: str | None = None,
         behavior_identity: Stage25BehaviorIdentity | None = None,
+        profile: Mapping[str, Any] | None = None,
     ) -> Stage25InferenceContext:
         """Build a read-only parent request before accepting a decision."""
+        timer = time.perf_counter
+        if profile is not None:
+            phase_started = timer()
         if not isinstance(obs, Mapping):
             raise Stage25ProviderError("obs must be a mapping")
         if _terminal_observation(obs):
@@ -813,13 +878,27 @@ class Stage25PlanProvider:
             raise Stage25ProviderError(
                 "external Stage 2.5 inference requires behavior_identity")
         curriculum = self.effective_curriculum()
+        if profile is not None:
+            profile["stage25_provider_prelude_seconds"] += (
+                timer() - phase_started)
         inputs, context, initial = self._stage_observation(
-            obs, previous_execution)
-        frozen_inputs: dict[str, np.ndarray] = {}
-        for name, value in inputs.items():
-            copied = np.array(value, copy=True)
-            copied.setflags(write=False)
-            frozen_inputs[name] = copied
+            obs, previous_execution, profile=profile)
+        frozen_inputs = self._freeze_inputs(inputs, profile)
+        if profile is not None:
+            phase_started = timer()
+        support_payload = (None if self.validation_mode != "strict" else
+                           self._support_payload(context, initial))
+        if profile is not None:
+            profile["stage25_provider_support_payload_seconds"] += (
+                timer() - phase_started)
+            phase_started = timer()
+        row_token = stage25_row_token(
+            f"episode={key.episode_id}/seat={key.seat}/day={key.day}"
+            f"/behavior={identity.identity_id()}")
+        if profile is not None:
+            profile["stage25_provider_row_token_seconds"] += (
+                timer() - phase_started)
+            phase_started = timer()
         prepared = Stage25InferenceContext(
             decision_key=key,
             behavior_identity=identity,
@@ -829,13 +908,13 @@ class Stage25PlanProvider:
             daily_start=(day, float(obs["farms"][self.seat]["money"])),
             curriculum=curriculum,
             seed=self.seed,
-            support=(None if self.validation_mode != "strict" else
-                     _FrozenMapping(tuple(
-                         self._support_payload(context, initial).items()))),
-            row_token=stage25_row_token(
-                f"episode={key.episode_id}/seat={key.seat}/day={key.day}"
-                f"/behavior={identity.identity_id()}"),
+            support=(None if support_payload is None else
+                     _FrozenMapping(tuple(support_payload.items()))),
+            row_token=row_token,
         )
+        if profile is not None:
+            profile["stage25_provider_context_object_build_seconds"] += (
+                timer() - phase_started)
         self._pending_context = prepared
         return prepared
 
@@ -858,12 +937,11 @@ class Stage25PlanProvider:
             raise Stage25ProviderError(
                 "Stage 2.5 bootstrap requires an immutable behavior identity")
         self.effective_curriculum()
+        # Bootstrap is a finalization seam, not a manager-boundary preparation,
+        # so it deliberately does not contribute to the provider preparation
+        # subphase timers (which partition `stage25_provider_prepare_seconds`).
         inputs, context, initial = self._stage_observation(obs, previous_execution)
-        frozen_inputs: dict[str, np.ndarray] = {}
-        for name, value in inputs.items():
-            copied = np.array(value, copy=True)
-            copied.setflags(write=False)
-            frozen_inputs[name] = copied
+        frozen_inputs = self._freeze_inputs(inputs, None)
         return Stage25InferenceContext(
             decision_key=Stage25DecisionKey(
                 self.episode_id, self.seat, day, "bootstrap"),
@@ -881,6 +959,7 @@ class Stage25PlanProvider:
         self, request: Stage25InferenceContext,
         action_classes: Sequence[int], *,
         behavior_identity: Stage25BehaviorIdentity | None = None,
+        profile: Mapping[str, Any] | None = None,
     ) -> DailyPlan:
         """Validate response identity, then perform exactly one K transition."""
         if not isinstance(request, Stage25InferenceContext):
@@ -909,7 +988,7 @@ class Stage25PlanProvider:
         plan = _lower_plan(classes, goals)
         result = self._commit(
             key, classes, goals, plan, request.inputs,
-            request.daily_start)
+            request.daily_start, profile=profile)
         self._pending_context = None
         return result
 
@@ -917,14 +996,24 @@ class Stage25PlanProvider:
         self, key: Stage25DecisionKey, classes: tuple[int, ...],
         goals: tuple[int, ...], plan: DailyPlan,
         inputs: Mapping[str, np.ndarray],
-        daily_start: tuple[int, float],
+        daily_start: tuple[int, float], *,
+        profile: Mapping[str, Any] | None = None,
     ) -> DailyPlan:
         # Compute every fallible value before mutating lifecycle fields so a
         # malformed observation (e.g. missing daily-start money) can never
         # leave a partially-applied decision.
         e_history = (int(daily_start[0]), float(daily_start[1]))
+        if profile is not None:
+            copy_started = time.perf_counter()
+            copied_bytes = 0
         last_inputs = {name: np.array(value, copy=True)
                        for name, value in inputs.items()}
+        if profile is not None:
+            copied_bytes = sum(
+                int(value.nbytes) for value in last_inputs.values())
+            profile["stage25_provider_accept_input_copy_seconds"] += (
+                time.perf_counter() - copy_started)
+            profile["stage25_provider_accept_copy_bytes"] += copied_bytes
         curriculum = self.effective_curriculum()
         diagnostics = {
             "decision_identity": key.identity,

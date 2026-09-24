@@ -1133,6 +1133,16 @@ class SelfPlayRunner:
             if profile is not None:
                 profile["fast_batch_step_seconds"] += time.perf_counter() - step_started
                 profile["native_batch_step_calls"] += 1
+                # Reuse the subphase timings already recorded by
+                # `BatchedFastEnv.step`; no extra inner-loop timers here.
+                timing = getattr(batch, "last_timing_seconds", None)
+                if timing is not None:
+                    profile["fast_action_encode_seconds"] += float(
+                        timing.get("action_encode", 0.0))
+                    profile["fast_native_step_seconds"] += float(
+                        timing.get("native_step", 0.0))
+                    profile["fast_observation_decode_seconds"] += float(
+                        timing.get("observation_decode", 0.0))
             for index, state in enumerate(states):
                 previous_obs = state.obs
                 causal_day = int(state.obs[0]["day"])
@@ -1308,7 +1318,8 @@ class SelfPlayRunner:
                     decision_id=(
                         f"episode={state.spec.episode_index}/seat={seat}/"
                         f"day={day}"),
-                    behavior_identity=provider.expected_behavior_identity)
+                    behavior_identity=provider.expected_behavior_identity,
+                    profile=profile)
                 if profile is not None:
                     profile["stage25_provider_prepare_seconds"] += (
                         time.perf_counter() - provider_started)
@@ -1388,7 +1399,8 @@ class SelfPlayRunner:
                     next_crop_capacity=context.crop_capacity)
                 state.providers[seat].accept_inference_response(
                     context, classes[row].tolist(),
-                    behavior_identity=context.behavior_identity)
+                    behavior_identity=context.behavior_identity,
+                    profile=profile)
                 if profile is not None:
                     profile["stage25_provider_accept_seconds"] += (
                         time.perf_counter() - accept_started)
@@ -1560,8 +1572,13 @@ class SelfPlayRunner:
     ) -> float:
         """Read the critic at the final state without accepting a plan."""
         provider = state.providers[seat]
+        profile = self.rollout_profile
+        started = time.perf_counter() if profile is not None else 0.0
         context = provider.prepare_bootstrap_context(
             state.obs[seat], state.previous_execution[seat])
+        if profile is not None:
+            profile["stage25_provider_bootstrap_seconds"] += (
+                time.perf_counter() - started)
         policy = state.spec.policies[seat]
         value_fn = (getattr(policy, "bootstrap_value", None) or
                     getattr(policy, "value_batch", None) or
