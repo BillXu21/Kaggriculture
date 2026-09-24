@@ -228,7 +228,90 @@ def _tile(raw: np.ndarray, day: int, *, canonical: bool = False) -> Any:
 
 
 def _inventory(raw: np.ndarray, start: int) -> dict[str, int]:
-    return {name: _round(raw[start + index] * 100.0) for index, name in enumerate(PRODUCTS + ANIMALS)}
+    # The multiplication intentionally happens while the slice is float32,
+    # just as ``raw[index] * 100.0`` did before vectorization.  Converting
+    # after multiplication preserves Python's ties-to-even result for the
+    # normalized protocol values while avoiding twelve scalar helper calls.
+    values = np.rint(raw[start:start + 12] * 100.0).astype(np.int64).tolist()
+    return dict(zip(PRODUCTS + ANIMALS, values))
+
+
+def _decode_tiles(
+    raw: np.ndarray,
+    day: int,
+    *,
+    canonical: bool,
+    prepared_kinds: np.ndarray | None = None,
+) -> list[list[list[Any]]]:
+    """Decode both farms after classifying their tile kinds in one block."""
+    tile_values = raw[OBS_FARM_BASE:OBS_FARM_BASE + 2 * 100 * 26].reshape(
+        2, 100, 26
+    )
+    decoded_farms: list[list[list[Any]]] = []
+    for farm_index, farm_values in enumerate(tile_values):
+        if prepared_kinds is None:
+            kind_flags = farm_values[:, 1:6] > 0.5
+            kinds = np.argmax(kind_flags, axis=1) + 1
+            kinds[~np.any(kind_flags, axis=1)] = 0
+        else:
+            kinds = prepared_kinds[farm_index]
+        tiles = [
+            None if kind == 0 else (
+                "LOCKED" if kind == 1 else _tile_from_kind(
+                    farm_values[index], int(kind), day, canonical=canonical
+                )
+            )
+            for index, kind in enumerate(kinds.tolist())
+        ]
+        decoded_farms.append([
+            tiles[row * 10:(row + 1) * 10]
+            for row in range(10)
+        ])
+    return decoded_farms
+
+
+def _tile_from_kind(
+    raw: np.ndarray,
+    kind: int,
+    day: int,
+    *,
+    canonical: bool,
+) -> Any:
+    """Decode a non-empty tile when its mutually-exclusive kind is known."""
+    if kind == 2:  # PLANT
+        crop = CROPS[next(index for index in range(5) if raw[7 + index] > 0.5)]
+        age = _round(raw[14] * 30.0)
+        result = {
+            "kind": "PLANT", "crop": crop, "age": age, "planted_day": day - age,
+            "max_lifespan_step": _round(raw[16] * SEASON_STEPS),
+            "yield_units": _round(raw[15] * 100.0),
+            "watered_today": bool(raw[17] > 0.5),
+            "consecutive_unwatered": _round(raw[18] * 2.0),
+            "fertilized_until_day": _round(raw[19] * 30.0),
+        }
+        if canonical:
+            del result["age"]
+        return result
+    if kind == 3:  # WEED
+        return {"kind": "WEED"}
+    result: dict[str, Any] = {
+        "kind": "COOP" if kind == 4 else "PASTURE"
+    }
+    if raw[11] > 0.5:
+        animal = ANIMALS[next(index for index in range(3) if raw[12 + index] > 0.5)]
+        age = _round(raw[20] * 30.0)
+        result.update({
+            "animal": animal, "yield_units": _round(raw[15] * 100.0),
+            "age": age, "fed_today": bool(raw[21] > 0.5),
+            "consecutive_unfed": _round(raw[22] * 2.0),
+            "cared_today": bool(raw[23] > 0.5),
+            "fertilizer_available": bool(raw[24] * 100.0 > 0.5),
+            "pending_care_bonus": _round(raw[25] * 100.0),
+        })
+        if canonical:
+            result["placed_day"] = day - age
+            del result["age"]
+    return result
 
 
 def _decode_public(
@@ -236,31 +319,30 @@ def _decode_public(
     configuration: Mapping[str, Any],
     *,
     canonical_farms: bool = False,
+    prepared_kinds: np.ndarray | None = None,
 ) -> dict[str, Any]:
     turns_per_day = int(configuration["turnsPerDay"])
     step = _round(raw[0] * SEASON_STEPS)
     day = step // turns_per_day
     hour = step % turns_per_day
+    farm_tiles = _decode_tiles(
+        raw,
+        day,
+        canonical=canonical_farms,
+        prepared_kinds=prepared_kinds,
+    )
     farms: list[dict[str, Any]] = []
     for farm_index in range(2):
         position = 7 + farm_index * 6
         hands_position = OBS_HAND_POSITIONS + farm_index * (MAX_HANDS + 1)
         hand_count = max(0, min(MAX_HANDS, _round(raw[hands_position] * float(MAX_HANDS))))
-        tiles = [
-            _tile(
-                raw[62 + farm_index * 2600 + index * 26:62 + farm_index * 2600 + index * 26 + 26],
-                day,
-                canonical=canonical_farms,
-            )
-            for index in range(100)
-        ]
         farms.append({
             # Money is always an exact integer in the official engine
             # (integer starting value, integer prices only); recovering it
             # via rounding removes the f32 normalize(10000) round-trip noise
             # that otherwise shows up as spurious canonical divergences.
             "money": float(_round(raw[5 + farm_index] * 10000.0)),
-            "tiles": [tiles[row * 10:(row + 1) * 10] for row in range(10)],
+            "tiles": farm_tiles[farm_index],
             "farmer": [_round(raw[position + 1] * 9.0), _round(raw[position + 2] * 9.0)],
             "hands": [[
                 (_round(raw[hands_position + 1 + hand] * 100.0 - 1.0) % 10),
@@ -315,10 +397,14 @@ def _decode_observation_pair(
     configuration: Mapping[str, Any],
     *,
     canonical_farms: bool = False,
+    prepared_kinds: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     """Decode shared public state once and each seat's private row once."""
     public = _decode_public(
-        raw[0], configuration, canonical_farms=canonical_farms
+        raw[0],
+        configuration,
+        canonical_farms=canonical_farms,
+        prepared_kinds=prepared_kinds,
     )
     observations = []
     for player in range(2):

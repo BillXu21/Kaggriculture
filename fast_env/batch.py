@@ -12,6 +12,7 @@ from ._kaggriculture_env import ACTION_SLOTS, OBS_SIZE, RustBatchEnv
 from .api import (
     DEFAULT_CONFIGURATION,
     MARKET_ACTION_START,
+    OBS_FARM_BASE,
     _as_int,
     _decode_observation_pair,
     _market_row,
@@ -85,11 +86,22 @@ class BatchedFastEnv:
         }
 
     def _decode(self) -> list[list[dict[str, Any]]]:
+        prepared_kinds = None
+        if self.num_envs > 1:
+            tile_values = self.observation_buffer[
+                :, 0, OBS_FARM_BASE:OBS_FARM_BASE + 2 * 100 * 26
+            ].reshape(self.num_envs, 2, 100, 26)
+            kind_flags = tile_values[:, :, :, 1:6] > 0.5
+            prepared_kinds = np.argmax(kind_flags, axis=3) + 1
+            prepared_kinds[~np.any(kind_flags, axis=3)] = 0
         self._observations = [
             _decode_observation_pair(
                 self.observation_buffer[index],
                 self.configuration,
                 canonical_farms=self.canonical_observations,
+                prepared_kinds=(
+                    None if prepared_kinds is None else prepared_kinds[index]
+                ),
             )
             for index in range(self.num_envs)
         ]
