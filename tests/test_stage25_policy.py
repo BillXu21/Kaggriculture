@@ -53,7 +53,7 @@ def _encoded(batch_size: int = 1, *, economics: float = 0.0,
              ledger: np.ndarray | None = None) -> dict[str, np.ndarray]:
     """Small corrected-E-shaped arrays; no Parquet or Torch dependency.
 
-    ``ledger`` is the persistent goal ledger ``K`` of shape ``[B, 5]``.  The
+    ``ledger`` is the physical crop baseline ``B`` of shape ``[B, 5]``.  The
     physical capacity ``C`` is not an input; it is derived from the encoded
     board / ``physical_contexts``.
     """
@@ -401,12 +401,12 @@ def test_zero_capacity_forces_contraction_and_remains_valid():
                           np.zeros((1, 5), dtype=np.int32))
 
 
-def test_ledger_input_is_required_and_rectangular():
+def test_physical_crop_baseline_input_is_required_and_rectangular():
     config = _config()
     params = init_stage25_params(config, seed=106)
     omitted = _encoded(1)
     del omitted["crop_capacity"]
-    with pytest.raises(ValueError, match="persistent goal ledger"):
+    with pytest.raises(ValueError, match="physical crop baseline"):
         greedy_act(params, omitted, config)
     for bad in (np.zeros((1,), dtype=np.int16),
                 np.zeros((1, 3), dtype=np.int16),
@@ -673,7 +673,7 @@ def test_greedy_is_masked_argmax_and_same_seed_is_row_stable_under_reorder_paddi
 def test_teacher_forced_nll_has_finite_gradients_through_all_trainable_blocks():
     config = _config()
     params = init_stage25_params(config, seed=37)
-    # A nonzero persistent ledger keeps capacity conditioning differentiable.
+    # A nonzero physical baseline keeps capacity conditioning differentiable.
     inputs = _encoded_board(_board(), ("NW",),
                             ledger=np.full((1, 5), 4, dtype=np.int16))
     classes = jnp.asarray([[1, 1, 1, 1, 100, 100, 100, 100, 100]], dtype=jnp.int16)

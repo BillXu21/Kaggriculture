@@ -1,8 +1,8 @@
 """Lower accepted Stage 2.5 actions into the legacy executor transport.
 
-Validation of physical/curriculum support and the persistent crop-ledger
+Validation of physical/curriculum support and the board-relative crop-delta
 transition belong to the lifecycle provider.  This adapter deliberately only
-translates an already accepted nine-class action and its resolved crop goals
+translates an already accepted nine-class action and its resolved end-of-day goals
 into :class:`executor_v0.plan.DailyPlan`.
 """
 
@@ -44,7 +44,7 @@ def lower_stage25_daily_plan(
         animal_class_to_target(value) for value in classes[1:4]
     )
     # Decode crop classes as a boundary check without applying their deltas a
-    # second time; ``goals`` is already the provider's committed K'.
+    # second time; ``goals`` is already the provider's committed daily goal.
     from rl_manager.stage25_mechanics import crop_class_to_delta
 
     for value in classes[4:]:

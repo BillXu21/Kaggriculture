@@ -5,36 +5,43 @@ optional curriculum masks, crop-logit bias, and crop-capacity shortfall. It
 consumes the physical rules in
 [`STAGE25_PHYSICAL_CONTRACT.md`](STAGE25_PHYSICAL_CONTRACT.md); it does not
 replace or reinterpret them. Packet 1B is framework-free and disabled
-features must be behaviorally identical to the Packet 1A baseline.
+features must be behaviorally identical to the Packet 1A baseline. Its
+synthetic continuity is an offline BC-label construction detail; live manager
+inference always re-reads the physical crop baseline at the current boundary.
 
 ## Outcome proxies
 
 Outcome proxies describe observed outcomes. They are not fabricated
 transactions, economic labels, or maintenance-aware reconstructions.
 
-### Crops: synthetic persistent `K`
+### Crops: offline physical-start-relative deltas
 
-For each contiguous `(episode, seat)` manager history, construct a synthetic
-persistent crop-goal vector `K` using Packet 1A:
+For each contiguous `(episode, seat)` manager history, construct the offline
+pre-decision crop baseline used by the existing BC labels. The compatibility
+provenance field `prior_crop_goals` is a baseline vector, not live strategic
+state:
 
 1. At the first manager boundary after opening or an explicit reset,
-   initialize `K` from the five observed planted-crop counts.
+   initialize the offline baseline from the five observed planted-crop counts.
 2. At each later adjacent boundary, decode the five sampled crop classes to
-   signed deltas and apply each delta exactly once. The post-action `K` is the
-   next boundary's pre-action `K`.
+   signed deltas and apply each delta exactly once. On ordinary consecutive
+   rows this reproduces the physical-start-relative labels already used by
+   BC; the synthetic continuity is only an offline preprocessing mechanism.
 3. Adjacency requires the same episode and seat, ordered manager boundaries,
    the expected consecutive day/boundary identity, and no duplicate or
    missing row. An opening, explicit environment reset, episode/seat change,
    schema/version change, gap, duplicate, or out-of-order row starts a new
-   sequence; it never bridges to the previous `K`.
+   sequence; it never bridges to the previous offline baseline.
 4. A reset row needs a valid observed planted-count baseline. If the baseline,
    adjacency, or delta transition is invalid, exclude the affected proxy
    rather than guessing, clipping, or repairing it.
 
 The full unfiltered history is built before any date or minimum-score filter,
 so filters cannot manufacture adjacency. Harvests, losses, unfinished work,
-and temporary occupancy do not rewrite `K`; maintenance-aware reconstruction
-from those events is deferred.
+and temporary occupancy do not rewrite the offline baseline; maintenance-aware
+reconstruction from those events is deferred. Live inference does not carry
+this synthetic value forward: it reads current physical crop counts at every
+manager boundary.
 
 ### Land and animals: observed end outcomes
 
@@ -86,7 +93,8 @@ which covers rows with no usable component at all.
 Every land, animal, and crop action/proxy is validated through the public
 Packet 1A helpers and constants. In particular, land uses absolute-target
 support; animal prefixes use the sequential Packet 1A housing/reuse rules;
-crop deltas use the persistent-goal and residual-capacity support. The
+crop deltas use the supplied physical-start baseline and residual-capacity
+support. The
 physical context contains no economic state.
 
 Validity is autoregressive. A component is usable only when its own class is
@@ -119,7 +127,7 @@ and full-contraction guarantees.
 The optional configuration is versioned as `stage25_curriculum_v1` and is
 `enabled = false` by default. Its only caps are:
 
-- `max_positive_crop_delta`: relative to the current persistent crop goal,
+- `max_positive_crop_delta`: relative to the current physical crop baseline,
   allow `delta <= cap` for positive crop deltas; every physically supported
   `delta <= 0` remains available.
 - `max_land_expansion_per_decision`: allow an absolute land target no greater
@@ -207,7 +215,7 @@ training/evaluation adapters, and artifact metadata. It must consume the
 Packet 1A action/support API and the Packet 1B versioned proxy, curriculum,
 bias, shortfall, and invalid-count schemas without redefining them. It must
 preserve sampled class indices separately from signed deltas, absolute
-targets, synthetic `K`, physical context, masks, and end outcomes, and must
+targets, offline baseline provenance, physical context, masks, and end outcomes, and must
 prove disabled-path behavior/checkpoint identity and sample/evaluation
 support parity.
 

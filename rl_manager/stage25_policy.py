@@ -338,13 +338,13 @@ def _host_inputs(
         inputs: Mapping[str, Any], config: Stage25ModelConfig,
         crop_capacity: Any = None,
 ) -> tuple[dict[str, jax.Array], jax.Array, int]:
-    """Prepare encoder inputs and the persistent crop-goal ledger ``K``.
+    """Prepare encoder inputs and the physical crop baseline ``B``.
 
-    ``crop_capacity`` is the pre-decision persistent goal ledger ``K`` of
-    shape ``[B, 5]`` with integer entries in ``[0, 100]``.  It conditions the
-    encoder/decoder and supplies each crop head's delta base; it never supplies
-    the physical capacity ``C``, which is derived from the decoded physical
-    context after the land and animal decisions.
+    ``crop_capacity`` is the pre-decision physical baseline ``B`` of shape
+    ``[B, 5]`` with integer entries in ``[0, 100]``.  It conditions the
+    encoder/decoder and supplies each crop head's board-relative delta base;
+    it never supplies the physical capacity ``C``, which is derived from the
+    decoded physical context after the land and animal decisions.
     """
     if not isinstance(inputs, Mapping):
         raise ValueError("inputs must be a mapping")
@@ -352,7 +352,7 @@ def _host_inputs(
               else inputs.get("crop_capacity"))
     if ledger is None:
         raise ValueError(
-            "inputs must contain crop_capacity (persistent goal ledger K [B,5])")
+            "inputs must contain crop_capacity (physical crop baseline B [B,5])")
     base = {key: value for key, value in inputs.items()
             if key not in ("crop_capacity", "row_ids")}
     _validate_encoder_inputs(base, config.manager_config, model_variant="E")
@@ -379,8 +379,8 @@ def _host_inputs(
     ledger_array = np.asarray(ledger)
     if ledger_array.shape != (b, _N_CROPS):
         raise ValueError(
-            "crop_capacity (persistent goal ledger K) must have shape [B, 5]; "
-            "a scalar or omitted ledger is not accepted")
+            "crop_capacity (physical crop baseline B) must have shape [B, 5]; "
+            "a scalar or omitted baseline is not accepted")
     if not np.issubdtype(ledger_array.dtype, np.integer):
         integral_float = (
             np.issubdtype(ledger_array.dtype, np.floating)
@@ -388,10 +388,10 @@ def _host_inputs(
             and np.all(ledger_array == np.floor(ledger_array)))
         if not integral_float:
             raise ValueError(
-                "crop_capacity (persistent goal ledger K) must be integers")
+                "crop_capacity (physical crop baseline B) must be integers")
     if np.any(ledger_array < 0) or np.any(ledger_array > 100):
         raise ValueError(
-            "crop_capacity (persistent goal ledger K) entries must lie in "
+            "crop_capacity (physical crop baseline B) entries must lie in "
             "[0, 100]")
     prepared = {
         key: (jnp.asarray(value, dtype=jnp.int32)
@@ -554,9 +554,9 @@ def _policy_core(
 ) -> dict[str, jax.Array | dict[str, jax.Array]]:
     """One jitted core shared by stochastic, greedy, and evaluation paths.
 
-    ``crop_capacity`` is the persistent goal ledger ``K``.  The physical
-    capacity ``C`` is derived here from the decoded context after the land and
-    animal steps; it is never supplied by the caller.
+    ``crop_capacity`` is the physical crop baseline ``B`` for this boundary.
+    The physical capacity ``C`` is derived here from the decoded context after
+    the land and animal steps; it is never supplied by the caller.
     """
     dropout_rng = None
     if mode == "train":

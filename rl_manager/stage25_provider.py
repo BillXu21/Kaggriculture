@@ -1,10 +1,11 @@
 """Persistent Stage 2.5 manager lifecycle/provider seam.
 
-The provider owns the state which must outlive one executor call: one crop
-goal ledger, one corrected-E daily-start tracker, and one immutable accepted
-plan for each episode/seat.  The external path accepts class indices from a
-parent process and imports no policy framework.  The optional native path is
-loaded lazily so importing this module remains framework-neutral.
+The provider owns the state which must outlive one executor call: the physical
+crop baseline observed at the accepted boundary, one corrected-E daily-start
+tracker, and one immutable accepted plan for each episode/seat.  The external
+path accepts class indices from a parent process and imports no policy
+framework.  The optional native path is loaded lazily so importing this module
+remains framework-neutral.
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ from .stage25_mechanics import (
 )
 from .stage25_types import Stage25BehaviorIdentity
 
-STATE_VERSION = "stage25_provider_state_v2"
+STATE_VERSION = "stage25_provider_state_v3"
 SOURCE_TRANSFER = "encoder_only"
 DecisionMode = Literal["deterministic", "stochastic"]
 
@@ -231,7 +232,7 @@ class Stage25LifecycleState:
     episode_id: str | int
     seat: int
     manager_start_day: int
-    crop_capacity: tuple[int, ...] | None = None
+    physical_crop_baseline: tuple[int, ...] | None = None
     accepted_decision: Stage25DecisionKey | None = None
     accepted_classes: tuple[int, ...] | None = None
     crop_goals: tuple[int, ...] | None = None
@@ -247,8 +248,9 @@ class Stage25LifecycleState:
             "episode_id": self.episode_id,
             "seat": self.seat,
             "manager_start_day": self.manager_start_day,
-            "crop_capacity": None if self.crop_capacity is None
-            else list(self.crop_capacity),
+            "physical_crop_baseline": (
+                None if self.physical_crop_baseline is None
+                else list(self.physical_crop_baseline)),
             "accepted_decision": None if self.accepted_decision is None
             else self.accepted_decision.to_json_dict(),
             "accepted_classes": None if self.accepted_classes is None
@@ -269,7 +271,7 @@ class Stage25LifecycleState:
     def from_json_dict(cls, value: Mapping[str, Any]) -> "Stage25LifecycleState":
         expected = {
             "version", "episode_id", "seat", "manager_start_day",
-            "crop_capacity", "accepted_decision", "accepted_classes",
+            "physical_crop_baseline", "accepted_decision", "accepted_classes",
             "crop_goals", "cached_plan", "e_history", "e_history_version",
             "source_history_version", "curriculum",
         }
@@ -279,11 +281,14 @@ class Stage25LifecycleState:
         if value["version"] != STATE_VERSION:
             raise Stage25ProviderError(
                 f"provider state version {value.get('version')!r} is incompatible")
-        crop_capacity = None if value["crop_capacity"] is None else tuple(
-            _goal_int(item, "crop_capacity item")
-            for item in value["crop_capacity"])
-        if crop_capacity is not None and len(crop_capacity) != len(CROP_ORDER):
-            raise Stage25ProviderError("crop_capacity must contain five values")
+        physical_crop_baseline = (
+            None if value["physical_crop_baseline"] is None else tuple(
+                _goal_int(item, "physical crop baseline item")
+                for item in value["physical_crop_baseline"]))
+        if (physical_crop_baseline is not None
+                and len(physical_crop_baseline) != len(CROP_ORDER)):
+            raise Stage25ProviderError(
+                "physical_crop_baseline must contain five values")
         accepted = value["accepted_decision"]
         key = None if accepted is None else Stage25DecisionKey.from_json_dict(accepted)
         classes = None if value["accepted_classes"] is None else _class_tuple(
@@ -348,7 +353,8 @@ class Stage25LifecycleState:
         return cls(
             episode_id=_json_scalar(value["episode_id"], "episode_id"),
             seat=value["seat"], manager_start_day=value["manager_start_day"],
-            crop_capacity=crop_capacity, accepted_decision=key,
+            physical_crop_baseline=physical_crop_baseline,
+            accepted_decision=key,
             accepted_classes=classes, crop_goals=goals, cached_plan=plan,
             e_history=history, e_history_version=operating,
             source_history_version=source, curriculum=curriculum,
@@ -356,10 +362,10 @@ class Stage25LifecycleState:
 
 
 def _validate_action(
-    classes: tuple[int, ...], previous_goals: tuple[int, ...],
+    classes: tuple[int, ...], crop_baseline: tuple[int, ...],
     context: PhysicalContext, curriculum: Stage25CurriculumConfig,
 ) -> tuple[int, ...]:
-    """Validate the complete teacher-forced action using pure Packet 1/1B."""
+    """Validate one action against the current physical crop baseline."""
     for index, (value, count) in enumerate(zip(classes, ACTION_CLASS_COUNTS)):
         if not 0 <= value < count:
             raise Stage25ProviderError(
@@ -389,7 +395,7 @@ def _validate_action(
     total_capacity = physical_crop_capacity(context, land_target, animal_targets)
     goals: list[int] = []
     for crop_index, class_index in enumerate(classes[4:]):
-        previous = previous_goals[crop_index]
+        previous = crop_baseline[crop_index]
         residual = total_capacity - sum(goals)
         support = apply_crop_curriculum(
             crop_delta_support_mask(previous, residual), curriculum)
@@ -501,7 +507,7 @@ class Stage25NativePolicy:
 
 
 class Stage25PlanProvider:
-    """One persistent manager owner for one configured episode and seat."""
+    """One lifecycle manager owner for one configured episode and seat."""
 
     def __init__(
         self, episode_id: str | int, seat: int, manager_start_day: int, *,
@@ -547,7 +553,7 @@ class Stage25PlanProvider:
 
     def reset(self) -> None:
         """Clear all lifecycle state, including corrected-E history."""
-        self._crop_capacity: tuple[int, ...] | None = None
+        self._physical_crop_baseline: tuple[int, ...] | None = None
         self._accepted_key: Stage25DecisionKey | None = None
         self._accepted_classes: tuple[int, ...] | None = None
         self._crop_goals: tuple[int, ...] | None = None
@@ -563,7 +569,13 @@ class Stage25PlanProvider:
 
     @property
     def crop_capacity(self) -> tuple[int, ...] | None:
-        return self._crop_capacity
+        """Return the last accepted physical baseline for key compatibility."""
+        return self._physical_crop_baseline
+
+    @property
+    def physical_crop_baseline(self) -> tuple[int, ...] | None:
+        """Return the physical crop counts observed at the last boundary."""
+        return self._physical_crop_baseline
 
     @property
     def last_accepted_decision(self) -> Stage25DecisionKey | None:
@@ -647,7 +659,7 @@ class Stage25PlanProvider:
         return Stage25LifecycleState(
             episode_id=self.episode_id, seat=self.seat,
             manager_start_day=self.manager_start_day,
-            crop_capacity=self._crop_capacity,
+            physical_crop_baseline=self._physical_crop_baseline,
             accepted_decision=self._accepted_key,
             accepted_classes=self._accepted_classes,
             crop_goals=self._crop_goals,
@@ -726,9 +738,9 @@ class Stage25PlanProvider:
         )
         observed = tuple(int(value) for value in current_crop_counts(
             inputs["board_crop"])[0])
-        initial = initialize_crop_ledger(observed) if self._crop_capacity is None \
-            else self._crop_capacity
-        inputs["crop_capacity"] = np.asarray([initial], dtype=np.int16)
+        physical_baseline = initialize_crop_ledger(observed)
+        inputs["crop_capacity"] = np.asarray(
+            [physical_baseline], dtype=np.int16)
         farm = obs["farms"][self.seat]
         private = obs.get("private") or {}
         unplaced = unplaced_animal_counts(
@@ -738,10 +750,10 @@ class Stage25PlanProvider:
             board, farm["unlocked_quadrants"],
             unplaced_animals=unplaced,
         )
-        return inputs, context, initial
+        return inputs, context, physical_baseline
 
     def _support_payload(
-        self, context: PhysicalContext, initial: tuple[int, ...]
+        self, context: PhysicalContext, physical_baseline: tuple[int, ...]
     ) -> dict[str, Any]:
         """Materialize the pre-decision support without sampling anything."""
         land = tuple(land_target_support_mask(context.observed_land))
@@ -758,8 +770,8 @@ class Stage25PlanProvider:
             physical_crop_capacity(context, context.observed_land,
                                    context.placed_animals), 0)
         crops = tuple(
-            crop_delta_support_mask(goal, total_capacity)
-            for goal in initial)
+            crop_delta_support_mask(baseline, total_capacity)
+            for baseline in physical_baseline)
         return {"land": land, "animals": animals, "crops": crops}
 
     def prepare_inference_context(
@@ -783,7 +795,7 @@ class Stage25PlanProvider:
             raise Stage25ProviderError(
                 "external Stage 2.5 inference requires behavior_identity")
         self.effective_curriculum()
-        inputs, context, initial = self._stage_observation(
+        inputs, context, physical_baseline = self._stage_observation(
             obs, previous_execution)
         frozen_inputs: dict[str, np.ndarray] = {}
         for name, value in inputs.items():
@@ -794,9 +806,9 @@ class Stage25PlanProvider:
             decision_key=key,
             behavior_identity=identity,
             inputs=frozen_inputs,
-            crop_capacity=tuple(initial),
+            crop_capacity=tuple(physical_baseline),
             physical_context=context,
-            support=self._support_payload(context, initial),
+            support=self._support_payload(context, physical_baseline),
             observation=copy.deepcopy(dict(obs)),
             seed=self.seed,
         )
@@ -810,7 +822,7 @@ class Stage25PlanProvider:
         This intentionally bypasses ``_check_delivery`` and uses a distinct
         row identity.  Callers may evaluate the critic at the final observed
         state, but cannot accidentally submit the resulting classes as the
-        next manager decision or advance the crop ledger.
+        next manager decision or apply a crop delta twice.
         """
         if not isinstance(obs, Mapping) or _terminal_observation(obs):
             raise Stage25TerminalError("terminal state has no bootstrap context")
@@ -820,7 +832,8 @@ class Stage25PlanProvider:
             raise Stage25ProviderError(
                 "Stage 2.5 bootstrap requires an immutable behavior identity")
         self.effective_curriculum()
-        inputs, context, initial = self._stage_observation(obs, previous_execution)
+        inputs, context, physical_baseline = self._stage_observation(
+            obs, previous_execution)
         frozen_inputs: dict[str, np.ndarray] = {}
         for name, value in inputs.items():
             copied = np.array(value, copy=True)
@@ -831,9 +844,9 @@ class Stage25PlanProvider:
                 self.episode_id, self.seat, day, "bootstrap"),
             behavior_identity=identity,
             inputs=frozen_inputs,
-            crop_capacity=tuple(initial),
+            crop_capacity=tuple(physical_baseline),
             physical_context=context,
-            support=self._support_payload(context, initial),
+            support=self._support_payload(context, physical_baseline),
             observation=copy.deepcopy(dict(obs)),
             seed=self.seed,
         )
@@ -843,7 +856,7 @@ class Stage25PlanProvider:
         action_classes: Sequence[int], *,
         behavior_identity: Stage25BehaviorIdentity | None = None,
     ) -> DailyPlan:
-        """Validate response identity, then perform exactly one K transition."""
+        """Validate response identity, then apply one board-relative delta."""
         if not isinstance(request, Stage25InferenceContext):
             raise TypeError("request must be Stage25InferenceContext")
         expected = behavior_identity or self.behavior_identity
@@ -858,8 +871,8 @@ class Stage25PlanProvider:
 
     def _commit(
         self, key: Stage25DecisionKey, classes: tuple[int, ...],
-        goals: tuple[int, ...], plan: DailyPlan, inputs: dict[str, np.ndarray],
-        obs: Mapping[str, Any],
+        physical_baseline: tuple[int, ...], goals: tuple[int, ...],
+        plan: DailyPlan, inputs: dict[str, np.ndarray], obs: Mapping[str, Any],
     ) -> DailyPlan:
         # Compute every fallible value before mutating lifecycle fields so a
         # malformed observation (e.g. missing daily-start money) can never
@@ -871,13 +884,14 @@ class Stage25PlanProvider:
         diagnostics = {
             "decision_identity": key.identity,
             "requested_classes": classes,
+            "physical_crop_baseline": physical_baseline,
             "requested_crop_goals": goals,
             "plan": plan.to_json_dict(),
             "curriculum_version": curriculum.version,
             "e_history_version": self.e_history_version,
         }
         # All validation and policy work has completed before this point.
-        self._crop_capacity = goals
+        self._physical_crop_baseline = physical_baseline
         self._accepted_key = key
         self._accepted_classes = classes
         self._crop_goals = goals
@@ -912,7 +926,8 @@ class Stage25PlanProvider:
         inputs, context, initial = self._stage_observation(obs, previous_execution)
         goals = _validate_action(classes, initial, context, curriculum)
         plan = _lower_plan(classes, goals)
-        return self._commit(key, classes, goals, plan, inputs, obs)
+        return self._commit(
+            key, classes, initial, goals, plan, inputs, obs)
 
     submit_classes = accept_classes
     accept_decision = accept_classes
@@ -941,8 +956,8 @@ class Stage25PlanProvider:
         day = _scalar_int(obs.get("day"), "obs.day")
         if day < self.manager_start_day:
             # The executor still asks for a daily plan during opening days.
-            # Supply a neutral, non-deliverable plan without touching K or
-            # creating a manager trajectory row; the first real boundary is
+            # Supply a neutral, non-deliverable plan without creating a
+            # manager trajectory row or lifecycle state; the first real boundary is
             # accepted by the runner at manager_start_day.
             return _lower_plan(
                 (0, 0, 0, 0, 100, 100, 100, 100, 100),
@@ -977,7 +992,8 @@ class Stage25PlanProvider:
         classes_tuple = _class_tuple(sampled)
         goals = _validate_action(classes_tuple, initial, context, curriculum)
         plan = _lower_plan(classes_tuple, goals)
-        return self._commit(key, classes_tuple, goals, plan, inputs, obs)
+        return self._commit(
+            key, classes_tuple, initial, goals, plan, inputs, obs)
 
     def export_state(self) -> dict[str, Any]:
         """Export lifecycle state only; executor queues are deliberately absent."""
@@ -1009,18 +1025,18 @@ class Stage25PlanProvider:
             raise Stage25ProviderError("accepted decision and cached plan must agree")
         if snapshot.accepted_decision is None and any(
                 item is not None for item in (
-                    snapshot.crop_capacity, snapshot.accepted_classes,
+                    snapshot.physical_crop_baseline, snapshot.accepted_classes,
                     snapshot.crop_goals, snapshot.e_history)):
             raise Stage25ProviderError("empty provider state contains lifecycle data")
         if snapshot.accepted_decision is not None:
             if snapshot.accepted_decision.episode_id != self.episode_id \
                     or snapshot.accepted_decision.seat != self.seat:
                 raise Stage25ProviderError("accepted decision identity mismatch")
-            if snapshot.accepted_classes is None or snapshot.crop_goals is None:
+            if (snapshot.physical_crop_baseline is None
+                    or snapshot.accepted_classes is None
+                    or snapshot.crop_goals is None):
                 raise Stage25ProviderError("accepted state is incomplete")
-            if snapshot.crop_capacity != snapshot.crop_goals:
-                raise Stage25ProviderError("crop ledger and accepted goals disagree")
-        self._crop_capacity = snapshot.crop_capacity
+        self._physical_crop_baseline = snapshot.physical_crop_baseline
         self._accepted_key = snapshot.accepted_decision
         self._accepted_classes = snapshot.accepted_classes
         self._crop_goals = snapshot.crop_goals

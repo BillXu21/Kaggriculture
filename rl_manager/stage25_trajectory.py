@@ -32,6 +32,9 @@ from rl_manager.stage25_types import Stage25BehaviorIdentity, Stage25PolicyOutpu
 STAGE25_TRAJECTORY_SCHEMA_VERSION = "stage25_trajectory_v1"
 TRAJECTORY_SCHEMA_VERSION = STAGE25_TRAJECTORY_SCHEMA_VERSION
 STAGE25_OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_v1"
+# The metadata name is retained for checkpoint/trajectory compatibility.  The
+# carried crop_capacity value is the physical pre-decision baseline, not a
+# requested-goal ledger.
 STAGE25_PERSISTENT_LEDGER_VERSION = "stage25_crop_capacity_ledger_v1"
 STAGE25_PHYSICAL_SUPPORT_VERSION = ACTION_SCHEMA_VERSION
 STAGE25_MANAGER_START_DAY = 4

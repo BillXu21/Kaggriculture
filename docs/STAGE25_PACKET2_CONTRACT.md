@@ -34,25 +34,24 @@ mechanics and vocabularies remain authoritative.
   explicit validity, and marks the affected and downstream likelihoods and
   entropies invalid instead of substituting a repaired class.
 
-`inputs` contain the own-only corrected-E arrays plus the pre-decision
-persistent goal ledger `crop_capacity` (`K`, integer `[B, 5]`, entries in
-`[0, 100]`). The ledger is required and unambiguous: a scalar `[B]` ledger or
-an omitted ledger is rejected, there is no separate caller-supplied
-`crop_goals`, and there is no occupancy-derived default. If the ledger is not
-embedded in `inputs`, a caller may pass `crop_capacity` through the explicit
-keyword seam; `physical_contexts` may likewise be passed explicitly.
-First-boundary ledger construction from observed occupancy belongs outside
-policy inference.
+`inputs` contain the own-only corrected-E arrays plus the pre-decision physical
+crop baseline `crop_capacity` (`B`, integer `[B, 5]`, entries in `[0, 100]`).
+The baseline is required and unambiguous: a scalar `[B]` baseline or an
+omitted baseline is rejected, there is no separate caller-supplied
+`crop_goals`, and the provider derives the baseline from current physical
+occupancy at every daily boundary. If the baseline is not embedded in
+`inputs`, a caller may pass `crop_capacity` through the explicit keyword seam;
+`physical_contexts` may likewise be passed explicitly.
 
-`K` conditions the encoder/decoder and supplies each crop head's delta base
-(`goal_i = K_i + class_i - 100`). It does not define available space and need
-not fit the footprint: a ledger with `sum(K) > C` is valid and the
+`B` conditions the encoder/decoder and supplies each crop head's delta base
+(`goal_i = B_i + class_i - 100`). It does not define available space and need
+not fit the footprint: a physical baseline with `sum(B) > C` is valid and the
 autoregressive masks force contraction. The physical capacity
 `C = B(requested_land) - required_new_housing_cells` is always derived by the
 policy from the decoded Packet 1A context (observed placed animals, reusable
 empty coops, shared empty pastures, requested land footprint) after the land
 and animal actions; it is never supplied by the caller, never taken from
-`sum(K)`, never reserved for future crops, and never clamped to zero. A
+`sum(B)`, never reserved for future crops, and never clamped to zero. A
 negative `C` yields empty crop support.
 
 `physical_contexts` are Packet 1A `PhysicalContext` values, one per row;

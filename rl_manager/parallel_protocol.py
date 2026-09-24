@@ -98,9 +98,11 @@ class Stage25RequestIdentity:
 class Stage25InferenceRequest:
     """Framework-neutral parent-inference request.
 
-    ``crop_capacity`` is explicitly the pre-decision K ledger.  Physical
-    context and support are copied by the producer and are never recomputed
-    by the parent from policy outputs.
+    ``crop_capacity`` is the physical pre-decision crop baseline for this
+    boundary.  It is kept under the existing model-facing key for checkpoint
+    compatibility; it is not a carried-forward requested-goal ledger.
+    Physical context and support are copied by the producer and are never
+    recomputed by the parent from policy outputs.
     """
 
     identity: Stage25RequestIdentity
