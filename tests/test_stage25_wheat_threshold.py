@@ -109,7 +109,8 @@ def test_manager_requested_removal_and_feed_buy_survive_threshold():
         obs, 0, feasible_plan=make_plan(crop_targets={"WHEAT": 0,
                                                       "TOMATO": 1}),
         remaining_sells={}, wheat_harvest_threshold=True)
-    assert any(t.kind == "DIG" and t.tile == (0, 0) for t in result.tasks)
+    assert not any(t.kind == "DIG" and t.tile == (0, 0) for t in result.tasks)
+    assert "crop_reduction_unresolved:WHEAT:1" in result.unresolved
     assert any(t.kind == "FEED" and t.tile == (0, 1) for t in result.tasks)
     assert any(t.kind == "BUY_PRODUCT" and t.product == "WHEAT"
                for t in result.tasks)

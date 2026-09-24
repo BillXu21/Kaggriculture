@@ -112,6 +112,9 @@ class AgentConfig:
     heuristic_care: bool = False
     heuristic_fertilizer: bool = False
     wheat_harvest_threshold: bool = False
+    allow_live_crop_sacrifice: bool = False
+    allow_productive_recurring_crop_sacrifice: bool = False
+    allow_older_crop_sacrifice: bool = False
 
     @property
     def idle_cleanup_enabled(self) -> bool:
@@ -1458,7 +1461,11 @@ class ExecutorAgent:
             canonical_board_value=board,
             heuristic_care=self.config.heuristic_care,
             heuristic_fertilizer=self.config.heuristic_fertilizer,
-            wheat_harvest_threshold=self.config.wheat_harvest_threshold)
+            wheat_harvest_threshold=self.config.wheat_harvest_threshold,
+            allow_live_crop_sacrifice=self.config.allow_live_crop_sacrifice,
+            allow_productive_recurring_crop_sacrifice=(
+                self.config.allow_productive_recurring_crop_sacrifice),
+            allow_older_crop_sacrifice=self.config.allow_older_crop_sacrifice)
         generated_tasks = generation.sorted_tasks()
         worker_positions = [
             (int(obs["farms"][seat]["farmer"][1]),
@@ -1924,6 +1931,12 @@ class ExecutorAgent:
                 "heuristic_care": self.config.heuristic_care,
                 "heuristic_fertilizer": self.config.heuristic_fertilizer,
                 "wheat_harvest_threshold": self.config.wheat_harvest_threshold,
+                "allow_live_crop_sacrifice": (
+                    self.config.allow_live_crop_sacrifice),
+                "allow_productive_recurring_crop_sacrifice": (
+                    self.config.allow_productive_recurring_crop_sacrifice),
+                "allow_older_crop_sacrifice": (
+                    self.config.allow_older_crop_sacrifice),
                 "optional_idle_cleanup_mode": self.config.cleanup_mode,
                 "cleanup_mode": self.config.cleanup_mode,
                 "immediate_plant_water": self.config.immediate_plant_water,

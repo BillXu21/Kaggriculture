@@ -152,7 +152,9 @@ def test_purchased_cow_crop_sacrifice_completes_across_regenerated_tasks():
     obs["farms"][0]["unlocked_quadrants"] = ["NW"]
     plan = make_plan(animals={"COW": 1}, crops={"WHEAT": 25})
 
-    first = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
+    first = generate_tasks(
+        obs, 0, feasible_plan=plan, remaining_sells={},
+        allow_live_crop_sacrifice=True)
     assert not any(task.source == "crop_sacrifice" for task in first.tasks)
     assert not any(task.kind in ("DIG", "BUILD_PASTURE", "PLACE")
                    for task in first.tasks)
@@ -161,7 +163,9 @@ def test_purchased_cow_crop_sacrifice_completes_across_regenerated_tasks():
 
     purchased = copy.deepcopy(obs)
     purchased["private"]["shed"]["COW"] = 1
-    second = generate_tasks(purchased, 0, feasible_plan=plan, remaining_sells={})
+    second = generate_tasks(
+        purchased, 0, feasible_plan=plan, remaining_sells={},
+        allow_live_crop_sacrifice=True)
     assert any(task.source == "crop_sacrifice" for task in second.tasks)
     assert run_foreman(purchased, 0, second.sorted_tasks()).farmer_action == (
         "DIG",)
@@ -170,7 +174,9 @@ def test_purchased_cow_crop_sacrifice_completes_across_regenerated_tasks():
 
     dug = copy.deepcopy(purchased)
     dug["farms"][0]["tiles"][4][4] = None
-    third = generate_tasks(dug, 0, feasible_plan=plan, remaining_sells={})
+    third = generate_tasks(
+        dug, 0, feasible_plan=plan, remaining_sells={},
+        allow_live_crop_sacrifice=True)
     assert run_foreman(dug, 0, third.sorted_tasks()).farmer_action == (
         "BUILD_PASTURE",)
 
@@ -178,14 +184,18 @@ def test_purchased_cow_crop_sacrifice_completes_across_regenerated_tasks():
     built["farms"][0]["tiles"][4][4] = {"kind": "PASTURE"}
     built["private"]["shed"]["COW"] = 0
     built["private"]["inventories"][0]["COW"] = 1
-    fourth = generate_tasks(built, 0, feasible_plan=plan, remaining_sells={})
+    fourth = generate_tasks(
+        built, 0, feasible_plan=plan, remaining_sells={},
+        allow_live_crop_sacrifice=True)
     assert run_foreman(built, 0, fourth.sorted_tasks()).farmer_action == (
         "PLACE", "COW", 1)
 
     placed = copy.deepcopy(built)
     placed["private"]["inventories"][0]["COW"] = 0
     placed["farms"][0]["tiles"][4][4] = animal_tile("COW")
-    final = generate_tasks(placed, 0, feasible_plan=plan, remaining_sells={})
+    final = generate_tasks(
+        placed, 0, feasible_plan=plan, remaining_sells={},
+        allow_live_crop_sacrifice=True)
     assert sum(
         tile_role(tile) == "animal_structure"
         and tile.get("animal") == "COW"

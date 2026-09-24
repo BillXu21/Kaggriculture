@@ -28,7 +28,7 @@ __all__ = [
 ]
 
 EXECUTOR_FACTORY_VERSION = "executor_v0.make_agent(strict=True)@stage-a-v1"
-STAGE25_EXECUTOR_PROFILE_VERSION = "strip_executor_v1@stage25-v1"
+STAGE25_EXECUTOR_PROFILE_VERSION = "strip_executor_v1@stage25-packet3-v1"
 STAGE25_EXECUTOR_PROFILE_NAME = "stage25_strip_executor"
 
 

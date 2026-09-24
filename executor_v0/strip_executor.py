@@ -60,7 +60,7 @@ _LOCAL_PRIORITY = LOCAL_ACTION_PRIORITY
 
 @dataclass(frozen=True)
 class StripExecutorConfig:
-    """Packet 2 routing, Packet 3 prep, and strip bootstrap policy knobs."""
+    """Packet 2 routing, Packet 3 removal, and strip bootstrap policy knobs."""
 
     acting_seat: int = 0
     work_config: StripWorkConfig = field(default_factory=StripWorkConfig)
@@ -68,6 +68,9 @@ class StripExecutorConfig:
     max_market_orders: int = 10
     market_params: Mapping[str, Mapping[str, Any]] | None = None
     aggressive_sell_all: bool = False
+    allow_live_crop_sacrifice: bool = False
+    allow_productive_recurring_crop_sacrifice: bool = False
+    allow_older_crop_sacrifice: bool = False
 
 
 @dataclass(frozen=True)
@@ -720,6 +723,10 @@ class StripExecutorController:
             config=self.config.work_config,
             acting_seat=self.config.acting_seat,
             preferred_crop_slots=preferred_crop_slots,
+            allow_live_crop_sacrifice=self.config.allow_live_crop_sacrifice,
+            allow_productive_recurring_crop_sacrifice=(
+                self.config.allow_productive_recurring_crop_sacrifice),
+            allow_older_crop_sacrifice=self.config.allow_older_crop_sacrifice,
         )
 
     def _refresh_route_supply_plans(

@@ -126,7 +126,7 @@ def test_sacrifice_weights_are_configurable_and_change_ordering():
 
 def test_sacrifice_tie_breaks_deterministically_on_yx():
     tile = plant("CARROT")
-    cfg = SacrificeConfig(distance_weight=0.0)
+    cfg = SacrificeConfig(distance_weight=0.0, allow_live_crop_sacrifice=True)
     assert sacrifice_score(tile, (4, 2), anchor=ANCHOR, config=cfg) == \
         sacrifice_score(tile, (2, 4), anchor=ANCHOR, config=cfg)
     board = filled_board(open_coords={(2, 4), (4, 2)})
@@ -134,7 +134,7 @@ def test_sacrifice_tie_breaks_deterministically_on_yx():
     board[2][4] = copy.deepcopy(tile)
     result = plan_animal_layout(board, unlocked_quadrants=("NW",),
                                 animals_needed={"GOOSE": 1}, anchor=ANCHOR,
-                                config=cfg)
+                                config=cfg, current_day=1, current_step=24)
     assert coords(result.placements) == [(2, 4)]  # lower (y, x) wins
     assert result.placements[0].source == "crop_sacrifice"
 
@@ -199,9 +199,11 @@ def test_reconcile_reduction_keeps_most_valuable_matches():
     assert idle.digs == () and idle.plants == ()
     # A TOMATO deficit with no empty tiles consumes the cheapest released
     # WHEAT excess; the harvestable match is preserved.
-    result = reconcile_crops(board, unlocked_quadrants=("NW",),
-                             crop_targets={"WHEAT": 2, "TOMATO": 1},
-                             anchor=ANCHOR)
+    result = reconcile_crops(
+        board, unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 2, "TOMATO": 1}, anchor=ANCHOR,
+        config=SacrificeConfig(allow_live_crop_sacrifice=True),
+        current_day=0, current_step=0)
     assert [(d.coord, d.crop) for d in result.digs] == [((0, 2), "WHEAT")]
     assert [(p.coord, p.crop) for p in result.plants] == [((0, 2), "TOMATO")]
     assert result.unresolved_deficits == ()
@@ -236,9 +238,11 @@ def test_reconcile_mixed_targets_deterministic_and_excess_only():
     board[1][1] = plant("TOMATO", planted_day=0, yield_units=0,
                         harvestable=False, fertilized_until_day=-1)
     board[1][2] = None  # the single empty legal tile
-    result = reconcile_crops(board, unlocked_quadrants=("NW",),
-                             crop_targets={"WHEAT": 1, "TOMATO": 3},
-                             anchor=ANCHOR)
+    result = reconcile_crops(
+        board, unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 1, "TOMATO": 3}, anchor=ANCHOR,
+        config=SacrificeConfig(allow_live_crop_sacrifice=True),
+        current_day=0, current_step=0)
     # Empty tile goes to TOMATO first (canonical order processing).
     assert (result.plants[0].coord, result.plants[0].crop) == ((1, 2), "TOMATO")
     # Remaining TOMATO deficit 1 converts the cheapest WHEAT excess.
@@ -250,9 +254,11 @@ def test_reconcile_mixed_targets_deterministic_and_excess_only():
     assert replacement and replacement[0].crop == "TOMATO"
     assert result.unresolved_deficits == ()
     # Determinism: identical inputs -> identical outputs.
-    again = reconcile_crops(copy.deepcopy(board), unlocked_quadrants=("NW",),
-                            crop_targets={"WHEAT": 1, "TOMATO": 3},
-                            anchor=ANCHOR)
+    again = reconcile_crops(
+        copy.deepcopy(board), unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 1, "TOMATO": 3}, anchor=ANCHOR,
+        config=SacrificeConfig(allow_live_crop_sacrifice=True),
+        current_day=0, current_step=0)
     assert again == result
 
 
@@ -291,7 +297,10 @@ def test_animal_layout_empty_nearby_first_no_reserved_zone():
     board[0][1] = plant("WHEAT")  # nearest selectable tile is a crop
     board[2][0] = None            # farther empty tile
     result = plan_animal_layout(board, unlocked_quadrants=("NW",),
-                                animals_needed={"GOOSE": 1}, anchor=(0, 0))
+                                animals_needed={"GOOSE": 1}, anchor=(0, 0),
+                                config=SacrificeConfig(
+                                    allow_live_crop_sacrifice=True),
+                                current_day=0, current_step=0)
     # No reservation logic: the empty tile is used and the nearer crop is
     # untouched because empties suffice.
     assert coords(result.placements) == [(2, 0)]
@@ -304,7 +313,10 @@ def test_animal_layout_matching_empty_structure_before_new_build():
     board[4][4] = structure("COOP")  # matching but far
     board[0][1] = None               # near empty build spot
     result = plan_animal_layout(board, unlocked_quadrants=("NW",),
-                                animals_needed={"GOOSE": 1}, anchor=(0, 0))
+                                animals_needed={"GOOSE": 1}, anchor=(0, 0),
+                                config=SacrificeConfig(
+                                    allow_live_crop_sacrifice=True),
+                                current_day=0, current_step=0)
     assert coords(result.placements) == [(4, 4)]
     assert result.placements[0].source == "empty_structure"
 
@@ -335,8 +347,11 @@ def test_animal_layout_sacrifices_only_when_necessary_and_cheapest():
                  fertilized_until_day=9)
     board[0][1] = cheap
     board[0][2] = dear
-    result = plan_animal_layout(board, unlocked_quadrants=("NW",),
-                                animals_needed={"GOOSE": 1}, anchor=(0, 0))
+    result = plan_animal_layout(
+        board, unlocked_quadrants=("NW",),
+        animals_needed={"GOOSE": 1}, anchor=(0, 0),
+        config=SacrificeConfig(allow_live_crop_sacrifice=True),
+        current_day=0, current_step=0)
     assert coords(result.placements) == [(0, 1)]
     assert result.placements[0].source == "crop_sacrifice"
 

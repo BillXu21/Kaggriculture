@@ -229,10 +229,11 @@ def test_replacement_has_harvest_plant_water_but_reduction_has_no_replacement():
     board[0][1] = plant("WHEAT", planted_day=0, yield_units=1)
     reduced = build_strip_work_plan(obs(board, day=3), plan(crop_targets={"WHEAT": 1}))
     assert not kinds(reduced, "PLANT")
-    assert [(item.kind, item.tile) for item in kinds(reduced, "DIG")] == [
-        ("DIG", (0, 1))
+    assert [(item.kind, item.tile) for item in kinds(reduced, "HARVEST")] == [
+        ("HARVEST", (0, 0))
     ]
-    assert not [item for item in kinds(reduced, "WATER") if item.tile == (0, 1)]
+    assert not kinds(reduced, "DIG")
+    assert any(item.tile == (0, 1) for item in kinds(reduced, "WATER"))
 
 
 @pytest.mark.parametrize(
