@@ -205,6 +205,7 @@ def _empty_params(config: Stage25ModelConfig) -> dict[str, Any]:
     return {
         "encoder": encoder,
         "capacity_conditioning": jnp.zeros((_N_CROPS, d), jnp.float32),
+        "replaceable_conditioning": jnp.zeros((_N_CROPS, d), jnp.float32),
         "recurrent_decoder": {
             "Wz": jnp.zeros((d, d), jnp.float32),
             "Wh": jnp.zeros((d, d), jnp.float32),
@@ -314,6 +315,7 @@ def init_stage25_params(
     params = {
         "encoder": encoder,
         "capacity_conditioning": normal(leaves[0], (_N_CROPS, d)),
+        "replaceable_conditioning": normal(leaves[5], (_N_CROPS, d)),
         "recurrent_decoder": {
             "Wz": normal(leaves[1], (d, d)),
             "Wh": normal(leaves[2], (d, d)),
@@ -354,7 +356,7 @@ def _host_inputs(
         raise ValueError(
             "inputs must contain crop_capacity (physical crop baseline B [B,5])")
     base = {key: value for key, value in inputs.items()
-            if key not in ("crop_capacity", "row_ids")}
+            if key not in ("crop_capacity", "replaceable_today", "row_ids")}
     _validate_encoder_inputs(base, config.manager_config, model_variant="E")
     # Economics are allowed as encoder context, but never enter the physical
     # support equations below.  This preserves the corrected-E representation
@@ -393,6 +395,18 @@ def _host_inputs(
         raise ValueError(
             "crop_capacity (physical crop baseline B) entries must lie in "
             "[0, 100]")
+    replaceable = inputs.get("replaceable_today")
+    if replaceable is None:
+        raise ValueError(
+            "inputs must contain replaceable_today [B,5] for Stage 2.5")
+    replaceable_array = np.asarray(replaceable)
+    if replaceable_array.shape != (b, _N_CROPS):
+        raise ValueError(
+            "replaceable_today must have shape [B, 5]")
+    if not np.issubdtype(replaceable_array.dtype, np.integer):
+        raise ValueError("replaceable_today must have an integer-compatible dtype")
+    if np.any(replaceable_array < 0) or np.any(replaceable_array > 100):
+        raise ValueError("replaceable_today entries must lie in [0, 100]")
     prepared = {
         key: (jnp.asarray(value, dtype=jnp.int32)
               if key in {"board_kind", "board_crop", "board_animal",
@@ -402,6 +416,8 @@ def _host_inputs(
               else jnp.asarray(value, dtype=jnp.float32))
         for key, value in base.items()
     }
+    prepared["replaceable_today"] = jnp.asarray(
+        replaceable_array.astype(np.int32))
     return prepared, jnp.asarray(ledger_array.astype(np.int32)), b
 
 
@@ -564,10 +580,14 @@ def _policy_core(
         # dropout sites.  Use one explicit batch key; evaluation and PPO keep
         # the historical no-dropout behavior bit-for-bit.
         dropout_rng = jax.random.fold_in(rng_keys[0], 0x25)
+    encoder_inputs = {key: value for key, value in inputs.items()
+                      if key != "replaceable_today"}
     z = _manager_representation(
-        params["encoder"], inputs, config.manager_config,
+        params["encoder"], encoder_inputs, config.manager_config,
         _Dropout(config.dropout if mode == "train" else 0.0, dropout_rng), "E")
     z = z + (crop_capacity / 100.0) @ params["capacity_conditioning"]
+    z = z + (jnp.clip(inputs["replaceable_today"], 0, 100) / 100.0) @ \
+        params["replaceable_conditioning"]
     value = (z @ params["value_head"]["kernel"] +
              params["value_head"]["bias"])[:, 0]
     derived_context = _physical_context_jax(inputs)

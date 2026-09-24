@@ -11,7 +11,7 @@ is folded into the canonical ``planted_day``/``placed_day`` field inside
 Values that are not deterministically derivable from observation state are null.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from numbers import Integral
 from typing import Any
 
@@ -19,6 +19,13 @@ from .constants import ANIMALS, CROPS
 
 # Pinned 1.32.7 turns per day; the absolute step is day*STEPS_PER_DAY + hour.
 STEPS_PER_DAY = 24
+
+# A one-shot crop released by h21 leaves h22/h23 for PLANT -> WATER.  A
+# recurring crop needs one extra retirement action, so HARVEST -> DIG must
+# finish by h20 before that same replacement tail.
+ONE_SHOT_REPLACEABLE_CUTOFF_HOUR = 21
+RECURRING_REPLACEABLE_CUTOFF_HOUR = 20
+REPLACEABLE_CROP_ORDER = tuple(CROPS)
 
 
 def _nonnegative_int(value: object, what: str) -> int:
@@ -117,6 +124,112 @@ def derive_plant(tile: dict[str, Any], current_day: int, current_step: int) -> d
         "fertilizer_active": tile.get("fertilized_until_day", -1) >= current_day,
         "past_lifespan": mls >= 0 and current_step >= mls,
     }
+
+
+def _plant_age_days(tile: Mapping[str, Any], current_day: int) -> int | None:
+    """Return canonical plant age, or ``None`` for an incomplete fixture."""
+    planted_day = tile.get("planted_day")
+    if planted_day is not None:
+        return int(current_day) - int(planted_day)
+    derived = tile.get("derived") or {}
+    age = derived.get("age_days")
+    return None if age is None else int(age)
+
+
+def _yield_after_ordinary_water(
+    tile: Mapping[str, Any], current_day: int, age_days: int,
+) -> int:
+    """Forecast same-day yield after at most one ordinary WATER action."""
+    held = int(tile.get("yield_units", 0) or 0)
+    crop = tile.get("crop")
+    data = CROPS.get(crop)
+    if data is None or data["ongoing"] or tile.get("watered_today") is True:
+        return held
+    window_start = (data["max_yield_day"] + 1) // 2
+    if not window_start <= age_days <= data["max_yield_day"]:
+        return held
+    bonus = 2 if int(tile.get("fertilized_until_day", -1) or -1) \
+        >= int(current_day) else 1
+    return min(int(data["max_yield"]), held + bonus)
+
+
+def _plant_is_replaceable_today(
+    tile: Mapping[str, Any], current_day: int, current_step: int,
+) -> bool:
+    """Whether one canonical PLANT can follow the normal replacement path.
+
+    TOMATO retirement is mechanics-derived (there is no useful Tetsuya
+    removal sample): like STRAWBERRY, it becomes cleanly retireable only once
+    the last scheduled production is available to harvest, after which DIG is
+    the normal retirement action.
+    """
+    crop = tile.get("crop")
+    data = CROPS.get(crop)
+    age = _plant_age_days(tile, current_day)
+    if data is None or age is None or age < int(data["first_yield_day"]):
+        return False
+    held = int(tile.get("yield_units", 0) or 0)
+
+    if data["ongoing"]:
+        final_production_age = int(data["first_yield_day"]) + (
+            int(data["max_yield"]) - 1) * int(data["interval"])
+        retirement_cutoff = (
+            current_day * STEPS_PER_DAY + RECURRING_REPLACEABLE_CUTOFF_HOUR)
+        return (held > 0 and age >= final_production_age
+                and current_step <= retirement_cutoff)
+
+    cutoff_step = current_day * STEPS_PER_DAY + ONE_SHOT_REPLACEABLE_CUTOFF_HOUR
+    threshold = 2 if current_day == 29 else 3
+    already_ready = (
+        held >= threshold if crop == "WHEAT" else held > 0)
+    if already_ready:
+        return current_step <= cutoff_step
+
+    forecast_yield = _yield_after_ordinary_water(tile, current_day, age)
+    release_step = current_step + int(forecast_yield > held)
+    if crop != "WHEAT":
+        return forecast_yield > 0 and release_step <= cutoff_step
+
+    if forecast_yield >= threshold and release_step <= cutoff_step:
+        return True
+
+    # The day-29 threshold does not make yield-1 wheat replaceable.  Preserve
+    # only the separately mechanical expiry case: harvest positive mature
+    # yield before per-step decay consumes it, provided release is still no
+    # later than the one-shot h21 cutoff.
+    lifespan = int(tile.get("max_lifespan_step", -1) or -1)
+    return held > 0 and 0 <= lifespan <= cutoff_step and current_step <= cutoff_step
+
+
+def replaceable_today(
+    board: Sequence[Sequence[Any]], current_day: int, current_step: int | None = None,
+) -> tuple[int, ...]:
+    """Count clean same-day replacement capacity in canonical crop order.
+
+    This is the day-start forecast used by manager decisions.  A supplied
+    same-day ``current_step`` is also accepted for value-bootstrap transport,
+    where the remaining h20/h21 cutoff is applied.  One-shot crops may use
+    one ordinary WATER before HARVEST and must release by h21.  Recurring
+    crops must already hold their final scheduled production so HARVEST ->
+    DIG can retire them by h20.  Worker contention is intentionally not
+    simulated.
+    """
+    day = _nonnegative_int(current_day, "current_day")
+    step = day * STEPS_PER_DAY if current_step is None else _nonnegative_int(
+        current_step, "current_step")
+    if not day * STEPS_PER_DAY <= step < (day + 1) * STEPS_PER_DAY:
+        raise ValueError(
+            "replaceable_today current_step must be within current_day")
+    counts = [0] * len(REPLACEABLE_CROP_ORDER)
+    for row in board:
+        for tile in row:
+            if not isinstance(tile, Mapping) or tile.get("kind") != "PLANT":
+                continue
+            crop = tile.get("crop")
+            if crop in REPLACEABLE_CROP_ORDER and _plant_is_replaceable_today(
+                    tile, day, step):
+                counts[REPLACEABLE_CROP_ORDER.index(crop)] += 1
+    return tuple(counts)
 
 
 def animal_placed_day(tile: Mapping[str, Any], current_day: int) -> int:

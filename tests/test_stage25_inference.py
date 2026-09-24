@@ -44,6 +44,7 @@ def _inputs(batch: int = 1) -> dict[str, np.ndarray]:
         "days_remaining": np.full((batch,), 29, dtype=np.int16),
         "economic_context": np.zeros((batch, 14), dtype=np.float32),
         "crop_capacity": np.zeros((batch, 5), dtype=np.int16),
+        "replaceable_today": np.zeros((batch, 5), dtype=np.int16),
     }
 
 

@@ -45,8 +45,8 @@ STAGE25_CHECKPOINT_VERSION = "stage25_native_checkpoint_v1"
 INFERENCE_PAYLOAD_KIND = "stage25_inference_params_v1"
 BC_TRAINING_PAYLOAD_KIND = "stage25_bc_training_state_v1"
 PPO_TRAINING_PAYLOAD_KIND = "stage25_ppo_training_state_v1"
-ARCHITECTURE_VERSION = "stage25_policy_v1"
-OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_v1"
+ARCHITECTURE_VERSION = "stage25_policy_v2_replaceable_today"
+OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_replaceable_today_v2"
 PERSISTENT_LEDGER_VERSION = "stage25_crop_capacity_ledger_v1"
 PHYSICAL_SUPPORT_VERSION = ACTION_SCHEMA_VERSION
 BC_TARGET_VERSION = "stage25_outcome_proxy_v1"
@@ -58,6 +58,7 @@ OBSERVATION_VOCABULARY = (
     "board_bool", "board_mask", "scalars", "shed_counts", "seed_counts",
     "carried_counts", "unlocked", "market_inventory", "market_prices",
     "shop_counts", "day", "days_remaining", "economic_context", "crop_capacity",
+    "replaceable_today",
 )
 
 

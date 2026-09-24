@@ -78,6 +78,7 @@ def _encoded(batch_size: int = 1, *, economics: float = 0.0,
         "economic_context": np.full((b, 14), economics, dtype=np.float32),
         "crop_capacity": (np.zeros((b, 5), dtype=np.int16)
                           if ledger is None else np.asarray(ledger)),
+        "replaceable_today": np.zeros((b, 5), dtype=np.int16),
     }
     return inputs
 
@@ -417,6 +418,24 @@ def test_physical_crop_baseline_input_is_required_and_rectangular():
             greedy_act(params, _encoded(1), config, crop_capacity=bad)
 
 
+def test_replaceable_today_input_is_required_bounded_and_rectangular():
+    config = _config()
+    params = init_stage25_params(config, seed=1071)
+    omitted = _encoded(1)
+    del omitted["replaceable_today"]
+    with pytest.raises(ValueError, match="replaceable_today"):
+        greedy_act(params, omitted, config)
+    for bad in (np.zeros((1,), dtype=np.int16),
+                np.zeros((1, 3), dtype=np.int16),
+                np.full((1, 5), 101, dtype=np.int16),
+                np.full((1, 5), -1, dtype=np.int16),
+                np.full((1, 5), 1.5, dtype=np.float32)):
+        inputs = _encoded(1)
+        inputs["replaceable_today"] = bad
+        with pytest.raises(ValueError):
+            greedy_act(params, inputs, config)
+
+
 def test_sampled_and_teacher_forced_crop_masks_match_packet1():
     config = _config()
     params = init_stage25_params(config, seed=107)
@@ -676,6 +695,7 @@ def test_teacher_forced_nll_has_finite_gradients_through_all_trainable_blocks():
     # A nonzero physical baseline keeps capacity conditioning differentiable.
     inputs = _encoded_board(_board(), ("NW",),
                             ledger=np.full((1, 5), 4, dtype=np.int16))
+    inputs["replaceable_today"] = np.full((1, 5), 3, dtype=np.int16)
     classes = jnp.asarray([[1, 1, 1, 1, 100, 100, 100, 100, 100]], dtype=jnp.int16)
 
     def loss(tree):
@@ -689,6 +709,7 @@ def test_teacher_forced_nll_has_finite_gradients_through_all_trainable_blocks():
     assert leaves and all(bool(jnp.isfinite(leaf).all()) for leaf in leaves)
     assert bool(jnp.any(jax.tree_util.tree_leaves(grads["encoder"])[0] != 0))
     assert bool(jnp.any(grads["capacity_conditioning"] != 0))
+    assert bool(jnp.any(grads["replaceable_conditioning"] != 0))
     assert bool(jnp.any(grads["recurrent_decoder"]["Wz"] != 0))
     assert bool(jnp.any(jax.tree_util.tree_leaves(grads["output_projections"])[0] != 0))
 
@@ -736,9 +757,10 @@ out = greedy_act(p, {
     'shop_counts': np.zeros((1, 9), dtype=np.int32),
     'day': np.zeros((1,), dtype=np.int16),
     'days_remaining': np.full((1,), 29, dtype=np.int16),
-    'economic_context': np.zeros((1, 14), dtype=np.float32),
-    'crop_capacity': np.zeros((1, 5), dtype=np.int16),
-}, c)
+        'economic_context': np.zeros((1, 14), dtype=np.float32),
+        'crop_capacity': np.zeros((1, 5), dtype=np.int16),
+        'replaceable_today': np.zeros((1, 5), dtype=np.int16),
+    }, c)
 assert out['classes'].shape == (1, 9)
 """
     result = subprocess.run([sys.executable, "-c", script], cwd=ROOT,

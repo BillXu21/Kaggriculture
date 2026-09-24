@@ -31,7 +31,9 @@ from bc_manager.economics import (
 from bc_manager.live import encode_live_inputs, validate_previous_execution
 from executor_v0.plan import DailyPlan, SELL_BIN_ANCHORS
 from replay_daily.constants import PRODUCTS
-from replay_daily.lifecycle import canonical_board, resolve_observation_step
+from replay_daily.lifecycle import (
+    canonical_board, replaceable_today, resolve_observation_step,
+)
 
 from .stage25_config import (
     Stage25CurriculumConfig,
@@ -746,6 +748,8 @@ class Stage25PlanProvider:
         unplaced = unplaced_animal_counts(
             private.get("shed") or {}, private.get("inventories") or ())
         board = canonical_board(farm["tiles"], int(obs["day"]), step)
+        inputs["replaceable_today"] = np.asarray(
+            [replaceable_today(board, int(obs["day"]), step)], dtype=np.int16)
         context = physical_context_from_board(
             board, farm["unlocked_quadrants"],
             unplaced_animals=unplaced,

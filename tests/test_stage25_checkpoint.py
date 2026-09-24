@@ -54,6 +54,10 @@ def test_inference_round_trip_persists_native_contract(tmp_path: Path) -> None:
 
     assert _same_tree(params, loaded)
     assert meta["payload_kind"] == INFERENCE_PAYLOAD_KIND
+    assert meta["architecture_version"] == "stage25_policy_v2_replaceable_today"
+    assert meta["observation_schema_version"] == (
+        "stage25_corrected_e_own_only_replaceable_today_v2")
+    assert meta["observation_vocabulary"][-1] == "replaceable_today"
     assert meta["e_identity"]["history_version"] == E_HISTORY_CORRECTED_V1
     assert meta["source_identity"]["checkpoint"] == "historical-e"
     assert meta["executor"]["profile"] == "native-test"

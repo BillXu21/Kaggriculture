@@ -143,6 +143,8 @@ def test_real_projected_parquet_returns_fixed_bc_arrays_and_diagnostics(tmp_path
     assert result["actions"].shape == (1, 9)
     assert result["actions"].dtype == np.int16
     assert result["inputs"]["crop_capacity"].tolist() == [[0, 0, 0, 0, 0]]
+    assert result["inputs"]["replaceable_today"].shape == (1, 5)
+    assert result["inputs"]["replaceable_today"].dtype == np.int16
     assert result["actions"][0].tolist() == [0, 0, 0, 0, 101, 100, 100, 100, 100]
     assert result["row_identities"][0]["source_row"] == 0
     assert result["diagnostics"]["support_validity"]["wheat"]["valid"] == 1

@@ -29,9 +29,9 @@ from rl_manager.stage25_mechanics import ACTION_CLASS_COUNTS, ACTION_ORDER, ACTI
 from rl_manager.stage25_types import Stage25BehaviorIdentity, Stage25PolicyOutputs
 
 
-STAGE25_TRAJECTORY_SCHEMA_VERSION = "stage25_trajectory_v1"
+STAGE25_TRAJECTORY_SCHEMA_VERSION = "stage25_trajectory_v2_replaceable_today"
 TRAJECTORY_SCHEMA_VERSION = STAGE25_TRAJECTORY_SCHEMA_VERSION
-STAGE25_OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_v1"
+STAGE25_OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_replaceable_today_v2"
 # The metadata name is retained for checkpoint/trajectory compatibility.  The
 # carried crop_capacity value is the physical pre-decision baseline, not a
 # requested-goal ledger.
@@ -84,6 +84,7 @@ def stage25_input_spec() -> dict[str, tuple[tuple[int, ...], np.dtype]]:
         "days_remaining": ((), np.dtype(np.int16)),
         "economic_context": ((14,), np.dtype(np.float32)),
         "crop_capacity": ((len(CROP_ORDER),), np.dtype(np.int16)),
+        "replaceable_today": ((len(CROP_ORDER),), np.dtype(np.int16)),
     }
 
 

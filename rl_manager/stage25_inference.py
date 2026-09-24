@@ -68,6 +68,7 @@ _INTEGER_INPUTS = frozenset({
     "board_kind", "board_crop", "board_animal", "board_mask", "shed_counts",
     "seed_counts", "carried_counts", "unlocked", "market_inventory",
     "shop_counts", "day", "days_remaining", "crop_capacity",
+    "replaceable_today",
 })
 _FLOAT_INPUTS = frozenset(OBSERVATION_VOCABULARY) - _INTEGER_INPUTS
 _BOOLEAN_INPUTS = frozenset({"board_bool"})

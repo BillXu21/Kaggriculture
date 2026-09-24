@@ -25,6 +25,7 @@ from bc_manager.economics import (
     derive_economic_context,
 )
 from replay_daily.constants import SCHEMA_VERSION
+from replay_daily.lifecycle import replaceable_today
 from replay_daily.storage import (
     _denorm_map,
     _denorm_public,
@@ -186,6 +187,21 @@ def _take_inputs(inputs: Mapping[str, np.ndarray], indices: Sequence[int]) -> di
         name: np.ascontiguousarray(np.asarray(value)[selected])
         for name, value in inputs.items()
     }
+
+
+def _replaceable_today_arrays(
+    records: Sequence[Mapping[str, Any]], days: Sequence[int],
+) -> np.ndarray:
+    """Materialize the shared lifecycle forecast for canonical start rows."""
+    if len(records) != len(days):
+        raise ValueError("records and days must have equal lengths")
+    if not records:
+        return np.empty((0, len(CROP_STEPS)), dtype=np.int16)
+    return np.asarray(
+        [replaceable_today(record["start"]["self"]["board"], int(day))
+         for record, day in zip(records, days)],
+        dtype=np.int16,
+    )
 
 
 def _label_actions(label: OutcomeProxyLabel) -> tuple[int, ...]:
@@ -392,6 +408,7 @@ def load_dataset(
         e_history_version=e_history_version,
         manager_start_day=manager_start_day,
     )
+    inputs_all["replaceable_today"] = _replaceable_today_arrays(records, days)
     build = build_outcome_proxy_labels(
         records, selected_dates=dates, min_score=min_score)
     return _materialize_split(

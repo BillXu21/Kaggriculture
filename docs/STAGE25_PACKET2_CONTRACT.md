@@ -35,7 +35,24 @@ mechanics and vocabularies remain authoritative.
   entropies invalid instead of substituting a repaired class.
 
 `inputs` contain the own-only corrected-E arrays plus the pre-decision physical
-crop baseline `crop_capacity` (`B`, integer `[B, 5]`, entries in `[0, 100]`).
+crop baseline `crop_capacity` (`B`, integer `[B, 5]`, entries in `[0, 100]`)
+and the observation-only `replaceable_today` forecast (integer-compatible
+`[B, 5]`, canonical order `[WHEAT, CARROT, TOMATO, STRAWBERRY, MELON]`,
+entries in `[0, 100]`). The forecast is produced by the shared
+`replay_daily.lifecycle.replaceable_today` function in both the canonical
+offline adapter and live provider. One-shot crops must be harvest-releasable
+by h21; recurring crops must have their final useful production available for
+HARVEST -> DIG retirement with the final harvest no later than h20. TOMATO's
+final-retirement age is mechanics-derived from the engine constants, using the
+same rule as STRAWBERRY; it is not inferred from a Tetsuya removal sample.
+The policy clips/normalizes this bounded count vector by 100 and applies a
+learned five-crop projection before decoding. It adds no action head.
+
+The feature changes the native policy architecture and observation contract:
+the checkpoint metadata uses `stage25_policy_v2_replaceable_today` and
+`stage25_corrected_e_own_only_replaceable_today_v2`, and trajectories use the
+matching v2 schema. Older checkpoints/trajectories fail the explicit version
+checks rather than silently dropping this input.
 The baseline is required and unambiguous: a scalar `[B]` baseline or an
 omitted baseline is rejected, there is no separate caller-supplied
 `crop_goals`, and the provider derives the baseline from current physical
@@ -87,24 +104,25 @@ head. For hidden width `D`:
 `N_decoder = (4 + 3*101 + 5*201) * (2D + 1) = 1312 * (2D + 1)`.
 
 The non-decoder tree is the corrected-E own-board encoder/trunk, a `5 x D`
-capacity-conditioning matrix, the two `D x D` recurrent matrices, recurrent
+capacity-conditioning matrix, a second `5 x D` replaceable-today conditioning
+matrix, the two `D x D` recurrent matrices, recurrent
 bias/step embeddings/state-relative scale, and a `D -> 1` value head. For
 `L=num_layers` and FFN width `F`:
 
-`N_non_decoder = 12D^2 + 208D + 5 + L*(4D^2 + 2DF + 9D + F)`.
+`N_non_decoder = 12D^2 + 213D + 5 + L*(4D^2 + 2DF + 9D + F)`.
 
 The corrected-E encoder/trunk is
 `10D^2 + 192D + L*(4D^2 + 2DF + 9D + F)`; the remaining
-`2D^2 + 16D + 5` is the capacity conditioning, recurrent decoder state,
+`2D^2 + 21D + 5` is the two conditioning matrices, recurrent decoder state,
 nine-step embeddings/scales, and value head. Counts for the `tiny`, `small`,
 and `large` convenience constructors (`(D,L,H,F)` of `(16,1,1,32)`,
 `(128,4,4,384)`, and `(256,7,8,1024)`):
 
 | config | D | decoder | non-decoder | total |
 |---|---:|---:|---:|---:|
-| tiny | 16 | 43,296 | 8,629 | 51,925 |
-| small | 128 | 337,184 | 884,741 | 1,221,925 |
-| large | 256 | 673,056 | 6,368,005 | 7,041,061 |
+| tiny | 16 | 43,296 | 8,709 | 52,005 |
+| small | 128 | 337,184 | 885,381 | 1,222,565 |
+| large | 256 | 673,056 | 6,369,285 | 7,042,341 |
 
 `parameter_spec` and `stage25_parameter_count` are executable authority; a
 transposed-kernel storage convention does not change counts.
@@ -154,7 +172,7 @@ entropy, and value; Python does not perform per-head inference. Native import
 and tiny forward must work when importing `torch` raises. Torch is allowed only
 in an explicit historical-checkpoint conversion seam.
 
-Packet 2 has no BC training, native checkpoint conversion/resume, PPO,
-trajectory, provider, executor, or TPU support. It launches no training or
+This packet adds no BC training, checkpoint conversion/resume migration, PPO
+logic, executor DIG-policy change, or TPU support. It launches no training or
 evaluation runs and does not add CARE, fertilizer, selling, economic support
 masking, post-hoc repair, or a second physical-context implementation.
