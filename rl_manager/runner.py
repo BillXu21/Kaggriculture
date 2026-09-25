@@ -331,16 +331,22 @@ class EpisodeResult:
 
 def _canonical_executor_provenance_value(value: Any) -> Any:
     """Copy executor identity into the strict JSON value domain."""
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None:
         return value
+    if isinstance(value, str):
+        return str(value)
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, int):
+        return int(value)
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError("executor provenance contains a non-finite float")
-        return value
-    if isinstance(value, dict):
+        return float(value)
+    if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise TypeError("executor provenance object keys must be strings")
-        return {key: _canonical_executor_provenance_value(item)
+        return {str(key): _canonical_executor_provenance_value(item)
                 for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_canonical_executor_provenance_value(item) for item in value]

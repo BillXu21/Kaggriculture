@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, replace
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import jax
 import numpy as np
@@ -361,6 +361,34 @@ def test_legacy_executor_provenance_is_canonical_json() -> None:
     assert json.loads(json.dumps(provenance, allow_nan=False)) == provenance
 
 
+def test_executor_provenance_canonicalizes_scalar_subclasses() -> None:
+    class JsonInt(int):
+        pass
+
+    class JsonFloat(float):
+        pass
+
+    class JsonString(str):
+        pass
+
+    factory = SimpleNamespace(
+        name="typed", version="v1",
+        effective_profile=MappingProxyType({
+            JsonString("nested"): MappingProxyType({
+                JsonString("values"): [
+                    JsonInt(3), JsonFloat(2.5), JsonString("value"), True],
+            }),
+        }))
+
+    profile = _executor_factory_provenance(factory)["effective_profile"]
+    assert type(profile) is dict
+    assert [type(key) for key in profile] == [str]
+    assert type(profile["nested"]) is dict
+    assert [type(key) for key in profile["nested"]] == [str]
+    values = profile["nested"]["values"]
+    assert [type(value) for value in values] == [int, float, str, bool]
+
+
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), {1: "bad"}, object()])
 def test_executor_provenance_rejects_non_json_values(bad) -> None:
     factory = SimpleNamespace(name="invalid", version="v1",
@@ -530,6 +558,29 @@ def test_failed_ppo_update_never_saves_final_checkpoint(
     monkeypatch.setattr(ppo, "ppo_update", fail_update)
     monkeypatch.setattr(checkpoint, "save_stage25_ppo_checkpoint", fail_save)
     with pytest.raises(RuntimeError, match="PPO update failed"):
+        cli.run(args)
+    assert not (tmp_path / "latest.npz").exists()
+    assert not (tmp_path / "metrics.jsonl").exists()
+
+
+def test_failed_rollout_never_saves_final_checkpoint(
+        monkeypatch, tmp_path) -> None:
+    args = cli._parser().parse_args([
+        "--scratch", "--physical-batch-size", "1", "--minibatch-size", "1",
+        "--checkpoint-every", "10", "--output-dir", str(tmp_path)])
+    config = cli._config(args)
+    state = ppo.init_stage25_ppo_state(config, seed=7)
+    monkeypatch.setattr(cli, "_new_state", lambda *a: (state, {}))
+
+    def fail_collection(*args, **kwargs):
+        raise RuntimeError("rollout failed")
+
+    def fail_save(*args, **kwargs):
+        raise AssertionError("failed rollout must not be checkpointed")
+
+    monkeypatch.setattr(cli, "_collection", fail_collection)
+    monkeypatch.setattr(checkpoint, "save_stage25_ppo_checkpoint", fail_save)
+    with pytest.raises(RuntimeError, match="rollout failed"):
         cli.run(args)
     assert not (tmp_path / "latest.npz").exists()
     assert not (tmp_path / "metrics.jsonl").exists()
