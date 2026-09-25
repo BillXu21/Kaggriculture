@@ -46,6 +46,8 @@ def _inputs(batch: int = 1) -> dict[str, np.ndarray]:
         "days_remaining": np.full((batch,), 29, dtype=np.int16),
         "economic_context": np.zeros((batch, 14), dtype=np.float32),
         "crop_capacity": np.zeros((batch, 5), dtype=np.int16),
+        "replaceable_today": np.zeros((batch, 5), dtype=np.int16),
+        "available_crop_slots": np.full((batch,), 25, dtype=np.int16),
     }
 
 
@@ -354,6 +356,27 @@ def test_optimized_adapter_matches_legacy_policy_outputs_exactly():
     for name in ("classes", "component_logprobs", "joint_logprob", "value",
                  "decoded_goals", "valid"):
         np.testing.assert_array_equal(getattr(output, name), np.asarray(legacy[name]))
+
+
+def test_local_and_parent_inference_parity_with_crop_lifecycle_features():
+    adapter = _adapter()
+    inputs = _inputs(2)
+    inputs["replaceable_today"] = np.asarray(
+        [[2, 0, 0, 0, 0], [0, 1, 0, 0, 0]], dtype=np.int16)
+    inputs["available_crop_slots"] = np.asarray([17, 23], dtype=np.int16)
+    contexts = (_context(), _context())
+    row_ids = ("crop-row-a", "crop-row-b")
+    prng_id = "stage25/rollout/v1/seed=7/behavior=test"
+    local = adapter.plan_batch_with_row_ids(
+        inputs, row_ids, prng_id, physical_contexts=contexts)
+    parent = adapter.infer_batch(
+        inputs, crop_capacity=inputs["crop_capacity"],
+        physical_contexts=contexts, row_ids=row_ids, prng_id=prng_id)
+
+    for name in ("classes", "component_logprobs", "joint_logprob", "value",
+                 "decoded_goals", "valid"):
+        np.testing.assert_array_equal(
+            getattr(local, name), getattr(parent, name))
 
 
 def test_deterministic_adapter_classes_and_scores_match_policy_exactly():

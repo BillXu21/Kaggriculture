@@ -34,19 +34,43 @@ mechanics and vocabularies remain authoritative.
   explicit validity, and marks the affected and downstream likelihoods and
   entropies invalid instead of substituting a repaired class.
 
-`inputs` contain the own-only corrected-E arrays plus the pre-decision
-persistent goal ledger `crop_capacity` (`K`, integer `[B, 5]`, entries in
-`[0, 100]`). The ledger is required and unambiguous: a scalar `[B]` ledger or
-an omitted ledger is rejected, there is no separate caller-supplied
-`crop_goals`, and there is no occupancy-derived default. If the ledger is not
-embedded in `inputs`, a caller may pass `crop_capacity` through the explicit
-keyword seam; `physical_contexts` may likewise be passed explicitly.
-First-boundary ledger construction from observed occupancy belongs outside
-policy inference.
+`inputs` contain the own-only corrected-E arrays plus the pre-decision physical
+crop baseline `crop_capacity` (`B`, integer `[B, 5]`, entries in `[0, 100]`),
+the observation-only `replaceable_today` forecast (integer-compatible
+`[B, 5]`, canonical order `[WHEAT, CARROT, TOMATO, STRAWBERRY, MELON]`,
+entries in `[0, 100]`), and `available_crop_slots` (integer `[B]`, entries in
+`[0, 100]`). Both new features are materialized at the morning boundary by
+the canonical replay/lifecycle and physical-mechanics helpers. The forecast is produced by the shared
+`replay_daily.lifecycle.replaceable_today` function in both the canonical
+offline adapter and live provider. One-shot crops must be harvest-releasable
+by h21; recurring crops must have their final useful production available for
+HARVEST -> DIG retirement with the final harvest no later than h20. TOMATO's
+final-retirement age is mechanics-derived from the engine constants, using the
+same rule as STRAWBERRY; it is not inferred from a Tetsuya removal sample.
+The policy normalizes both new fields by 100 and applies learned side
+conditioning before the value head and decoder; neither field changes the
+corrected-E encoder dimensions or adds an action head. `available_crop_slots`
+is current morning free space and is distinct from autoregressive residual
+capacity after the sampled/teacher-forced land and animal prefix.
 
-`K` conditions the encoder/decoder and supplies each crop head's delta base
-(`goal_i = K_i + class_i - 100`). It does not define available space and need
-not fit the footprint: a ledger with `sum(K) > C` is valid and the
+The lifecycle features change the native policy architecture and observation
+contract: checkpoint metadata uses
+`stage25_policy_v3_crop_lifecycle_capacity` and
+`stage25_corrected_e_own_only_crop_lifecycle_capacity_v3`; trajectories use
+`stage25_trajectory_v3_crop_lifecycle_capacity`. Older checkpoints and
+trajectories fail explicit version checks rather than silently dropping these
+inputs. The one-way physical-baseline BC migration is documented in
+`STAGE25_CROP_LIFECYCLE_CONTRACT.md`.
+The baseline is required and unambiguous: a scalar `[B]` baseline or an
+omitted baseline is rejected, there is no separate caller-supplied
+`crop_goals`, and the provider derives the baseline from current physical
+occupancy at every daily boundary. If the baseline is not embedded in
+`inputs`, a caller may pass `crop_capacity` through the explicit keyword seam;
+`physical_contexts` may likewise be passed explicitly.
+
+`B` conditions the encoder/decoder and supplies each crop head's delta base
+(`goal_i = B_i + class_i - 100`). It does not define available space and need
+not fit the footprint: a physical baseline with `sum(B) > C` is valid and the
 autoregressive masks force contraction. The physical capacity
 `C = B(requested_land) - required_new_housing_cells` is always derived by the
 policy from the decoded Packet 1A context (observed placed animals, reusable

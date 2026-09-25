@@ -25,14 +25,21 @@ ROOT = Path(__file__).resolve().parents[1]
 HOLD = (0, 1, 0, 1, 100, 100, 100, 100, 100)
 
 
-def _obs(day: int = 3, money: float = 3000.0) -> dict:
+def _obs(day: int = 3, money: float = 3000.0, wheat_count: int = 1) -> dict:
     tiles = [[None for _ in range(10)] for _ in range(10)]
-    tiles[0][0] = {
+    wheat = {
         "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
         "yield_units": 0, "watered_today": True,
         "fertilized_until_day": -1, "max_lifespan_step": -1,
         "consecutive_unwatered": 0,
     }
+    tiles[0][0] = wheat
+    open_positions = [
+        (y, x) for y in range(10) for x in range(10)
+        if (y, x) not in {(0, 0), (0, 1), (0, 2)}
+    ]
+    for y, x in open_positions[:wheat_count - 1]:
+        tiles[y][x] = dict(wheat)
     tiles[0][1] = {
         "kind": "COOP", "animal": "GOOSE", "placed_day": 0,
         "yield_units": 0, "consecutive_unfed": 0, "fed_today": True,

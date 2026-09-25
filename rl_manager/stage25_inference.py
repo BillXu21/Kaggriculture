@@ -72,6 +72,7 @@ _INTEGER_INPUTS = frozenset({
     "board_kind", "board_crop", "board_animal", "board_mask", "shed_counts",
     "seed_counts", "carried_counts", "unlocked", "market_inventory",
     "shop_counts", "day", "days_remaining", "crop_capacity",
+    "replaceable_today", "available_crop_slots",
 })
 _FLOAT_INPUTS = frozenset(OBSERVATION_VOCABULARY) - _INTEGER_INPUTS
 _BOOLEAN_INPUTS = frozenset({"board_bool"})
@@ -201,6 +202,10 @@ def _validate_inputs(inputs: Mapping[str, Any]) -> int:
                 np.issubdtype(array.dtype, np.floating) and
                 not np.all(np.isfinite(array))):
             raise ValueError(f"input {name!r} contains non-finite values")
+        if name in {"crop_capacity", "replaceable_today",
+                    "available_crop_slots"} and (
+                np.any(array < 0) or np.any(array > 100)):
+            raise ValueError(f"input {name!r} entries must lie in [0, 100]")
     if batch is None or batch < 1:
         raise ValueError("inputs must contain at least one row")
     return batch
@@ -231,6 +236,7 @@ def _normalise_contexts(
                 reusable_empty_coops=int(context.reusable_empty_coops),
                 reusable_empty_pastures=int(context.reusable_empty_pastures),
                 unplaced_animals=tuple(context.unplaced_animals),
+                observed_crop_counts=tuple(context.observed_crop_counts),
             ))
         except (AttributeError, TypeError, ValueError) as exc:
             raise ValueError(f"invalid physical context at row {index}") from exc

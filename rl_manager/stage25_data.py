@@ -27,7 +27,7 @@ from .stage25_mechanics import (
 )
 
 
-OUTCOME_PROXY_SCHEMA_VERSION = "stage25_outcome_proxy_v1"
+OUTCOME_PROXY_SCHEMA_VERSION = "stage25_outcome_proxy_v2_physical_crop_baseline"
 # Short aliases make the persisted contract discoverable without introducing
 # a second version value.
 STAGE25_DATA_VERSION = OUTCOME_PROXY_SCHEMA_VERSION
@@ -792,8 +792,11 @@ def _make_label(row: _HistoryRow, prior: OutcomeProxyProvenance,
         if capacity >= 0:
             decoded_goals: list[int] = []
             crop_ok = True
-            for index, (prior_goal, desired) in enumerate(
-                     zip(prior.prior_crop_goals, row.end_crops)):
+            # A manager action is always relative to this morning's actual
+            # board. Historical requested goals remain provenance only and
+            # must never become the crop-delta baseline.
+            for index, (physical_baseline, desired) in enumerate(
+                     zip(row.start_crops, row.end_crops)):
                 component = _component_name("crop", index)
                 if component in target_invalid:
                     crop_ok = False
@@ -804,14 +807,14 @@ def _make_label(row: _HistoryRow, prior: OutcomeProxyProvenance,
                     if component not in invalid:
                         invalid.append(component)
                     continue
-                delta = desired - prior_goal
+                delta = desired - physical_baseline
                 if not _CROP_DELTA_MIN <= delta <= _CROP_DELTA_MAX:
                     counters["crop_delta_outside_vocabulary_components"] += 1
                     crop_ok = False
                     if component not in invalid:
                         invalid.append(component)
                     continue
-                if not 0 <= prior_goal <= 100 or not 0 <= desired <= 100:
+                if not 0 <= physical_baseline <= 100 or not 0 <= desired <= 100:
                     counters["crop_physical_incompatibility_components"] += 1
                     crop_ok = False
                     if component not in invalid:
@@ -820,7 +823,7 @@ def _make_label(row: _HistoryRow, prior: OutcomeProxyProvenance,
                 residual = capacity - sum(decoded_goals)
                 try:
                     class_index = crop_delta_to_class(delta)
-                    if not crop_delta_support_mask(prior_goal, residual)[class_index]:
+                    if not crop_delta_support_mask(physical_baseline, residual)[class_index]:
                         raise ValueError
                 except (ValueError, IndexError):
                     counters["crop_physical_incompatibility_components"] += 1
@@ -830,7 +833,7 @@ def _make_label(row: _HistoryRow, prior: OutcomeProxyProvenance,
                     continue
                 crop_deltas[index] = delta
                 crop_classes[index] = class_index
-                decoded_goals.append(prior_goal + delta)
+                decoded_goals.append(physical_baseline + delta)
                 valid.append(component)
         else:
             # Capacity is a shared prerequisite, so it invalidates all crop

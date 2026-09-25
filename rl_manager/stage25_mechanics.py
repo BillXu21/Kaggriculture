@@ -34,6 +34,7 @@ __all__ = [
     "transition_crop_goal", "transition_crop_ledger",
     "transition_crop_ledger_classes", "physical_context_from_board",
     "required_new_housing_cells", "physical_crop_capacity",
+    "physical_crop_counts", "available_crop_slots",
     "animal_prefix_is_feasible", "animal_target_support_mask",
     "animal_acquisition_deficits", "unplaced_animal_counts",
     "crop_delta_support_mask",
@@ -195,6 +196,7 @@ class PhysicalContext:
     reusable_empty_coops: int = 0
     reusable_empty_pastures: int = 0
     unplaced_animals: tuple[int, ...] = (0, 0, 0)
+    observed_crop_counts: tuple[int, ...] = (0, 0, 0, 0, 0)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -216,6 +218,10 @@ class PhysicalContext:
         object.__setattr__(
             self, "unplaced_animals", _animal_vector(
                 self.unplaced_animals, "unplaced animal counts"))
+        object.__setattr__(
+            self, "observed_crop_counts",
+            _crop_goal_vector(self.observed_crop_counts,
+                              "observed crop count"))
         for name in ("reusable_empty_coops", "reusable_empty_pastures"):
             value = _require_int(getattr(self, name), name)
             if value < 0:
@@ -254,6 +260,21 @@ def _tile_physical_role(tile: object) -> str:
     return "unusable"
 
 
+def _count_physical_crops(board: Sequence[Sequence[object]]) \
+        -> tuple[int, ...]:
+    counts = [0] * len(CROP_ORDER)
+    for row in board:
+        for tile in row:
+            if not isinstance(tile, Mapping) or tile.get("kind") != "PLANT":
+                continue
+            crop = tile.get("crop")
+            if crop in CROP_ORDER:
+                counts[CROP_ORDER.index(crop)] += 1
+            elif crop is not None:
+                raise ValueError(f"unknown crop {crop!r} on physical board")
+    return initialize_crop_ledger(counts)
+
+
 def physical_context_from_board(
     board: Sequence[Sequence[object]],
     unlocked_quadrants: Iterable[str],
@@ -277,10 +298,18 @@ def physical_context_from_board(
     if set(unlocked) != set(QUADRANT_ORDER[:len(unlocked)]):
         raise ValueError("unlocked_quadrants must be the canonical land prefix")
 
-    role_by_coord = {
-        (y, x): _tile_physical_role(rows[y][x])
-        for y in range(10) for x in range(10)
-    }
+    role_by_coord: dict[tuple[int, int], str] = {}
+    crop_counts = [0] * len(CROP_ORDER)
+    for y in range(10):
+        for x in range(10):
+            tile = rows[y][x]
+            role_by_coord[(y, x)] = _tile_physical_role(tile)
+            if isinstance(tile, Mapping) and tile.get("kind") == "PLANT":
+                crop = tile.get("crop")
+                if crop in CROP_ORDER:
+                    crop_counts[CROP_ORDER.index(crop)] += 1
+                elif crop is not None:
+                    raise ValueError(f"unknown crop {crop!r} on physical board")
     cells_by_land: list[int] = []
     for target in range(1, LAND_TARGET_MAX + 1):
         footprint = set(QUADRANT_ORDER[:target])
@@ -325,6 +354,7 @@ def physical_context_from_board(
         reusable_empty_coops=empty_coops,
         reusable_empty_pastures=empty_pastures,
         unplaced_animals=unplaced_animals,
+        observed_crop_counts=tuple(crop_counts),
     )
 
 
@@ -358,6 +388,36 @@ def physical_crop_capacity(
     """Return ``C = B - newly-required housing cells`` for one prefix."""
     return context.crop_build_cells(land_target) - required_new_housing_cells(
         context, land_target, animal_targets)
+
+
+def physical_crop_counts(
+    board: Sequence[Sequence[object]],
+) -> tuple[int, ...]:
+    """Count currently planted crops on one canonical physical board."""
+    rows = tuple(tuple(row) for row in board)
+    if len(rows) != 10 or any(len(row) != 10 for row in rows):
+        raise ValueError("board must be a 10x10 sequence")
+    return _count_physical_crops(rows)
+
+
+def available_crop_slots(
+    context: PhysicalContext,
+    observed_crop_counts: Sequence[int] | None = None,
+) -> int:
+    """Return current morning crop/build capacity not occupied by crops.
+
+    This uses the observed land and placed-animal/structure state only.  It is
+    deliberately distinct from the post-prefix residual capacity used while
+    decoding new land, animal, and crop actions.
+    """
+    crops = (context.observed_crop_counts if observed_crop_counts is None
+             else initialize_crop_ledger(observed_crop_counts))
+    if crops != context.observed_crop_counts:
+        raise ValueError(
+            "observed crop counts disagree with the physical context")
+    available = physical_crop_capacity(
+        context, context.observed_land, context.placed_animals) - sum(crops)
+    return _require_range(available, "available crop slots", 0, 100)
 
 
 def animal_prefix_is_feasible(

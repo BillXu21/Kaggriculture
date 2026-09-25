@@ -26,6 +26,7 @@ from bc_manager.economics import (
     derive_economic_context,
 )
 from replay_daily.constants import SCHEMA_VERSION
+from replay_daily.lifecycle import canonical_board, replaceable_today
 from replay_daily.storage import (
     _denorm_map,
     _denorm_public,
@@ -40,6 +41,10 @@ from .stage25_data import (
     OutcomeProxyBuilder,
     _date as _data_date,
     _score as _data_score,
+)
+from .stage25_mechanics import (
+    available_crop_slots,
+    physical_context_from_board,
 )
 
 PROJECTED_COLUMNS = ("schema_version", "metadata", "day", "start", "targets", "end")
@@ -297,6 +302,45 @@ def _take_inputs(inputs: Mapping[str, np.ndarray], indices: Sequence[int]) -> di
     }
 
 
+def _morning_crop_observation_arrays(
+    records: Sequence[Mapping[str, Any]], days: Sequence[int],
+) -> dict[str, np.ndarray]:
+    """Materialize physical morning crop features from one canonical board scan."""
+    if len(records) != len(days):
+        raise ValueError("records and days must have equal lengths")
+    if not records:
+        return {
+            "crop_capacity": np.empty((0, len(CROP_STEPS)), dtype=np.int16),
+            "replaceable_today": np.empty((0, len(CROP_STEPS)), dtype=np.int16),
+            "available_crop_slots": np.empty((0,), dtype=np.int16),
+        }
+    baselines = []
+    replaceable = []
+    available = []
+    for record, day in zip(records, days):
+        start_self = record["start"]["self"]
+        step = int(day) * 24
+        board = canonical_board(start_self["board"], int(day), step)
+        context = physical_context_from_board(
+            board, start_self["unlocked_quadrants"])
+        baseline = context.observed_crop_counts
+        baselines.append(baseline)
+        replaceable.append(replaceable_today(board, int(day), step))
+        available.append(available_crop_slots(context))
+    return {
+        "crop_capacity": np.asarray(baselines, dtype=np.int16),
+        "replaceable_today": np.asarray(replaceable, dtype=np.int16),
+        "available_crop_slots": np.asarray(available, dtype=np.int16),
+    }
+
+
+def _replaceable_today_arrays(
+    records: Sequence[Mapping[str, Any]], days: Sequence[int],
+) -> np.ndarray:
+    """Backward-compatible focused seam for the lifecycle feature tests."""
+    return _morning_crop_observation_arrays(records, days)["replaceable_today"]
+
+
 def _label_actions(label: OutcomeProxyLabel) -> tuple[int, ...]:
     values = (label.land_class, *label.animal_classes, *label.crop_classes)
     if any(value is None for value in values):
@@ -457,13 +501,9 @@ def _materialize_split(
     actions = np.asarray([_label_actions(label) for label in complete], dtype=np.int16)
     if actions.size == 0:
         actions = np.empty((0, len(ACTION_STEPS)), dtype=np.int16)
-    crop_capacity = np.asarray(
-        [label.provenance.prior_crop_goals for label in complete], dtype=np.int16)
-    if crop_capacity.size == 0:
-        crop_capacity = np.empty((0, len(CROP_STEPS)), dtype=np.int16)
-
     inputs = _take_inputs(inputs_all, complete_indices)
-    inputs["crop_capacity"] = crop_capacity
+    # `crop_capacity` is the persisted legacy key for physical morning board
+    # counts B_t. It is never the historical synthetic crop-goal ledger.
     meta = []
     for index, identity in zip(complete_indices, identities):
         item = dict(row_infos[index].metadata)
@@ -543,6 +583,9 @@ def _load_streamed(
     corpus_builder = _CorpusAccumulator(min_score)
     row_infos: list[_RowInfo] = []
     input_chunks: dict[str, list[np.ndarray]] = {}
+    morning_baselines: list[Any] = []
+    morning_replaceable: list[Any] = []
+    morning_available: list[Any] = []
     for path, global_start, source_start, batch in _iter_projected_batches(
             paths, read_batch_size=read_batch_size):
         arrow_rows = batch.to_pylist()
@@ -560,6 +603,15 @@ def _load_streamed(
             row_infos.append(info)
             corpus_builder.add(info, logical["schema_version"])
             builder.consume(logical)
+            day = int(arrow_row["day"])
+            start_self = logical["start"]["self"]
+            step = day * 24
+            board = canonical_board(start_self["board"], day, step)
+            context = physical_context_from_board(
+                board, start_self["unlocked_quadrants"])
+            morning_baselines.append(context.observed_crop_counts)
+            morning_replaceable.append(replaceable_today(board, day, step))
+            morning_available.append(available_crop_slots(context))
         del starts, days, batch_inputs, arrow_rows
         del logical, arrow_row, source, info, batch
 
@@ -570,6 +622,14 @@ def _load_streamed(
         }
     else:
         inputs_all = _input_arrays_from_starts([], [], include_opponent=False)
+    # `crop_capacity` is the persisted legacy key for physical morning board
+    # counts B_t. It is never the historical synthetic crop-goal ledger.
+    inputs_all["crop_capacity"] = np.asarray(
+        morning_baselines, dtype=np.int16).reshape(len(row_infos), -1)
+    inputs_all["replaceable_today"] = np.asarray(
+        morning_replaceable, dtype=np.int16).reshape(len(row_infos), -1)
+    inputs_all["available_crop_slots"] = np.asarray(
+        morning_available, dtype=np.int16).reshape((len(row_infos),))
     inputs_all[ECONOMIC_CONTEXT_KEY] = derive_economic_context(
         [info.episode_id for info in row_infos],
         [info.seat for info in row_infos],

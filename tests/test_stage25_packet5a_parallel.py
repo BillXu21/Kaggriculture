@@ -53,13 +53,21 @@ class _Stage25Policy:
         self.row_tokens: list[list[int]] = []
         self.prng_ids: list[str] = []
         self.supports_precomputed_row_tokens = True
+        self.crop_feature_batches: list[dict[str, np.ndarray]] = []
 
     def infer_batch(self, *, inputs, crop_capacity, physical_contexts,
                     supports, row_ids, prng_id, row_tokens=None):
-        del inputs, supports
+        del supports
         self.row_ids.append(list(row_ids))
         self.row_tokens.append(list(row_tokens) if row_tokens is not None else [])
         self.prng_ids.append(prng_id)
+        self.crop_feature_batches.append({
+            "crop_capacity": np.array(crop_capacity, copy=True),
+            "replaceable_today": np.array(
+                inputs["replaceable_today"], copy=True),
+            "available_crop_slots": np.array(
+                inputs["available_crop_slots"], copy=True),
+        })
         batch = len(row_ids)
         classes = np.zeros((batch, 9), dtype=np.int16)
         for row, context in enumerate(physical_contexts):
@@ -81,11 +89,12 @@ class _Stage25Policy:
         return np.full(batch, 3.25, dtype=np.float32)
 
 
-def _request(index: int, day: int = 4) -> Stage25InferenceRequest:
+def _request(index: int, day: int = 4, observation=None) -> Stage25InferenceRequest:
     provider = Stage25PlanProvider(
         index, 0, day, behavior_identity=IDENTITY)
     prepared = provider.prepare_inference_context(
-        _obs(day=day), behavior_identity=IDENTITY)
+        _obs(day=day) if observation is None else observation,
+        behavior_identity=IDENTITY)
     identity = Stage25RequestIdentity(index, 0, day, IDENTITY)
     return Stage25InferenceRequest(
         identity=identity, worker_id=0, prng_id="test-prng",
@@ -238,6 +247,44 @@ def test_stage25_parent_padding_has_no_extra_responses_and_stable_rows():
     assert len([queue.get_nowait() for _ in range(2)]) == 2
     assert runner.inference_metrics["real_requests"] == 2
     assert runner.inference_metrics["padding_rows"] == 2
+
+
+def test_stage25_parallel_batch_preserves_morning_crop_features():
+    def ready_wheat_observation(count: int) -> dict:
+        obs = _obs(day=2, wheat_count=count)
+        plant = {
+            "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+            "yield_units": 3, "watered_today": False,
+            "fertilized_until_day": -1, "max_lifespan_step": -1,
+            "consecutive_unwatered": 0,
+        }
+        for farm in obs["farms"]:
+            farm["tiles"][0][0] = dict(plant)
+        return obs
+
+    requests = [
+        _request(9, day=2, observation=ready_wheat_observation(1)),
+        _request(2, day=2, observation=ready_wheat_observation(2)),
+    ]
+    policy = _Stage25Policy()
+    runner = _runner(4)
+    runner._dispatch(IDENTITY, requests, 0.0, {IDENTITY: policy}, [Queue()])
+
+    observed = policy.crop_feature_batches[0]
+    expected_capacity = np.concatenate(
+        [np.asarray(requests[index].crop_capacity) for index in (1, 0)],
+        axis=0)
+    np.testing.assert_array_equal(
+        observed["crop_capacity"][:2], expected_capacity)
+    assert observed["crop_capacity"].dtype == np.int16
+    for name in ("replaceable_today", "available_crop_slots"):
+        expected = np.concatenate(
+            [requests[index].inputs[name] for index in (1, 0)], axis=0)
+        np.testing.assert_array_equal(observed[name][:2], expected)
+        assert observed[name].dtype == np.int16
+    assert observed["replaceable_today"][0, 0] > 0
+    assert observed["available_crop_slots"][0] != \
+        observed["available_crop_slots"][1]
 
 
 def test_stage25_worker_import_boundary_is_accelerator_free():
@@ -474,6 +521,14 @@ def test_stage25_provider_transitions_k_once_and_rejects_terminal_delivery():
     provider = Stage25PlanProvider(7, 0, 4, behavior_identity=IDENTITY)
     prepared = provider.prepare_inference_context(
         _obs(day=4), behavior_identity=IDENTITY)
+    assert prepared.inputs["crop_capacity"].shape == (1, 5)
+    assert prepared.inputs["replaceable_today"].shape == (1, 5)
+    assert prepared.inputs["available_crop_slots"].shape == (1,)
+    for name in ("crop_capacity", "replaceable_today", "available_crop_slots"):
+        assert prepared.inputs[name].dtype == np.int16
+        assert np.all((0 <= prepared.inputs[name]) & (prepared.inputs[name] <= 100))
+    np.testing.assert_array_equal(prepared.inputs["crop_capacity"], [[1, 0, 0, 0, 0]])
+    np.testing.assert_array_equal(prepared.inputs["available_crop_slots"], [22])
     provider.accept_inference_response(prepared, HOLD, behavior_identity=IDENTITY)
     assert provider.crop_capacity == (1, 0, 0, 0, 0)
     with pytest.raises(Stage25ProviderError):

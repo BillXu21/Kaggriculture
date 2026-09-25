@@ -54,6 +54,10 @@ def test_inference_round_trip_persists_native_contract(tmp_path: Path) -> None:
 
     assert _same_tree(params, loaded)
     assert meta["payload_kind"] == INFERENCE_PAYLOAD_KIND
+    assert meta["architecture_version"] == "stage25_policy_v3_crop_lifecycle_capacity"
+    assert meta["observation_schema_version"] == (
+        "stage25_corrected_e_own_only_crop_lifecycle_capacity_v3")
+    assert meta["observation_vocabulary"][-1] == "available_crop_slots"
     assert meta["e_identity"]["history_version"] == E_HISTORY_CORRECTED_V1
     assert meta["source_identity"]["checkpoint"] == "historical-e"
     assert meta["executor"]["profile"] == "native-test"
@@ -208,7 +212,8 @@ def test_reserved_metadata_collisions_are_rejected(tmp_path: Path) -> None:
     config = _config()
     params = init_stage25_params(config, seed=53)
     for reserved in ("e_history_version", "e_identity", "source_identity",
-                     "provenance", "executor", "source_e_identity"):
+                     "provenance", "executor", "source_e_identity",
+                     "crop_baseline_semantics"):
         with pytest.raises(Stage25CheckpointError, match="reserved checkpoint keys"):
             save_stage25_inference_checkpoint(
                 tmp_path / f"{reserved}.npz", params, config, seed=53,

@@ -410,6 +410,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--scratch-hold-prior-tau", type=float, default=None,
         help="scratch-only output-bias hold prior temperature")
+    parser.add_argument(
+        "--migrate-physical-baseline-bc", action="store_true",
+        help="explicitly migrate a provenance-marked v1/v2 physical-baseline BC checkpoint as weights only")
     parser.add_argument("--model-size", choices=("tiny", "small", "large"), default="tiny")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--engine", choices=("fast", "official"), default="fast")
@@ -584,9 +587,14 @@ def _identity_from_meta(meta: Mapping[str, Any], field: str) -> Stage25BehaviorI
 
 def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stage25PPOTrainState, dict[str, Any]]:
     from rl_manager.stage25_checkpoint import (
-        initialize_stage25_ppo_from_checkpoint, load_stage25_ppo_checkpoint)
+        initialize_stage25_ppo_from_checkpoint,
+        load_stage25_ppo_checkpoint,
+        migrate_stage25_bc_checkpoint_for_ppo,
+    )
     from rl_manager.stage25_ppo import init_stage25_ppo_state
     if args.scratch:
+        if args.migrate_physical_baseline_bc:
+            raise ValueError("--migrate-physical-baseline-bc requires --init")
         from rl_manager.stage25_policy import init_stage25_params
         params = init_stage25_params(
             config.model, seed=args.seed,
@@ -594,9 +602,15 @@ def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stag
         return init_stage25_ppo_state(
             config, seed=args.seed, params=params), {}
     if args.init is not None:
-        params, source_meta = initialize_stage25_ppo_from_checkpoint(
-            args.init, config=config.model, seed=None)
+        if args.migrate_physical_baseline_bc:
+            params, source_meta = migrate_stage25_bc_checkpoint_for_ppo(
+                args.init, config=config.model)
+        else:
+            params, source_meta = initialize_stage25_ppo_from_checkpoint(
+                args.init, config=config.model, seed=None)
         return init_stage25_ppo_state(config, seed=args.seed, params=params), source_meta
+    if args.migrate_physical_baseline_bc:
+        raise ValueError("--migrate-physical-baseline-bc requires --init")
     from rl_manager.runner import _executor_factory_provenance
     from rl_manager.stage25_inference import Stage25InferenceAdapter
     fresh = init_stage25_ppo_state(config, seed=args.seed)
@@ -808,6 +822,8 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                         "payload_kind": source_meta.get("payload_kind"),
                         "update_counter": source_meta.get("update_counter"),
                     }),
+                "initialization_migration": source_meta.get(
+                    "architecture_migration"),
             }
             checkpoint_started = time.perf_counter()
             save_stage25_ppo_checkpoint(

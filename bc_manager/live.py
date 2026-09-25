@@ -100,6 +100,7 @@ def encode_live_inputs(
     economic_history: EconomicHistory | None = None,
     economic_prev_start: tuple[int, float] | None = None,
     e_history_version: str | None = None,
+    canonical_self_board: Sequence[Sequence[Any]] | None = None,
 ) -> dict[str, np.ndarray]:
     """Encode one raw live 1.32.7 observation into one-row BC input arrays.
 
@@ -158,11 +159,28 @@ def encode_live_inputs(
     resolved_step = resolve_observation_step(obs, step=step)
     prev = validate_previous_execution(previous_execution)
 
+    if canonical_self_board is None:
+        encoded_self = normalize_self_state(
+            self_state(dict(obs), seat, day, resolved_step))
+    else:
+        farm = farms[seat]
+        private = obs.get("private") or {}
+        encoded_self = normalize_self_state({
+            "money": farm["money"],
+            "board": canonical_self_board,
+            "unlocked_quadrants": list(farm["unlocked_quadrants"]),
+            "farmer": list(farm["farmer"]),
+            "hands": [list(hand) for hand in (farm.get("hands") or [])],
+            "hires_today": farm["hires_today"],
+            "shed": dict(private.get("shed") or {}),
+            "seeds": dict(private.get("seeds") or {}),
+            "inventories": [dict(item) for item in
+                            (private.get("inventories") or [])],
+        })
     start: dict[str, Any] = {
         "day": day,
         "hour": hour,
-        "self": normalize_self_state(
-            self_state(dict(obs), seat, day, resolved_step)),
+        "self": encoded_self,
         **normalize_shared_state(shared_state(dict(obs)), "live"),
         "previous_execution": prev,
     }

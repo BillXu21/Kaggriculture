@@ -14,6 +14,7 @@ from rl_manager.stage25_mechanics import (
     animal_acquisition_deficits,
     animal_prefix_is_feasible,
     animal_target_support_mask,
+    available_crop_slots,
     crop_class_to_delta,
     crop_delta_support_mask,
     crop_delta_to_class,
@@ -24,6 +25,7 @@ from rl_manager.stage25_mechanics import (
     land_target_to_class,
     physical_context_from_board,
     physical_crop_capacity,
+    physical_crop_counts,
     required_new_housing_cells,
     transition_crop_goal,
     transition_crop_ledger,
@@ -78,6 +80,54 @@ def test_physical_context_counts_sticky_structures_and_new_land():
     assert result.placed_animals == (1, 0, 0)
     assert result.reusable_empty_coops == 1
     assert result.reusable_empty_pastures == 1
+
+
+def test_available_crop_slots_uses_current_reclaimable_capacity():
+    board = [["LOCKED"] * 10 for _ in range(10)]
+    for y in range(5):
+        for x in range(5):
+            board[y][x] = None
+    context = physical_context_from_board(board, ("NW",))
+    assert physical_crop_counts(board) == (0, 0, 0, 0, 0)
+    assert available_crop_slots(context, (0, 0, 0, 0, 0)) == 25
+
+    board[0][0] = {"kind": "PLANT", "crop": "WHEAT"}
+    board[0][1] = {"kind": "PLANT", "crop": "CARROT"}
+    board[0][2] = "WEED"
+    board[0][3] = {"kind": "COOP", "animal": "GOOSE"}
+    board[0][4] = {"kind": "PASTURE"}
+    context = physical_context_from_board(board, ("NW",))
+    counts = physical_crop_counts(board)
+    assert counts == (1, 1, 0, 0, 0)
+    # Plants occupy crop slots, weeds remain reclaimable, and both occupied
+    # and reusable empty structures stay outside crop/build-compatible cells.
+    assert context.crop_build_cells_by_land[0] == 23
+    assert context.reusable_empty_pastures == 1
+    assert available_crop_slots(context, counts) == 21
+
+
+def test_available_crop_slots_tracks_multi_quadrant_morning_land():
+    board = [["LOCKED"] * 10 for _ in range(10)]
+    for y, x in ((range(0, 5), range(0, 5)),
+                 (range(0, 5), range(5, 10)),
+                 (range(5, 10), range(0, 5))):
+        for row in y:
+            for col in x:
+                board[row][col] = None
+    board[1][7] = {"kind": "PLANT", "crop": "MELON"}
+    context = physical_context_from_board(board, ("NW", "NE", "SW"))
+    counts = physical_crop_counts(board)
+    assert context.crop_build_cells_by_land[2] == 75
+    assert counts == (0, 0, 0, 0, 1)
+    assert available_crop_slots(context, counts) == 74
+
+
+def test_available_crop_slots_rejects_inconsistent_or_out_of_range_inputs():
+    context = PhysicalContext(1, (25, 50, 75, 100), (0, 0, 0))
+    with pytest.raises(ValueError, match="disagree"):
+        available_crop_slots(context, (26, 0, 0, 0, 0))
+    with pytest.raises(ValueError, match="observed crop count"):
+        available_crop_slots(context, (101, 0, 0, 0, 0))
 
 
 def test_reusable_housing_and_shared_pasture_capacity():

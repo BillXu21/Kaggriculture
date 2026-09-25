@@ -29,9 +29,12 @@ from rl_manager.stage25_mechanics import ACTION_CLASS_COUNTS, ACTION_ORDER, ACTI
 from rl_manager.stage25_types import Stage25BehaviorIdentity, Stage25PolicyOutputs
 
 
-STAGE25_TRAJECTORY_SCHEMA_VERSION = "stage25_trajectory_v1"
+STAGE25_TRAJECTORY_SCHEMA_VERSION = "stage25_trajectory_v3_crop_lifecycle_capacity"
 TRAJECTORY_SCHEMA_VERSION = STAGE25_TRAJECTORY_SCHEMA_VERSION
-STAGE25_OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_v1"
+STAGE25_OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_crop_lifecycle_capacity_v3"
+# The metadata name is retained for checkpoint/trajectory compatibility.  The
+# carried crop_capacity value is the physical pre-decision baseline, not a
+# requested-goal ledger.
 STAGE25_PERSISTENT_LEDGER_VERSION = "stage25_crop_capacity_ledger_v1"
 STAGE25_PHYSICAL_SUPPORT_VERSION = ACTION_SCHEMA_VERSION
 STAGE25_MANAGER_START_DAY = 4
@@ -81,6 +84,8 @@ def stage25_input_spec() -> dict[str, tuple[tuple[int, ...], np.dtype]]:
         "days_remaining": ((), np.dtype(np.int16)),
         "economic_context": ((14,), np.dtype(np.float32)),
         "crop_capacity": ((len(CROP_ORDER),), np.dtype(np.int16)),
+        "replaceable_today": ((len(CROP_ORDER),), np.dtype(np.int16)),
+        "available_crop_slots": ((), np.dtype(np.int16)),
     }
 
 
@@ -371,9 +376,14 @@ class Stage25TrajectoryBuffer:
         if not np.isclose(float(joint), float(np.sum(component, dtype=np.float32)), atol=1e-5, rtol=1e-5):
             raise ValueError("joint_logprob must equal the sum of component_logprobs")
         if not isinstance(row.inputs, Mapping) or set(row.inputs) != set(INPUT_SPEC):
-            raise ValueError("inputs must contain exactly the canonical own-only keys plus crop_capacity")
+            raise ValueError("inputs must contain exactly the canonical Stage 2.5 input vocabulary")
         for name, (shape, dtype) in INPUT_SPEC.items():
             normalized = _require_exact_array(row.inputs[name], shape, dtype, f"input {name!r}")
+            if name in {"crop_capacity", "replaceable_today"} and (
+                    np.any(normalized < 0) or np.any(normalized > 100)):
+                raise ValueError(f"input {name!r} entries must lie in [0, 100]")
+            if name == "available_crop_slots" and not 0 <= int(normalized) <= 100:
+                raise ValueError("input 'available_crop_slots' must lie in [0, 100]")
             if np.issubdtype(dtype, np.floating):
                 if name == "board_numeric":
                     if np.any(np.isinf(normalized)):

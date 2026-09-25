@@ -50,6 +50,8 @@ def _inputs(rows: int = 2):
         "days_remaining": np.full((rows,), 29, np.int16),
         "economic_context": np.zeros((rows, 14), np.float32),
         "crop_capacity": np.zeros((rows, 5), np.int16),
+        "replaceable_today": np.zeros((rows, 5), np.int16),
+        "available_crop_slots": np.full((rows,), 25, np.int16),
     }
 
 

@@ -45,11 +45,12 @@ STAGE25_CHECKPOINT_VERSION = "stage25_native_checkpoint_v1"
 INFERENCE_PAYLOAD_KIND = "stage25_inference_params_v1"
 BC_TRAINING_PAYLOAD_KIND = "stage25_bc_training_state_v1"
 PPO_TRAINING_PAYLOAD_KIND = "stage25_ppo_training_state_v1"
-ARCHITECTURE_VERSION = "stage25_policy_v1"
-OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_v1"
+ARCHITECTURE_VERSION = "stage25_policy_v3_crop_lifecycle_capacity"
+OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_crop_lifecycle_capacity_v3"
 PERSISTENT_LEDGER_VERSION = "stage25_crop_capacity_ledger_v1"
 PHYSICAL_SUPPORT_VERSION = ACTION_SCHEMA_VERSION
-BC_TARGET_VERSION = "stage25_outcome_proxy_v1"
+BC_TARGET_VERSION = "stage25_outcome_proxy_v2_physical_crop_baseline"
+PHYSICAL_CROP_BASELINE_SEMANTICS = "physical_morning_board_counts"
 RESUME_BOUNDARY = "after_completed_update_before_next_batch"
 PPO_RESUME_BOUNDARY = "after_completed_rollout_update_before_next_rollout"
 
@@ -58,7 +59,27 @@ OBSERVATION_VOCABULARY = (
     "board_bool", "board_mask", "scalars", "shed_counts", "seed_counts",
     "carried_counts", "unlocked", "market_inventory", "market_prices",
     "shop_counts", "day", "days_remaining", "economic_context", "crop_capacity",
+    "replaceable_today", "available_crop_slots",
 )
+
+_LEGACY_PHYSICAL_BASELINE_SOURCES = {
+    "stage25_policy_v1": {
+        "observation_schema_version": "stage25_corrected_e_own_only_v1",
+        "observation_vocabulary": OBSERVATION_VOCABULARY[:-2],
+        "missing_conditioning": (
+            "replaceable_conditioning",
+            "available_crop_slots_conditioning",
+        ),
+        "bc_targets": {BC_TARGET_VERSION},
+    },
+    "stage25_policy_v2_replaceable_today": {
+        "observation_schema_version":
+            "stage25_corrected_e_own_only_replaceable_today_v2",
+        "observation_vocabulary": OBSERVATION_VOCABULARY[:-1],
+        "missing_conditioning": ("available_crop_slots_conditioning",),
+        "bc_targets": {BC_TARGET_VERSION},
+    },
+}
 
 
 class Stage25CheckpointError(ValueError):
@@ -68,7 +89,8 @@ class Stage25CheckpointError(ValueError):
 _REQUIRED_META = frozenset({
     "format", "payload_kind", "architecture_version", "action_schema_version",
     "observation_schema_version", "persistent_ledger_version",
-    "physical_support_version", "action_vocabulary", "action_class_counts",
+    "physical_support_version", "crop_baseline_semantics",
+    "action_vocabulary", "action_class_counts",
     "observation_vocabulary", "config", "model_config", "init_params",
     "dtype_precision", "precision", "curriculum", "bc_target",
     "e_history_version", "e_identity", "source_identity", "provenance",
@@ -237,6 +259,7 @@ def _metadata(*, payload_kind: str, config: Stage25ModelConfig, seed: int,
         "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
         "persistent_ledger_version": PERSISTENT_LEDGER_VERSION,
         "physical_support_version": PHYSICAL_SUPPORT_VERSION,
+        "crop_baseline_semantics": PHYSICAL_CROP_BASELINE_SEMANTICS,
         "action_vocabulary": list(ACTION_ORDER),
         "action_class_counts": list(ACTION_CLASS_COUNTS),
         "observation_vocabulary": list(OBSERVATION_VOCABULARY),
@@ -347,6 +370,7 @@ def _validate_meta(meta: Mapping[str, Any], path: Path, expected_kind: str) -> N
         "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
         "persistent_ledger_version": PERSISTENT_LEDGER_VERSION,
         "physical_support_version": PHYSICAL_SUPPORT_VERSION,
+        "crop_baseline_semantics": PHYSICAL_CROP_BASELINE_SEMANTICS,
         "action_vocabulary": list(ACTION_ORDER),
         "action_class_counts": list(ACTION_CLASS_COUNTS),
         "observation_vocabulary": list(OBSERVATION_VOCABULARY),
@@ -1077,6 +1101,145 @@ def initialize_stage25_ppo_from_checkpoint(
 init_stage25_ppo_from_checkpoint = initialize_stage25_ppo_from_checkpoint
 
 
+def migrate_stage25_bc_checkpoint_for_ppo(
+    source: str | Path, config: Stage25ModelConfig | None = None, *,
+    seed: int | None = None,
+    expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
+    allow_legacy_e: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Explicitly migrate a physical-baseline BC checkpoint as weights only.
+
+    General native checkpoint loading remains strict. This seam accepts only
+    the known v1/v2 BC architectures, requires explicit physical morning
+    baseline provenance, copies every compatible parameter leaf, and zeroes
+    only missing crop-observation conditioning leaves. BC optimizer state and
+    RNG are deliberately discarded; callers must create a fresh PPO state.
+    """
+    source_path = Path(source)
+    flat, meta = _read_archive(source_path)
+    if meta.get("format") != STAGE25_CHECKPOINT_VERSION:
+        raise Stage25CheckpointError(
+            f"{source_path}: architecture migration requires a native Stage 2.5 archive")
+    if meta.get("payload_kind") != BC_TRAINING_PAYLOAD_KIND:
+        raise Stage25CheckpointError(
+            f"{source_path}: architecture migration accepts BC weights only")
+    architecture = meta.get("architecture_version")
+    legacy = _LEGACY_PHYSICAL_BASELINE_SOURCES.get(architecture)
+    if legacy is None:
+        raise Stage25CheckpointError(
+            f"{source_path}: unsupported migration source architecture {architecture!r}")
+    if meta.get("crop_baseline_semantics") != PHYSICAL_CROP_BASELINE_SEMANTICS:
+        raise Stage25CheckpointError(
+            f"{source_path}: migration requires explicit physical morning crop-baseline semantics")
+    if meta.get("observation_schema_version") != legacy[
+            "observation_schema_version"]:
+        raise Stage25CheckpointError(
+            f"{source_path}: source observation schema does not match its architecture")
+    if meta.get("observation_vocabulary") != list(legacy["observation_vocabulary"]):
+        raise Stage25CheckpointError(
+            f"{source_path}: source observation vocabulary does not match its architecture")
+    checks = {
+        "action_schema_version": ACTION_SCHEMA_VERSION,
+        "persistent_ledger_version": PERSISTENT_LEDGER_VERSION,
+        "physical_support_version": PHYSICAL_SUPPORT_VERSION,
+        "action_vocabulary": list(ACTION_ORDER),
+        "action_class_counts": list(ACTION_CLASS_COUNTS),
+    }
+    for key, expected in checks.items():
+        if meta.get(key) != expected:
+            raise Stage25CheckpointError(
+                f"{source_path}: incompatible migration source {key}")
+    if meta.get("bc_target") not in legacy["bc_targets"]:
+        raise Stage25CheckpointError(
+            f"{source_path}: incompatible BC target semantics for migration")
+    if meta.get("config") != meta.get("model_config"):
+        raise Stage25CheckpointError(
+            f"{source_path}: source config/model_config metadata disagree")
+    stored_config = _config_from_json(meta["config"])
+    if config is not None and config != stored_config:
+        raise Stage25CheckpointError(
+            "source checkpoint config is incompatible with requested config")
+    init = meta.get("init_params")
+    if not isinstance(init, Mapping) or isinstance(init.get("seed"), bool) \
+            or not isinstance(init.get("seed"), int):
+        raise Stage25CheckpointError(
+            f"{source_path}: migration source has invalid init_params")
+    stored_seed = int(init["seed"])
+    if seed is not None and int(seed) != stored_seed:
+        raise Stage25CheckpointError(
+            "source checkpoint seed does not match requested seed")
+    _check_history(meta, expected=expected_e_history_version,
+                   allow_legacy_e=allow_legacy_e, path=source_path)
+    _validate_flat_against_manifest(flat, meta, source_path)
+
+    allowed_array_names = {"rng"}
+    allowed_array_names.update(
+        key for key in flat if key.startswith(("param:", "opt:")))
+    if set(flat) != allowed_array_names:
+        raise Stage25CheckpointError(
+            f"{source_path}: source contains unexpected native arrays")
+    target_template = init_stage25_params(stored_config, seed=stored_seed)
+    target_flat = _flatten_arrays(target_template)
+    expected_missing = set(legacy["missing_conditioning"])
+    missing_paths = {name for name in target_flat
+                     if name in expected_missing}
+    expected_source = set(target_flat) - missing_paths
+    source_params = {
+        key[len("param:"):]: value for key, value in flat.items()
+        if key.startswith("param:")
+    }
+    if set(source_params) != expected_source:
+        raise Stage25CheckpointError(
+            f"{source_path}: source parameter tree mismatch; "
+            f"missing={sorted(expected_source - set(source_params))}, "
+            f"unexpected={sorted(set(source_params) - expected_source)}")
+    for name, source_array in source_params.items():
+        expected_array = target_flat[name]
+        if source_array.shape != expected_array.shape \
+                or source_array.dtype != expected_array.dtype:
+            raise Stage25CheckpointError(
+                f"{source_path}: incompatible source parameter {name!r}")
+
+    migrated_flat = {name: np.array(value, copy=True)
+                     for name, value in target_flat.items()}
+    migrated_flat.update({name: np.array(value, copy=True)
+                          for name, value in source_params.items()})
+    for name in missing_paths:
+        migrated_flat[name] = np.zeros_like(target_flat[name])
+    params = _rebuild(target_template, migrated_flat)
+    source_identity = _source_identity(source_path, meta)
+    metadata = {
+        "transfer": "weights_only_architecture_migration",
+        "resumable": False,
+        "optimizer_state_discarded": True,
+        "source_identity": source_identity,
+        "source_metadata": {
+            "architecture_version": architecture,
+            "observation_schema_version": meta["observation_schema_version"],
+            "bc_target": meta["bc_target"],
+            "crop_baseline_semantics": meta["crop_baseline_semantics"],
+            "e_history_version": meta["e_history_version"],
+            "provenance": meta.get("provenance", {}),
+            "source_identity": meta.get("source_identity", {}),
+        },
+        "architecture_migration": {
+            "kind": "stage25_bc_to_crop_lifecycle_capacity_v3",
+            "source_architecture_version": architecture,
+            "target_architecture_version": ARCHITECTURE_VERSION,
+            "source_observation_schema_version":
+                meta["observation_schema_version"],
+            "target_observation_schema_version": OBSERVATION_SCHEMA_VERSION,
+            "copied_parameter_leaves": len(source_params),
+            "preserved_conditioning_leaves": sorted(
+                expected_missing.symmetric_difference(
+                    {"replaceable_conditioning",
+                     "available_crop_slots_conditioning"})),
+            "zero_initialized_conditioning_leaves": sorted(missing_paths),
+        },
+    }
+    return params, metadata
+
+
 def _extract_encoder(params: Mapping[str, Any]) -> dict[str, Any]:
     names = ("manager_token", "role_embedding", "tile_encoder", "global_encoders",
              "encoder", "encoder_norm")
@@ -1176,6 +1339,7 @@ load_ppo_checkpoint = load_stage25_ppo_checkpoint
 __all__ = [
     "ACTION_ORDER", "ACTION_CLASS_COUNTS", "ARCHITECTURE_VERSION",
     "BC_TARGET_VERSION", "BC_TRAINING_PAYLOAD_KIND", "INFERENCE_PAYLOAD_KIND",
+    "PHYSICAL_CROP_BASELINE_SEMANTICS",
     "PPO_RESUME_BOUNDARY", "PPO_TRAINING_PAYLOAD_KIND",
     "OBSERVATION_SCHEMA_VERSION", "OBSERVATION_VOCABULARY",
     "PERSISTENT_LEDGER_VERSION", "PHYSICAL_SUPPORT_VERSION", "RESUME_BOUNDARY",
@@ -1184,6 +1348,7 @@ __all__ = [
     "save_stage25_bc_checkpoint", "load_stage25_bc_checkpoint",
     "save_stage25_ppo_checkpoint", "load_stage25_ppo_checkpoint",
     "initialize_stage25_ppo_from_checkpoint", "init_stage25_ppo_from_checkpoint",
+    "migrate_stage25_bc_checkpoint_for_ppo",
     "save_inference_checkpoint", "load_inference_checkpoint", "save_bc_checkpoint",
     "load_bc_checkpoint", "save_ppo_checkpoint", "load_ppo_checkpoint",
     "import_historical_encoder",

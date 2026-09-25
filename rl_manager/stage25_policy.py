@@ -64,7 +64,8 @@ _KIND_LOCKED = TILE_KIND_IDS["LOCKED"]
 _STAGE25_INTEGER_INPUTS = frozenset({
     "board_kind", "board_crop", "board_animal", "board_mask", "shed_counts",
     "seed_counts", "carried_counts", "unlocked", "market_inventory",
-    "shop_counts", "day", "days_remaining",
+    "shop_counts", "day", "days_remaining", "replaceable_today",
+    "available_crop_slots",
 })
 _STAGE25_INPUT_SHAPES = {
     "board_kind": (100,),
@@ -84,6 +85,8 @@ _STAGE25_INPUT_SHAPES = {
     "day": (),
     "days_remaining": (),
     "economic_context": (14,),
+    "replaceable_today": (5,),
+    "available_crop_slots": (),
 }
 
 
@@ -229,6 +232,8 @@ def _empty_params(config: Stage25ModelConfig) -> dict[str, Any]:
     return {
         "encoder": encoder,
         "capacity_conditioning": jnp.zeros((_N_CROPS, d), jnp.float32),
+        "replaceable_conditioning": jnp.zeros((_N_CROPS, d), jnp.float32),
+        "available_crop_slots_conditioning": jnp.zeros((d,), jnp.float32),
         "recurrent_decoder": {
             "Wz": jnp.zeros((d, d), jnp.float32),
             "Wh": jnp.zeros((d, d), jnp.float32),
@@ -356,6 +361,9 @@ def init_stage25_params(
     params = {
         "encoder": encoder,
         "capacity_conditioning": normal(leaves[0], (_N_CROPS, d)),
+        "replaceable_conditioning": normal(leaves[5], (_N_CROPS, d)),
+        "available_crop_slots_conditioning": normal(
+            jax.random.fold_in(key, 25), (d,)),
         "recurrent_decoder": {
             "Wz": normal(leaves[1], (d, d)),
             "Wh": normal(leaves[2], (d, d)),
@@ -403,7 +411,7 @@ def _validate_stage25_inputs(
               else inputs.get("crop_capacity"))
     if ledger is None:
         raise ValueError(
-            "inputs must contain crop_capacity (persistent goal ledger K [B,5])")
+            "inputs must contain crop_capacity (physical crop baseline B [B,5])")
 
     arrays: dict[str, np.ndarray] = {}
     batch: int | None = None
@@ -451,7 +459,7 @@ def _validate_stage25_inputs(
     ledger_array = np.asarray(ledger)
     if ledger_array.shape != (batch, _N_CROPS):
         raise ValueError(
-            "crop_capacity (persistent goal ledger K) must have shape [B, 5]; "
+            "crop_capacity (physical crop baseline B) must have shape [B, 5]; "
             "a scalar or omitted ledger is not accepted")
     if ledger_array.dtype.hasobject or not np.issubdtype(
             ledger_array.dtype, np.integer):
@@ -461,14 +469,49 @@ def _validate_stage25_inputs(
             and np.all(ledger_array == np.floor(ledger_array)))
         if not integral_float:
             raise ValueError(
-                "crop_capacity (persistent goal ledger K) must be integers")
+                "crop_capacity (physical crop baseline B) must be integers")
     if np.any(ledger_array < 0) or np.any(ledger_array > 100):
         raise ValueError(
-            "crop_capacity (persistent goal ledger K) entries must lie in "
+            "crop_capacity (physical crop baseline B) entries must lie in "
             "[0, 100]")
+    replaceable_array = arrays["replaceable_today"]
+    if np.any(replaceable_array < 0) or np.any(replaceable_array > 100):
+        raise ValueError("replaceable_today entries must lie in [0, 100]")
+    available_array = arrays["available_crop_slots"]
+    if np.any(available_array < 0) or np.any(available_array > 100):
+        raise ValueError("available_crop_slots entries must lie in [0, 100]")
     canonical_ledger = (ledger_array if ledger_array.dtype == np.int32
                         else ledger_array.astype(np.int32, copy=False))
     return _ValidatedStage25Inputs(arrays, canonical_ledger, int(batch))
+
+
+def _prepare_stage25_inputs_validated(
+        validated: _ValidatedStage25Inputs,
+) -> tuple[dict[str, jax.Array], jax.Array, int]:
+    """Perform the one eager NumPy-to-JAX preparation after validation."""
+    prepared = {key: jnp.asarray(value) for key, value in validated.inputs.items()}
+    return prepared, jnp.asarray(validated.crop_capacity), validated.batch
+
+
+def _host_inputs(
+        inputs: Mapping[str, Any], config: Stage25ModelConfig,
+        crop_capacity: Any = None,
+) -> tuple[dict[str, jax.Array], jax.Array, int]:
+    """Public policy boundary: validate once, then prepare canonical inputs."""
+    validated = _validate_stage25_inputs(inputs, config, crop_capacity)
+    return _prepare_stage25_inputs_validated(validated)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPhysicalContexts:
+    source: tuple[Any, ...]
+    values: tuple[jax.Array, ...]
+
+    def __len__(self) -> int:
+        return len(self.source)
+
+    def __iter__(self):
+        return iter(self.source)
 
 
 def _prepare_stage25_inputs_validated(
@@ -660,9 +703,9 @@ def _policy_core(
 ) -> dict[str, jax.Array | dict[str, jax.Array]]:
     """One jitted core shared by stochastic, greedy, and evaluation paths.
 
-    ``crop_capacity`` is the persistent goal ledger ``K``.  The physical
-    capacity ``C`` is derived here from the decoded context after the land and
-    animal steps; it is never supplied by the caller.
+    ``crop_capacity`` is the physical crop baseline ``B`` for this boundary.
+    The physical capacity ``C`` is derived here from the decoded context after
+    the land and animal steps; it is never supplied by the caller.
     """
     if use_root_rng:
         rng_keys = jax.vmap(
@@ -673,10 +716,17 @@ def _policy_core(
         # dropout sites.  Use one explicit batch key; evaluation and PPO keep
         # the historical no-dropout behavior bit-for-bit.
         dropout_rng = jax.random.fold_in(rng_keys[0], 0x25)
+    encoder_inputs = {key: value for key, value in inputs.items()
+                      if key not in ("replaceable_today",
+                                     "available_crop_slots")}
     z = _manager_representation(
-        params["encoder"], inputs, config.manager_config,
+        params["encoder"], encoder_inputs, config.manager_config,
         _Dropout(config.dropout if mode == "train" else 0.0, dropout_rng), "E")
     z = z + (crop_capacity / 100.0) @ params["capacity_conditioning"]
+    z = z + (jnp.clip(inputs["replaceable_today"], 0, 100) / 100.0) @ \
+        params["replaceable_conditioning"]
+    z = z + (jnp.clip(inputs["available_crop_slots"], 0, 100) / 100.0)[:, None] * \
+        params["available_crop_slots_conditioning"][None, :]
     value = (z @ params["value_head"]["kernel"] +
              params["value_head"]["bias"])[:, 0]
     derived_context = _physical_context_jax(inputs)

@@ -23,7 +23,6 @@ from typing import Any, Literal
 
 import numpy as np
 
-from bc_manager.coherence import current_crop_counts
 from bc_manager.economics import (
     E_HISTORY_CORRECTED_V1,
     normalize_e_history_version,
@@ -31,7 +30,11 @@ from bc_manager.economics import (
 from bc_manager.live import encode_live_inputs, validate_previous_execution
 from executor_v0.plan import DailyPlan, SELL_BIN_ANCHORS
 from replay_daily.constants import PRODUCTS
-from replay_daily.lifecycle import canonical_board, resolve_observation_step
+from replay_daily.lifecycle import (
+    canonical_board,
+    replaceable_today,
+    resolve_observation_step,
+)
 
 from .stage25_config import (
     Stage25CurriculumConfig,
@@ -48,18 +51,18 @@ from .stage25_mechanics import (
     animal_target_support_mask,
     crop_class_to_delta,
     crop_delta_support_mask,
+    available_crop_slots,
     physical_context_from_board,
     physical_crop_capacity,
     land_target_support_mask,
     land_class_to_target,
     animal_class_to_target,
     transition_crop_goal,
-    initialize_crop_ledger,
     unplaced_animal_counts,
 )
 from .stage25_types import Stage25BehaviorIdentity, stage25_row_token
 
-STATE_VERSION = "stage25_provider_state_v2"
+STATE_VERSION = "stage25_provider_state_v3"
 SOURCE_TRANSFER = "encoder_only"
 DecisionMode = Literal["deterministic", "stochastic"]
 
@@ -762,35 +765,27 @@ class Stage25PlanProvider:
             profile["stage25_provider_previous_execution_validation_seconds"] += (
                 timer() - phase_started)
             phase_started = timer()
+        farm = obs["farms"][self.seat]
+        board = canonical_board(farm["tiles"], int(obs["day"]), step)
+        if profile is not None:
+            profile["stage25_provider_canonical_board_seconds"] += (
+                timer() - phase_started)
+            phase_started = timer()
         inputs = encode_live_inputs(
             obs, self.seat, previous, step=step,
             economic_prev_start=self._e_history,
             e_history_version=self.e_history_version,
+            canonical_self_board=board,
         )
         if profile is not None:
             profile["stage25_provider_encode_live_inputs_seconds"] += (
                 timer() - phase_started)
             phase_started = timer()
-        observed = tuple(int(value) for value in current_crop_counts(
-            inputs["board_crop"])[0])
-        initial = initialize_crop_ledger(observed) if self._crop_capacity is None \
-            else self._crop_capacity
-        inputs["crop_capacity"] = np.asarray([initial], dtype=np.int16)
-        if profile is not None:
-            profile["stage25_provider_crop_count_seconds"] += (
-                timer() - phase_started)
-            phase_started = timer()
-        farm = obs["farms"][self.seat]
         private = obs.get("private") or {}
         unplaced = unplaced_animal_counts(
             private.get("shed") or {}, private.get("inventories") or ())
         if profile is not None:
             profile["stage25_provider_unplaced_animals_seconds"] += (
-                timer() - phase_started)
-            phase_started = timer()
-        board = canonical_board(farm["tiles"], int(obs["day"]), step)
-        if profile is not None:
-            profile["stage25_provider_canonical_board_seconds"] += (
                 timer() - phase_started)
             phase_started = timer()
         context = physical_context_from_board(
@@ -800,6 +795,13 @@ class Stage25PlanProvider:
         if profile is not None:
             profile["stage25_provider_physical_context_seconds"] += (
                 timer() - phase_started)
+        initial = context.observed_crop_counts
+        inputs["crop_capacity"] = np.asarray(
+            [initial], dtype=np.int16)
+        inputs["replaceable_today"] = np.asarray(
+            [replaceable_today(board, int(obs["day"]), step)], dtype=np.int16)
+        inputs["available_crop_slots"] = np.asarray(
+            [available_crop_slots(context)], dtype=np.int16)
         return inputs, context, initial
 
     @staticmethod

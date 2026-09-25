@@ -54,11 +54,14 @@ mutation. Workers remain accelerator-free.
 
 ## Trajectory schema
 
-`Stage25TrajectoryBuffer` persists schema `stage25_trajectory_v1` using strict
+`Stage25TrajectoryBuffer` persists schema
+`stage25_trajectory_v3_crop_lifecycle_capacity` using strict
 NPZ arrays plus a JSON sidecar; it is pickle-free and checks version, shape,
 dtype, row count, and identity metadata on load. Each row contains:
 
-* exact pre-decision predictive inputs and int16 pre-decision `crop_capacity`;
+* exact pre-decision predictive inputs, including int16 physical pre-decision
+  `crop_capacity` baseline `[5]`, `replaceable_today` `[5]`, and scalar
+  `available_crop_slots`;
 * original sampled int16 classes `[9]`, component logprobs `[9]`, raw-summed
   joint logprob, and old action-independent value;
 * reward, episode/seat/day, immutable row/request identity, seed, trainable

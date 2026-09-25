@@ -17,7 +17,7 @@ import numpy as np
 from bc_manager.economics import normalize_e_history_version
 
 
-STAGE25_POLICY_SCHEMA_VERSION = "stage25_policy_v1"
+STAGE25_POLICY_SCHEMA_VERSION = "stage25_policy_v3_crop_lifecycle_capacity"
 STAGE25_PHYSICAL_SUPPORT_VERSION = "stage25_physical_v1"
 STAGE25_RNG_NAMESPACE = "stage25/rollout/v1"
 

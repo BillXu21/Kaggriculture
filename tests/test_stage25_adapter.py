@@ -18,6 +18,7 @@ from rl_manager.stage25_adapter import (
     load_dataset,
     load_train_val,
 )
+from rl_manager.stage25_data import OUTCOME_PROXY_SCHEMA_VERSION
 
 
 def _board(*, wheat: int = 0, goose: bool = False) -> list[list[object]]:
@@ -31,9 +32,15 @@ def _board(*, wheat: int = 0, goose: bool = False) -> list[list[object]]:
     if wheat:
         cells = [(y, x) for y in range(5) for x in range(5)]
         for y, x in cells[:wheat]:
-            board[y][x] = {"kind": "PLANT", "crop": "WHEAT"}
+            board[y][x] = {
+                "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+                "yield_units": 0, "watered_today": False,
+                "fertilized_until_day": -1, "max_lifespan_step": -1,
+            }
     elif goose:
-        board[0][0] = {"kind": "COOP", "animal": "GOOSE"}
+        board[0][0] = {
+            "kind": "COOP", "animal": "GOOSE", "placed_day": 0,
+        }
     return board
 
 
@@ -144,6 +151,11 @@ def test_real_projected_parquet_returns_fixed_bc_arrays_and_diagnostics(tmp_path
     assert result["actions"].shape == (1, 9)
     assert result["actions"].dtype == np.int16
     assert result["inputs"]["crop_capacity"].tolist() == [[0, 0, 0, 0, 0]]
+    assert result["inputs"]["replaceable_today"].shape == (1, 5)
+    assert result["inputs"]["replaceable_today"].dtype == np.int16
+    assert result["inputs"]["available_crop_slots"].shape == (1,)
+    assert result["inputs"]["available_crop_slots"].dtype == np.int16
+    assert result["inputs"]["available_crop_slots"].tolist() == [25]
     assert result["actions"][0].tolist() == [0, 0, 0, 0, 101, 100, 100, 100, 100]
     assert result["row_identities"][0]["source_row"] == 0
     assert result["diagnostics"]["support_validity"]["wheat"]["valid"] == 1
@@ -192,7 +204,10 @@ def test_history_is_built_before_date_and_score_filtering(tmp_path):
     result = load_dataset(path, dates=("2026-08-17",), min_score=2950)
 
     assert [label.row_index for label in result["labels"]] == [1]
-    assert result["inputs"]["crop_capacity"].tolist() == [[1, 0, 0, 0, 0]]
+    assert result["inputs"]["crop_capacity"].tolist() == [[0, 0, 0, 0, 0]]
+    assert result["actions"][0, 4] == 102
+    assert OUTCOME_PROXY_SCHEMA_VERSION == \
+        "stage25_outcome_proxy_v2_physical_crop_baseline"
     assert result["labels"][0].provenance.prior_source == "previous_synthetic_desired_end_goal"
 
 
