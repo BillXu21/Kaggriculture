@@ -223,6 +223,10 @@ class RouteAssignment:
     routes: tuple[StripRoute, ...]
     unassigned: tuple[HorizontalRouteCandidate, ...]
     idle_workers: tuple[WorkerId, ...]
+    large_route_assignment_mode: bool = False
+    primary_rows_assigned: int = 0
+    overflow_rows_assigned: int = 0
+    idle_workers_with_unassigned_feasible_rows: int = 0
 
 
 def _manhattan_distance(left: tuple[int, int], right: tuple[int, int]) -> int:
@@ -315,6 +319,14 @@ class _ChainPlan:
     useful_interactions: int
     useful_segments: int
     assigned: tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]
+
+
+@dataclass(frozen=True)
+class _LargeRoutePacking:
+    grouped: dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]]
+    primary_rows_assigned: int
+    overflow_rows_assigned: int
+    idle_workers_with_unassigned_feasible_rows: int
 
 
 def _chain_plan_for_mask(
@@ -573,13 +585,62 @@ def _pack_large_route_set(
     workers: tuple[WorkerId, ...],
     positions: Mapping[WorkerId, tuple[int, int]],
     worker_action_slots: Mapping[WorkerId, int] | None = None,
-    ) -> dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]]:
-    """Bounded fallback for unusually dense forecasts."""
+    ) -> _LargeRoutePacking:
+    """Spread feasible primary rows before greedily packing overflow rows."""
 
     masks = {worker: 0 for worker in workers}
-    for index, candidate in enumerate(candidates):
+    preferences: dict[WorkerId, tuple[int, ...]] = {}
+    for worker in workers:
+        slots = (
+            None if worker_action_slots is None else worker_action_slots[worker]
+        )
         choices = []
-        for worker in workers:
+        for index, candidate in enumerate(candidates):
+            plan = _chain_plan_for_mask(
+                candidates,
+                positions[worker],
+                1 << index,
+                slots,
+            )
+            if slots is not None and plan.useful_interactions <= 0:
+                continue
+            choices.append(
+                (
+                    -plan.useful_interactions if slots is not None else 0,
+                    -plan.useful_segments if slots is not None else 0,
+                    plan.completion_turns,
+                    plan.movement_turns,
+                    candidate.row_key,
+                    index,
+                )
+            )
+        preferences[worker] = tuple(choice[-1] for choice in sorted(choices))
+
+    primary_owner: dict[int, WorkerId] = {}
+
+    def assign_primary(worker: WorkerId, seen: set[int]) -> bool:
+        for index in preferences[worker]:
+            if index in seen:
+                continue
+            seen.add(index)
+            owner = primary_owner.get(index)
+            if owner is None or assign_primary(owner, seen):
+                primary_owner[index] = worker
+                return True
+        return False
+
+    for worker in workers:
+        assign_primary(worker, set())
+    for index, worker in primary_owner.items():
+        masks[worker] |= 1 << index
+
+    primary_workers = tuple(worker for worker in workers if masks[worker])
+    overflow_workers = primary_workers
+    for index, candidate in enumerate(candidates):
+        if index in primary_owner:
+            continue
+        choices = []
+        for worker in overflow_workers:
             mask = masks[worker] | (1 << index)
             base = _chain_plan_for_mask(
                 candidates,
@@ -614,9 +675,15 @@ def _pack_large_route_set(
                     worker,
                 )
             )
+        if not choices or (
+            worker_action_slots is not None
+            and max(-choice[0] for choice in choices) <= 0
+        ):
+            continue
         worker = min(choices)[-1]
         masks[worker] |= 1 << index
-    return {
+
+    grouped = {
         worker: _chain_plan_for_mask(
             candidates,
             positions[worker],
@@ -625,6 +692,35 @@ def _pack_large_route_set(
         ).assigned
         for worker in workers
     }
+    assigned_indices = {
+        index
+        for mask in masks.values()
+        for index in range(len(candidates))
+        if mask & (1 << index)
+    }
+    idle_workers = tuple(worker for worker in workers if not grouped[worker])
+    unassigned_indices = set(range(len(candidates))) - assigned_indices
+    idle_feasible = sum(
+        any(
+            worker_action_slots is None
+            or _chain_plan_for_mask(
+                candidates,
+                positions[worker],
+                1 << index,
+                worker_action_slots[worker],
+            ).useful_interactions > 0
+            for index in unassigned_indices
+        )
+        for worker in idle_workers
+    )
+    primary_count = len(primary_owner)
+    assigned_count = len(assigned_indices)
+    return _LargeRoutePacking(
+        grouped=grouped,
+        primary_rows_assigned=primary_count,
+        overflow_rows_assigned=max(0, assigned_count - primary_count),
+        idle_workers_with_unassigned_feasible_rows=idle_feasible,
+    )
 
 
 def assign_horizontal_routes(
@@ -640,8 +736,9 @@ def assign_horizontal_routes(
     With a remaining-day budget, the exact small-board path scores useful
     interactions, useful completed segments, unfinished interactions, maximum
     completion, movement, and the stable subset signature.  Without a budget
-    it preserves the historical makespan/movement score.  Larger inputs use a
-    bounded marginal-gain approximation of the same objective.
+    it preserves the historical makespan/movement score.  Larger inputs first
+    match feasible primary rows to distinct workers, then use a bounded
+    marginal-gain approximation for overflow rows.
     """
 
     ordered_candidates = tuple(
@@ -657,7 +754,11 @@ def assign_horizontal_routes(
         worker: () for worker in ordered_workers
     }
 
-    if ordered_workers and len(ordered_candidates) <= 8:
+    large_route_assignment_mode = len(ordered_candidates) > 8
+    primary_rows_assigned = 0
+    overflow_rows_assigned = 0
+    idle_workers_with_unassigned_feasible_rows = 0
+    if ordered_workers and not large_route_assignment_mode:
         slots = worker_action_slots
         if slots is None and remaining_action_slots is not None:
             slots = {worker: remaining_action_slots for worker in ordered_workers}
@@ -668,8 +769,14 @@ def assign_horizontal_routes(
         slots = worker_action_slots
         if slots is None and remaining_action_slots is not None:
             slots = {worker: remaining_action_slots for worker in ordered_workers}
-        grouped = _pack_large_route_set(
+        large_packing = _pack_large_route_set(
             ordered_candidates, ordered_workers, worker_positions, slots
+        )
+        grouped = large_packing.grouped
+        primary_rows_assigned = large_packing.primary_rows_assigned
+        overflow_rows_assigned = large_packing.overflow_rows_assigned
+        idle_workers_with_unassigned_feasible_rows = (
+            large_packing.idle_workers_with_unassigned_feasible_rows
         )
 
     routes: list[StripRoute] = []
@@ -709,4 +816,10 @@ def assign_horizontal_routes(
             if candidate.route_id not in assigned_ids
         ),
         idle_workers=tuple(worker for worker in ordered_workers if not grouped[worker]),
+        large_route_assignment_mode=large_route_assignment_mode,
+        primary_rows_assigned=primary_rows_assigned,
+        overflow_rows_assigned=overflow_rows_assigned,
+        idle_workers_with_unassigned_feasible_rows=(
+            idle_workers_with_unassigned_feasible_rows
+        ),
     )

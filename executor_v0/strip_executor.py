@@ -197,6 +197,12 @@ class StripExecutorController:
             "assigned_routes": len(assignment.routes),
             "unassigned_routes": len(assignment.unassigned),
             "workers": len(positions),
+            "large_route_assignment_mode": assignment.large_route_assignment_mode,
+            "primary_rows_assigned": assignment.primary_rows_assigned,
+            "overflow_rows_assigned": assignment.overflow_rows_assigned,
+            "idle_workers_with_unassigned_feasible_rows": (
+                assignment.idle_workers_with_unassigned_feasible_rows
+            ),
             "unassigned_active_routes": list(self._unassigned_ids),
             "unassigned_supply_demand": {
                 candidate.route_id: dict(
@@ -596,11 +602,35 @@ class StripExecutorController:
             )
             for worker in sorted(positions)
         )
+        diagnostics = self._diagnostics()
+        diagnostics.update(
+            {
+                "assigned_routes": len(assignment.routes),
+                "unassigned_routes": len(assignment.unassigned),
+                "idle_workers": [
+                    worker.label for worker in assignment.idle_workers
+                ],
+                "packed_rows_per_worker": {
+                    route.owner.label: [
+                        segment.segment_id for segment in route.segments
+                    ]
+                    for route in assignment.routes
+                },
+                "large_route_assignment_mode": (
+                    assignment.large_route_assignment_mode
+                ),
+                "primary_rows_assigned": assignment.primary_rows_assigned,
+                "overflow_rows_assigned": assignment.overflow_rows_assigned,
+                "idle_workers_with_unassigned_feasible_rows": (
+                    assignment.idle_workers_with_unassigned_feasible_rows
+                ),
+            }
+        )
         return StripExecutorResult(
             farmer_action=actions[0] if actions else ("PASS",),
             hands_actions=actions[1:],
             market_actions=tuple(tuple(order) for order in market_actions),
-            diagnostics=self._diagnostics(),
+            diagnostics=diagnostics,
         )
 
     def _bootstrap_worker_action(

@@ -535,17 +535,21 @@ def plan_strip_hiring(
     if driving_total:
         current_completed = packed_results[current_workers][1]
         best_completed = max(result[1] for result in packed_results.values())
-        target_workers = min(
-            worker_count
-            for worker_count, result in packed_results.items()
-            if result[1] == best_completed
-        )
-        if current_completed >= driving_total:
-            hire_reason = "covered_by_existing_packed_capacity"
-        elif current_completed == best_completed:
-            hire_reason = "no_extra_worker_useful_before_deadline"
+        if len(candidates) > 8:
+            target_workers = max(current_workers, len(candidates))
+            hire_reason = "one_worker_per_useful_row_large_board"
         else:
-            hire_reason = "additional_workers_reach_best_packed_coverage"
+            target_workers = min(
+                worker_count
+                for worker_count, result in packed_results.items()
+                if result[1] == best_completed
+            )
+            if current_completed >= driving_total:
+                hire_reason = "covered_by_existing_packed_capacity"
+            elif current_completed == best_completed:
+                hire_reason = "no_extra_worker_useful_before_deadline"
+            else:
+                hire_reason = "additional_workers_reach_best_packed_coverage"
     final_estimates = packed_results.get(target_workers or current_workers, ((), 0, 0))[0]
     estimates = list(final_estimates)
     rows_with_n = packed_results.get(current_workers, ((), 0, 0))[1]

@@ -241,6 +241,27 @@ def _mechanical_rows(workloads=(1, 1, 1, 1)):
     )
 
 
+def _large_mechanical_rows(count):
+    candidates = []
+    for index in range(count):
+        row = index // 2
+        x_start = 0 if index % 2 == 0 else 5
+        quadrant = ("N" if row < 5 else "S") + (
+            "W" if x_start == 0 else "E"
+        )
+        candidates.append(
+            HorizontalRouteCandidate(
+                f"ROW:{quadrant}:{row}",
+                RowKey(quadrant, row % 5, row, x_start, x_start + 4),
+                tuple((row, x) for x in range(x_start, x_start + 5)),
+                1,
+                1,
+                0,
+            )
+        )
+    return tuple(candidates)
+
+
 def _route_rows(route):
     return tuple(segment.traversal[0][0] for segment in route.segments)
 
@@ -423,6 +444,65 @@ def test_geometric_assignment_ties_are_repeatable():
     assert [route.to_json_dict() for route in first.routes] == [
         route.to_json_dict() for route in second.routes
     ]
+
+
+def test_large_assignment_spreads_thirteen_rows_across_eleven_workers_first():
+    candidates = _large_mechanical_rows(13)
+    positions = {WorkerId(index): (0, 0) for index in range(11)}
+    assigned = assign_horizontal_routes(
+        candidates, positions, assignment_hour=0
+    )
+
+    assert assigned.large_route_assignment_mode is True
+    assert assigned.primary_rows_assigned == 11
+    assert assigned.overflow_rows_assigned == 2
+    assert assigned.idle_workers_with_unassigned_feasible_rows == 0
+    assert len(assigned.routes) == 11
+    assert all(route.segments for route in assigned.routes)
+    assert sum(len(route.segments) for route in assigned.routes) == 13
+
+
+def test_large_assignment_uses_one_primary_row_per_worker_when_counts_match():
+    candidates = _large_mechanical_rows(15)
+    positions = {WorkerId(index): (index % 8, 0) for index in range(15)}
+    assigned = assign_horizontal_routes(
+        candidates, positions, assignment_hour=0
+    )
+
+    assert assigned.primary_rows_assigned == 15
+    assert assigned.overflow_rows_assigned == 0
+    assert len(assigned.routes) == 15
+    assert all(len(route.segments) == 1 for route in assigned.routes)
+    assert not assigned.idle_workers
+
+
+def test_large_assignment_spreads_nine_workers_before_six_overflow_rows():
+    candidates = _large_mechanical_rows(15)
+    positions = {WorkerId(index): (index % 8, 0) for index in range(9)}
+    assigned = assign_horizontal_routes(
+        candidates, positions, assignment_hour=0
+    )
+
+    assert assigned.primary_rows_assigned == 9
+    assert assigned.overflow_rows_assigned == 6
+    assert assigned.idle_workers_with_unassigned_feasible_rows == 0
+    assert len(assigned.routes) == 9
+    assert all(len(route.segments) >= 1 for route in assigned.routes)
+    assert sum(len(route.segments) for route in assigned.routes) == 15
+
+
+def test_eight_rows_keep_the_exact_packer_with_surplus_workers():
+    candidates = _large_mechanical_rows(8)
+    positions = {WorkerId(index): (0, 0) for index in range(12)}
+    assigned = assign_horizontal_routes(
+        candidates, positions, assignment_hour=0
+    )
+
+    assert assigned.large_route_assignment_mode is False
+    assert len(assigned.routes) <= len(candidates)
+    assert sum(len(route.segments) for route in assigned.routes) == 8
+    assert not assigned.unassigned
+    assert len(assigned.idle_workers) == 12 - len(assigned.routes)
 
 
 def test_remaining_day_slots_match_engine_terminal_boundary():

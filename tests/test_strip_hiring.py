@@ -162,6 +162,14 @@ def hiring_plan(
     )
 
 
+def _large_row_items(count):
+    return [
+        item("WATER", row, x=x)
+        for row in range(8)
+        for x in (0, 5)
+    ][:count]
+
+
 def hiring_plan_with_curve(monkeypatch, completed_by_workers, *, driving_total=None, **kwargs):
     """Keep the real planner boundary while fixing the packed estimator's curve."""
 
@@ -250,13 +258,35 @@ def test_multi_hire_order_cap_submits_legal_prefix(monkeypatch):
     assert result.stop_reason is HireStopReason.ORDER_CAP
 
 
+def test_large_board_hiring_targets_one_worker_per_useful_row():
+    result = hiring_plan(_large_row_items(15), money=100_000, max_orders=10)
+
+    assert result.target_workers == 15
+    assert result.wanted_hires == 14
+    assert result.affordable_hires == 14
+    assert result.submittable_hires == 10
+    assert result.orders == (("HIRE",),) * 10
+    assert result.stop_reason is HireStopReason.ORDER_CAP
+
+
+def test_large_board_hiring_keeps_target_but_submits_only_affordable_prefix():
+    result = hiring_plan(_large_row_items(15), money=3, max_orders=10)
+
+    assert result.target_workers == 15
+    assert result.wanted_hires == 14
+    assert result.sequential_hire_costs[:3] == (1, 1, 2)
+    assert result.affordable_hires == result.submittable_hires == 2
+    assert result.orders == (("HIRE",), ("HIRE",))
+    assert result.stop_reason is HireStopReason.CASH
+
+
 def test_controller_submits_multiple_hires_in_one_market_batch():
     rows = [item("WATER", row, x=x) for row in range(10) for x in range(5)]
     forecast = work_plan(*rows)
     controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: forecast)
     result = controller.act(observation(money=1000), daily_plan())
-    assert result.market_actions == (("HIRE",),) * 4
-    assert result.diagnostics["hiring_diagnostics"]["target_workers"] == 5
+    assert result.market_actions == (("HIRE",),) * 9
+    assert result.diagnostics["hiring_diagnostics"]["target_workers"] == 10
     assert result.farmer_action != ("PASS",)
     assert result.hands_actions == ()
 
@@ -274,6 +304,32 @@ def test_existing_hand_can_work_during_hire_submission():
     assert result.farmer_action != ("PASS",)
     assert len(result.hands_actions) == 1
     assert result.hands_actions[0] != ("PASS",)
+
+
+def test_thirteen_row_hiring_and_assignment_leave_no_feasible_worker_idle():
+    rows = _large_row_items(13)
+    forecast = work_plan(*rows)
+    controller = StripExecutorController(
+        work_builder=lambda obs, plan, **kwargs: forecast
+    )
+    result = controller.act(
+        observation(hands=((0, 0),) * 10, money=100_000),
+        daily_plan(),
+    )
+    packed_rows = result.diagnostics["packed_rows_per_worker"]
+
+    assert result.market_actions == (("HIRE",), ("HIRE",))
+    assert result.diagnostics["hiring_diagnostics"]["target_workers"] == 13
+    assert result.diagnostics["hiring_diagnostics"]["wanted_hires"] == 2
+    assert result.diagnostics["large_route_assignment_mode"] is True
+    assert result.diagnostics["primary_rows_assigned"] == 11
+    assert result.diagnostics["overflow_rows_assigned"] == 2
+    assert result.diagnostics["idle_workers_with_unassigned_feasible_rows"] == 0
+    assert not result.diagnostics["idle_workers"]
+    assert len(result.hands_actions) == 10
+    assert len(packed_rows) == 11
+    assert sum(len(route_rows) for route_rows in packed_rows.values()) == 13
+    assert any(len(route_rows) > 1 for route_rows in packed_rows.values())
 
 
 def test_three_useful_rows_fit_one_packed_worker():
@@ -493,23 +549,23 @@ def test_hire_submission_reconciles_before_final_route_ownership():
     )
     controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: forecast)
     submitted = controller.act(observation(money=1000), daily_plan())
-    assert submitted.market_actions == (("HIRE",),) * 4
+    assert submitted.market_actions == (("HIRE",),) * 9
     assert submitted.farmer_action != ("PASS",)
     assert submitted.hands_actions == ()
 
     confirmed = observation(
-        hands=((4, 4), (5, 4), (4, 5), (5, 5)),
-        money=990,
-        hires_today=4,
+        hands=tuple((index % 10, index // 10) for index in range(9)),
+        money=912,
+        hires_today=9,
         hour=1,
     )
     result = controller.act(confirmed, daily_plan())
     assert result.market_actions == ()
     assert result.diagnostics["routes_finalized"] is True
-    assert result.diagnostics["observed_hires"] == 4
+    assert result.diagnostics["observed_hires"] == 9
     assert controller._pending_hires is None
-    assert result.diagnostics["worker_count_final"] == 5
-    assert len(result.hands_actions) == 4
+    assert result.diagnostics["worker_count_final"] == 10
+    assert len(result.hands_actions) == 9
 
     route_ids = [
         segment.segment_id
@@ -670,16 +726,16 @@ def test_supplies_needed_after_first_driving_do_not_inflate_eta():
 # --- Packet 5B diagnostics cleanups -------------------------------------------
 
 
-def test_packed_capacity_avoids_order_cap_for_unneeded_workers():
+def test_small_board_packed_capacity_avoids_order_cap_for_unneeded_workers():
     result = hiring_plan(
-        [item("WATER", r) for r in range(10)],
+        [item("WATER", r) for r in range(8)],
         money=12,
         max_orders=3,
     )
-    assert result.target_workers == 3
-    assert result.wanted_hires == 2
-    assert result.affordable_hires == 2
-    assert result.submittable_hires == 2
+    assert result.target_workers == 2
+    assert result.wanted_hires == 1
+    assert result.affordable_hires == 1
+    assert result.submittable_hires == 1
     assert result.stop_reason is HireStopReason.COVERED
 
 
