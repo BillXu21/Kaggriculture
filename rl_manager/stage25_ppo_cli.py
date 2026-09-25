@@ -241,7 +241,8 @@ def _format_report(record: Mapping[str, Any]) -> str:
         line("epochs", ppo.get("epochs", 0)),
         line("weight audit", audit_text),
         "",
-        f"checkpoint: {record['checkpoint']}",
+        f"checkpoint saved: {record['checkpoint_saved']}",
+        f"latest checkpoint: {record['checkpoint']}",
         "=" * 64,
     ]
     report = "\n".join(lines)
@@ -451,6 +452,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--updates", type=int, default=1)
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=1,
+        help="save every N absolute completed updates and on the final update")
     parser.add_argument(
         "--json-stdout", action="store_true",
         help="also emit each complete machine-readable update record")
@@ -732,6 +736,8 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     _validate_rollout_controls(args)
     if args.updates < 1 or args.rollout_size < 1 or args.workers < 1:
         raise ValueError("updates, rollout-size, and workers must be positive")
+    if args.checkpoint_every < 1:
+        raise ValueError("checkpoint-every must be positive")
     config = _config(args)
     if args.workers == 1 and config.physical_batch_size != 1:
         raise ValueError(
@@ -744,7 +750,8 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = args.output_dir / "metrics.jsonl"
     all_metrics = []
-    for _ in range(args.updates):
+    latest_checkpoint = str(args.resume) if args.resume else None
+    for local_update in range(args.updates):
         update_started = time.perf_counter()
         _, learner, ppo_batch, rollout_stats = _collection(
             state, config, seed=state.rollout_seed, args=args,
@@ -782,42 +789,48 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         state = replace(state, opponent_params=previous_learner_params,
                         opponent_identity=next_opponent.identity)
         state = replace(state, rollout_seed=state.rollout_seed + args.rollout_size)
-        metadata = {
-            "run": {
-                "cli": "rl_manager.stage25_ppo_cli",
-                "source": str(args.init) if args.init else None,
-                "opening": rollout_stats.get("opening_provenance"),
-            },
-            "training_contract": _training_contract(args),
-            "resume_from": (
-                None if not args.resume else {
-                    "path": str(args.resume),
-                    "payload_kind": source_meta.get("payload_kind"),
-                    "update_counter": source_meta.get("update_counter"),
-                }),
-        }
         checkpoint = args.output_dir / "latest.npz"
-        checkpoint_started = time.perf_counter()
-        save_stage25_ppo_checkpoint(
-            checkpoint, state.params, state.optimizer_state, state.rng,
-            config.model, seed=args.seed, update_counter=state.update_counter,
-            rollout_seed=state.rollout_seed, rollout_progression=state.rollout_progression,
-            ppo_config=config.to_dict(), optimizer_config=config.to_dict(),
-            curriculum=config.model.curriculum, behavior_identity=state.behavior_identity,
-            provenance={"run": metadata},
-            physical_contract=_physical_contract(config),
-            executor=executor_provenance,
-            metadata={
-                "cli_args": vars(args),
+        checkpoint_saved = (
+            state.update_counter % args.checkpoint_every == 0
+            or local_update == args.updates - 1)
+        checkpoint_seconds = 0.0
+        if checkpoint_saved:
+            metadata = {
+                "run": {
+                    "cli": "rl_manager.stage25_ppo_cli",
+                    "source": str(args.init) if args.init else None,
+                    "opening": rollout_stats.get("opening_provenance"),
+                },
                 "training_contract": _training_contract(args),
-            },
-            opponent_params=state.opponent_params,
-            opponent_identity=state.opponent_identity,
-            source_identity=(source_meta.get("source_identity") or None),
-            source_history_version=(
-                (source_meta.get("source_e_identity") or {}).get("history_version")),
-        )
-        checkpoint_seconds = time.perf_counter() - checkpoint_started
+                "resume_from": (
+                    None if not args.resume else {
+                        "path": str(args.resume),
+                        "payload_kind": source_meta.get("payload_kind"),
+                        "update_counter": source_meta.get("update_counter"),
+                    }),
+            }
+            checkpoint_started = time.perf_counter()
+            save_stage25_ppo_checkpoint(
+                checkpoint, state.params, state.optimizer_state, state.rng,
+                config.model, seed=args.seed, update_counter=state.update_counter,
+                rollout_seed=state.rollout_seed, rollout_progression=state.rollout_progression,
+                ppo_config=config.to_dict(), optimizer_config=config.to_dict(),
+                curriculum=config.model.curriculum, behavior_identity=state.behavior_identity,
+                provenance={"run": metadata},
+                physical_contract=_physical_contract(config),
+                executor=executor_provenance,
+                metadata={
+                    "cli_args": vars(args),
+                    "training_contract": _training_contract(args),
+                },
+                opponent_params=state.opponent_params,
+                opponent_identity=state.opponent_identity,
+                source_identity=(source_meta.get("source_identity") or None),
+                source_history_version=(
+                    (source_meta.get("source_e_identity") or {}).get("history_version")),
+            )
+            checkpoint_seconds = time.perf_counter() - checkpoint_started
+            latest_checkpoint = str(checkpoint)
         update_seconds = time.perf_counter() - update_started
         collection_timing = dict(rollout_stats.get("timing", {}))
         for timing_name in (
@@ -850,7 +863,8 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             **rollout_stats,
             "games_in_update": args.rollout_size,
             "update_metrics": update_stats,
-            "checkpoint": str(checkpoint),
+            "checkpoint": latest_checkpoint,
+            "checkpoint_saved": checkpoint_saved,
             "startup": {"state_initialization_seconds": startup_seconds},
             "timing": timing,
             "throughput": {

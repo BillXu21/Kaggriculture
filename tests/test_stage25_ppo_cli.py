@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import jax
@@ -12,7 +13,8 @@ import pytest
 from rl_manager import stage25_checkpoint as checkpoint
 from rl_manager import stage25_ppo as ppo
 from rl_manager import stage25_ppo_cli as cli
-from rl_manager.executor_factory import make_stage25_executor_factory
+from rl_manager.executor_factory import (
+    make_default_executor_factory, make_stage25_executor_factory)
 from rl_manager.reward import RewardConfig
 from rl_manager.runner import _executor_factory_provenance
 from rl_manager.stage25_inference import Stage25InferenceAdapter
@@ -167,6 +169,7 @@ def test_current_current_cli_contract_requires_own_bank_reward() -> None:
 def test_rollout_control_defaults_preserve_runner_defaults() -> None:
     args = cli._parser().parse_args([
         "--scratch", "--output-dir", "out"])
+    assert args.checkpoint_every == 1
     runner_config = cli._runner_config(
         args, seed=17, reward_config=RewardConfig())
 
@@ -341,3 +344,192 @@ def test_candidate_collection_only_batches_learner_seat(monkeypatch):
     assert len(trajectory) == 2
     assert stats["learner_rows"] == 1
     assert [row.trainable for row in trajectory.rows] == [True, False]
+
+
+def _same_tree(left, right) -> bool:
+    return all(np.array_equal(np.asarray(a), np.asarray(b))
+               for a, b in zip(jax.tree_util.tree_leaves(left),
+                                jax.tree_util.tree_leaves(right)))
+
+
+def test_legacy_executor_provenance_is_canonical_json() -> None:
+    provenance = _executor_factory_provenance(
+        cli._resolve_executor_factory("legacy"))
+    tiles = provenance["effective_profile"]["agent_config"]["foreman"][
+        "shed_access_tiles"]
+    assert tiles == [[4, 4], [5, 4], [4, 5], [5, 5]]
+    assert json.loads(json.dumps(provenance, allow_nan=False)) == provenance
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), {1: "bad"}, object()])
+def test_executor_provenance_rejects_non_json_values(bad) -> None:
+    factory = SimpleNamespace(name="invalid", version="v1",
+                              effective_profile={"bad": bad})
+    with pytest.raises((TypeError, ValueError), match="executor provenance"):
+        _executor_factory_provenance(factory)
+
+
+def _legacy_resume_checkpoint(tmp_path):
+    args = cli._parser().parse_args([
+        "--resume", str(tmp_path / "source.npz"), "--executor", "legacy",
+        "--model-size", "tiny", "--physical-batch-size", "1",
+        "--minibatch-size", "1", "--epochs", "1", "--seed", "7",
+        "--output-dir", str(tmp_path)])
+    config = cli._config(args)
+    fresh = ppo.init_stage25_ppo_state(config, seed=7)
+    frozen = init_stage25_params(config.model, seed=8)
+    learner = Stage25InferenceAdapter(
+        params=fresh.params, config=config.model, name="stage25_learner",
+        version="ppo-native-v1", seed=7, mode="stochastic")
+    opponent = Stage25InferenceAdapter(
+        params=frozen, config=config.model, name="stage25_opponent",
+        version="frozen-v1", seed=8, mode="stochastic")
+    executor = _executor_factory_provenance(cli._resolve_executor_factory("legacy"))
+    checkpoint.save_stage25_ppo_checkpoint(
+        args.resume, fresh.params, fresh.optimizer_state, fresh.rng,
+        config.model, seed=7, update_counter=70, rollout_seed=281,
+        rollout_progression={"completed_rollouts": 70},
+        ppo_config=config.to_dict(), optimizer_config=config.to_dict(),
+        curriculum=config.model.curriculum,
+        behavior_identity=learner.identity, opponent_params=frozen,
+        opponent_identity=opponent.identity,
+        physical_contract=cli._physical_contract(config), executor=executor,
+        metadata={"training_contract": cli._training_contract(args)})
+    return args, config, fresh, frozen, learner, opponent, executor
+
+
+def test_legacy_ppo_checkpoint_resumes_with_exact_state(tmp_path) -> None:
+    args, config, fresh, frozen, learner, opponent, executor = (
+        _legacy_resume_checkpoint(tmp_path))
+    with np.load(args.resume, allow_pickle=False) as archive:
+        stored_executor = json.loads(
+            archive["__meta__"].tobytes().decode("utf-8"))["executor"]
+    assert stored_executor == executor
+    assert stored_executor["effective_profile"]["agent_config"]["foreman"][
+        "shed_access_tiles"] == [[4, 4], [5, 4], [4, 5], [5, 5]]
+
+    state, meta = cli._new_state(args, config)
+    assert _same_tree(state.params, fresh.params)
+    assert _same_tree(state.optimizer_state, fresh.optimizer_state)
+    assert _same_tree(state.rng, fresh.rng)
+    assert _same_tree(state.opponent_params, frozen)
+    assert state.rollout_seed == 281
+    assert state.rollout_progression == {"completed_rollouts": 70}
+    assert state.update_counter == 70
+    assert state.behavior_identity == learner.identity
+    assert state.opponent_identity == opponent.identity
+    assert meta["model_config"] == json.loads(json.dumps(asdict(config.model)))
+    assert meta["ppo_config"] == config.to_dict()
+    assert meta["optimizer_config"] == config.to_dict()
+    assert meta["physical_contract"] == cli._physical_contract(config)
+    assert meta["executor"] == executor
+    assert meta["training_contract"] == cli._training_contract(args)
+
+
+def test_legacy_ppo_resume_rejects_changed_executor_setting(
+        tmp_path, monkeypatch) -> None:
+    args, config, *_ = _legacy_resume_checkpoint(tmp_path)
+    original = cli._resolve_executor_factory("legacy")
+    changed = make_default_executor_factory(
+        replace(original.agent_config, tasks_per_worker=11))
+    monkeypatch.setattr(cli, "_resolve_executor_factory", lambda _: changed)
+    with pytest.raises(ValueError, match="executor provenance does not match"):
+        cli._new_state(args, config)
+
+
+@pytest.mark.parametrize(
+    ("start", "updates", "cadence", "expected"), [
+        (0, 3, 1, [1, 2, 3]),
+        (0, 25, 10, [10, 20, 25]),
+        (70, 25, 10, [80, 90, 95]),
+        (0, 3, 10, [3]),
+    ])
+def test_checkpoint_cadence_uses_absolute_counter_and_final_boundary(
+        monkeypatch, tmp_path, start, updates, cadence, expected) -> None:
+    config = tiny_stage25_config()
+    learner = Stage25InferenceAdapter(
+        params=init_stage25_params(config, seed=7), config=config,
+        name="stage25_learner", version="ppo-native-v1", mode="stochastic")
+    base_args = cli._parser().parse_args([
+        "--scratch", "--physical-batch-size", "1", "--minibatch-size", "1",
+        "--output-dir", str(tmp_path)])
+    base_state = ppo.init_stage25_ppo_state(cli._config(base_args), seed=7)
+    saved = []
+
+    def fake_state(args, config):
+        del args, config
+        return replace(base_state, update_counter=start, rollout_seed=100 + start), {}
+
+    def fake_collection(state, config, *, seed, args, previous_params=None):
+        del state, config, seed, args, previous_params
+        return None, learner, object(), {"learner_rows": 1}
+
+    def fake_update(state, batch, config):
+        del batch, config
+        next_update = state.update_counter + 1
+        return replace(state, update_counter=next_update,
+                       rollout_progression={"completed_rollouts": next_update}), {}
+
+    def fake_save(path, *args, **kwargs):
+        del args
+        saved.append(kwargs["update_counter"])
+        return path
+
+    monkeypatch.setattr(cli, "_new_state", fake_state)
+    monkeypatch.setattr(cli, "_collection", fake_collection)
+    monkeypatch.setattr(ppo, "ppo_update", fake_update)
+    monkeypatch.setattr(checkpoint, "save_stage25_ppo_checkpoint", fake_save)
+    source = (["--resume", str(tmp_path / "source.npz")]
+              if start else ["--scratch"])
+    argv = [
+        *source, "--model-size", "tiny", "--physical-batch-size", "1",
+        "--minibatch-size", "1", "--updates", str(updates),
+        "--checkpoint-every", str(cadence), "--output-dir", str(tmp_path)]
+    records = cli.run(cli._parser().parse_args(argv))
+    assert saved == expected
+    assert [row["update"] for row in records] == list(
+        range(start + 1, start + updates + 1))
+    assert [row["update"] for row in records if row["checkpoint_saved"]] == expected
+    assert all(row["timing"]["checkpoint_seconds"] == 0.0
+               for row in records if not row["checkpoint_saved"])
+    assert records[-1]["checkpoint"] == str(tmp_path / "latest.npz")
+    if cadence > 1 and updates > 1:
+        assert records[0]["checkpoint"] == (
+            str(tmp_path / "source.npz") if start else None)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_checkpoint_cadence_rejects_nonpositive_values(tmp_path, value) -> None:
+    args = cli._parser().parse_args([
+        "--scratch", "--output-dir", str(tmp_path),
+        "--checkpoint-every", str(value)])
+    with pytest.raises(ValueError, match="checkpoint-every must be positive"):
+        cli.run(args)
+
+
+def test_failed_ppo_update_never_saves_final_checkpoint(
+        monkeypatch, tmp_path) -> None:
+    args = cli._parser().parse_args([
+        "--scratch", "--physical-batch-size", "1", "--minibatch-size", "1",
+        "--checkpoint-every", "10", "--output-dir", str(tmp_path)])
+    config = cli._config(args)
+    state = ppo.init_stage25_ppo_state(config, seed=7)
+    learner = Stage25InferenceAdapter(
+        params=state.params, config=config.model, name="stage25_learner",
+        version="ppo-native-v1", mode="stochastic")
+    monkeypatch.setattr(cli, "_new_state", lambda *a: (state, {}))
+    monkeypatch.setattr(
+        cli, "_collection", lambda *a, **k: (None, learner, object(), {}))
+
+    def fail_update(*args):
+        raise RuntimeError("PPO update failed")
+
+    def fail_save(*args, **kwargs):
+        raise AssertionError("failed update must not be checkpointed")
+
+    monkeypatch.setattr(ppo, "ppo_update", fail_update)
+    monkeypatch.setattr(checkpoint, "save_stage25_ppo_checkpoint", fail_save)
+    with pytest.raises(RuntimeError, match="PPO update failed"):
+        cli.run(args)
+    assert not (tmp_path / "latest.npz").exists()
+    assert not (tmp_path / "metrics.jsonl").exists()
