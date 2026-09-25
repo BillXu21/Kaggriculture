@@ -10,9 +10,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from functools import lru_cache
 from typing import Any, Iterable, Mapping
 
-from executor_v0.foreman import SHED_ACCESS_TILES
+from executor_v0.strip_cost import (
+    RouteCostResult,
+    RouteCostSegment,
+    inventory_requirements,
+    route_cost_segment_from_forecast,
+    route_cost_segment_from_items,
+    simulate_route_cost,
+)
 from executor_v0.strip_work import (
     RowKey,
     StripWorkPlan,
@@ -76,6 +84,8 @@ class HorizontalRouteCandidate:
     inventory_items: tuple[str, ...] = ()
     tile_hire_driving_interactions: tuple[int, ...] = ()
     tile_inventory_items: tuple[tuple[str, ...], ...] = ()
+    tile_work_items: tuple[tuple[WorkItem, ...], ...] = ()
+    fertilizer_work_ids: frozenset[str] = frozenset()
     physical_row_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -134,6 +144,7 @@ class RouteSegment:
     represented_interactions: int = 0
     known_continuation_interactions: int = 0
     forecast_tile_interactions: tuple[int, ...] = ()
+    cost_segment: RouteCostSegment | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -310,6 +321,43 @@ def _manhattan_distance(left: tuple[int, int], right: tuple[int, int]) -> int:
     return abs(left[0] - right[0]) + abs(left[1] - right[1])
 
 
+@lru_cache(maxsize=4096)
+def _candidate_cost_segment(
+    candidate: HorizontalRouteCandidate,
+    traversal: tuple[tuple[int, int], ...],
+) -> RouteCostSegment:
+    if len(candidate.tile_work_items) == len(candidate.owned_tiles) and any(
+        candidate.tile_work_items
+    ):
+        items_by_tile = dict(zip(candidate.owned_tiles, candidate.tile_work_items, strict=True))
+        return route_cost_segment_from_items(
+            candidate.route_id,
+            traversal,
+            (item for tile in traversal for item in items_by_tile.get(tile, ())),
+            physical_row_id=candidate.row_id,
+            fertilizer_item_ids=candidate.fertilizer_work_ids,
+        )
+    represented = _candidate_tile_values(
+        candidate, candidate.tile_interactions, candidate.forecasted_tile_interactions
+    )
+    continuation = _candidate_tile_values(
+        candidate, candidate.tile_known_continuation_interactions, (0,) * len(candidate.owned_tiles)
+    )
+    driving = _candidate_tile_values(
+        candidate, candidate.tile_hire_driving_interactions, candidate.forecasted_tile_interactions
+    )
+    inventory = _candidate_inventory_by_tile(candidate)
+    return route_cost_segment_from_forecast(
+        candidate.route_id,
+        traversal,
+        tuple(represented.get(tile, 0) for tile in traversal),
+        tuple(continuation.get(tile, 0) for tile in traversal),
+        physical_row_id=candidate.row_id,
+        hire_driving_interactions=tuple(driving.get(tile, 0) for tile in traversal),
+        inventory_items_by_tile=tuple(inventory.get(tile, ()) for tile in traversal),
+    )
+
+
 def remaining_day_action_slots(
     obs: Mapping[str, Any], *, include_current_turn: bool = True
 ) -> int:
@@ -362,6 +410,12 @@ def generate_horizontal_route_candidates(
             items_by_tile.setdefault(item.tile, []).append(item)
 
     candidates: list[HorizontalRouteCandidate] = []
+    fertilizer_work_ids = frozenset(
+        item_id
+        for chain in work_plan.chains
+        if chain.kind == "FERTILIZER_UPKEEP" or chain.source == "fertilizer_policy"
+        for item_id in chain.item_ids
+    )
     for summary in work_plan.row_summaries:
         interactions = summary.ready_interactions + summary.future_interactions
         if interactions <= 0:
@@ -377,7 +431,8 @@ def generate_horizontal_route_candidates(
             driving_items = tuple(
                 item
                 for item in values
-                if item.kind != "FERTILIZE"
+                if item.id not in fertilizer_work_ids
+                and item.kind != "FERTILIZE"
                 and not (
                     item.kind == "WATER"
                     and item.source == "fertilizer_linked_productive"
@@ -389,22 +444,8 @@ def generate_horizontal_route_candidates(
             tile_inventory: set[str] = set()
             for item in values:
                 tile_inventory.update(
-                    requirement.item
-                    for requirement in item.required_supplies
-                    if requirement.scope == "inventory" and requirement.quantity > 0
+                    requirement.item for requirement in inventory_requirements(item)
                 )
-                if item.kind == "FEED" and not any(
-                    requirement.item == "WHEAT"
-                    and requirement.scope == "inventory"
-                    for requirement in item.required_supplies
-                ):
-                    tile_inventory.add("WHEAT")
-                if item.kind == "PLACE" and item.animal and not any(
-                    requirement.item == item.animal
-                    and requirement.scope == "inventory"
-                    for requirement in item.required_supplies
-                ):
-                    tile_inventory.add(item.animal)
             tile_inventory_items.append(tuple(sorted(tile_inventory)))
             inventory_items.update(tile_inventory)
         candidates.append(
@@ -431,6 +472,8 @@ def generate_horizontal_route_candidates(
                 inventory_items=tuple(sorted(inventory_items)),
                 tile_hire_driving_interactions=tuple(driving_forecasts),
                 tile_inventory_items=tuple(tile_inventory_items),
+                tile_work_items=tile_items,
+                fertilizer_work_ids=fertilizer_work_ids,
             )
         )
     return tuple(sorted(candidates, key=lambda candidate: candidate.row_key))
@@ -442,6 +485,7 @@ class _ChainPlan:
     completion_turns: int
     useful_interactions: int
     useful_segments: int
+    unfinished_interactions: int
     assigned: tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]
 
 
@@ -453,16 +497,19 @@ class _LargeRoutePacking:
     idle_workers_with_unassigned_feasible_rows: int
 
 
-def _chain_plan_for_mask(
+def _compute_chain_plan_for_mask(
     candidates: tuple[HorizontalRouteCandidate, ...],
     worker_position: tuple[int, int],
     mask: int,
     remaining_action_slots: int | None = None,
+    worker_inventory: Mapping[str, int] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
 ) -> _ChainPlan:
     """Find the cheapest ordered/oriented chain for one candidate subset."""
 
     if not mask:
-        return _ChainPlan(0, 0, 0, 0, ())
+        return _ChainPlan(0, 0, 0, 0, 0, ())
 
     indices = tuple(index for index in range(len(candidates)) if mask & (1 << index))
     # Preserve the canonical west/east ordering for the two halves of one
@@ -472,92 +519,76 @@ def _chain_plan_for_mask(
     if len({candidates[index].row_key.global_row for index in indices}) > 1:
         allowed_orders.append(tuple(reversed(indices)))
 
-    choices: list[tuple[int, tuple[tuple[int, int, int], ...]]] = []
+    choices: list[tuple[tuple[int, int, int], ...]] = []
     for order in allowed_orders:
-        first = order[0]
-        states: dict[int, tuple[int, tuple[tuple[int, int, int], ...]]] = {}
-        for side in (0, 1):
-            traversal = (
-                candidates[first].owned_tiles
-                if side == 0
-                else tuple(reversed(candidates[first].owned_tiles))
-            )
-            distance = _manhattan_distance(worker_position, traversal[0])
-            states[side] = (distance, ((first, side, distance),))
-
-        for previous_index, index in zip(order, order[1:]):
-            next_states: dict[
-                int, tuple[int, tuple[tuple[int, int, int], ...]]
-            ] = {}
-            for next_side in (0, 1):
+        for orientation_bits in range(1 << len(order)):
+            path: list[tuple[int, int, int]] = []
+            previous_end = worker_position
+            for offset, index in enumerate(order):
+                side = (orientation_bits >> offset) & 1
                 traversal = (
                     candidates[index].owned_tiles
-                    if next_side == 0
+                    if side == 0
                     else tuple(reversed(candidates[index].owned_tiles))
                 )
-                transitions = []
-                for previous_side, (movement, path) in states.items():
-                    previous = candidates[previous_index].owned_tiles
-                    previous_end = (
-                        previous[-1] if previous_side == 0 else previous[0]
-                    )
-                    distance = _manhattan_distance(previous_end, traversal[0])
-                    transitions.append(
-                        (
-                            movement + distance,
-                            path + ((index, next_side, distance),),
-                        )
-                    )
-                next_states[next_side] = min(
-                    transitions, key=lambda value: (value[0], value[1])
-                )
-            states = next_states
-        choices.extend(states.values())
+                distance = _manhattan_distance(previous_end, traversal[0])
+                path.append((index, side, distance))
+                previous_end = traversal[-1]
+            choices.append(tuple(path))
 
-    def path_metrics(path_value):
-        elapsed = 0
-        useful = 0
-        useful_segments = 0
-        for index, side, distance in path_value:
-            candidate = candidates[index]
-            elapsed += distance
-            tile_counts = candidate.forecasted_tile_interactions
-            if side:
-                tile_counts = tuple(reversed(tile_counts))
-            for tile_index in range(len(candidate.owned_tiles)):
-                if tile_index:
-                    elapsed += 1
-                count = tile_counts[tile_index]
-                for _ in range(max(0, count)):
-                    elapsed += 1
-                    if (
-                        remaining_action_slots is None
-                        or elapsed <= remaining_action_slots
-                    ):
-                        useful += 1
-            if (
-                remaining_action_slots is None
-                or elapsed <= remaining_action_slots
-            ):
-                useful_segments += 1
-        return elapsed, useful, useful_segments
+    def path_result(path_value):
+        route_segments = tuple(
+            _candidate_cost_segment(
+                candidates[index],
+                (
+                    candidates[index].owned_tiles
+                    if side == 0
+                    else tuple(reversed(candidates[index].owned_tiles))
+                ),
+            )
+            for index, side, _distance in path_value
+        )
+        budget = (
+            1_000_000_000
+            if remaining_action_slots is None
+            else remaining_action_slots
+        )
+        return simulate_route_cost(
+            worker_position,
+            route_segments,
+            carried_inventory=worker_inventory,
+            remaining_action_slots=budget,
+            shed_stock=shed_stock,
+            global_resources=global_resources,
+            include_segment_results=False,
+        )
+
+    evaluated = [(path_result(path), path) for path in choices]
+
+    def approach_travel(result: RouteCostResult) -> int:
+        return (
+            result.setup_travel_turns
+            + result.pickup_travel_turns
+            + result.inter_segment_travel_turns
+        )
 
     if remaining_action_slots is None:
-        movement, path = min(choices, key=lambda value: (value[0], value[1]))
+        result, path = min(
+            evaluated,
+            key=lambda value: (value[0].total_turns, approach_travel(value[0]), value[1]),
+        )
     else:
-        movement, path = min(
-            choices,
+        result, path = min(
+            evaluated,
             key=lambda value: (
-                -path_metrics(value[1])[1],
-                -path_metrics(value[1])[2],
-                path_metrics(value[1])[0],
-                value[0],
+                -value[0].effective_interactions_completed_before_deadline,
+                -value[0].segments_completed_before_deadline,
+                value[0].total_turns,
+                approach_travel(value[0]),
                 value[1],
             ),
         )
     assigned: list[tuple[HorizontalRouteCandidate, RouteSegment]] = []
-    interactions = 0
-    sweep = 0
     for index, side, distance in path:
         candidate = candidates[index]
         traversal = candidate.owned_tiles if side == 0 else tuple(reversed(candidate.owned_tiles))
@@ -578,23 +609,68 @@ def _chain_plan_for_mask(
                         if side == 0
                         else tuple(reversed(candidate.forecasted_tile_interactions))
                     ),
+                    _candidate_cost_segment(candidate, traversal),
                 ),
             )
         )
-        interactions += candidate.forecasted_workload_interactions
-        sweep += max(0, len(traversal) - 1)
-    completion = movement + sweep + interactions
-    if remaining_action_slots is None:
-        useful_interactions = interactions
-        useful_segments = len(assigned)
-    else:
-        completion, useful_interactions, useful_segments = path_metrics(path)
+    completion = result.total_turns
+    useful_interactions = result.effective_interactions_completed_before_deadline
+    useful_segments = result.segments_completed_before_deadline
+    movement = (
+        result.setup_travel_turns
+        + result.pickup_travel_turns
+        + result.inter_segment_travel_turns
+    )
     return _ChainPlan(
         movement,
         completion,
         useful_interactions,
         useful_segments,
+        result.effective_interactions_missed,
         tuple(assigned),
+    )
+
+
+@lru_cache(maxsize=4096)
+def _cached_chain_plan_for_mask(
+    candidates: tuple[HorizontalRouteCandidate, ...],
+    worker_position: tuple[int, int],
+    mask: int,
+    remaining_action_slots: int | None,
+    worker_inventory: tuple[tuple[str, int], ...],
+    shed_stock: tuple[tuple[str, int], ...] | None,
+    global_resources: tuple[tuple[str, int], ...] | None,
+) -> _ChainPlan:
+    return _compute_chain_plan_for_mask(
+        candidates,
+        worker_position,
+        mask,
+        remaining_action_slots,
+        dict(worker_inventory),
+        None if shed_stock is None else dict(shed_stock),
+        None if global_resources is None else dict(global_resources),
+    )
+
+
+def _chain_plan_for_mask(
+    candidates: tuple[HorizontalRouteCandidate, ...],
+    worker_position: tuple[int, int],
+    mask: int,
+    remaining_action_slots: int | None = None,
+    worker_inventory: Mapping[str, int] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
+) -> _ChainPlan:
+    """Cache deterministic subset costs across repeated assignment forecasts."""
+
+    return _cached_chain_plan_for_mask(
+        candidates,
+        worker_position,
+        mask,
+        remaining_action_slots,
+        tuple(sorted((worker_inventory or {}).items())),
+        None if shed_stock is None else tuple(sorted(shed_stock.items())),
+        None if global_resources is None else tuple(sorted(global_resources.items())),
     )
 
 
@@ -632,6 +708,9 @@ def _pack_small_route_sets(
     workers: tuple[WorkerId, ...],
     positions: Mapping[WorkerId, tuple[int, int]],
     worker_action_slots: Mapping[WorkerId, int] | None = None,
+    worker_inventories: Mapping[WorkerId, Mapping[str, int]] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
 ) -> dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]]:
     """Pack at most eight rows while retaining exact load/travel tradeoffs."""
 
@@ -643,6 +722,9 @@ def _pack_small_route_sets(
                 positions[worker],
                 mask,
                 None if worker_action_slots is None else worker_action_slots[worker],
+                (worker_inventories or {}).get(worker),
+                shed_stock,
+                global_resources,
             )
             for mask in range(full_mask + 1)
         }
@@ -675,12 +757,7 @@ def _pack_small_route_sets(
                         candidate_value = (
                             useful - plan.useful_interactions,
                             segments - plan.useful_segments,
-                            unfinished
-                            + sum(
-                                candidate.forecasted_workload_interactions
-                                for candidate, _ in plan.assigned
-                            )
-                            - plan.useful_interactions,
+                            unfinished + plan.unfinished_interactions,
                             max(maximum, plan.completion_turns),
                             movement + plan.movement_turns,
                             0,
@@ -709,6 +786,9 @@ def _pack_large_route_set(
     workers: tuple[WorkerId, ...],
     positions: Mapping[WorkerId, tuple[int, int]],
     worker_action_slots: Mapping[WorkerId, int] | None = None,
+    worker_inventories: Mapping[WorkerId, Mapping[str, int]] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
     ) -> _LargeRoutePacking:
     """Spread feasible primary rows before greedily packing overflow rows."""
 
@@ -725,6 +805,9 @@ def _pack_large_route_set(
                 positions[worker],
                 1 << index,
                 slots,
+                (worker_inventories or {}).get(worker),
+                shed_stock,
+                global_resources,
             )
             if slots is not None and plan.useful_interactions <= 0:
                 continue
@@ -771,17 +854,20 @@ def _pack_large_route_set(
                 positions[worker],
                 masks[worker],
                 None if worker_action_slots is None else worker_action_slots[worker],
+                (worker_inventories or {}).get(worker),
+                shed_stock,
+                global_resources,
             )
             plan = _chain_plan_for_mask(
                 candidates,
                 positions[worker],
                 mask,
                 None if worker_action_slots is None else worker_action_slots[worker],
+                (worker_inventories or {}).get(worker),
+                shed_stock,
+                global_resources,
             )
-            assigned_work = sum(
-                value.forecasted_workload_interactions for value, _ in plan.assigned
-            )
-            unfinished = max(0, assigned_work - plan.useful_interactions)
+            unfinished = plan.unfinished_interactions
             choices.append(
                 (
                     -(
@@ -813,6 +899,9 @@ def _pack_large_route_set(
             positions[worker],
             masks[worker],
             None if worker_action_slots is None else worker_action_slots[worker],
+            (worker_inventories or {}).get(worker),
+            shed_stock,
+            global_resources,
         ).assigned
         for worker in workers
     }
@@ -832,6 +921,9 @@ def _pack_large_route_set(
                 positions[worker],
                 1 << index,
                 worker_action_slots[worker],
+                (worker_inventories or {}).get(worker),
+                shed_stock,
+                global_resources,
             ).useful_interactions > 0
             for index in unassigned_indices
         )
@@ -854,6 +946,9 @@ def _assign_horizontal_routes_unsplit(
     assignment_hour: int,
     remaining_action_slots: int | None = None,
     worker_action_slots: Mapping[WorkerId, int] | None = None,
+    worker_inventories: Mapping[WorkerId, Mapping[str, int]] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
 ) -> RouteAssignment:
     """Pack row segments into deterministic, deadline-aware worker chains.
 
@@ -887,14 +982,26 @@ def _assign_horizontal_routes_unsplit(
         if slots is None and remaining_action_slots is not None:
             slots = {worker: remaining_action_slots for worker in ordered_workers}
         grouped = _pack_small_route_sets(
-            ordered_candidates, ordered_workers, worker_positions, slots
+            ordered_candidates,
+            ordered_workers,
+            worker_positions,
+            slots,
+            worker_inventories,
+            shed_stock,
+            global_resources,
         )
     elif ordered_workers:
         slots = worker_action_slots
         if slots is None and remaining_action_slots is not None:
             slots = {worker: remaining_action_slots for worker in ordered_workers}
         large_packing = _pack_large_route_set(
-            ordered_candidates, ordered_workers, worker_positions, slots
+            ordered_candidates,
+            ordered_workers,
+            worker_positions,
+            slots,
+            worker_inventories,
+            shed_stock,
+            global_resources,
         )
         grouped = large_packing.grouped
         primary_rows_assigned = large_packing.primary_rows_assigned
@@ -966,30 +1073,6 @@ def _candidate_inventory_by_tile(
     return {tile: candidate.inventory_items for tile in candidate.owned_tiles}
 
 
-def _pickup_overhead(
-    position: tuple[int, int],
-    entry: tuple[int, int],
-    inventory_items: Iterable[str],
-    carried: Mapping[str, int],
-) -> tuple[int, int]:
-    missing = tuple(
-        item for item in sorted(set(inventory_items)) if int(carried.get(item, 0)) <= 0
-    )
-    if not missing:
-        return 0, 0
-    pickup_tile = min(
-        SHED_ACCESS_TILES,
-        key=lambda tile: (_manhattan_distance(position, tile), tile),
-    )
-    direct = _manhattan_distance(position, entry)
-    detour = (
-        _manhattan_distance(position, pickup_tile)
-        + _manhattan_distance(pickup_tile, entry)
-        - direct
-    )
-    return max(0, detour), len(missing)
-
-
 def forecast_row_overloads(
     candidates: Iterable[HorizontalRouteCandidate],
     assignment: RouteAssignment,
@@ -999,14 +1082,10 @@ def forecast_row_overloads(
     worker_action_slots: Mapping[WorkerId, int] | None = None,
     remaining_action_slots: int | None = None,
     worker_inventories: Mapping[WorkerId, Mapping[str, int]] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
 ) -> tuple[dict[str, Any], ...]:
-    """Forecast complete physical-row work from the assigned primary routes.
-
-    This is the authoritative overload calculation shared by route splitting
-    and hiring. Completion includes the worker's planned entry travel, every
-    horizontal sweep move, effective tile interactions, and distinct inventory
-    pickup turns represented by the existing row-level estimator.
-    """
+    """Forecast physical-row overloads from canonical chained route costs."""
 
     ordered = tuple(sorted(candidates, key=lambda item: item.row_key))
     by_segment = {candidate.route_id: candidate for candidate in ordered}
@@ -1028,42 +1107,60 @@ def forecast_row_overloads(
             "row_overload_resolved": True,
             "primary_entry_elapsed": None,
             "primary_entry_travel_turns": 0,
+            "canonical_cost": None,
         }
 
+    remaining_shed = (
+        None
+        if shed_stock is None
+        else {str(item): max(0, int(amount)) for item, amount in shed_stock.items()}
+    )
+    remaining_global = (
+        None
+        if global_resources is None
+        else {str(item): max(0, int(amount)) for item, amount in global_resources.items()}
+    )
     for route in assignment.routes:
         if not route.segments or route.owner not in worker_positions:
             continue
-        position = worker_positions[route.owner]
-        carried = inventories.get(route.owner, {})
+        candidates_by_route_segment = {
+            segment.segment_id: by_segment.get(segment.segment_id)
+            or by_segment.get(segment.physical_row_id)
+            for segment in route.segments
+        }
+        route_cost_segments = tuple(
+            _candidate_cost_segment(candidate, segment.traversal)
+            for segment in route.segments
+            if (candidate := candidates_by_route_segment[segment.segment_id]) is not None
+        )
+        slots = (
+            slots_by_worker.get(route.owner)
+            if worker_action_slots is not None
+            else remaining_action_slots
+        )
+        cost = simulate_route_cost(
+            worker_positions[route.owner],
+            route_cost_segments,
+            carried_inventory=inventories.get(route.owner, {}),
+            remaining_action_slots=1_000_000_000 if slots is None else slots,
+            assignment_turn=assignment_hour,
+            shed_stock=remaining_shed,
+            global_resources=remaining_global,
+        )
+        if remaining_shed is not None:
+            for item, quantity in cost.supply_quantities_requiring_pickup:
+                remaining_shed[item] = max(0, remaining_shed.get(item, 0) - quantity)
+        if remaining_global is not None:
+            for item, quantity in cost.global_quantities_consumed:
+                remaining_global[item] = max(0, remaining_global.get(item, 0) - quantity)
+        costs_by_segment = {result.segment_id: result for result in cost.segment_results}
         for segment in route.segments:
-            candidate = by_segment.get(segment.segment_id)
+            candidate = candidates_by_route_segment[segment.segment_id]
             if candidate is not None:
-                distance = _manhattan_distance(position, segment.entry_tile)
-                pickups = sum(
-                    int(int(carried.get(item, 0)) <= 0)
-                    for item in candidate.inventory_items
-                )
-                entry_elapsed = distance + pickups
-                costs = _candidate_tile_values(
-                    candidate,
-                    candidate.forecasted_tile_interactions,
-                    candidate.forecasted_tile_interactions,
-                )
-                tile_costs = tuple(costs.get(tile, 0) for tile in segment.traversal)
-                completion_elapsed = (
-                    entry_elapsed
-                    + max(0, len(segment.traversal) - 1)
-                    + sum(tile_costs)
-                )
+                segment_cost = costs_by_segment[segment.segment_id]
                 diagnostic = rows[candidate.row_id]
-                slots = (
-                    slots_by_worker.get(route.owner)
-                    if worker_action_slots is not None
-                    else remaining_action_slots
-                )
                 overloaded = (
-                    slots is not None
-                    and completion_elapsed > slots
+                    segment_cost.hire_driving_interactions_missed > 0
                     and candidate.hire_driving_interactions > 0
                 )
                 diagnostic.update(
@@ -1071,14 +1168,39 @@ def forecast_row_overloads(
                         "primary_worker": route.owner.label,
                         "primary_tiles": [list(tile) for tile in segment.traversal],
                         "primary_expected_completion_turn": assignment_hour
-                        + completion_elapsed,
+                        + segment_cost.completion_elapsed_turns,
                         "helper_required": overloaded,
                         "row_overload_resolved": not overloaded,
-                        "primary_entry_elapsed": entry_elapsed,
-                        "primary_entry_travel_turns": distance + pickups,
+                        "primary_entry_elapsed": segment_cost.arrival_elapsed_turns,
+                        "primary_entry_travel_turns": (
+                            segment_cost.arrival_elapsed_turns
+                            - segment_cost.start_elapsed_turns
+                        ),
+                        "canonical_cost": {
+                            "total_turns": cost.total_turns,
+                            "completion_hour": cost.completion_hour,
+                            "route_complete_before_deadline": (
+                                cost.route_complete_before_deadline
+                            ),
+                            "effective_interactions_missed": (
+                                cost.effective_interactions_missed
+                            ),
+                            "supply_quantities_required": dict(
+                                cost.supply_quantities_required
+                            ),
+                            "supply_quantities_already_carried": dict(
+                                cost.supply_quantities_already_carried
+                            ),
+                            "supply_quantities_requiring_pickup": dict(
+                                cost.supply_quantities_requiring_pickup
+                            ),
+                            "supply_shortage": dict(cost.supply_shortage),
+                            "pickup_tile": cost.pickup_tile,
+                            "segment": segment_cost.to_json_dict(),
+                            "available_slots": slots,
+                        },
                     }
                 )
-
     return tuple(rows[candidate.row_id] for candidate in ordered)
 
 
@@ -1110,6 +1232,11 @@ def _fragment_candidate(
         candidate.forecasted_tile_interactions,
     )
     inventory = _candidate_inventory_by_tile(candidate)
+    work_items = (
+        dict(zip(candidate.owned_tiles, candidate.tile_work_items, strict=True))
+        if len(candidate.tile_work_items) == len(candidate.owned_tiles)
+        else {}
+    )
     tile_inventory = tuple(inventory.get(tile, ()) for tile in tiles)
     return replace(
         candidate,
@@ -1127,6 +1254,7 @@ def _fragment_candidate(
         inventory_items=tuple(sorted({item for values in tile_inventory for item in values})),
         tile_hire_driving_interactions=tuple(driving.get(tile, 0) for tile in tiles),
         tile_inventory_items=tile_inventory,
+        tile_work_items=tuple(work_items.get(tile, ()) for tile in tiles),
         physical_row_id=candidate.row_id,
     )
 
@@ -1166,6 +1294,7 @@ def _fragment_segment(
         sum(represented.get(tile, 0) for tile in traversal),
         sum(continuation.get(tile, 0) for tile in traversal),
         tuple(by_tile.get(tile, 0) for tile in traversal),
+        _candidate_cost_segment(candidate, traversal),
     )
 
 
@@ -1177,6 +1306,8 @@ def assign_horizontal_routes(
     remaining_action_slots: int | None = None,
     worker_action_slots: Mapping[WorkerId, int] | None = None,
     worker_inventories: Mapping[WorkerId, Mapping[str, int]] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
     enable_row_helpers: bool = True,
 ) -> RouteAssignment:
     """Pack rows and split any overloaded physical row across one helper."""
@@ -1188,6 +1319,9 @@ def assign_horizontal_routes(
         assignment_hour=assignment_hour,
         remaining_action_slots=remaining_action_slots,
         worker_action_slots=worker_action_slots,
+        worker_inventories=worker_inventories,
+        shed_stock=shed_stock,
+        global_resources=global_resources,
     )
     row_diagnostics = list(
         forecast_row_overloads(
@@ -1198,6 +1332,8 @@ def assign_horizontal_routes(
             worker_action_slots=worker_action_slots,
             remaining_action_slots=remaining_action_slots,
             worker_inventories=worker_inventories,
+            shed_stock=shed_stock,
+            global_resources=global_resources,
         )
     )
     if not enable_row_helpers or not row_diagnostics:
@@ -1207,6 +1343,81 @@ def assign_horizontal_routes(
     routes = list(base.routes)
     helper_routes: list[StripRoute] = []
     diagnostic_by_row = {row["physical_row_id"]: row for row in row_diagnostics}
+    by_id = {candidate.route_id: candidate for candidate in ordered_candidates}
+
+    def segments_for_route(route: StripRoute) -> tuple[RouteCostSegment, ...]:
+        values = []
+        for segment in route.segments:
+            if segment.cost_segment is not None:
+                values.append(segment.cost_segment)
+                continue
+            source = by_id.get(segment.segment_id) or by_id.get(
+                segment.physical_row_id
+            )
+            if source is not None:
+                values.append(_candidate_cost_segment(source, segment.traversal))
+        return tuple(values)
+
+    def simulate_split(
+        primary_route: StripRoute,
+        primary_segments: tuple[RouteCostSegment, ...],
+        helper: WorkerId,
+        helper_segment: RouteCostSegment,
+    ):
+        """Reallocate shared resources in the final worker execution order."""
+
+        route_segments = {
+            route.owner: segments_for_route(route)
+            for route in (*routes, *helper_routes)
+        }
+        route_segments[primary_route.owner] = primary_segments
+        route_segments[helper] = (helper_segment,)
+        available_shed = (
+            None
+            if shed_stock is None
+            else {
+                str(item): max(0, int(amount))
+                for item, amount in shed_stock.items()
+            }
+        )
+        available_global = (
+            None
+            if global_resources is None
+            else {
+                str(item): max(0, int(amount))
+                for item, amount in global_resources.items()
+            }
+        )
+        costs = {}
+        for owner in sorted(route_segments):
+            worker_slots = (
+                worker_action_slots.get(owner)
+                if worker_action_slots is not None
+                else remaining_action_slots
+            )
+            cost = simulate_route_cost(
+                worker_positions[owner],
+                route_segments[owner],
+                carried_inventory=(worker_inventories or {}).get(owner, {}),
+                remaining_action_slots=(
+                    1_000_000_000 if worker_slots is None else worker_slots
+                ),
+                assignment_turn=assignment_hour,
+                shed_stock=available_shed,
+                global_resources=available_global,
+            )
+            costs[owner] = cost
+            if available_shed is not None:
+                for item, quantity in cost.supply_quantities_requiring_pickup:
+                    available_shed[item] = max(
+                        0, available_shed.get(item, 0) - quantity
+                    )
+            if available_global is not None:
+                for item, quantity in cost.global_quantities_consumed:
+                    available_global[item] = max(
+                        0, available_global.get(item, 0) - quantity
+                    )
+        return costs[primary_route.owner], costs[helper]
 
     for candidate in ordered_candidates:
         diagnostic = diagnostic_by_row[candidate.row_id]
@@ -1232,11 +1443,9 @@ def assign_horizontal_routes(
             if segment.physical_row_id == candidate.row_id
         )
         original_segment = primary.segments[segment_index]
-        traversal = original_segment.traversal
-        costs = _candidate_tile_values(
-            candidate,
-            candidate.forecasted_tile_interactions,
-            candidate.forecasted_tile_interactions,
+        traversal_options = (
+            original_segment.traversal,
+            tuple(reversed(original_segment.traversal)),
         )
         primary_slots = (
             worker_action_slots.get(primary.owner, 0)
@@ -1247,10 +1456,12 @@ def assign_horizontal_routes(
             diagnostic["row_overload_resolved"] = True
             diagnostic["helper_required"] = False
             continue
-        primary_position = worker_positions[primary.owner]
-        primary_carried = (worker_inventories or {}).get(primary.owner, {})
         candidates_for_split = []
-        for suffix_size in range(1, len(traversal)):
+        for suffix_size, traversal in (
+            (size, oriented)
+            for size in range(1, len(original_segment.traversal))
+            for oriented in traversal_options
+        ):
             prefix = traversal[:-suffix_size]
             suffix = traversal[-suffix_size:]
             prefix_candidate = _fragment_candidate(
@@ -1262,53 +1473,78 @@ def assign_horizontal_routes(
                 role="HELPER",
                 boundary_index=len(prefix),
             )
-            new_pickups = sum(
-                int(int(primary_carried.get(item, 0)) <= 0)
-                for item in prefix_candidate.inventory_items
-            )
-            primary_start = (
-                _manhattan_distance(primary_position, original_segment.entry_tile)
-                + new_pickups
-            )
-            primary_completion = (
-                primary_start
-                + max(0, len(prefix) - 1)
-                + sum(costs[tile] for tile in prefix)
-            )
             for helper in helper_workers:
-                helper_position = worker_positions[helper]
                 helper_slots = (
                     worker_action_slots.get(helper, 0)
                     if worker_action_slots is not None
                     else remaining_action_slots
                 )
+                if helper_slots is None:
+                    continue
                 helper_traversal = tuple(reversed(suffix))
-                direct_travel = _manhattan_distance(
-                    helper_position, helper_traversal[0]
+                primary_cost_segments = []
+                for index, segment in enumerate(primary.segments):
+                    if index == segment_index:
+                        primary_cost_segments.append(
+                            _candidate_cost_segment(prefix_candidate, prefix)
+                        )
+                        continue
+                    prior_candidate = by_id.get(segment.segment_id)
+                    if prior_candidate is None:
+                        prior_candidate = next(
+                            (
+                                item
+                                for item in ordered_candidates
+                                if item.row_id == segment.physical_row_id
+                            ),
+                            None,
+                        )
+                    if prior_candidate is not None:
+                        primary_cost_segments.append(
+                            _candidate_cost_segment(prior_candidate, segment.traversal)
+                        )
+                helper_cost_segment = _candidate_cost_segment(
+                    helper_candidate, helper_traversal
                 )
-                pickup_detour, pickup_turns = _pickup_overhead(
-                    helper_position,
-                    helper_traversal[0],
-                    helper_candidate.inventory_items,
-                    (worker_inventories or {}).get(helper, {}),
+                primary_cost, helper_cost = simulate_split(
+                    primary,
+                    tuple(primary_cost_segments),
+                    helper,
+                    helper_cost_segment,
                 )
-                helper_completion = (
-                    direct_travel
-                    + pickup_detour
-                    + pickup_turns
-                    + max(0, len(helper_traversal) - 1)
-                    + sum(costs[tile] for tile in suffix)
+                prefix_result = next(
+                    result
+                    for result in primary_cost.segment_results
+                    if result.segment_id == prefix_candidate.route_id
                 )
                 if (
-                    primary_completion <= primary_slots
-                    and helper_slots is not None
-                    and helper_completion <= helper_slots
+                    primary_cost.resource_feasible
+                    and prefix_result.resource_feasible
+                    and helper_cost.resource_feasible
+                    and prefix_result.hire_driving_interactions_missed == 0
+                    and prefix_result.effective_interactions_missed == 0
+                    and helper_cost.hire_driving_interactions_missed == 0
+                    and helper_cost.effective_interactions_missed == 0
+                    and helper_cost.feasible_hire_driving_interaction_turns > 0
                 ):
+                    primary_movement = (
+                        primary_cost.setup_travel_turns
+                        + primary_cost.pickup_travel_turns
+                        + primary_cost.pickup_action_turns
+                        + primary_cost.inter_segment_travel_turns
+                        + primary_cost.horizontal_sweep_turns
+                    )
+                    helper_movement = (
+                        helper_cost.setup_travel_turns
+                        + helper_cost.pickup_travel_turns
+                        + helper_cost.pickup_action_turns
+                        + helper_cost.horizontal_sweep_turns
+                    )
                     candidates_for_split.append(
                         (
                             suffix_size,
-                            primary_completion + helper_completion,
-                            direct_travel + pickup_detour,
+                            prefix_result.completion_elapsed_turns + helper_cost.total_turns,
+                            primary_movement + helper_movement,
                             helper.index,
                             suffix,
                             helper,
@@ -1316,8 +1552,9 @@ def assign_horizontal_routes(
                             prefix_candidate,
                             helper_candidate,
                             helper_traversal,
-                            helper_completion,
-                            primary_start,
+                            helper_cost,
+                            prefix_result,
+                            primary_cost,
                         )
                     )
             if candidates_for_split:
@@ -1337,8 +1574,9 @@ def assign_horizontal_routes(
             prefix_candidate,
             helper_candidate,
             helper_traversal,
-            helper_completion,
-            primary_start,
+            helper_cost,
+            primary_segment_cost,
+            primary_route_cost,
         ) = selected
         prefix_segment = _fragment_segment(
             prefix_candidate,
@@ -1387,14 +1625,33 @@ def assign_horizontal_routes(
             {
                 "primary_tiles": [list(tile) for tile in prefix],
                 "primary_expected_completion_turn": assignment_hour
-                + primary_start
-                + max(0, len(prefix) - 1)
-                + sum(costs[tile] for tile in prefix),
+                + primary_segment_cost.completion_elapsed_turns,
                 "helper_required": True,
                 "helper_worker": helper.label,
                 "helper_tiles": [list(tile) for tile in helper_traversal],
-                "helper_expected_completion_turn": assignment_hour + helper_completion,
+                "helper_expected_completion_turn": assignment_hour + helper_cost.total_turns,
                 "row_overload_resolved": True,
+                "canonical_cost": {
+                    **(diagnostic.get("canonical_cost") or {}),
+                    "primary_after_split": {
+                        "total_turns": primary_route_cost.total_turns,
+                        "route_complete_before_deadline": (
+                            primary_route_cost.route_complete_before_deadline
+                        ),
+                        "effective_interactions_missed": (
+                            primary_route_cost.effective_interactions_missed
+                        ),
+                        "supply_quantities_required": dict(
+                            primary_route_cost.supply_quantities_required
+                        ),
+                        "supply_quantities_requiring_pickup": dict(
+                            primary_route_cost.supply_quantities_requiring_pickup
+                        ),
+                        "supply_shortage": dict(primary_route_cost.supply_shortage),
+                    },
+                    "primary_fragment": primary_segment_cost.to_json_dict(),
+                    "helper_fragment": helper_cost.to_json_dict(),
+                },
             }
         )
 

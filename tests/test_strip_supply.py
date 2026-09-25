@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 
 from executor_v0.plan import DailyPlan
+from executor_v0.strip_cost import route_cost_segment_from_items, simulate_route_cost
 from executor_v0.strip_executor import StripExecutorController
 from executor_v0.strip_routes import (
     StripRoute,
@@ -119,6 +120,59 @@ def test_demand_extraction_excludes_global_seeds_and_uses_work_items_once():
     demand, order = extract_route_supply_demand(route("A", 0), current)
     assert dict(demand) == {"FERTILIZER": 1, "WHEAT": 2}
     assert order == ("WHEAT", "FERTILIZER")
+
+
+def test_legacy_feed_place_demand_matches_candidates_planner_and_simulator():
+    feed = WorkItem(
+        id="FEED:0,0",
+        kind="FEED",
+        tile=(0, 0),
+        animal="COW",
+        quantity=2,
+        row_key=row_key_for_tile((0, 0)),
+    )
+    place = WorkItem(
+        id="PLACE:SHEEP:0,1",
+        kind="PLACE",
+        tile=(0, 1),
+        animal="SHEEP",
+        quantity=2,
+        row_key=row_key_for_tile((0, 1)),
+    )
+    current = work_plan(feed, place)
+    candidate = generate_horizontal_route_candidates(current)[0]
+    assigned = route(candidate.route_id, 0)
+    supply_plan = build_route_supply_plans(
+        (assigned,),
+        current,
+        {WorkerId(0): {}},
+        {"WHEAT": 2, "SHEEP": 1},
+        {WorkerId(0): (0, 0)},
+    )[0]
+    cost = simulate_route_cost(
+        (0, 0),
+        (
+            route_cost_segment_from_items(
+                candidate.route_id,
+                candidate.owned_tiles,
+                current.items,
+                physical_row_id=candidate.row_id,
+            ),
+        ),
+        remaining_action_slots=24,
+        shed_stock={"WHEAT": 2, "SHEEP": 1},
+        pickup_tile=supply_plan.pickup_tile,
+    )
+
+    assert candidate.tile_inventory_items[:2] == (("WHEAT",), ("SHEEP",))
+    assert dict(supply_plan.demand) == dict(cost.supply_quantities_required) == {
+        "SHEEP": 2,
+        "WHEAT": 2,
+    }
+    assert dict(supply_plan.reserved_from_shed) == dict(
+        cost.supply_quantities_requiring_pickup
+    ) == {"SHEEP": 1, "WHEAT": 2}
+    assert dict(cost.supply_shortage) == {"SHEEP": 1}
 
 
 def test_existing_inventory_is_worker_local_and_satisfies_first():

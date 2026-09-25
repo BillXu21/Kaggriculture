@@ -13,7 +13,12 @@ from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from executor_v0.foreman import SHED_ACCESS_TILES
+from executor_v0.strip_cost import (
+    LOCAL_ACTION_PRIORITY,
+    nearest_shed_access,
+    ordered_inventory_demand,
+    ordered_route_items,
+)
 from executor_v0.strip_routes import StripRoute, WorkerId
 from executor_v0.strip_work import StripWorkPlan, WorkItem
 
@@ -27,23 +32,6 @@ __all__ = [
     "extract_route_supply_demand",
     "extract_tile_supply_demand",
 ]
-
-
-# This is Packet 2's existing same-tile order.  The executor imports this map
-# as well, keeping supply first-use ordering and sweep ordering identical.
-LOCAL_ACTION_PRIORITY = {
-    "FEED": 10,
-    "FERTILIZE": 20,
-    "WATER": 30,
-    "CARE": 40,
-    "COLLECT_FERTILIZER": 50,
-    "HARVEST": 60,
-    "DIG": 70,
-    "BUILD_COOP": 80,
-    "BUILD_PASTURE": 81,
-    "PLACE": 90,
-    "PLANT": 100,
-}
 
 
 def _pairs(values: Mapping[str, int]) -> tuple[tuple[str, int], ...]:
@@ -172,17 +160,7 @@ class RouteSupplyState:
 
 
 def _ordered_route_items(route: StripRoute, work_plan: StripWorkPlan) -> tuple[WorkItem, ...]:
-    traversal_index = {tile: index for index, tile in enumerate(route.traversal)}
-    return tuple(
-        sorted(
-            (item for item in work_plan.items if item.tile in traversal_index),
-            key=lambda item: (
-                traversal_index[item.tile],
-                LOCAL_ACTION_PRIORITY.get(item.kind, 1000),
-                item.id,
-            ),
-        )
-    )
+    return ordered_route_items(work_plan.items, route.traversal)
 
 
 def extract_route_supply_demand(
@@ -194,20 +172,7 @@ def extract_route_supply_demand(
     non-inventory scopes are excluded rather than reinterpreted.
     """
 
-    demand: dict[str, int] = defaultdict(int)
-    first_use: list[str] = []
-    seen: set[str] = set()
-    for work_item in _ordered_route_items(route, work_plan):
-        for requirement in sorted(
-            work_item.required_supplies, key=lambda item: (item.item, item.quantity)
-        ):
-            if requirement.scope != "inventory" or requirement.quantity <= 0:
-                continue
-            demand[requirement.item] += requirement.quantity
-            if requirement.item not in seen:
-                seen.add(requirement.item)
-                first_use.append(requirement.item)
-    return _pairs(demand), tuple(first_use)
+    return ordered_inventory_demand(_ordered_route_items(route, work_plan))
 
 
 def extract_tile_supply_demand(
@@ -216,24 +181,9 @@ def extract_tile_supply_demand(
     """Summarize inventory-scoped demand for an unassigned tile set."""
 
     owned = set(tiles)
-    demand: dict[str, int] = defaultdict(int)
-    for work_item in work_plan.items:
-        if work_item.tile not in owned:
-            continue
-        for requirement in work_item.required_supplies:
-            if requirement.scope == "inventory" and requirement.quantity > 0:
-                demand[requirement.item] += requirement.quantity
-    return _pairs(demand)
-
-
-def _nearest_shed_access(position: tuple[int, int]) -> tuple[int, int]:
-    return min(
-        SHED_ACCESS_TILES,
-        key=lambda tile: (
-            abs(position[0] - tile[0]) + abs(position[1] - tile[1]),
-            tile,
-        ),
-    )
+    ordered = ordered_route_items(work_plan.items, tuple(sorted(owned)))
+    demand, _ = ordered_inventory_demand(ordered)
+    return demand
 
 
 def build_route_supply_plans(
@@ -270,7 +220,7 @@ def build_route_supply_plans(
             PickupBatch(item, reserved[item]) for item in item_order if reserved[item] > 0
         )
         position = worker_positions.get(route.owner)
-        pickup_tile = _nearest_shed_access(position) if sequence and position else None
+        pickup_tile = nearest_shed_access(position) if sequence and position else None
         plans.append(
             RouteSupplyPlan(
                 route_id=route.route_id,

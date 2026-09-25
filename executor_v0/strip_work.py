@@ -243,6 +243,7 @@ class EffectiveInteractionForecast:
 
     represented_interactions: int
     known_continuation_interactions: int
+    continuation_stages_by_work_item: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     @property
     def effective_interactions(self) -> int:
@@ -261,7 +262,7 @@ def forecast_effective_interactions(
 
     represented = tuple(items)
     kinds_by_tile: dict[tuple[int, int], set[str]] = defaultdict(set)
-    retained_harvest_tiles: set[tuple[int, int]] = set()
+    retained_harvest_by_tile: dict[tuple[int, int], str] = {}
     for item in represented:
         if item.tile is None:
             continue
@@ -271,18 +272,30 @@ def forecast_effective_interactions(
             and item.source == "routine_harvest"
             and item.crop in _RETAINED_ONE_SHOT_CROPS
         ):
-            retained_harvest_tiles.add(item.tile)
+            retained_harvest_by_tile.setdefault(item.tile, item.id)
 
-    continuation = sum(
-        int("PLANT" not in kinds_by_tile[tile])
-        + int("WATER" not in kinds_by_tile[tile])
-        for tile in retained_harvest_tiles
+    continuation_stages = tuple(
+        (
+            work_id,
+            tuple(
+                stage
+                for stage in ("PLANT", "WATER")
+                if stage not in kinds_by_tile[tile]
+            ),
+        )
+        for tile, work_id in sorted(retained_harvest_by_tile.items())
+        if any(
+            stage not in kinds_by_tile[tile] for stage in ("PLANT", "WATER")
+        )
     )
     return EffectiveInteractionForecast(
         represented_interactions=sum(
             max(0, int(item.interaction_turns)) for item in represented
         ),
-        known_continuation_interactions=continuation,
+        known_continuation_interactions=sum(
+            len(stages) for _, stages in continuation_stages
+        ),
+        continuation_stages_by_work_item=continuation_stages,
     )
 
 

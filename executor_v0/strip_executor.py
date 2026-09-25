@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from executor_v0.plan import DailyPlan
+from executor_v0.strip_cost import route_cost_segment_from_items, simulate_route_cost
 from executor_v0.strip_market import (
     MarketBootstrapState,
     build_market_turn_plan,
@@ -22,6 +23,7 @@ from executor_v0.strip_routes import (
     RoutePhase,
     StripRoute,
     WorkerId,
+    _candidate_cost_segment,
     assign_horizontal_routes,
     generate_horizontal_route_candidates,
     remaining_day_action_slots,
@@ -160,6 +162,8 @@ class StripExecutorController:
                 worker: remaining_day_action_slots(obs) for worker in positions
             },
             worker_inventories=inventories,
+            shed_stock=((obs.get("private") or {}).get("shed") or {}),
+            global_resources=((obs.get("private") or {}).get("seeds") or {}),
         )
         self._day = day
         self._plan = work_plan
@@ -292,69 +296,120 @@ class StripExecutorController:
         per_worker: dict[str, list[dict[str, Any]]] = {}
         complete_segments = 0
         useful_completed = 0
-        useful_total = sum(
-            candidate.forecasted_workload_interactions for candidate in candidates
+        useful_missed = 0
+        route_costs: dict[str, Any] = {}
+        private = obs.get("private") or {}
+        remaining_global = (
+            {
+                str(item): max(0, int(amount))
+                for item, amount in private.get("seeds", {}).items()
+            }
+            if isinstance(private.get("seeds"), Mapping)
+            else None
         )
+        remaining_unassigned_shed = {
+            str(item): max(0, int(amount))
+            for item, amount in (private.get("shed") or {}).items()
+        }
+        for supply_plan in self._supply_plans.values():
+            for item, quantity in supply_plan.reserved_from_shed:
+                remaining_unassigned_shed[item] = max(
+                    0, remaining_unassigned_shed.get(item, 0) - quantity
+                )
         for route in assignment.routes:
-            elapsed = 0
-            previous = positions[route.owner]
             entries: list[dict[str, Any]] = []
+            route_segments = []
             for segment in route.segments:
                 candidate = by_id.get(segment.segment_id) or by_id.get(
                     segment.physical_row_id
                 )
-                if candidate is None and not segment.forecast_tile_interactions:
+                if segment.cost_segment is not None:
+                    route_segments.append(segment.cost_segment)
+                elif candidate is not None:
+                    route_segments.append(
+                        _candidate_cost_segment(candidate, segment.traversal)
+                    )
+            supply_plan = self._supply_plans.get(route.route_id)
+            reserved = (
+                dict(supply_plan.reserved_from_shed)
+                if supply_plan is not None
+                else None
+            )
+            cost = simulate_route_cost(
+                positions[route.owner],
+                tuple(route_segments),
+                carried_inventory=self._latest_inventories.get(route.owner, {}),
+                remaining_action_slots=slots,
+                assignment_turn=start_hour,
+                reserved_supply=reserved,
+                global_resources=remaining_global,
+                pickup_tile=(
+                    supply_plan.pickup_tile if supply_plan is not None else None
+                ),
+            )
+            route_costs[route.route_id] = cost.to_json_dict()
+            if remaining_global is not None:
+                for item, quantity in cost.global_quantities_consumed:
+                    remaining_global[item] = max(
+                        0, remaining_global.get(item, 0) - quantity
+                    )
+            results = {value.segment_id: value for value in cost.segment_results}
+            for segment in route.segments:
+                segment_cost = results.get(segment.segment_id)
+                if segment_cost is None:
                     continue
-                elapsed += abs(previous[0] - segment.entry_tile[0]) + abs(
-                    previous[1] - segment.entry_tile[1]
+                complete_segments += int(segment_cost.complete_before_deadline)
+                useful_completed += (
+                    segment_cost.effective_interactions_completed_before_deadline
                 )
-                arrival = elapsed
-                counts = segment.forecast_tile_interactions
-                if len(counts) != len(segment.traversal):
-                    if candidate is None:
-                        counts = (0,) * (len(segment.traversal) - 1) + (
-                            segment.represented_interactions,
-                        )
-                    else:
-                        tile_counts = dict(
-                            zip(
-                                candidate.owned_tiles,
-                                candidate.forecasted_tile_interactions,
-                                strict=True,
-                            )
-                        )
-                        counts = tuple(
-                            tile_counts.get(tile, 0) for tile in segment.traversal
-                        )
-                completed = 0
-                for index, count in enumerate(counts):
-                    if index:
-                        elapsed += 1
-                    available = max(0, slots - elapsed)
-                    completed += min(max(0, int(count)), available)
-                    elapsed += max(0, int(count))
-                segment_complete = elapsed <= slots
-                complete_segments += int(segment_complete)
-                useful_completed += completed
+                useful_missed += segment_cost.effective_interactions_missed
                 entries.append(
                     {
                         "segment_id": segment.segment_id,
-                        "estimated_arrival_turn": start_hour + arrival,
-                        "estimated_completion_turn": start_hour + elapsed,
-                        "expected_useful_interactions_completed_before_deadline": completed,
-                        "expected_useful_interactions_left_after_deadline": max(
-                            0, sum(counts) - completed
+                        "estimated_arrival_turn": start_hour
+                        + segment_cost.arrival_elapsed_turns,
+                        "estimated_completion_turn": start_hour
+                        + segment_cost.completion_elapsed_turns,
+                        "expected_useful_interactions_completed_before_deadline": (
+                            segment_cost.effective_interactions_completed_before_deadline
                         ),
-                        "forecast_effective_interactions": sum(counts),
+                        "expected_useful_interactions_left_after_deadline": (
+                            segment_cost.effective_interactions_missed
+                        ),
+                        "forecast_effective_interactions": (
+                            segment_cost.effective_interaction_turns
+                        ),
                         "forecast_known_continuation_interactions": (
-                            segment.known_continuation_interactions
+                            segment_cost.known_continuation_turns
                         ),
-                        "expected_complete_before_deadline": segment_complete,
+                        "expected_complete_before_deadline": (
+                            segment_cost.complete_before_deadline
+                        ),
+                        "canonical_cost": segment_cost.to_json_dict(),
                     }
                 )
-                previous = segment.traversal[-1]
             per_worker[route.owner.label] = entries
-        useful_missed = max(0, useful_total - useful_completed)
+        for candidate in assignment.unassigned:
+            segment = _candidate_cost_segment(candidate, candidate.owned_tiles)
+            cost = simulate_route_cost(
+                candidate.owned_tiles[0],
+                (segment,),
+                remaining_action_slots=0,
+                assignment_turn=start_hour,
+                shed_stock=remaining_unassigned_shed,
+                global_resources=remaining_global,
+            )
+            route_costs[f"UNASSIGNED:{candidate.route_id}"] = cost.to_json_dict()
+            useful_missed += cost.effective_interactions_missed
+            for item, quantity in cost.supply_quantities_requiring_pickup:
+                remaining_unassigned_shed[item] = max(
+                    0, remaining_unassigned_shed.get(item, 0) - quantity
+                )
+            if remaining_global is not None:
+                for item, quantity in cost.global_quantities_consumed:
+                    remaining_global[item] = max(
+                        0, remaining_global.get(item, 0) - quantity
+                    )
         return {
             "deadline_route_diagnostics": per_worker,
             "per_worker_segment_sequence": {
@@ -370,6 +425,7 @@ class StripExecutorController:
             "useful_interactions_expected_missed": useful_missed,
             "expected_useful_interactions_completed": useful_completed,
             "expected_useful_interactions_missed": useful_missed,
+            "canonical_route_costs": route_costs,
             "overloaded_rows_detected": assignment.overloaded_rows_detected,
             "row_helpers_required": assignment.overloaded_rows_detected,
             "row_helpers_assigned": assignment.row_helpers_assigned,
@@ -625,6 +681,8 @@ class StripExecutorController:
             worker_inventories={
                 worker: self._worker_inventory(obs, worker) for worker in positions
             },
+            shed_stock=((obs.get("private") or {}).get("shed") or {}),
+            global_resources=((obs.get("private") or {}).get("seeds") or {}),
         )
         routes = {route.owner: route for route in assignment.routes}
         items_by_tile: dict[tuple[int, int], list[WorkItem]] = {}
@@ -688,7 +746,11 @@ class StripExecutorController:
         work_plan: StripWorkPlan,
         obs: Mapping[str, Any],
     ) -> tuple:
-        """Move toward or perform forecast work without retaining ownership."""
+        """Perform at most one reachable bootstrap action without ownership.
+
+        The distance check only guards this proposed action; it does not score
+        the route's total duration, which is owned by the canonical simulator.
+        """
 
         if route is None:
             return ("PASS",)
@@ -905,12 +967,16 @@ class StripExecutorController:
             old = self._supply_plans.get(route.route_id)
             old_demand = dict(old.demand) if old is not None else {}
             new_demand = dict(refreshed.demand)
+            old_requires_pickup = old.requires_pickup if old is not None else False
             added = any(
                 new_demand.get(item, 0) > old_demand.get(item, 0)
                 for item in new_demand
             )
+            pickup_became_available = (
+                refreshed.requires_pickup and not old_requires_pickup
+            )
             self._supply_plans[route.route_id] = refreshed
-            if not added or not refreshed.requires_pickup:
+            if not (added or pickup_became_available) or not refreshed.requires_pickup:
                 continue
             state = self._supply_states.setdefault(
                 route.route_id, RouteSupplyState()
@@ -981,7 +1047,7 @@ class StripExecutorController:
         )
         if route.phase == RoutePhase.PREPARE_SUPPLIES and supply_plan is not None:
             action = self._prepare_supplies(
-                route, position, supply_plan, supply_state, obs
+                route, position, supply_plan, supply_state, obs, work_plan
             )
             if action is not None:
                 return action
@@ -1198,6 +1264,7 @@ class StripExecutorController:
         supply_plan: RouteSupplyPlan,
         supply_state: RouteSupplyState,
         obs: Mapping[str, Any],
+        work_plan: StripWorkPlan,
     ) -> tuple | None:
         """Advance one bounded pickup step for an unfinalized supply batch.
 
@@ -1208,6 +1275,64 @@ class StripExecutorController:
 
         inventory = self._worker_inventory(obs, route.owner)
         shed = ((obs.get("private") or {}).get("shed") or {})
+        slots = remaining_day_action_slots(obs)
+        self._schedule_animal_revisit(route, work_plan)
+        items_by_tile: dict[tuple[int, int], list[WorkItem]] = {}
+        for item in work_plan.items:
+            if item.tile is not None:
+                items_by_tile.setdefault(item.tile, []).append(item)
+
+        def can_reach_first_interaction() -> bool:
+            segments = []
+            revisit_tile = self._animal_revisit_tiles.get(route.route_id)
+            if revisit_tile is not None:
+                segments.append(
+                    route_cost_segment_from_items(
+                        f"{route.route_id}:PICKUP_REVISIT:{revisit_tile[0]},{revisit_tile[1]}",
+                        (revisit_tile,),
+                        items_by_tile.get(revisit_tile, ()),
+                    )
+                )
+            else:
+                remaining_tiles = set(route.traversal[route.cursor :])
+                for segment in route.segments:
+                    traversal = tuple(
+                        tile for tile in segment.traversal if tile in remaining_tiles
+                    )
+                    if not traversal:
+                        continue
+                    segments.append(
+                        route_cost_segment_from_items(
+                            segment.segment_id,
+                            traversal,
+                            (
+                                item
+                                for tile in traversal
+                                for item in items_by_tile.get(tile, ())
+                            ),
+                            physical_row_id=segment.physical_row_id,
+                        )
+                    )
+            if not segments:
+                return False
+            reserved = dict(supply_plan.reserved_from_shed)
+            for item, quantity in supply_state.failed_or_unfulfilled.items():
+                reserved[item] = max(0, reserved.get(item, 0) - quantity)
+            estimate = simulate_route_cost(
+                position,
+                tuple(segments),
+                carried_inventory=inventory,
+                remaining_action_slots=slots,
+                assignment_turn=int(obs.get("hour", 0)),
+                reserved_supply=reserved,
+                global_resources=((obs.get("private") or {}).get("seeds") or {}),
+                pickup_tile=supply_plan.pickup_tile,
+            )
+            return (
+                estimate.first_interaction_turn is not None
+                and estimate.first_interaction_turn <= slots
+            )
+
         while True:
             batch = next(
                 (
@@ -1241,18 +1366,8 @@ class StripExecutorController:
                     supply_state.failed_or_unfulfilled.get(batch.item, 0) + remaining
                 )
                 continue
-            slots = remaining_day_action_slots(obs)
             if position != supply_plan.pickup_tile:
-                setup = (
-                    abs(position[0] - supply_plan.pickup_tile[0])
-                    + abs(position[1] - supply_plan.pickup_tile[1])
-                    + 1
-                    + abs(supply_plan.pickup_tile[0] - route.entry_tile[0])
-                    + abs(supply_plan.pickup_tile[1] - route.entry_tile[1])
-                    + max(0, len(route.traversal) - 1)
-                    + 1
-                )
-                if setup > slots:
+                if not can_reach_first_interaction():
                     route.blocked_local_work["DEADLINE_UNREACHABLE"] = (
                         route.blocked_local_work.get("DEADLINE_UNREACHABLE", 0) + 1
                     )
@@ -1268,14 +1383,7 @@ class StripExecutorController:
                     continue
                 supply_state.travel_turns += 1
                 return movement
-            setup = (
-                1
-                + abs(supply_plan.pickup_tile[0] - route.entry_tile[0])
-                + abs(supply_plan.pickup_tile[1] - route.entry_tile[1])
-                + max(0, len(route.traversal) - 1)
-                + 1
-            )
-            if setup > slots:
+            if not can_reach_first_interaction():
                 route.blocked_local_work["DEADLINE_UNREACHABLE"] = (
                     route.blocked_local_work.get("DEADLINE_UNREACHABLE", 0) + 1
                 )
@@ -1303,6 +1411,12 @@ class StripExecutorController:
         work_plan: StripWorkPlan,
         obs: Mapping[str, Any],
     ) -> bool:
+        """Guard one transfer with a one-use reachability check.
+
+        This does not estimate the segment's completion time; full assignment
+        and overload decisions use the canonical route cost simulator.
+        """
+
         slots = remaining_day_action_slots(obs)
         if slots <= 0:
             return False
@@ -1331,6 +1445,13 @@ class StripExecutorController:
         obs: Mapping[str, Any],
         target: tuple[int, int],
     ) -> bool:
+        """Guard the next movement turn against a futile departure.
+
+        The predicate asks whether any currently ready action remains
+        reachable (or whether one step toward a known continuation is useful).
+        It is a local execution safety check, not a whole-route forecast.
+        """
+
         slots = remaining_day_action_slots(obs)
         if slots <= 0:
             return False
@@ -1565,7 +1686,12 @@ class StripExecutorController:
         work_plan: StripWorkPlan,
         obs: Mapping[str, Any],
     ) -> bool:
-        """Defer optional work when it makes required tail work unreachable."""
+        """Ask whether one optional action pushes required tail work past the boundary.
+
+        This is a per-turn opportunity-cost guard for PASS-only cleanup.  It
+        does not predict route completion; planner deadline estimates use the
+        canonical route cost simulator.
+        """
 
         slots = remaining_day_action_slots(obs)
         if slots <= 0:

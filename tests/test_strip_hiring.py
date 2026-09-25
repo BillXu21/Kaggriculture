@@ -99,7 +99,9 @@ def work_plan(*items: WorkItem) -> StripWorkPlan:
     )
 
 
-def observation(*, hands=(), money=1000, hour=0, hires_today=0, shed=None) -> dict:
+def observation(
+    *, hands=(), money=1000, hour=0, hires_today=0, shed=None, seeds=None
+) -> dict:
     farm = {
         "money": float(money),
         "hires_today": hires_today,
@@ -116,7 +118,7 @@ def observation(*, hands=(), money=1000, hour=0, hires_today=0, shed=None) -> di
         "farms": [farm, copy.deepcopy(farm)],
         "private": {
             "shed": shed or {},
-            "seeds": {"WHEAT": 10},
+            "seeds": seeds if seeds is not None else {"WHEAT": 10},
             "inventories": [{} for _ in range(len(hands) + 1)],
         },
         "configuration": {
@@ -137,6 +139,7 @@ def hiring_plan(
     hour=0,
     hires_today=0,
     shed=None,
+    seeds=None,
     inventories=None,
     max_orders=10,
     positions=None,
@@ -158,6 +161,7 @@ def hiring_plan(
             hour=hour,
             hires_today=hires_today,
             shed=shed,
+            seeds=seeds,
         ),
         forecast,
         candidates,
@@ -241,6 +245,19 @@ def test_no_hire_driving_work_keeps_current_worker_target():
     assert result.stop_reason is HireStopReason.NO_HIRE_DRIVING_WORK
 
 
+def test_missing_inventory_stock_does_not_add_hire_driving_capacity():
+    result = hiring_plan(
+        [item("FEED", 0, requirements=(SupplyRequirement("WHEAT", 1),))],
+        shed={},
+    )
+
+    assert result.target_workers == 1
+    assert result.wanted_hires == 0
+    assert result.stop_reason is HireStopReason.NO_HIRE_DRIVING_WORK
+    assert result.route_estimates[0].resource_feasible is False
+    assert result.route_estimates[0].hire_driving is False
+
+
 def test_incremental_coverage_hires_to_final_useful_count(monkeypatch):
     result = hiring_plan_with_curve(monkeypatch, {1: 2, 2: 3, 3: 4, 4: 5})
     assert result.target_workers == 4
@@ -306,7 +323,13 @@ def test_large_board_hiring_adds_one_worker_for_an_overloaded_row():
         *(item("WATER", row) for row in range(8)),
         item("WATER", 9),
     ]
-    result = hiring_plan(rows, money=100_000, max_orders=10)
+    result = hiring_plan(
+        rows,
+        money=100_000,
+        max_orders=10,
+        shed={"WHEAT": 2},
+        seeds={"WHEAT": 10, "CARROT": 10, "MELON": 10},
+    )
 
     assert result.target_workers == 11
     assert result.overloaded_rows_detected == 1
@@ -320,10 +343,36 @@ def test_small_board_overload_adds_helper_without_changing_exact_no_overload_pac
         _overloaded_row_items(),
         money=100_000,
         positions={WorkerId(0): (5, 0)},
+        shed={"WHEAT": 2},
+        seeds={"WHEAT": 10, "CARROT": 10, "MELON": 10},
     )
     assert result.target_workers == 2
     assert result.row_helpers_required == 1
     assert result.row_helpers_assigned == 1
+
+
+def test_final_assignment_keeps_observed_workers_turn_during_hire(monkeypatch):
+    assignments = []
+    original_assign = strip_hiring.assign_horizontal_routes
+
+    def record_assignment(*args, **kwargs):
+        assignments.append(kwargs.get("worker_action_slots"))
+        return original_assign(*args, **kwargs)
+
+    monkeypatch.setattr(strip_hiring, "assign_horizontal_routes", record_assignment)
+    result = hiring_plan(
+        _overloaded_row_items(),
+        positions={WorkerId(0): (5, 0)},
+        shed={"WHEAT": 2},
+        seeds={"WHEAT": 10, "CARROT": 10, "MELON": 10},
+    )
+
+    assert result.target_workers == 2
+    final_slots = assignments[-1]
+    assert final_slots[WorkerId(0)] == remaining_day_action_slots(observation())
+    assert final_slots[WorkerId(1)] == remaining_day_action_slots(
+        observation(), include_current_turn=False
+    )
 
 
 def test_two_helper_orders_continue_toward_target_after_cap_observation():
@@ -371,7 +420,11 @@ def test_two_helper_orders_continue_toward_target_after_cap_observation():
         work_builder=lambda obs, daily_plan, **kwargs: forecast
     )
 
-    first = controller.act(observation(money=100_000), daily_plan())
+    seeds = {"WHEAT": 10, "CARROT": 10, "MELON": 10}
+    first = controller.act(
+        observation(money=100_000, seeds=seeds, shed={"WHEAT": 10}),
+        daily_plan(),
+    )
     assert first.diagnostics["hiring_diagnostics"]["target_workers"] == 17
     assert first.diagnostics["hiring_diagnostics"]["overloaded_rows_detected"] == 2
     assert first.market_actions == (("HIRE",),) * 10
@@ -381,6 +434,8 @@ def test_two_helper_orders_continue_toward_target_after_cap_observation():
         money=100_000,
         hour=1,
         hires_today=10,
+        seeds=seeds,
+        shed={"WHEAT": 10},
     )
     second = controller.act(confirmed, daily_plan())
     assert second.diagnostics["hiring_diagnostics"]["target_workers"] == 17
@@ -504,13 +559,39 @@ def test_impossible_route_does_not_poison_later_useful_route():
     assert result.route_estimates[1].hire_driving is True
 
 
-def test_useful_overloaded_route_can_drive_hire():
+def test_useful_work_fits_even_when_empty_route_tail_does_not():
     result = hiring_plan([item("WATER", 0)], hour=22)
     estimate = result.route_estimates[0]
     assert estimate.hire_driving is True
-    assert estimate.route_overloaded is True
+    assert estimate.route_overloaded is False
     assert estimate.useful_before_deadline is True
     assert result.wanted_hires == 0  # farmer already owns the only route
+
+
+def test_non_hire_driving_tail_does_not_mark_route_overloaded():
+    result = hiring_plan(
+        [
+            item("WATER", 0, x=0),
+            item(
+                "FERTILIZE",
+                0,
+                x=4,
+                source="fertilizer_policy",
+                requirements=(SupplyRequirement("FERTILIZER", 1),),
+            ),
+            item("WATER", 0, x=4, source="fertilizer_linked_productive"),
+        ],
+        hour=18,
+        inventories={WorkerId(0): {"FERTILIZER": 1}},
+        positions={WorkerId(0): (0, 0)},
+    )
+
+    estimate = result.route_estimates[0]
+    assert estimate.expected_useful_interactions_left_after_deadline == 0
+    assert estimate.forecast_effective_interactions > (
+        estimate.expected_useful_interactions_completed_before_deadline
+    )
+    assert estimate.route_overloaded is False
 
 
 def test_too_late_uncovered_route_does_not_drive_hiring():
@@ -766,28 +847,29 @@ def test_preceding_fertilizer_delays_first_use_past_deadline():
     estimate = result.route_estimates[1]
     assert estimate.route_index == 1
     assert estimate.first_use_work_id == "WATER:0:0"
-    # The packed single-worker chain approaches the second segment from the
-    # first segment's endpoint: movement 13, sweep to (0,0) 4,
-    # one batched FERTILIZER pickup, three fertilizer interactions, one water.
-    assert estimate.movement_turns == 13
+    # The canonical chain includes shed and inter-segment movement before the
+    # first WATER; all three earlier fertilizer interactions also consume turns.
+    assert estimate.movement_turns == 8
     assert estimate.preceding_interaction_turns == 3
     assert estimate.pickup_turns == 1
-    assert estimate.first_use_eta == 13 + 4 + 1 + 3 + 1
-    assert estimate.future_action_slots == 0
+    assert estimate.first_use_eta == 8 + 1 + 3 + 1
+    assert estimate.future_action_slots == 9
     assert estimate.useful_before_deadline is False
-    # The late route must not independently raise the coverage target.
-    assert result.target_workers == 1
-    assert result.wanted_hires == 0
-    assert result.orders == ()
+    # The overloaded NW work itself misses with one worker; the extra worker is
+    # still justified by canonical packed coverage freeing the NE row.
+    assert result.rows_expected_complete_with_n_workers == 0
+    assert result.rows_expected_complete_with_n_plus_one_workers == 1
+    assert result.target_workers == 2
+    assert result.wanted_hires == 1
 
 
 def test_preceding_fertilizer_still_useful_earlier_in_day():
     result = hiring_plan(_fertilizer_before_water_row(), shed={"FERTILIZER": 10}, hour=8)
     estimate = result.route_estimates[1]
-    # The improved packing gives the NW segment to the spawned worker, whose
-    # predicted position is already on its entry tile.
-    assert estimate.first_use_eta == 1
-    assert estimate.future_action_slots == 16
+    # The spawned worker still has to collect the route's fertilizer batch
+    # before entering the NW segment.
+    assert estimate.first_use_eta == 13
+    assert estimate.future_action_slots == 15
     assert estimate.useful_before_deadline is True
     assert result.target_workers == 2
     assert result.wanted_hires == result.submittable_hires == 1
@@ -819,27 +901,27 @@ def test_carried_fertilizer_removes_pickup_but_keeps_interactions():
         hour=14,
     )
     estimate = result.route_estimates[1]
-    assert estimate.preceding_interaction_turns == 0
+    assert estimate.preceding_interaction_turns == 3
     assert estimate.pickup_turns == 0
 
 
-def test_supplies_needed_after_first_driving_do_not_inflate_eta():
+def test_route_wide_pickup_precedes_first_driving_action():
     result = hiring_plan(
         [
             item("WATER", 0, x=5),  # NE route -> farmer
-            item("WATER", 0, x=4, source="optional_deferrable"),  # entry tile, first driving
+            item("WATER", 0, x=4, source="optional_deferrable"),
             item("FEED", 0, x=3, requirements=(SupplyRequirement("WHEAT", 1),)),
         ],
         shed={"WHEAT": 5},
         hour=8,
     )
     estimate = result.route_estimates[1]
-    assert estimate.first_use_work_id == "FEED:0:3"
+    assert estimate.first_use_work_id == "WATER:0:4"
     assert estimate.preceding_interaction_turns == 0
-    # The endpoint-aware packing gives this segment to the spawned worker;
-    # FEED is consequently the first driving item on its west-to-east sweep.
+    # Route supply is collected up front, even though the FEED is after WATER.
     assert estimate.pickup_turns == 1
-    assert estimate.first_use_eta == 21
+    assert estimate.movement_turns == 4
+    assert estimate.first_use_eta == 6
 
 
 # --- Packet 5B diagnostics cleanups -------------------------------------------

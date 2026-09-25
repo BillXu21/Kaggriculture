@@ -7,28 +7,26 @@ directly.  It has no dependency on the legacy task scheduler or hiring policy.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import Any
 
 from replay_daily.constants import FARM_HAND_COST_MULT_DEFAULT, hire_cost
 
-from executor_v0.foreman import SHED_ACCESS_TILES
+from executor_v0.strip_cost import (
+    RouteCostResult,
+    RouteCostSegment,
+    SegmentCostResult,
+    simulate_route_cost,
+)
 from executor_v0.strip_routes import (
     HorizontalRouteCandidate,
     WorkerId,
+    _candidate_cost_segment,
     assign_horizontal_routes,
     remaining_day_action_slots,
 )
-from executor_v0.strip_supply import LOCAL_ACTION_PRIORITY
-from executor_v0.strip_work import (
-    BlockReason,
-    StripWorkPlan,
-    SupplyRequirement,
-    WorkItem,
-    WorkStatus,
-    forecast_effective_interactions,
-)
+from executor_v0.strip_work import StripWorkPlan
 
 __all__ = [
     "HireStopReason",
@@ -73,6 +71,7 @@ class RouteLaborEstimate:
     expected_useful_interactions_left_after_deadline: int = 0
     forecast_effective_interactions: int = 0
     forecast_known_continuation_interactions: int = 0
+    resource_feasible: bool = True
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -120,10 +119,6 @@ class _SupplyLedger:
     shed: dict[str, int]
     seeds: dict[str, int]
 
-    def copy(self) -> _SupplyLedger:
-        return _SupplyLedger(dict(self.shed), dict(self.seeds))
-
-
 def _positive_counts(value: Any) -> dict[str, int]:
     if not isinstance(value, Mapping):
         return {}
@@ -163,259 +158,68 @@ def _spawn_positions(
     return tuple(spawned)
 
 
-def _nearest_shed_access(position: tuple[int, int]) -> tuple[int, int]:
-    """Mirror Packet 3's nearest shed-access tile (Manhattan, then tile order)."""
-
-    return min(
-        SHED_ACCESS_TILES,
-        key=lambda tile: (
-            abs(position[0] - tile[0]) + abs(position[1] - tile[1]),
-            tile,
-        ),
-    )
-
-
-def _is_fertilizer_only_item(
-    item: WorkItem, fertilizer_item_ids: frozenset[str] = frozenset()
-) -> bool:
-    return item.id in fertilizer_item_ids or item.kind == "FERTILIZE" or (
-        item.kind == "WATER" and item.source == "fertilizer_linked_productive"
-    )
-
-
-def _ordered_route_items(
-    candidate: HorizontalRouteCandidate,
-    work_plan: StripWorkPlan,
-    position: tuple[int, int],
-    traversal: tuple[tuple[int, int], ...] | None = None,
-) -> tuple[tuple[tuple[int, int], ...], tuple[WorkItem, ...]]:
-    if traversal is None:
-        left_to_right = candidate.owned_tiles
-        left, right = left_to_right[0], left_to_right[-1]
-        left_distance = abs(position[0] - left[0]) + abs(position[1] - left[1])
-        right_distance = abs(position[0] - right[0]) + abs(position[1] - right[1])
-        traversal = (
-            left_to_right
-            if left_distance <= right_distance
-            else tuple(reversed(left_to_right))
-        )
-    tile_rank = {tile: index for index, tile in enumerate(traversal)}
-    items = tuple(
-        sorted(
-            (
-                item
-                for item in work_plan.items
-                if item.tile in tile_rank and item.kind in LOCAL_ACTION_PRIORITY
-            ),
-            key=lambda item: (
-                tile_rank[item.tile],
-                LOCAL_ACTION_PRIORITY[item.kind],
-                item.id,
-            ),
-        )
-    )
-    return traversal, items
-
-
-def _consume_requirements(
-    item: WorkItem,
-    ledger: _SupplyLedger,
-    carried: dict[str, int],
-) -> bool:
-    trial = ledger.copy()
-    trial_carried = dict(carried)
-    requirements = list(item.required_supplies)
-    declared = {(requirement.item, requirement.scope) for requirement in requirements}
-    if item.kind == "PLANT" and item.crop and (item.crop, "global_seed") not in declared:
-        requirements.append(SupplyRequirement(item.crop, 1, "global_seed"))
-    if item.kind == "FEED" and ("WHEAT", "inventory") not in declared:
-        requirements.append(SupplyRequirement("WHEAT", max(1, item.quantity), "inventory"))
-    if item.kind == "PLACE" and item.animal and (item.animal, "inventory") not in declared:
-        requirements.append(SupplyRequirement(item.animal, max(1, item.quantity), "inventory"))
-    for requirement in requirements:
-        need = max(0, int(requirement.quantity))
-        if requirement.scope == "global_seed":
-            available = trial.seeds.get(requirement.item, 0)
-            if available < need:
-                return False
-            trial.seeds[requirement.item] = available - need
-            continue
-        from_worker = min(need, trial_carried.get(requirement.item, 0))
-        trial_carried[requirement.item] = (
-            trial_carried.get(requirement.item, 0) - from_worker
-        )
-        need -= from_worker
-        available = trial.shed.get(requirement.item, 0)
-        if available < need:
-            return False
-        trial.shed[requirement.item] = available - need
-    ledger.shed, ledger.seeds = trial.shed, trial.seeds
-    carried.clear()
-    carried.update(trial_carried)
-    return True
-
-
-def _item_can_progress(
-    item: WorkItem,
-    feasible_ids: set[str],
-    ledger: _SupplyLedger,
-    carried: dict[str, int],
-) -> bool:
-    if item.depends_on and not all(dependency in feasible_ids for dependency in item.depends_on):
-        return False
-    if item.status != WorkStatus.READY and item.block_reason not in {
-        BlockReason.DEPENDENCY_BLOCKED,
-        BlockReason.MISSING_SUPPLY,
-        BlockReason.MISSING_GLOBAL_RESOURCE,
-        BlockReason.MISSING_PURCHASE,
-    }:
-        return False
-    if item.block_reason == BlockReason.MISSING_PURCHASE:
-        if item.kind != "PLACE" or not item.animal:
-            return False
-        # Packet 1 may omit PLACE's inventory requirement while waiting for a
-        # purchase; _consume_requirements adds the exact implicit animal check.
-    return _consume_requirements(item, ledger, carried)
 
 
 def _estimate_route(
     candidate: HorizontalRouteCandidate,
     route_index: int,
-    position: tuple[int, int],
-    work_plan: StripWorkPlan,
-    ledger: _SupplyLedger,
-    carried: Mapping[str, int],
+    segment_cost: SegmentCostResult,
+    route_cost: RouteCostResult,
     action_slots: int,
-    fertilizer_item_ids: frozenset[str],
-    traversal: tuple[tuple[int, int], ...] | None = None,
 ) -> RouteLaborEstimate:
-    traversal, items = _ordered_route_items(candidate, work_plan, position, traversal)
-    original_carried = _positive_counts(carried)
-    route_carried = dict(original_carried)
-    feasible_ids: set[str] = set()
-    feasible: list[WorkItem] = []
-    for item in items:
-        if _item_can_progress(item, feasible_ids, ledger, route_carried):
-            feasible_ids.add(item.id)
-            feasible.append(item)
-
-    driving = [
-        item for item in feasible if not _is_fertilizer_only_item(item, fertilizer_item_ids)
-    ]
-    represented_driving = [
-        item
-        for item in items
-        if not _is_fertilizer_only_item(item, fertilizer_item_ids)
-    ]
-    fertilizer_only = bool(items) and not represented_driving
-    first = driving[0] if driving else None
-    first_use_eta: int | None = None
-    movement_turns = 0
-    pickup_turns = 0
-    preceding_interaction_turns = 0
-    if first is not None and first.tile is not None:
-        entry = traversal[0]
-        entry_travel = abs(position[0] - entry[0]) + abs(position[1] - entry[1])
-        sweep_travel = traversal.index(first.tile)
-        # The real executor stops on every tile and performs each executable
-        # local interaction before moving on.  Everything feasible ahead of the
-        # first hire-driving item (e.g. fertilizer upkeep) therefore costs turns.
-        preceding = feasible[: feasible.index(first)]
-        preceding_interaction_turns = sum(
-            item.interaction_turns for item in preceding
-        )
-        # Packet 3 performs one batched pickup per distinct inventory item that
-        # the worker does not already carry.  Only supplies needed by work up to
-        # and including the first driving item affect the first-use ETA.
-        prep_demand: dict[str, int] = {}
-        for item in (*preceding, first):
-            for requirement in item.required_supplies:
-                if requirement.scope == "global_seed" or requirement.quantity <= 0:
-                    continue
-                prep_demand[requirement.item] = (
-                    prep_demand.get(requirement.item, 0) + requirement.quantity
-                )
-        pickup_turns = sum(
-            1
-            for item, quantity in prep_demand.items()
-            if original_carried.get(item, 0) < quantity
-        )
-        if pickup_turns:
-            pickup_tile = _nearest_shed_access(position)
-            movement_turns = (
-                abs(position[0] - pickup_tile[0])
-                + abs(position[1] - pickup_tile[1])
-                + abs(pickup_tile[0] - entry[0])
-                + abs(pickup_tile[1] - entry[1])
-            )
-        else:
-            movement_turns = entry_travel
-        first_use_eta = (
-            movement_turns
-            + sweep_travel
-            + pickup_turns
-            + preceding_interaction_turns
-            + first.interaction_turns
-        )
-
-    inventory_items = {
-        requirement.item
-        for item in items
-        for requirement in item.required_supplies
-        if requirement.scope != "global_seed"
-    }
-    entry = traversal[0]
-    entry_travel = abs(position[0] - entry[0]) + abs(position[1] - entry[1])
-    interaction_forecast = forecast_effective_interactions(items)
-    estimated_full_turns = (
-        entry_travel
-        + max(0, len(traversal) - 1)
-        + interaction_forecast.effective_interactions
-        + len(inventory_items)
+    driving_turns = segment_cost.feasible_hire_driving_interaction_turns
+    represented_driving = candidate.hire_driving_interactions > 0
+    fertilizer_only = (
+        candidate.forecasted_workload_interactions > 0 and not represented_driving
     )
-    useful = first_use_eta is not None and first_use_eta <= action_slots
-    expected_useful = min(
-        len(driving),
-        max(
-            0,
-            action_slots
-            - movement_turns
-            - pickup_turns
-            - max(0, len(traversal) - 1),
-        ),
+    useful = (
+        driving_turns > 0
+        and segment_cost.first_use_turn is not None
+        and segment_cost.first_use_turn <= action_slots
     )
     reasons: list[str] = []
     if not represented_driving:
         reasons.append("FERTILIZER_ONLY" if fertilizer_only else "NO_HIRE_DRIVING_WORK")
-    elif first is None:
+    elif driving_turns <= 0:
         reasons.append("NO_MECHANICALLY_FEASIBLE_HIRE_DRIVING_WORK")
     elif not useful:
         reasons.append("FIRST_USE_AFTER_DEADLINE")
+    movement_turns = segment_cost.first_use_movement_turns
     return RouteLaborEstimate(
         route_id=candidate.route_id,
         route_index=route_index,
-        hire_driving=bool(driving),
+        hire_driving=driving_turns > 0,
         fertilizer_only=fertilizer_only,
-        first_use_eta=first_use_eta,
-        estimated_full_turns=estimated_full_turns,
-        future_action_slots=action_slots,
+        first_use_eta=segment_cost.first_use_turn,
+        estimated_full_turns=max(
+            0, segment_cost.completion_elapsed_turns - segment_cost.start_elapsed_turns
+        ),
+        future_action_slots=max(
+            0, action_slots - segment_cost.start_elapsed_turns
+        ),
         useful_before_deadline=useful,
-        route_overloaded=bool(items) and estimated_full_turns > action_slots,
-        first_use_work_id=first.id if first else None,
+        route_overloaded=(
+            driving_turns > 0
+            and segment_cost.hire_driving_interactions_missed > 0
+        ),
+        first_use_work_id=segment_cost.first_use_work_id,
         reasons=tuple(reasons),
         movement_turns=movement_turns,
-        pickup_turns=pickup_turns,
-        preceding_interaction_turns=preceding_interaction_turns,
-        estimated_arrival_turn=movement_turns,
-        estimated_completion_turn=estimated_full_turns,
-        expected_useful_interactions_completed_before_deadline=expected_useful,
-        expected_useful_interactions_left_after_deadline=max(
-            0, len(driving) - expected_useful
+        pickup_turns=route_cost.pickup_action_turns,
+        preceding_interaction_turns=(
+            segment_cost.first_use_preceding_interaction_turns
         ),
-        forecast_effective_interactions=interaction_forecast.effective_interactions,
-        forecast_known_continuation_interactions=(
-            interaction_forecast.known_continuation_interactions
+        estimated_arrival_turn=segment_cost.arrival_elapsed_turns,
+        estimated_completion_turn=segment_cost.completion_elapsed_turns,
+        expected_useful_interactions_completed_before_deadline=(
+            segment_cost.hire_driving_interactions_completed_before_deadline
         ),
+        expected_useful_interactions_left_after_deadline=(
+            segment_cost.hire_driving_interactions_missed
+        ),
+        forecast_effective_interactions=segment_cost.effective_interaction_turns,
+        forecast_known_continuation_interactions=segment_cost.known_continuation_turns,
+        resource_feasible=segment_cost.resource_feasible,
     )
 
 
@@ -445,14 +249,12 @@ def _estimate_packed_workers(
             for worker in worker_positions
         },
         worker_inventories=worker_inventories,
+        shed_stock=shed,
+        global_resources=seeds,
         enable_row_helpers=False,
     )
-    overloaded_rows = {
-        row["physical_row_id"]
-        for row in assignment.row_diagnostics
-        if row["helper_required"]
-    }
     by_id = {candidate.route_id: candidate for candidate in candidates}
+    index_by_id = {candidate.route_id: index for index, candidate in enumerate(candidates)}
     estimates: dict[str, RouteLaborEstimate] = {}
     completed_driving = 0
     driving_total = 0
@@ -460,42 +262,47 @@ def _estimate_packed_workers(
     for route in assignment.routes:
         position = worker_positions[route.owner]
         carried = _positive_counts(worker_inventories.get(route.owner))
-        elapsed = 0
         slots = future_action_slots + (1 if route.owner.index < current_workers else 0)
+        cost_segments: list[RouteCostSegment] = []
         for segment in route.segments:
-            candidate = by_id[segment.segment_id]
+            candidate = by_id.get(segment.segment_id)
+            if segment.cost_segment is not None:
+                cost_segments.append(segment.cost_segment)
+            elif candidate is not None:
+                cost_segments.append(_candidate_cost_segment(candidate, segment.traversal))
+        route_cost = simulate_route_cost(
+            position,
+            tuple(cost_segments),
+            carried_inventory=carried,
+            remaining_action_slots=slots,
+            shed_stock=ledger.shed,
+            global_resources=ledger.seeds,
+        )
+        for item, quantity in route_cost.supply_quantities_requiring_pickup:
+            ledger.shed[item] = max(0, ledger.shed.get(item, 0) - quantity)
+        for item, quantity in route_cost.global_quantities_consumed:
+            ledger.seeds[item] = max(0, ledger.seeds.get(item, 0) - quantity)
+        segment_costs = {result.segment_id: result for result in route_cost.segment_results}
+        for segment in route.segments:
+            candidate = by_id.get(segment.segment_id)
+            if candidate is None:
+                continue
             estimate = _estimate_route(
                 candidate,
-                next(index for index, value in enumerate(candidates) if value.route_id == candidate.route_id),
-                position,
-                work_plan,
-                ledger,
-                carried,
-                max(0, slots - elapsed),
-                fertilizer_item_ids,
-                segment.traversal,
-            )
-            estimate = replace(
-                estimate,
-                route_overloaded=candidate.route_id in overloaded_rows,
-                estimated_arrival_turn=elapsed + estimate.movement_turns,
-                estimated_completion_turn=elapsed + estimate.estimated_full_turns,
-                expected_useful_interactions_completed_before_deadline=(
-                    estimate.expected_useful_interactions_completed_before_deadline
-                ),
-                expected_useful_interactions_left_after_deadline=max(
-                    0,
-                    int(estimate.hire_driving)
-                    - estimate.expected_useful_interactions_completed_before_deadline,
-                ),
+                index_by_id[candidate.route_id],
+                segment_costs[segment.segment_id],
+                route_cost,
+                slots,
             )
             estimates[candidate.route_id] = estimate
             driving_total += int(estimate.hire_driving)
-            elapsed += estimate.estimated_full_turns
-            if estimate.hire_driving and elapsed <= slots:
+            if estimate.hire_driving and not estimate.expected_useful_interactions_left_after_deadline:
                 completed_driving += 1
-            position = segment.traversal[-1]
-    ordered = tuple(estimates[candidate.route_id] for candidate in candidates if candidate.route_id in estimates)
+    ordered = tuple(
+        estimates[candidate.route_id]
+        for candidate in candidates
+        if candidate.route_id in estimates
+    )
     return ordered, completed_driving, driving_total
 
 
@@ -591,6 +398,8 @@ def plan_strip_hiring(
             for worker in sorted(all_positions)[:base_target_workers]
         },
         worker_inventories=worker_inventories,
+        shed_stock=private.get("shed"),
+        global_resources=private.get("seeds"),
         enable_row_helpers=False,
     )
     overloaded_rows = overload_assignment.overloaded_rows_detected
@@ -622,6 +431,8 @@ def plan_strip_hiring(
                 for worker in helper_positions
             },
             worker_inventories=worker_inventories,
+            shed_stock=private.get("shed"),
+            global_resources=private.get("seeds"),
         )
         row_helpers_assigned = helper_target_assignment.row_helpers_assigned
         if row_helpers_assigned:
@@ -676,12 +487,14 @@ def plan_strip_hiring(
         worker_action_slots={
             worker: (
                 remaining_day_action_slots(obs)
-                if target_workers == current_workers
+                if worker.index < current_workers
                 else future_slots
             )
             for worker in final_worker_positions
         },
         worker_inventories=worker_inventories,
+        shed_stock=private.get("shed"),
+        global_resources=private.get("seeds"),
     )
     return StripHiringPlan(
         current_workers=current_workers,
