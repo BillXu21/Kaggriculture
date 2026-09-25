@@ -306,6 +306,34 @@ class EpisodeResult:
     manager_crop_rows: list[dict[str, Any]] = field(default_factory=list)
 
 
+def _canonical_executor_provenance_value(value: Any) -> Any:
+    """Copy executor identity into the strict JSON value domain."""
+    if value is None:
+        return value
+    if isinstance(value, str):
+        return str(value)
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("executor provenance contains a non-finite float")
+        return float(value)
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("executor provenance object keys must be strings")
+        return {
+            str(key): _canonical_executor_provenance_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_executor_provenance_value(item) for item in value]
+    raise TypeError(
+        f"executor provenance contains unsupported {type(value).__name__}"
+    )
+
+
 def _executor_factory_provenance(factory: Any) -> dict[str, Any]:
     """JSON-safe executor factory identity: name/version/identifier/hash."""
     name = str(getattr(factory, "name", "unknown"))
@@ -319,8 +347,8 @@ def _executor_factory_provenance(factory: Any) -> dict[str, Any]:
     }
     effective_profile = getattr(factory, "effective_profile", None)
     if effective_profile is not None:
-        provenance["effective_profile"] = copy.deepcopy(dict(effective_profile))
-    return provenance
+        provenance["effective_profile"] = effective_profile
+    return _canonical_executor_provenance_value(provenance)
 
 
 def _runner_opening_provenance(config: RunnerConfig) -> dict[str, Any]:
