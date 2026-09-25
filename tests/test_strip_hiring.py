@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 
+import executor_v0.strip_hiring as strip_hiring
 from executor_v0.plan import DailyPlan
 from executor_v0.strip_executor import StripExecutorController
 from executor_v0.strip_hiring import (
@@ -160,6 +161,103 @@ def hiring_plan(
     )
 
 
+def hiring_plan_with_curve(monkeypatch, completed_by_workers, *, driving_total=None, **kwargs):
+    """Keep the real planner boundary while fixing the packed estimator's curve."""
+
+    def estimate(_candidates, worker_positions, *_args, **_kwargs):
+        return (
+            (),
+            completed_by_workers[len(worker_positions)],
+            driving_total if driving_total is not None else max(completed_by_workers.values()),
+        )
+
+    monkeypatch.setattr(strip_hiring, "_estimate_packed_workers", estimate)
+    rows = [item("WATER", row) for row in range(len(completed_by_workers))]
+    return hiring_plan(rows, **kwargs)
+
+
+def test_multiple_useful_hires_reach_best_packed_coverage(monkeypatch):
+    result = hiring_plan_with_curve(monkeypatch, {1: 1, 2: 3, 3: 5, 4: 5})
+    assert result.target_workers == 3
+    assert result.wanted_hires == 2
+    assert result.orders == (("HIRE",), ("HIRE",))
+    assert result.hire_reason == "additional_workers_reach_best_packed_coverage"
+
+
+def test_existing_packed_capacity_wins_tie(monkeypatch):
+    result = hiring_plan_with_curve(
+        monkeypatch, {2: 5, 3: 5, 4: 5, 5: 5}, hands=((4, 4),)
+    )
+    assert result.target_workers == 2
+    assert result.wanted_hires == 0
+    assert result.orders == ()
+    assert result.hire_reason == "covered_by_existing_packed_capacity"
+
+
+def test_no_hire_driving_work_keeps_current_worker_target():
+    result = hiring_plan([], hands=((4, 4),))
+    assert result.target_workers == 2
+    assert result.wanted_hires == 0
+    assert result.stop_reason is HireStopReason.NO_HIRE_DRIVING_WORK
+
+
+def test_incremental_coverage_hires_to_final_useful_count(monkeypatch):
+    result = hiring_plan_with_curve(monkeypatch, {1: 2, 2: 3, 3: 4, 4: 5})
+    assert result.target_workers == 4
+    assert result.wanted_hires == 3
+    assert result.orders == (("HIRE",),) * 3
+
+
+def test_best_attainable_coverage_can_leave_work_unfinished(monkeypatch):
+    result = hiring_plan_with_curve(
+        monkeypatch, {1: 0, 2: 1, 3: 1}, driving_total=3
+    )
+    assert result.target_workers == 2
+    assert result.wanted_hires == 1
+    assert result.hire_reason == "additional_workers_reach_best_packed_coverage"
+
+
+def test_no_extra_worker_useful_before_deadline(monkeypatch):
+    result = hiring_plan_with_curve(
+        monkeypatch, {1: 1, 2: 1, 3: 1}, driving_total=3
+    )
+    assert result.target_workers == 1
+    assert result.orders == ()
+    assert result.hire_reason == "no_extra_worker_useful_before_deadline"
+
+
+def test_multi_hire_cash_uses_exact_sequential_fibonacci_prefix(monkeypatch):
+    result = hiring_plan_with_curve(
+        monkeypatch, {1: 1, 2: 2, 3: 3, 4: 4, 5: 5},
+        hires_today=1, money=3,
+    )
+    assert result.target_workers == 5
+    assert result.wanted_hires == 4
+    assert result.sequential_hire_costs == (1, 2, 3, 5)
+    assert result.affordable_hires == result.submittable_hires == 2
+    assert result.orders == (("HIRE",), ("HIRE",))
+    assert result.stop_reason is HireStopReason.CASH
+
+
+def test_multi_hire_order_cap_submits_legal_prefix(monkeypatch):
+    result = hiring_plan_with_curve(
+        monkeypatch, {1: 1, 2: 2, 3: 3, 4: 4, 5: 5}, max_orders=2
+    )
+    assert result.wanted_hires == result.affordable_hires == 4
+    assert result.submittable_hires == 2
+    assert result.orders == (("HIRE",), ("HIRE",))
+    assert result.stop_reason is HireStopReason.ORDER_CAP
+
+
+def test_controller_submits_multiple_hires_in_one_market_batch():
+    rows = [item("WATER", row, x=x) for row in range(10) for x in range(5)]
+    forecast = work_plan(*rows)
+    controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: forecast)
+    result = controller.act(observation(money=1000), daily_plan())
+    assert result.market_actions == (("HIRE",),) * 4
+    assert result.diagnostics["hiring_diagnostics"]["target_workers"] == 5
+
+
 def test_three_useful_rows_fit_one_packed_worker():
     result = hiring_plan([item("WATER", 0), item("WATER", 1), item("WATER", 2)])
     assert result.target_workers == 1
@@ -244,13 +342,12 @@ def test_sequential_fibonacci_affordability_and_no_economic_gate():
         money=2,
         hires_today=1,
     )
-    # The packed estimator now recognizes that two workers can cover the
-    # four contiguous rows without the old alternating-row travel penalty.
-    assert result.target_workers == 2
-    assert result.wanted_hires == 1
-    assert result.sequential_hire_costs == (1,)
+    # Three workers reach the best packed coverage, but cash buys only one.
+    assert result.target_workers == 3
+    assert result.wanted_hires == 2
+    assert result.sequential_hire_costs == (1, 2)
     assert result.affordable_hires == result.submittable_hires == 1
-    assert result.stop_reason.value == "COVERED"
+    assert result.stop_reason is HireStopReason.CASH
 
 
 def test_four_rows_three_workers_need_not_be_four_workers():
@@ -264,9 +361,9 @@ def test_four_rows_three_workers_need_not_be_four_workers():
         for _ in range(2)
     ]
     result = hiring_plan(rows)
-    assert result.target_workers == 2
-    assert result.wanted_hires == 1
-    assert result.hire_reason == "extra_worker_materially_completes_packed_work"
+    assert result.target_workers == 3
+    assert result.wanted_hires == 2
+    assert result.hire_reason == "additional_workers_reach_best_packed_coverage"
 
 
 def test_hiring_and_execution_expose_identical_packed_segment_groups():
@@ -503,9 +600,10 @@ def test_packed_capacity_avoids_order_cap_for_unneeded_workers():
         money=12,
         max_orders=3,
     )
-    assert result.wanted_hires == 1
-    assert result.affordable_hires == 1
-    assert result.submittable_hires == 1
+    assert result.target_workers == 3
+    assert result.wanted_hires == 2
+    assert result.affordable_hires == 2
+    assert result.submittable_hires == 2
     assert result.stop_reason is HireStopReason.COVERED
 
 
