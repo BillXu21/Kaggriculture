@@ -57,13 +57,18 @@ def item(
     status=WorkStatus.READY,
     requirements=(),
     x: int = 0,
+    crop: str | None = None,
+    animal: str | None = None,
+    item_id: str | None = None,
 ) -> WorkItem:
     tile = (row, x)
     return WorkItem(
-        id=f"{kind}:{row}:{x}",
+        id=item_id or f"{kind}:{row}:{x}",
         kind=kind,
         status=status,
         tile=tile,
+        crop=crop,
+        animal=animal,
         row_key=row_key_for_tile(tile),
         source=source,
         required_supplies=tuple(requirements),
@@ -170,6 +175,32 @@ def _large_row_items(count):
     ][:count]
 
 
+def _overloaded_row_items(row=0):
+    animals = [
+        item(
+            kind,
+            row,
+            x=tile,
+            source=f"routine_animal_{kind.lower()}",
+            animal=animal,
+            item_id=f"{kind}:{row}:{tile}",
+        )
+        for tile, animal in ((0, "COW"), (1, "SHEEP"))
+        for kind in ("FEED", "CARE", "HARVEST", "COLLECT_FERTILIZER")
+    ]
+    crops = [
+        item(
+            "HARVEST",
+            row,
+            x=tile,
+            source="routine_harvest",
+            crop=crop,
+        )
+        for tile, crop in zip((2, 3, 4), ("WHEAT", "CARROT", "MELON"), strict=True)
+    ]
+    return [*animals, *crops]
+
+
 def hiring_plan_with_curve(monkeypatch, completed_by_workers, *, driving_total=None, **kwargs):
     """Keep the real planner boundary while fixing the packed estimator's curve."""
 
@@ -267,6 +298,94 @@ def test_large_board_hiring_targets_one_worker_per_useful_row():
     assert result.submittable_hires == 10
     assert result.orders == (("HIRE",),) * 10
     assert result.stop_reason is HireStopReason.ORDER_CAP
+
+
+def test_large_board_hiring_adds_one_worker_for_an_overloaded_row():
+    rows = [
+        *_overloaded_row_items(8),
+        *(item("WATER", row) for row in range(8)),
+        item("WATER", 9),
+    ]
+    result = hiring_plan(rows, money=100_000, max_orders=10)
+
+    assert result.target_workers == 11
+    assert result.overloaded_rows_detected == 1
+    assert result.row_helpers_required == 1
+    assert result.row_helpers_assigned == 1
+    assert result.unresolved_overloaded_rows == 0
+
+
+def test_small_board_overload_adds_helper_without_changing_exact_no_overload_pack():
+    result = hiring_plan(
+        _overloaded_row_items(),
+        money=100_000,
+        positions={WorkerId(0): (5, 0)},
+    )
+    assert result.target_workers == 2
+    assert result.row_helpers_required == 1
+    assert result.row_helpers_assigned == 1
+
+
+def test_two_helper_orders_continue_toward_target_after_cap_observation():
+    rows = []
+    overloaded_candidates = {(9, 0), (9, 5)}
+    for index in range(15):
+        if index < 2:
+            row, x_start = 9, index * 5
+        else:
+            ordinary_index = index - 2
+            row = ordinary_index // 2
+            x_start = 0 if ordinary_index % 2 == 0 else 5
+        overload = (row, x_start) in overloaded_candidates
+        if overload:
+            animal_tiles = (x_start, x_start + 1)
+            rows.extend(
+                item(
+                    kind,
+                    row,
+                    x=tile,
+                    source=f"routine_animal_{kind.lower()}",
+                    animal=animal,
+                    item_id=f"{kind}:{index}:{tile}",
+                )
+                for tile, animal in zip(animal_tiles, ("COW", "SHEEP"), strict=True)
+                for kind in ("FEED", "CARE", "HARVEST", "COLLECT_FERTILIZER")
+            )
+            rows.extend(
+                item(
+                    "HARVEST",
+                    row,
+                    x=x_start + tile,
+                    source="routine_harvest",
+                    crop=crop,
+                    item_id=f"HARVEST:{index}:{tile}",
+                )
+                for tile, crop in zip(
+                    (2, 3, 4), ("WHEAT", "CARROT", "MELON"), strict=True
+                )
+            )
+        else:
+            rows.append(item("WATER", row, x=x_start))
+    forecast = work_plan(*rows)
+    controller = StripExecutorController(
+        work_builder=lambda obs, daily_plan, **kwargs: forecast
+    )
+
+    first = controller.act(observation(money=100_000), daily_plan())
+    assert first.diagnostics["hiring_diagnostics"]["target_workers"] == 17
+    assert first.diagnostics["hiring_diagnostics"]["overloaded_rows_detected"] == 2
+    assert first.market_actions == (("HIRE",),) * 10
+
+    confirmed = observation(
+        hands=((0, 0),) * 10,
+        money=100_000,
+        hour=1,
+        hires_today=10,
+    )
+    second = controller.act(confirmed, daily_plan())
+    assert second.diagnostics["hiring_diagnostics"]["target_workers"] == 17
+    assert second.diagnostics["hiring_diagnostics"]["wanted_hires"] == 6
+    assert second.market_actions == (("HIRE",),) * 6
 
 
 def test_large_board_hiring_keeps_target_but_submits_only_affordable_prefix():

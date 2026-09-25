@@ -147,12 +147,19 @@ class StripExecutorController:
         hire_stop_reason = self._daily.get("hire_stop_reason")
         work_plan = self._build_work_plan(obs, plan)
         positions = self._worker_positions(obs)
+        inventories = {
+            worker: self._worker_inventory(obs, worker) for worker in positions
+        }
         candidates = generate_horizontal_route_candidates(work_plan)
         assignment = assign_horizontal_routes(
             candidates,
             positions,
             assignment_hour=int(obs.get("hour", 0)),
             remaining_action_slots=remaining_day_action_slots(obs),
+            worker_action_slots={
+                worker: remaining_day_action_slots(obs) for worker in positions
+            },
+            worker_inventories=inventories,
         )
         self._day = day
         self._plan = work_plan
@@ -160,9 +167,7 @@ class StripExecutorController:
         self._routes = {route.owner: route for route in assignment.routes}
         self._unassigned_ids = tuple(route.route_id for route in assignment.unassigned)
         self._passed_work = {route.route_id: {} for route in assignment.routes}
-        self._latest_inventories = {
-            worker: self._worker_inventory(obs, worker) for worker in positions
-        }
+        self._latest_inventories = inventories
         self._initial_shed = {
             str(item): max(0, int(amount))
             for item, amount in ((obs.get("private") or {}).get("shed") or {}).items()
@@ -212,6 +217,14 @@ class StripExecutorController:
             },
             "route_workload": {
                 candidate.route_id: candidate.workload_interactions
+                for candidate in candidates
+            },
+            "route_forecast_effective_interactions": {
+                candidate.route_id: candidate.forecasted_workload_interactions
+                for candidate in candidates
+            },
+            "route_forecast_known_continuation_interactions": {
+                candidate.route_id: candidate.known_continuation_interactions
                 for candidate in candidates
             },
             "packed_rows_per_worker": {
@@ -279,26 +292,40 @@ class StripExecutorController:
         per_worker: dict[str, list[dict[str, Any]]] = {}
         complete_segments = 0
         useful_completed = 0
-        useful_total = sum(candidate.workload_interactions for candidate in candidates)
+        useful_total = sum(
+            candidate.forecasted_workload_interactions for candidate in candidates
+        )
         for route in assignment.routes:
             elapsed = 0
             previous = positions[route.owner]
             entries: list[dict[str, Any]] = []
             for segment in route.segments:
-                candidate = by_id.get(segment.segment_id)
-                if candidate is None:
+                candidate = by_id.get(segment.segment_id) or by_id.get(
+                    segment.physical_row_id
+                )
+                if candidate is None and not segment.forecast_tile_interactions:
                     continue
                 elapsed += abs(previous[0] - segment.entry_tile[0]) + abs(
                     previous[1] - segment.entry_tile[1]
                 )
                 arrival = elapsed
-                counts = candidate.tile_interactions
-                if len(counts) != len(candidate.owned_tiles):
-                    counts = (0,) * (len(candidate.owned_tiles) - 1) + (
-                        candidate.workload_interactions,
-                    )
-                if segment.traversal == tuple(reversed(candidate.owned_tiles)):
-                    counts = tuple(reversed(counts))
+                counts = segment.forecast_tile_interactions
+                if len(counts) != len(segment.traversal):
+                    if candidate is None:
+                        counts = (0,) * (len(segment.traversal) - 1) + (
+                            segment.represented_interactions,
+                        )
+                    else:
+                        tile_counts = dict(
+                            zip(
+                                candidate.owned_tiles,
+                                candidate.forecasted_tile_interactions,
+                                strict=True,
+                            )
+                        )
+                        counts = tuple(
+                            tile_counts.get(tile, 0) for tile in segment.traversal
+                        )
                 completed = 0
                 for index, count in enumerate(counts):
                     if index:
@@ -316,7 +343,11 @@ class StripExecutorController:
                         "estimated_completion_turn": start_hour + elapsed,
                         "expected_useful_interactions_completed_before_deadline": completed,
                         "expected_useful_interactions_left_after_deadline": max(
-                            0, int(candidate.workload_interactions) - completed
+                            0, sum(counts) - completed
+                        ),
+                        "forecast_effective_interactions": sum(counts),
+                        "forecast_known_continuation_interactions": (
+                            segment.known_continuation_interactions
                         ),
                         "expected_complete_before_deadline": segment_complete,
                     }
@@ -339,6 +370,11 @@ class StripExecutorController:
             "useful_interactions_expected_missed": useful_missed,
             "expected_useful_interactions_completed": useful_completed,
             "expected_useful_interactions_missed": useful_missed,
+            "overloaded_rows_detected": assignment.overloaded_rows_detected,
+            "row_helpers_required": assignment.overloaded_rows_detected,
+            "row_helpers_assigned": assignment.row_helpers_assigned,
+            "unresolved_overloaded_rows": assignment.unresolved_overloaded_rows,
+            "row_overload_diagnostics": list(assignment.row_diagnostics),
         }
 
     def reset_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
@@ -583,6 +619,12 @@ class StripExecutorController:
             positions,
             assignment_hour=int(obs.get("hour", 0)),
             remaining_action_slots=remaining_day_action_slots(obs),
+            worker_action_slots={
+                worker: remaining_day_action_slots(obs) for worker in positions
+            },
+            worker_inventories={
+                worker: self._worker_inventory(obs, worker) for worker in positions
+            },
         )
         routes = {route.owner: route for route in assignment.routes}
         items_by_tile: dict[tuple[int, int], list[WorkItem]] = {}
@@ -624,6 +666,11 @@ class StripExecutorController:
                 "idle_workers_with_unassigned_feasible_rows": (
                     assignment.idle_workers_with_unassigned_feasible_rows
                 ),
+                "row_overload_diagnostics": list(assignment.row_diagnostics),
+                "overloaded_rows_detected": assignment.overloaded_rows_detected,
+                "row_helpers_required": assignment.overloaded_rows_detected,
+                "row_helpers_assigned": assignment.row_helpers_assigned,
+                "unresolved_overloaded_rows": assignment.unresolved_overloaded_rows,
             }
         )
         return StripExecutorResult(

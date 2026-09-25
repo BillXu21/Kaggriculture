@@ -55,6 +55,7 @@ __all__ = [
     "RowKey",
     "WorkStatus",
     "WorkItem",
+    "EffectiveInteractionForecast",
     "WorkChain",
     "SupplyRequirement",
     "SupplyDemand",
@@ -65,6 +66,7 @@ __all__ = [
     "StripWorkConfig",
     "StripWorkPlan",
     "StripWorkResult",
+    "forecast_effective_interactions",
     "row_key_for_tile",
     "build_strip_work_plan",
 ]
@@ -233,6 +235,55 @@ class WorkItem:
         out["required_supplies"] = [r.to_json_dict() for r in self.required_supplies]
         out["row_key"] = self.row_key.to_json_dict() if self.row_key else None
         return out
+
+
+@dataclass(frozen=True)
+class EffectiveInteractionForecast:
+    """Represented work plus deterministic same-day continuation work."""
+
+    represented_interactions: int
+    known_continuation_interactions: int
+
+    @property
+    def effective_interactions(self) -> int:
+        return self.represented_interactions + self.known_continuation_interactions
+
+
+def forecast_effective_interactions(
+    items: Iterable[WorkItem],
+) -> EffectiveInteractionForecast:
+    """Return the shared deadline/hiring interaction forecast for ``items``.
+
+    Retained one-shot routine harvests are known to continue through PLANT and
+    WATER on the same day.  Those two interactions are forecast only when the
+    corresponding stages are not already represented on that tile.
+    """
+
+    represented = tuple(items)
+    kinds_by_tile: dict[tuple[int, int], set[str]] = defaultdict(set)
+    retained_harvest_tiles: set[tuple[int, int]] = set()
+    for item in represented:
+        if item.tile is None:
+            continue
+        kinds_by_tile[item.tile].add(item.kind)
+        if (
+            item.kind == "HARVEST"
+            and item.source == "routine_harvest"
+            and item.crop in _RETAINED_ONE_SHOT_CROPS
+        ):
+            retained_harvest_tiles.add(item.tile)
+
+    continuation = sum(
+        int("PLANT" not in kinds_by_tile[tile])
+        + int("WATER" not in kinds_by_tile[tile])
+        for tile in retained_harvest_tiles
+    )
+    return EffectiveInteractionForecast(
+        represented_interactions=sum(
+            max(0, int(item.interaction_turns)) for item in represented
+        ),
+        known_continuation_interactions=continuation,
+    )
 
 
 @dataclass(frozen=True)

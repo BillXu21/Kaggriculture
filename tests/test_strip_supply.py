@@ -6,7 +6,12 @@ import copy
 
 from executor_v0.plan import DailyPlan
 from executor_v0.strip_executor import StripExecutorController
-from executor_v0.strip_routes import StripRoute, WorkerId
+from executor_v0.strip_routes import (
+    StripRoute,
+    WorkerId,
+    assign_horizontal_routes,
+    generate_horizontal_route_candidates,
+)
 from executor_v0.strip_supply import (
     RouteSupplyState,
     build_route_supply_plans,
@@ -167,6 +172,55 @@ def test_shared_shed_reservation_is_assignment_ordered_and_non_overbooked():
     assert plans[1].reserved_from_shed == (("WHEAT", 1),)
     assert plans[1].missing_stock == (("WHEAT", 1),)
     assert sum(dict(plan.reserved_from_shed).get("WHEAT", 0) for plan in plans) == 3
+
+
+def test_helper_fragment_owns_its_supply_demand_exactly_once():
+    heavy = tuple(
+        WorkItem(
+            id=f"CARE:{tile}:{index}",
+            kind="CARE",
+            tile=(0, tile),
+            row_key=row_key_for_tile((0, tile)),
+        )
+        for tile in (0, 1)
+        for index in range(6)
+    ) + tuple(
+        WorkItem(
+            id=f"WATER:{index}",
+            kind="WATER",
+            tile=(0, 3),
+            row_key=row_key_for_tile((0, 3)),
+        )
+        for index in range(8)
+    )
+    feed = item("FEED", (0, 4), SupplyRequirement("WHEAT", 1))
+    current = work_plan(*heavy, feed)
+    candidate = generate_horizontal_route_candidates(current)
+    assignment = assign_horizontal_routes(
+        candidate,
+        {WorkerId(0): (0, 0), WorkerId(1): (9, 9)},
+        assignment_hour=0,
+        remaining_action_slots=24,
+    )
+    plans = build_route_supply_plans(
+        assignment.routes,
+        current,
+        {WorkerId(0): {}, WorkerId(1): {}},
+        {"WHEAT": 1},
+        {WorkerId(0): (0, 0), WorkerId(1): (9, 9)},
+    )
+
+    row = assignment.row_diagnostics[0]
+    helper = next(
+        route
+        for route in assignment.routes
+        if route.owner.label == row["helper_worker"]
+    )
+    by_route = {plan.route_id: plan for plan in plans}
+    assert (0, 4) in helper.owned_tiles
+    assert dict(by_route[helper.route_id].demand) == {"WHEAT": 1}
+    other = next(route for route in assignment.routes if route is not helper)
+    assert by_route[other.route_id].demand == ()
 
 
 def test_pickup_order_is_first_use_and_seed_demand_never_reserves():

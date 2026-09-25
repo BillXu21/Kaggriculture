@@ -31,6 +31,7 @@ from executor_v0.strip_work import (
     WorkDiagnostics,
     WorkItem,
     WorkStatus,
+    forecast_effective_interactions,
     row_key_for_tile,
 )
 
@@ -91,6 +92,7 @@ def work_item(
     *,
     status=WorkStatus.READY,
     crop=None,
+    animal=None,
     required_supplies=(),
     depends_on=(),
     block_reason=None,
@@ -104,6 +106,7 @@ def work_item(
         block_reason=block_reason,
         tile=tile,
         crop=crop,
+        animal=animal,
         depends_on=tuple(depends_on),
         required_supplies=tuple(required_supplies),
         row_key=row_key_for_tile(tile),
@@ -166,6 +169,277 @@ def test_horizontal_generation_and_exclusive_row_assignment():
         set(assigned.routes[0].owned_tiles)
         & set(assigned.routes[1].owned_tiles)
     )
+
+
+def test_retained_harvest_forecast_adds_two_continuations_per_crop_once():
+    harvests = tuple(
+        work_item(
+            "HARVEST",
+            (0, x),
+            crop=crop,
+            source="routine_harvest",
+            item_id=f"HARVEST:{x}",
+        )
+        for x, crop in enumerate(("WHEAT", "CARROT", "MELON"))
+    )
+    candidate = generate_horizontal_route_candidates(fake_plan(harvests))[0]
+
+    assert candidate.tile_interactions[:3] == (1, 1, 1)
+    assert candidate.tile_known_continuation_interactions[:3] == (2, 2, 2)
+    assert candidate.forecast_tile_interactions[:3] == (3, 3, 3)
+    assert candidate.represented_interactions == 3
+    assert candidate.known_continuation_interactions == 6
+    assert candidate.forecasted_workload_interactions == 9
+
+
+def test_retained_harvest_forecast_does_not_double_count_explicit_chain():
+    chain = (
+        work_item("HARVEST", (0, 0), crop="WHEAT", source="routine_harvest"),
+        work_item("PLANT", (0, 0), crop="WHEAT"),
+        work_item("WATER", (0, 0), crop="WHEAT"),
+    )
+    forecast = forecast_effective_interactions(chain)
+    candidate = generate_horizontal_route_candidates(fake_plan(chain))[0]
+
+    assert forecast.represented_interactions == 3
+    assert forecast.known_continuation_interactions == 0
+    assert candidate.forecasted_workload_interactions == 3
+
+
+def _overloaded_retained_row():
+    animals = tuple(
+        work_item(
+            kind,
+            (0, tile),
+            animal=animal,
+            item_id=f"{kind}:{tile}",
+            source=f"routine_animal_{kind.lower()}",
+        )
+        for tile, animal in ((0, "COW"), (1, "SHEEP"))
+        for kind in ("FEED", "CARE", "HARVEST", "COLLECT_FERTILIZER")
+    )
+    crops = tuple(
+        work_item(
+            "HARVEST",
+            (0, tile),
+            crop=crop,
+            source="routine_harvest",
+        )
+        for tile, crop in zip((2, 3, 4), ("WHEAT", "CARROT", "MELON"), strict=True)
+    )
+    return (*animals, *crops)
+
+
+def test_overloaded_row_gets_disjoint_contiguous_helper_suffix():
+    candidate = generate_horizontal_route_candidates(
+        fake_plan(_overloaded_retained_row())
+    )
+    assigned = assign_horizontal_routes(
+        candidate,
+        {WorkerId(0): (5, 0), WorkerId(1): (8, 4)},
+        assignment_hour=0,
+        remaining_action_slots=24,
+    )
+
+    row = assigned.row_diagnostics[0]
+    assert row["helper_required"] is True
+    assert row["row_overload_resolved"] is True
+    assert assigned.overloaded_rows_detected == 1
+    assert assigned.row_helpers_assigned == 1
+    primary = next(route for route in assigned.routes if route.owner == WorkerId(0))
+    helper = next(route for route in assigned.routes if route.owner == WorkerId(1))
+    assert set(primary.owned_tiles).isdisjoint(helper.owned_tiles)
+    assert set(primary.owned_tiles) | set(helper.owned_tiles) == set(candidate[0].owned_tiles)
+    assert all(route_cursor_invariants_hold(route) for route in assigned.routes)
+    assert len(
+        {segment.segment_id for route in assigned.routes for segment in route.segments}
+    ) == sum(len(route.segments) for route in assigned.routes)
+
+
+def test_helper_fragment_runs_retained_harvest_plant_water_continuation():
+    initial_items = _overloaded_retained_row()
+    initial_plan = fake_plan(initial_items)
+    candidates = generate_horizontal_route_candidates(initial_plan)
+    positions = {WorkerId(0): (5, 0), WorkerId(1): (8, 4)}
+    assignment = assign_horizontal_routes(
+        candidates,
+        positions,
+        assignment_hour=0,
+        remaining_action_slots=24,
+    )
+    row = assignment.row_diagnostics[0]
+    helper = next(
+        route for route in assignment.routes if route.owner.label == row["helper_worker"]
+    )
+    crop_tile = next(
+        item.tile
+        for item in initial_items
+        if item.kind == "HARVEST" and item.tile in helper.owned_tiles
+    )
+    crop = next(item.crop for item in initial_items if item.tile == crop_tile and item.kind == "HARVEST")
+    primary = next(route for route in assignment.routes if route is not helper)
+    assert crop_tile not in primary.owned_tiles
+
+    stage = 0
+
+    def builder(obs, plan_value, **kwargs):
+        del obs, plan_value, kwargs
+        if stage == 0:
+            return initial_plan
+        plant = work_item(
+            "PLANT",
+            crop_tile,
+            crop=crop,
+            source="retained_crop_maintenance",
+        )
+        if stage == 1:
+            water = work_item(
+                "WATER",
+                crop_tile,
+                crop=crop,
+                status=WorkStatus.BLOCKED,
+                block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                depends_on=(plant.id,),
+                source="planting_continuation",
+            )
+            return fake_plan((plant, water))
+        return fake_plan((work_item("WATER", crop_tile, crop=crop),))
+
+    controller = StripExecutorController(work_builder=builder)
+    controller._day = 3
+    controller._daily_plan = plan()
+    controller._plan = initial_plan
+    controller._assignment = assignment
+    controller._routes = {route.owner: route for route in assignment.routes}
+    controller._passed_work = {route.route_id: {} for route in assignment.routes}
+    controller._routes_finalized = True
+    helper_position = positions[helper.owner]
+    observed_actions = []
+    for hour in range(24):
+        obs = observation(
+            day=3,
+            hour=hour,
+            farmer=positions[WorkerId(0)],
+            hands=((helper_position[1], helper_position[0]),),
+            seeds={crop: 1},
+        )
+        obs["farms"][0]["tiles"][crop_tile[0]][crop_tile[1]] = (
+            {
+                "kind": "PLANT",
+                "crop": crop,
+                "planted_day": 0,
+                "yield_units": 1,
+                "watered_today": True,
+                "fertilized_until_day": -1,
+                "max_lifespan_step": -1,
+                "consecutive_unwatered": 0,
+            }
+            if stage == 0
+            else None
+            if stage == 1
+            else {
+                "kind": "PLANT",
+                "crop": crop,
+                "planted_day": 3,
+                "yield_units": 0,
+                "watered_today": False,
+                "fertilized_until_day": -1,
+                "max_lifespan_step": -1,
+                "consecutive_unwatered": 0,
+            }
+        )
+        result = controller.act(obs, plan())
+        helper_action = result.hands_actions[0]
+        if helper_action and helper_action[0] in {"HARVEST", "PLANT", "WATER"}:
+            observed_actions.append(helper_action[0])
+            if helper_action[0] == "HARVEST":
+                stage = 1
+            elif helper_action[0] == "PLANT":
+                stage = 2
+            else:
+                stage = 3
+        if stage == 3:
+            break
+        if helper_action == ("NORTH",):
+            helper_position = (helper_position[0] - 1, helper_position[1])
+        elif helper_action == ("SOUTH",):
+            helper_position = (helper_position[0] + 1, helper_position[1])
+        elif helper_action == ("WEST",):
+            helper_position = (helper_position[0], helper_position[1] - 1)
+        elif helper_action == ("EAST",):
+            helper_position = (helper_position[0], helper_position[1] + 1)
+
+    assert observed_actions == ["HARVEST", "PLANT", "WATER"]
+    assert crop_tile in helper.owned_tiles
+    assert crop_tile not in primary.owned_tiles
+    assert helper.continuation_status == "COMPLETED"
+
+
+def test_row_split_uses_smallest_suffix_that_makes_both_workers_feasible():
+    candidate = HorizontalRouteCandidate(
+        "ROW:TEST:0:0-4",
+        RowKey("NW", 0, 0, 0, 4),
+        tuple((0, x) for x in range(5)),
+        13,
+        13,
+        0,
+        tile_interactions=(1, 1, 1, 8, 1),
+        forecast_tile_interactions=(1, 1, 1, 8, 1),
+        tile_hire_driving_interactions=(1, 1, 1, 8, 1),
+    )
+    assigned = assign_horizontal_routes(
+        (candidate,),
+        {WorkerId(0): (0, 0), WorkerId(1): (0, 4)},
+        assignment_hour=0,
+        remaining_action_slots=12,
+    )
+
+    row = assigned.row_diagnostics[0]
+    assert row["row_overload_resolved"] is True
+    assert len(row["helper_tiles"]) == 2
+    assert len(row["primary_tiles"]) == 3
+    primary_tiles = {tuple(tile) for tile in row["primary_tiles"]}
+    helper_tiles = {tuple(tile) for tile in row["helper_tiles"]}
+    assert primary_tiles.isdisjoint(helper_tiles)
+    assert primary_tiles | helper_tiles == set(candidate.owned_tiles)
+
+
+def test_feasible_normal_row_keeps_one_five_tile_route():
+    candidate = generate_horizontal_route_candidates(
+        fake_plan((work_item("WATER", (0, 0)),))
+    )
+    assigned = assign_horizontal_routes(
+        candidate,
+        {WorkerId(0): (0, 0), WorkerId(1): (0, 4)},
+        assignment_hour=0,
+        remaining_action_slots=24,
+    )
+
+    assert assigned.row_diagnostics[0]["helper_required"] is False
+    assert len(assigned.routes) == 1
+    assert assigned.routes[0].owned_tiles == candidate[0].owned_tiles
+
+
+def test_unresolvable_two_worker_row_reports_without_third_helper():
+    candidate = HorizontalRouteCandidate(
+        "ROW:TEST:0:0-4",
+        RowKey("NW", 0, 0, 0, 4),
+        tuple((0, x) for x in range(5)),
+        5000,
+        5000,
+        0,
+    )
+    assigned = assign_horizontal_routes(
+        (candidate,),
+        {WorkerId(0): (0, 0), WorkerId(1): (0, 4)},
+        assignment_hour=0,
+        remaining_action_slots=24,
+    )
+
+    assert assigned.row_diagnostics[0]["helper_required"] is True
+    assert assigned.row_diagnostics[0]["row_overload_resolved"] is False
+    assert assigned.unresolved_overloaded_rows == 1
+    assert len(assigned.routes) == 1
 
 
 def test_assignment_endpoint_is_nearest_and_tie_is_left():

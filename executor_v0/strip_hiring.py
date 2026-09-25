@@ -27,6 +27,7 @@ from executor_v0.strip_work import (
     SupplyRequirement,
     WorkItem,
     WorkStatus,
+    forecast_effective_interactions,
 )
 
 __all__ = [
@@ -70,6 +71,8 @@ class RouteLaborEstimate:
     estimated_completion_turn: int = 0
     expected_useful_interactions_completed_before_deadline: int = 0
     expected_useful_interactions_left_after_deadline: int = 0
+    forecast_effective_interactions: int = 0
+    forecast_known_continuation_interactions: int = 0
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -92,6 +95,10 @@ class StripHiringPlan:
     rows_expected_complete_with_n_workers: int = 0
     rows_expected_complete_with_n_plus_one_workers: int = 0
     packed_segment_groups: tuple[tuple[str, ...], ...] = ()
+    overloaded_rows_detected: int = 0
+    row_helpers_required: int = 0
+    row_helpers_assigned: int = 0
+    unresolved_overloaded_rows: int = 0
 
     @property
     def orders(self) -> tuple[tuple[str], ...]:
@@ -359,8 +366,12 @@ def _estimate_route(
     }
     entry = traversal[0]
     entry_travel = abs(position[0] - entry[0]) + abs(position[1] - entry[1])
+    interaction_forecast = forecast_effective_interactions(items)
     estimated_full_turns = (
-        entry_travel + max(0, len(traversal) - 1) + len(items) + len(inventory_items)
+        entry_travel
+        + max(0, len(traversal) - 1)
+        + interaction_forecast.effective_interactions
+        + len(inventory_items)
     )
     useful = first_use_eta is not None and first_use_eta <= action_slots
     expected_useful = min(
@@ -401,6 +412,10 @@ def _estimate_route(
         expected_useful_interactions_left_after_deadline=max(
             0, len(driving) - expected_useful
         ),
+        forecast_effective_interactions=interaction_forecast.effective_interactions,
+        forecast_known_continuation_interactions=(
+            interaction_forecast.known_continuation_interactions
+        ),
     )
 
 
@@ -429,7 +444,14 @@ def _estimate_packed_workers(
             + int(worker.index < current_workers)
             for worker in worker_positions
         },
+        worker_inventories=worker_inventories,
+        enable_row_helpers=False,
     )
+    overloaded_rows = {
+        row["physical_row_id"]
+        for row in assignment.row_diagnostics
+        if row["helper_required"]
+    }
     by_id = {candidate.route_id: candidate for candidate in candidates}
     estimates: dict[str, RouteLaborEstimate] = {}
     completed_driving = 0
@@ -455,6 +477,7 @@ def _estimate_packed_workers(
             )
             estimate = replace(
                 estimate,
+                route_overloaded=candidate.route_id in overloaded_rows,
                 estimated_arrival_turn=elapsed + estimate.movement_turns,
                 estimated_completion_turn=elapsed + estimate.estimated_full_turns,
                 expected_useful_interactions_completed_before_deadline=(
@@ -499,7 +522,7 @@ def plan_strip_hiring(
     board_size = max(2, int(config.get("boardSize", 10)))
     predicted_spawns = _spawn_positions(
         tuple(worker_positions[worker] for worker in observed_workers),
-        max(0, len(candidates) - current_workers),
+        max(0, 2 * len(candidates) - current_workers),
         board_size,
     )
     fertilizer_item_ids = frozenset(
@@ -550,7 +573,66 @@ def plan_strip_hiring(
                 hire_reason = "no_extra_worker_useful_before_deadline"
             else:
                 hire_reason = "additional_workers_reach_best_packed_coverage"
+
+    base_target_workers = target_workers
+    overload_assignment = assign_horizontal_routes(
+        candidates,
+        {
+            worker: all_positions[worker]
+            for worker in sorted(all_positions)[:base_target_workers]
+        },
+        assignment_hour=int(obs.get("hour", 0)),
+        worker_action_slots={
+            worker: (
+                remaining_day_action_slots(obs)
+                if worker.index < current_workers
+                else future_slots
+            )
+            for worker in sorted(all_positions)[:base_target_workers]
+        },
+        worker_inventories=worker_inventories,
+        enable_row_helpers=False,
+    )
+    overloaded_rows = overload_assignment.overloaded_rows_detected
+    row_helpers_assigned = 0
+    helper_target_assignment = overload_assignment
+    if overloaded_rows:
+        # A dedicated extra position per forecast overload is the bounded
+        # correctness target. The assignment may use fewer if an observed idle
+        # worker is already available.
+        helper_capacity = max(
+            current_workers,
+            len(candidates) + overloaded_rows,
+            base_target_workers,
+        )
+        helper_positions = {
+            worker: all_positions[worker]
+            for worker in sorted(all_positions)[:helper_capacity]
+        }
+        helper_target_assignment = assign_horizontal_routes(
+            candidates,
+            helper_positions,
+            assignment_hour=int(obs.get("hour", 0)),
+            worker_action_slots={
+                worker: (
+                    remaining_day_action_slots(obs)
+                    if worker.index < current_workers
+                    else future_slots
+                )
+                for worker in helper_positions
+            },
+            worker_inventories=worker_inventories,
+        )
+        row_helpers_assigned = helper_target_assignment.row_helpers_assigned
+        if row_helpers_assigned:
+            target_workers = max(
+                base_target_workers,
+                len(candidates) + row_helpers_assigned,
+            )
+            hire_reason = "overloaded_rows_require_dedicated_helpers"
     final_estimates = packed_results.get(target_workers or current_workers, ((), 0, 0))[0]
+    if target_workers > max_workers:
+        final_estimates = packed_results.get(base_target_workers, ((), 0, 0))[0]
     estimates = list(final_estimates)
     rows_with_n = packed_results.get(current_workers, ((), 0, 0))[1]
     rows_with_n_plus_one = packed_results.get(
@@ -599,6 +681,7 @@ def plan_strip_hiring(
             )
             for worker in final_worker_positions
         },
+        worker_inventories=worker_inventories,
     )
     return StripHiringPlan(
         current_workers=current_workers,
@@ -621,4 +704,8 @@ def plan_strip_hiring(
             tuple(segment.segment_id for segment in route.segments)
             for route in final_assignment.routes
         ),
+        overloaded_rows_detected=overloaded_rows,
+        row_helpers_required=overloaded_rows,
+        row_helpers_assigned=final_assignment.row_helpers_assigned,
+        unresolved_overloaded_rows=final_assignment.unresolved_overloaded_rows,
     )
