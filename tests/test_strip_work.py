@@ -59,15 +59,27 @@ def plant(
     }
 
 
-def animal(name="GOOSE", *, fed_today=False, cared_today=False):
+def animal(
+    name="GOOSE",
+    *,
+    yield_units=0,
+    fertilizer_available=None,
+    fed_today=False,
+    cared_today=False,
+):
     return {
         "kind": "COOP" if name == "GOOSE" else "PASTURE",
         "animal": name,
         "placed_day": 0,
-        "yield_units": 0,
+        "yield_units": yield_units,
         "fed_today": fed_today,
         "cared_today": cared_today,
         "consecutive_unfed": 0,
+        **(
+            {"fertilizer_available": fertilizer_available}
+            if fertilizer_available is not None
+            else {}
+        ),
     }
 
 
@@ -341,6 +353,65 @@ def test_retained_harvest_output_is_deterministic():
     first = build_strip_work_plan(observation, daily_plan)
     second = build_strip_work_plan(copy.deepcopy(observation), daily_plan)
     assert first == second
+
+
+@pytest.mark.parametrize(
+    ("species", "product"),
+    [("GOOSE", "EGG"), ("COW", "MILK"), ("SHEEP", "WOOL")],
+)
+def test_routine_animal_harvest_maps_species_product_once(species, product):
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = animal(
+        species, yield_units=6, fed_today=True, cared_today=True
+    )
+
+    result = build_strip_work_plan(obs(board), plan())
+
+    harvests = kinds(result, "HARVEST")
+    assert len(harvests) == 1
+    harvest = harvests[0]
+    assert harvest.status == WorkStatus.READY
+    assert harvest.tile == (0, 0)
+    assert harvest.animal == species
+    assert harvest.product == product
+    assert harvest.source == "routine_animal_harvest"
+    assert result.diagnostics.work_counts_kind["HARVEST"] == 1
+    assert result.row_summary_by_key[row_key_for_tile((0, 0))].ready_interactions == 1
+
+
+def test_routine_animal_fertilizer_collection_requires_true_and_is_distinct():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = animal("SHEEP", fertilizer_available=True)
+    result = build_strip_work_plan(obs(board), plan())
+
+    harvests = kinds(result, "HARVEST")
+    collections = kinds(result, "COLLECT_FERTILIZER")
+    assert harvests == []
+    assert len(collections) == 1
+    collection = collections[0]
+    assert collection.status == WorkStatus.READY
+    assert collection.tile == (0, 0)
+    assert collection.animal == "SHEEP"
+    assert collection.product == "FERTILIZER"
+    assert collection.source == "routine_animal_fertilizer_collection"
+
+
+def test_routine_animal_outputs_expose_both_items_and_skip_zero_false():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = animal("SHEEP", yield_units=6, fertilizer_available=True)
+    both = build_strip_work_plan(obs(board), plan())
+    assert {item.kind for item in both.items if item.tile == (0, 0)} >= {
+        "HARVEST",
+        "COLLECT_FERTILIZER",
+    }
+    assert len(kinds(both, "HARVEST")) == 1
+    assert len(kinds(both, "COLLECT_FERTILIZER")) == 1
+    assert both.row_summary_by_key[row_key_for_tile((0, 0))].ready_interactions == 2
+
+    board[0][0] = animal("SHEEP", yield_units=0, fertilizer_available=False)
+    neither = build_strip_work_plan(obs(board), plan())
+    assert kinds(neither, "HARVEST") == []
+    assert kinds(neither, "COLLECT_FERTILIZER") == []
 
 
 def test_animal_build_and_place_are_retained_when_purchase_is_missing():

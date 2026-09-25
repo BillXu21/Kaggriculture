@@ -690,6 +690,63 @@ def test_controller_executes_retained_routine_harvest():
     )
 
 
+def test_controller_collects_animal_outputs_across_refreshed_observations():
+    initial = observation(day=8, farmer=(0, 0))
+    initial["farms"][0]["tiles"][0][0] = {
+        "kind": "PASTURE",
+        "animal": "SHEEP",
+        "placed_day": 0,
+        "yield_units": 6,
+        "fertilizer_available": True,
+        "fed_today": True,
+        "cared_today": True,
+        "consecutive_unfed": 0,
+    }
+    target = plan()
+    controller = StripExecutorController()
+
+    collected_fertilizer = controller.act(initial, target)
+    assert collected_fertilizer.farmer_action == ("COLLECT_FERTILIZER",)
+    assert any(
+        item.id == "COLLECT_FERTILIZER:0,0"
+        and item.source == "routine_animal_fertilizer_collection"
+        for item in controller._plan.items
+    )
+
+    after_fertilizer = copy.deepcopy(initial)
+    after_fertilizer["hour"] = 1
+    after_fertilizer["step"] += 1
+    after_fertilizer["farms"][0]["tiles"][0][0]["fertilizer_available"] = False
+    after_fertilizer["private"]["inventories"][0] = {"FERTILIZER": 1}
+    harvested = controller.act(after_fertilizer, target)
+    assert harvested.farmer_action == ("HARVEST",)
+    assert any(
+        item.id == "HARVEST:0,0"
+        and item.animal == "SHEEP"
+        and item.product == "WOOL"
+        and item.source == "routine_animal_harvest"
+        for item in controller._plan.items
+    )
+
+    after_harvest = copy.deepcopy(after_fertilizer)
+    after_harvest["hour"] = 2
+    after_harvest["step"] += 1
+    after_harvest["farms"][0]["tiles"][0][0]["yield_units"] = 0
+    after_harvest["private"]["inventories"][0] = {
+        "FERTILIZER": 1,
+        "WOOL": 6,
+    }
+    finished = controller.act(after_harvest, target)
+    assert finished.farmer_action not in {
+        ("HARVEST",),
+        ("COLLECT_FERTILIZER",),
+    }
+    assert not any(
+        item.kind in {"HARVEST", "COLLECT_FERTILIZER"}
+        for item in controller._plan.items
+    )
+
+
 @pytest.mark.parametrize("crop,day", [("WHEAT", 3), ("CARROT", 3), ("MELON", 10)])
 def test_retained_one_shot_harvest_replants_and_waters_same_day(crop, day):
     initial = observation(day=day, farmer=(0, 0))

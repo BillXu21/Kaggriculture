@@ -1188,6 +1188,33 @@ def build_strip_work_plan(
                 source="routine_harvest",
             )
 
+    for y, row in enumerate(board):
+        for x, tile in enumerate(row):
+            if quadrant_of(y, x) not in allowed_quadrants:
+                continue
+            if not isinstance(tile, Mapping) or tile.get("animal") not in ANIMALS:
+                continue
+            coord = (y, x)
+            animal = str(tile["animal"])
+            if tile.get("yield_units", 0) > 0:
+                builder.add(
+                    id=f"HARVEST:{y},{x}",
+                    kind="HARVEST",
+                    tile=coord,
+                    animal=animal,
+                    product=str(ANIMALS[animal]["product"]),
+                    source="routine_animal_harvest",
+                )
+            if tile.get("fertilizer_available") is True:
+                builder.add(
+                    id=f"COLLECT_FERTILIZER:{y},{x}",
+                    kind="COLLECT_FERTILIZER",
+                    tile=coord,
+                    animal=animal,
+                    product="FERTILIZER",
+                    source="routine_animal_fertilizer_collection",
+                )
+
     unresolved_space_reason = (
         BlockReason.LOCKED_LAND
         if plan.land_count > len(unlocked)
