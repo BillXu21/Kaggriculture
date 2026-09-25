@@ -1004,8 +1004,8 @@ def forecast_row_overloads(
 
     This is the authoritative overload calculation shared by route splitting
     and hiring. Completion includes the worker's planned entry travel, every
-    horizontal sweep move, effective tile interactions, and a route's initial
-    supply detour/pickup turns when those supplies are already represented.
+    horizontal sweep move, effective tile interactions, and distinct inventory
+    pickup turns represented by the existing row-level estimator.
     """
 
     ordered = tuple(sorted(candidates, key=lambda item: item.row_key))
