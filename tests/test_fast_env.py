@@ -229,6 +229,25 @@ def _hire_hands(env: FastKaggricultureEnv, counts: list[int]) -> None:
         env.step(actions)
 
 
+def test_farmer_action_and_hire_are_legal_in_same_turn() -> None:
+    env = FastKaggricultureEnv({"seed": 7})
+    observations = env.reset()
+    before = observations[0]["farms"][0]
+    x, y = before["farmer"]
+    direction = "EAST" if x < 4 else "WEST"
+
+    observations, _, statuses = env.step([
+        {"farmer": [direction], "hands": [], "market": [["HIRE"]]},
+        pass_action(),
+    ])
+
+    after = observations[0]["farms"][0]
+    assert statuses == ["ACTIVE", "ACTIVE"]
+    assert after["farmer"] != [x, y]
+    assert len(after["hands"]) == 1
+    assert after["hires_today"] == 1
+
+
 def test_scalar_api_supports_23_simultaneous_hands() -> None:
     # 10 orders/turn x 3 turns reaches 23 hands with startingMoney=100000
     # (total Fibonacci hire cost F(25)-1 = 75024). The old 16-slot layout
@@ -297,7 +316,6 @@ def test_hire_mask_matches_official_reachable_semantics() -> None:
     # observation money/hand_count/hires_today feeding the expectation are
     # the same decoded fields the real-official oracle proves identical.
     unit_mask_width = 18 + 17 + 101
-    market_mask_width = 7 + 17 + 101
     market_base = (MAX_HANDS + 1) * unit_mask_width
 
     def hire_mask_bit(env: FastKaggricultureEnv) -> int:

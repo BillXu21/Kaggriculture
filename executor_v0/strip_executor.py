@@ -425,7 +425,9 @@ class StripExecutorController:
                             "submitted": submitted,
                         }
                         self._hire_submitted += submitted
-                        return self._bootstrap_pass_result(obs, self._hire_plan.orders)
+                        return self._bootstrap_work_result(
+                            obs, work_plan, self._hire_plan.orders
+                        )
                 self._bootstrap_stage = "FINALIZED"
             work_plan = self._finalize_day(obs, active_plan)
             self._routes_finalized = True
@@ -560,6 +562,76 @@ class StripExecutorController:
             market_actions=tuple(tuple(order) for order in market_actions),
             diagnostics=self._diagnostics(),
         )
+
+    def _bootstrap_work_result(
+        self,
+        obs: Mapping[str, Any],
+        work_plan: StripWorkPlan,
+        market_actions: tuple[tuple, ...] | tuple,
+    ) -> StripExecutorResult:
+        """Let only currently observed workers make one safe provisional step."""
+
+        positions = self._worker_positions(obs)
+        assignment = assign_horizontal_routes(
+            generate_horizontal_route_candidates(work_plan),
+            positions,
+            assignment_hour=int(obs.get("hour", 0)),
+            remaining_action_slots=remaining_day_action_slots(obs),
+        )
+        routes = {route.owner: route for route in assignment.routes}
+        items_by_tile: dict[tuple[int, int], list[WorkItem]] = {}
+        for item in work_plan.items:
+            if item.tile is not None and item.kind != "DIG":
+                items_by_tile.setdefault(item.tile, []).append(item)
+        local_items_by_tile = {
+            tile: tuple(items) for tile, items in items_by_tile.items()
+        }
+        actions = tuple(
+            self._bootstrap_worker_action(
+                routes.get(worker),
+                positions[worker],
+                local_items_by_tile,
+                work_plan,
+                obs,
+            )
+            for worker in sorted(positions)
+        )
+        return StripExecutorResult(
+            farmer_action=actions[0] if actions else ("PASS",),
+            hands_actions=actions[1:],
+            market_actions=tuple(tuple(order) for order in market_actions),
+            diagnostics=self._diagnostics(),
+        )
+
+    def _bootstrap_worker_action(
+        self,
+        route: StripRoute | None,
+        position: tuple[int, int],
+        items_by_tile: Mapping[tuple[int, int], tuple[WorkItem, ...]],
+        work_plan: StripWorkPlan,
+        obs: Mapping[str, Any],
+    ) -> tuple:
+        """Move toward or perform forecast work without retaining ownership."""
+
+        if route is None:
+            return ("PASS",)
+        inventory = self._worker_inventory(obs, route.owner)
+        slots = remaining_day_action_slots(obs)
+        for tile in route.traversal:
+            item = self._select_local_item(items_by_tile.get(tile, ()), inventory)
+            if item is None:
+                continue
+            if item.source == "optional_deferrable" and self._optional_would_starve_tail(
+                route, tile, work_plan, obs
+            ):
+                continue
+            distance = abs(position[0] - tile[0]) + abs(position[1] - tile[1])
+            if distance + 1 > slots:
+                return ("PASS",)
+            if position != tile:
+                return _vertical_first_step(position, tile) or ("PASS",)
+            return _interaction_action(item) or ("PASS",)
+        return ("PASS",)
 
     def _reconcile_hire_observation(self, obs: Mapping[str, Any]) -> None:
         pending = self._pending_hires

@@ -18,6 +18,7 @@ from executor_v0.strip_routes import (
     assign_horizontal_routes,
     generate_horizontal_route_candidates,
     remaining_day_action_slots,
+    route_cursor_invariants_hold,
 )
 from executor_v0.strip_work import (
     RowSummary,
@@ -256,6 +257,23 @@ def test_controller_submits_multiple_hires_in_one_market_batch():
     result = controller.act(observation(money=1000), daily_plan())
     assert result.market_actions == (("HIRE",),) * 4
     assert result.diagnostics["hiring_diagnostics"]["target_workers"] == 5
+    assert result.farmer_action != ("PASS",)
+    assert result.hands_actions == ()
+
+
+def test_existing_hand_can_work_during_hire_submission():
+    rows = [item("WATER", row, x=x) for row in range(10) for x in range(5)]
+    forecast = work_plan(*rows)
+    controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: forecast)
+    result = controller.act(
+        observation(hands=((1, 0),), money=1000), daily_plan()
+    )
+
+    assert result.market_actions
+    assert all(order == ("HIRE",) for order in result.market_actions)
+    assert result.farmer_action != ("PASS",)
+    assert len(result.hands_actions) == 1
+    assert result.hands_actions[0] != ("PASS",)
 
 
 def test_three_useful_rows_fit_one_packed_worker():
@@ -467,6 +485,64 @@ def test_partial_hire_realization_recomputes_target_without_phantom_worker():
     assert second.market_actions == ()
     assert second.diagnostics["routes_finalized"] is True
     assert len(controller.routes) == 1
+
+
+def test_hire_submission_reconciles_before_final_route_ownership():
+    forecast = work_plan(
+        *(item("WATER", row, x=x) for row in range(10) for x in range(5))
+    )
+    controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: forecast)
+    submitted = controller.act(observation(money=1000), daily_plan())
+    assert submitted.market_actions == (("HIRE",),) * 4
+    assert submitted.farmer_action != ("PASS",)
+    assert submitted.hands_actions == ()
+
+    confirmed = observation(
+        hands=((4, 4), (5, 4), (4, 5), (5, 5)),
+        money=990,
+        hires_today=4,
+        hour=1,
+    )
+    result = controller.act(confirmed, daily_plan())
+    assert result.market_actions == ()
+    assert result.diagnostics["routes_finalized"] is True
+    assert result.diagnostics["observed_hires"] == 4
+    assert controller._pending_hires is None
+    assert result.diagnostics["worker_count_final"] == 5
+    assert len(result.hands_actions) == 4
+
+    route_ids = [
+        segment.segment_id
+        for route in controller.routes
+        for segment in route.segments
+    ]
+    assert len(route_ids) == len(set(route_ids))
+    assert all(route_cursor_invariants_hold(route) for route in controller.routes)
+    observed_workers = set(controller._worker_positions(confirmed))
+    assert {route.owner for route in controller.routes} <= observed_workers
+
+
+def test_failed_hires_keep_progress_and_finalize_only_observed_workers():
+    forecast = work_plan(
+        *(item("WATER", row, x=x) for row in range(10) for x in range(5))
+    )
+    controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: forecast)
+
+    first = controller.act(observation(money=1000), daily_plan())
+    assert first.market_actions
+    assert first.farmer_action != ("PASS",)
+    first_submitted = len(first.market_actions)
+
+    second = controller.act(observation(money=1000, hour=1), daily_plan())
+    assert second.market_actions
+    assert controller._hire_failures == first_submitted
+    second_submitted = len(second.market_actions)
+
+    final = controller.act(observation(money=1000, hour=2), daily_plan())
+    assert final.diagnostics["routes_finalized"] is True
+    assert final.diagnostics["failed_hires"] == first_submitted + second_submitted
+    assert final.diagnostics["worker_count_final"] == 1
+    assert {route.owner for route in controller.routes} <= {WorkerId(0)}
 
 
 def test_confirmed_hire_uses_real_endpoint_and_packet3_supply_plan():
