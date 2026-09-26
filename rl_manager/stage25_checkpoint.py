@@ -1121,22 +1121,26 @@ def migrate_stage25_bc_checkpoint_for_ppo(
     expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
     allow_legacy_e: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Explicitly migrate a physical-baseline BC checkpoint as weights only.
+    """Explicitly migrate a physical-baseline checkpoint as weights only.
 
     General native checkpoint loading remains strict. This seam accepts only
-    the known v1/v2/v3 BC architectures, requires explicit physical morning
-    baseline provenance, copies every compatible parameter leaf, and zeroes
-    only missing observation-conditioning leaves. BC optimizer state and
-    RNG are deliberately discarded; callers must create a fresh PPO state.
+    the known v1/v2/v3 BC-training or inference architectures, requires
+    explicit physical morning baseline provenance, copies every compatible
+    parameter leaf, and zeroes only missing observation-conditioning leaves.
+    Any BC optimizer state and RNG are deliberately discarded; callers must
+    create a fresh PPO state.
     """
     source_path = Path(source)
     flat, meta = _read_archive(source_path)
     if meta.get("format") != STAGE25_CHECKPOINT_VERSION:
         raise Stage25CheckpointError(
             f"{source_path}: architecture migration requires a native Stage 2.5 archive")
-    if meta.get("payload_kind") != BC_TRAINING_PAYLOAD_KIND:
+    source_payload_kind = meta.get("payload_kind")
+    if source_payload_kind not in (
+            BC_TRAINING_PAYLOAD_KIND, INFERENCE_PAYLOAD_KIND):
         raise Stage25CheckpointError(
-            f"{source_path}: architecture migration accepts BC weights only")
+            f"{source_path}: architecture migration accepts native BC-training "
+            "or inference weights only")
     architecture = meta.get("architecture_version")
     legacy = _LEGACY_PHYSICAL_BASELINE_SOURCES.get(architecture)
     if legacy is None:
@@ -1186,9 +1190,14 @@ def migrate_stage25_bc_checkpoint_for_ppo(
                    allow_legacy_e=allow_legacy_e, path=source_path)
     _validate_flat_against_manifest(flat, meta, source_path)
 
-    allowed_array_names = {"rng"}
-    allowed_array_names.update(
-        key for key in flat if key.startswith(("param:", "opt:")))
+    allowed_array_names = {
+        key for key in flat
+        if key.startswith("param:") or (
+            source_payload_kind == BC_TRAINING_PAYLOAD_KIND
+            and key.startswith("opt:"))
+    }
+    if source_payload_kind == BC_TRAINING_PAYLOAD_KIND:
+        allowed_array_names.add("rng")
     if set(flat) != allowed_array_names:
         raise Stage25CheckpointError(
             f"{source_path}: source contains unexpected native arrays")
@@ -1226,8 +1235,11 @@ def migrate_stage25_bc_checkpoint_for_ppo(
         "transfer": "weights_only_architecture_migration",
         "resumable": False,
         "optimizer_state_discarded": True,
+        "optimizer_state_present":
+            source_payload_kind == BC_TRAINING_PAYLOAD_KIND,
         "source_identity": source_identity,
         "source_metadata": {
+            "payload_kind": source_payload_kind,
             "architecture_version": architecture,
             "observation_schema_version": meta["observation_schema_version"],
             "bc_target": meta["bc_target"],
@@ -1237,7 +1249,10 @@ def migrate_stage25_bc_checkpoint_for_ppo(
             "source_identity": meta.get("source_identity", {}),
         },
         "architecture_migration": {
-            "kind": "stage25_bc_to_opponent_summary_v4",
+            "kind": (
+                "stage25_bc_to_opponent_summary_v4"
+                if source_payload_kind == BC_TRAINING_PAYLOAD_KIND
+                else "stage25_inference_to_opponent_summary_v4"),
             "source_architecture_version": architecture,
             "target_architecture_version": ARCHITECTURE_VERSION,
             "source_observation_schema_version":

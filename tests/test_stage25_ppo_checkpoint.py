@@ -20,6 +20,7 @@ from rl_manager.stage25_checkpoint import (
     initialize_stage25_ppo_from_checkpoint,
     migrate_stage25_bc_checkpoint_for_ppo,
     load_stage25_bc_checkpoint,
+    load_stage25_inference_checkpoint,
     load_stage25_ppo_checkpoint,
     save_stage25_bc_checkpoint,
     save_stage25_inference_checkpoint,
@@ -89,6 +90,57 @@ def _write_legacy_physical_bc(path: Path, architecture: str) -> tuple[dict, dict
         "architecture_version": architecture,
         "observation_schema_version": old_observation,
         "observation_vocabulary": list(vocab),
+        "crop_baseline_semantics": "physical_morning_board_counts",
+        "bc_target": checkpoint.BC_TARGET_VERSION,
+    })
+    meta["e_identity"]["observation_schema_version"] = old_observation
+    meta["leaf_manifest"] = checkpoint._leaf_manifest(items)
+    items["__meta__"] = np.frombuffer(
+        json.dumps(meta, sort_keys=True, separators=(",", ":")).encode(),
+        dtype=np.uint8)
+    with open(path, "wb") as handle:
+        np.savez(handle, **items)
+    params_flat = checkpoint._flatten_arrays(params)
+    for name in missing:
+        params_flat.pop(name)
+    return params_flat, meta
+
+
+def _write_legacy_physical_inference(
+        path: Path, architecture: str) -> tuple[dict[str, np.ndarray], dict]:
+    config = _config()
+    params = init_stage25_params(config, seed=29)
+    save_stage25_inference_checkpoint(
+        path, params, config, seed=29,
+        source_identity={"checkpoint": "physical-baseline-inference"},
+        provenance={"dataset": "physical-morning-baseline"},
+    )
+    with np.load(path, allow_pickle=False) as archive:
+        items = {key: archive[key] for key in archive.files}
+    meta = json.loads(items.pop("__meta__").tobytes().decode("utf-8"))
+    missing = {
+        "stage25_policy_v1": [
+            "replaceable_conditioning", "available_crop_slots_conditioning",
+            "opponent_conditioning"],
+        "stage25_policy_v2_replaceable_today": [
+            "available_crop_slots_conditioning", "opponent_conditioning"],
+        "stage25_policy_v3_crop_lifecycle_capacity": [
+            "opponent_conditioning"],
+    }[architecture]
+    for name in missing:
+        items.pop(f"param:{name}")
+    old_observation, vocab_end = {
+        "stage25_policy_v1": ("stage25_corrected_e_own_only_v1", -3),
+        "stage25_policy_v2_replaceable_today": (
+            "stage25_corrected_e_own_only_replaceable_today_v2", -2),
+        "stage25_policy_v3_crop_lifecycle_capacity": (
+            "stage25_corrected_e_own_only_crop_lifecycle_capacity_v3", -1),
+    }[architecture]
+    meta.update({
+        "architecture_version": architecture,
+        "observation_schema_version": old_observation,
+        "observation_vocabulary": list(
+            checkpoint.OBSERVATION_VOCABULARY[:vocab_end]),
         "crop_baseline_semantics": "physical_morning_board_counts",
         "bc_target": checkpoint.BC_TARGET_VERSION,
     })
@@ -271,6 +323,9 @@ def test_explicit_physical_bc_migration_is_weights_only_and_preserves_policy(
     assert metadata["transfer"] == "weights_only_architecture_migration"
     assert metadata["resumable"] is False
     assert metadata["optimizer_state_discarded"] is True
+    assert metadata["optimizer_state_present"] is True
+    assert metadata["source_metadata"]["payload_kind"] == \
+        checkpoint.BC_TRAINING_PAYLOAD_KIND
     assert metadata["source_metadata"]["provenance"] == {
         "dataset": "physical-morning-baseline"}
     assert metadata["architecture_migration"][
@@ -353,6 +408,160 @@ def test_explicit_physical_bc_migration_is_weights_only_and_preserves_policy(
     # Strict normal resume/load still rejects the older architecture.
     with pytest.raises(Stage25CheckpointError, match="architecture_version"):
         load_stage25_bc_checkpoint(path, config=config)
+
+
+def test_v3_inference_migration_preserves_policy_and_requires_fresh_ppo_state(
+        tmp_path: Path) -> None:
+    config = _config()
+    path = tmp_path / "v3-inference.npz"
+    source_params, _ = _write_legacy_physical_inference(
+        path, "stage25_policy_v3_crop_lifecycle_capacity")
+
+    with np.load(path, allow_pickle=False) as archive:
+        assert all(name.startswith("param:") for name in archive.files
+                   if name != "__meta__")
+        assert "rng" not in archive.files
+        assert not any(name.startswith("opt:") for name in archive.files)
+
+    migrated, metadata = migrate_stage25_bc_checkpoint_for_ppo(
+        path, config=config)
+    migrated_flat = checkpoint._flatten_arrays(migrated)
+    for name, value in source_params.items():
+        assert np.array_equal(value, migrated_flat[name]), name
+    assert np.array_equal(
+        migrated_flat["opponent_conditioning"],
+        np.zeros_like(migrated_flat["opponent_conditioning"]))
+    assert metadata["transfer"] == "weights_only_architecture_migration"
+    assert metadata["resumable"] is False
+    assert metadata["optimizer_state_discarded"] is True
+    assert metadata["optimizer_state_present"] is False
+    assert metadata["source_metadata"]["payload_kind"] == \
+        checkpoint.INFERENCE_PAYLOAD_KIND
+    assert metadata["architecture_migration"][
+        "kind"] == "stage25_inference_to_opponent_summary_v4"
+    assert metadata["architecture_migration"][
+        "zero_initialized_conditioning_leaves"] == ["opponent_conditioning"]
+
+    # A v3 policy has no opponent-summary input. Its v4 compatibility view
+    # supplies zeros; the migrated policy must ignore even nonzero summaries.
+    inputs = _migration_inputs()
+    v3_inputs = dict(inputs)
+    v3_inputs["opponent_summary"] = np.zeros((1, 11), dtype=np.float32)
+    v3_flat = checkpoint._flatten_arrays(
+        init_stage25_params(config, seed=29))
+    v3_flat.update(source_params)
+    v3_flat["opponent_conditioning"] = np.zeros_like(
+        v3_flat["opponent_conditioning"])
+    v3_policy_view = checkpoint._rebuild(
+        init_stage25_params(config, seed=29), v3_flat)
+    physical = (PhysicalContext(1, (25, 50, 75, 100), (0, 0, 0)),)
+    v3_output = greedy_act(
+        v3_policy_view, v3_inputs, config, physical_contexts=physical)
+    migrated_output = greedy_act(
+        migrated, inputs, config, physical_contexts=physical)
+    for old, new in zip(jax.tree_util.tree_leaves(v3_output),
+                        jax.tree_util.tree_leaves(migrated_output)):
+        assert np.array_equal(np.asarray(old), np.asarray(new))
+
+    rng_keys = np.asarray([jax.random.PRNGKey(451)], dtype=np.uint32)
+    row_ids = np.asarray([0x25A17], dtype=np.int32)
+    v3_sample = stochastic_act(
+        v3_policy_view, v3_inputs, config, rng_keys=rng_keys, row_ids=row_ids,
+        physical_contexts=physical)
+    migrated_sample = stochastic_act(
+        migrated, inputs, config, rng_keys=rng_keys, row_ids=row_ids,
+        physical_contexts=physical)
+    for old, new in zip(jax.tree_util.tree_leaves(v3_sample),
+                        jax.tree_util.tree_leaves(migrated_sample)):
+        assert np.array_equal(np.asarray(old), np.asarray(new))
+
+    ppo_config = Stage25PPOConfig(model=config, physical_batch_size=1,
+                                  minibatch_size=1, epochs=1)
+    optimizer = make_stage25_ppo_optimizer(migrated, ppo_config)
+    assert jax.tree_util.tree_leaves(optimizer.init(migrated))
+
+    # The explicit seam is the only path that accepts the v3 architecture.
+    with pytest.raises(Stage25CheckpointError, match="architecture_version"):
+        load_stage25_inference_checkpoint(path, config=config)
+    with pytest.raises(Stage25CheckpointError, match="architecture_version"):
+        initialize_stage25_ppo_from_checkpoint(path, config=config)
+    with pytest.raises(Stage25CheckpointError, match="payload kind"):
+        load_stage25_bc_checkpoint(path, config=config)
+
+
+def test_v3_inference_migration_rejects_malformed_parameter_and_state_leaves(
+        tmp_path: Path) -> None:
+    original = tmp_path / "v3-inference.npz"
+    _write_legacy_physical_inference(
+        original, "stage25_policy_v3_crop_lifecycle_capacity")
+    with np.load(original, allow_pickle=False) as archive:
+        original_items = {key: archive[key] for key in archive.files}
+
+    malformed_params = dict(original_items)
+    malformed_meta = json.loads(
+        malformed_params.pop("__meta__").tobytes().decode("utf-8"))
+    malformed_params.pop("param:action_embeddings/0")
+    malformed_meta["leaf_manifest"] = checkpoint._leaf_manifest(
+        malformed_params)
+    malformed_params["__meta__"] = np.frombuffer(
+        json.dumps(malformed_meta).encode(), dtype=np.uint8)
+    missing = tmp_path / "missing-inference-param.npz"
+    with open(missing, "wb") as handle:
+        np.savez(handle, **malformed_params)
+    with pytest.raises(Stage25CheckpointError, match="parameter tree mismatch"):
+        migrate_stage25_bc_checkpoint_for_ppo(missing, config=_config())
+
+    malformed_dtype = dict(original_items)
+    dtype_meta = json.loads(
+        malformed_dtype.pop("__meta__").tobytes().decode("utf-8"))
+    malformed_dtype["param:capacity_conditioning"] = malformed_dtype[
+        "param:capacity_conditioning"].astype(np.float64)
+    dtype_meta["leaf_manifest"] = checkpoint._leaf_manifest(malformed_dtype)
+    malformed_dtype["__meta__"] = np.frombuffer(
+        json.dumps(dtype_meta).encode(), dtype=np.uint8)
+    wrong_dtype = tmp_path / "wrong-inference-param-dtype.npz"
+    with open(wrong_dtype, "wb") as handle:
+        np.savez(handle, **malformed_dtype)
+    with pytest.raises(Stage25CheckpointError, match="incompatible source parameter"):
+        migrate_stage25_bc_checkpoint_for_ppo(wrong_dtype, config=_config())
+
+    malformed_state = dict(original_items)
+    state_meta = json.loads(
+        malformed_state.pop("__meta__").tobytes().decode("utf-8"))
+    malformed_state["opt:00000"] = np.zeros((1,), dtype=np.float32)
+    state_meta["leaf_manifest"] = checkpoint._leaf_manifest(malformed_state)
+    malformed_state["__meta__"] = np.frombuffer(
+        json.dumps(state_meta).encode(), dtype=np.uint8)
+    unexpected = tmp_path / "inference-with-optimizer.npz"
+    with open(unexpected, "wb") as handle:
+        np.savez(handle, **malformed_state)
+    with pytest.raises(Stage25CheckpointError, match="unexpected native arrays"):
+        migrate_stage25_bc_checkpoint_for_ppo(unexpected, config=_config())
+
+
+@pytest.mark.parametrize("metadata_change,error", [
+    ({"architecture_version": "stage25_policy_v9_unknown"},
+     "unsupported migration source architecture"),
+    ({"observation_schema_version": "wrong-schema"},
+     "source observation schema"),
+    ({"crop_baseline_semantics": "synthetic_crop_baseline"},
+     "explicit physical morning"),
+])
+def test_v3_inference_migration_rejects_incompatible_source_semantics(
+        tmp_path: Path, metadata_change: dict[str, str], error: str) -> None:
+    path = tmp_path / "bad-v3-inference.npz"
+    _write_legacy_physical_inference(
+        path, "stage25_policy_v3_crop_lifecycle_capacity")
+    with np.load(path, allow_pickle=False) as archive:
+        items = {key: archive[key] for key in archive.files}
+    meta = json.loads(items.pop("__meta__").tobytes().decode("utf-8"))
+    meta.update(metadata_change)
+    items["__meta__"] = np.frombuffer(
+        json.dumps(meta).encode(), dtype=np.uint8)
+    with open(path, "wb") as handle:
+        np.savez(handle, **items)
+    with pytest.raises(Stage25CheckpointError, match=error):
+        migrate_stage25_bc_checkpoint_for_ppo(path, config=_config())
 
 
 @pytest.mark.parametrize("metadata_change,error", [
