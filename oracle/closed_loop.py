@@ -17,6 +17,7 @@ from typing import Any, Protocol
 from .backend import EngineBackend, make_backend
 from .canonical import FieldDiff, deep_diff
 from .canonical import CROPS, SHED_ITEMS, _canonical_farm
+from rl_manager.stage25_submission_observation import executor_observation
 
 
 class StatefulAgent(Protocol):
@@ -29,33 +30,7 @@ BackendFactory = Callable[[Mapping[str, Any]], EngineBackend]
 AgentFactory = Callable[[str, int, Mapping[str, Any]], StatefulAgent]
 
 
-def _executor_observation(
-    observation: Mapping[str, Any], *, from_fast: bool
-) -> dict[str, Any]:
-    """Adapt wire aliases the existing executor does not consume."""
-    view = copy.deepcopy(dict(observation))
-    view.setdefault(
-        "step", int(view.get("day", 0)) * 24 + int(view.get("hour", 0))
-    )
-    view["farms"] = [
-        _canonical_farm(farm, int(view["day"]), from_fast=from_fast)
-        for farm in view.get("farms", [])
-    ]
-    private = view.get("private")
-    if isinstance(private, dict):
-        private["shed"] = {
-            name: int(private.get("shed", {}).get(name, 0))
-            for name in SHED_ITEMS
-        }
-        private["seeds"] = {
-            name: int(private.get("seeds", {}).get(name, 0))
-            for name in CROPS
-        }
-        private["inventories"] = [
-            {name: int(inventory.get(name, 0)) for name in SHED_ITEMS}
-            for inventory in private.get("inventories", [])
-        ]
-    return view
+_executor_observation = executor_observation
 
 
 @dataclass(frozen=True)
