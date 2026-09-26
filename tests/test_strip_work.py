@@ -162,7 +162,7 @@ def test_retained_crop_preferred_slot_is_reserved_without_duplicate_plant():
     plants = [item for item in result.items if item.kind == "PLANT"]
     assert {item.crop: item.tile for item in plants} == {
         "WHEAT": (0, 0),
-        "CARROT": (4, 4),
+        "CARROT": (0, 4),
     }
     assert len({item.tile for item in plants}) == len(plants)
     assert next(item for item in plants if item.crop == "WHEAT").source == (

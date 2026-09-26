@@ -237,6 +237,53 @@ def _sorted_coords(coords: list[tuple[int, int]], anchor) \
     return sorted(coords, key=lambda c: (manhattan(c, anchor), c[0], c[1]))
 
 
+PhysicalCropRowKey = tuple[int, int]  # (global y, quadrant x start)
+
+
+def _physical_crop_row_key(coord: tuple[int, int]) -> PhysicalCropRowKey:
+    """Return the horizontal five-tile strip containing ``coord``."""
+    y, x = coord
+    return y, 0 if x < 5 else 5
+
+
+def _physical_crop_row_distance(
+    row_key: PhysicalCropRowKey,
+    anchor: tuple[int, int],
+) -> int:
+    """Minimum Manhattan distance from ``anchor`` to a tile in the row."""
+    y, x_start = row_key
+    nearest_x = min(max(anchor[1], x_start), x_start + 4)
+    return abs(anchor[0] - y) + abs(anchor[1] - nearest_x)
+
+
+def _select_row_compact_coord(
+    candidates: Iterable[tuple[int, int]],
+    *,
+    crop_occupancy: Mapping[PhysicalCropRowKey, int],
+    anchor: tuple[int, int],
+) -> tuple[int, int]:
+    """Select one candidate while packing crop work into physical rows."""
+    candidates_by_row: dict[PhysicalCropRowKey, list[tuple[int, int]]] = {}
+    for coord in candidates:
+        candidates_by_row.setdefault(_physical_crop_row_key(coord), []).append(coord)
+    if not candidates_by_row:
+        raise ValueError("row-compact selection requires at least one candidate")
+
+    row_key = min(
+        candidates_by_row,
+        key=lambda key: (
+            0 if crop_occupancy.get(key, 0) > 0 else 1,
+            -crop_occupancy.get(key, 0),
+            _physical_crop_row_distance(key, anchor),
+            key,
+        ),
+    )
+    return min(
+        candidates_by_row[row_key],
+        key=lambda coord: (manhattan(coord, anchor), coord[0], coord[1]),
+    )
+
+
 def plan_animal_layout(
     board: list[list[Any]],
     *,
@@ -416,6 +463,7 @@ def reconcile_crops(
     tiles_by_coord: dict[tuple[int, int], Mapping[str, Any]] = {}
     empty_tiles: list[tuple[int, int]] = []
     weed_tiles: list[tuple[int, int]] = []
+    crop_row_occupancy: dict[PhysicalCropRowKey, int] = {}
 
     for y, row in enumerate(board):
         for x, tile in enumerate(row):
@@ -430,13 +478,14 @@ def reconcile_crops(
                     scored[crop].append(
                         (sacrifice_score(tile, coord, anchor=anchor,
                                          config=config), coord))
+                    row_key = _physical_crop_row_key(coord)
+                    crop_row_occupancy[row_key] = (
+                        crop_row_occupancy.get(row_key, 0) + 1
+                    )
             elif role == "empty":
                 empty_tiles.append(coord)
             elif role == "weed":
                 weed_tiles.append(coord)
-
-    empty_tiles = _sorted_coords(empty_tiles, anchor)
-    weed_tiles = _sorted_coords(weed_tiles, anchor)
 
     # A retained one-shot harvest may ask reconciliation to preserve its
     # freshly emptied tile.  Reserve only as many authoritative empty slots as
@@ -480,19 +529,37 @@ def reconcile_crops(
         while deficit > 0 and reserved_empty[crop]:
             coord = reserved_empty[crop].pop(0)
             plants.append(PlantIntent(coord, crop))
+            row_key = _physical_crop_row_key(coord)
+            crop_row_occupancy[row_key] = (
+                crop_row_occupancy.get(row_key, 0) + 1
+            )
             empty_filled[crop] += 1
             deficit -= 1
         while deficit > 0 and empty_tiles:
-            coord = empty_tiles.pop(0)
+            coord = _select_row_compact_coord(
+                empty_tiles, crop_occupancy=crop_row_occupancy,
+                anchor=anchor)
+            empty_tiles.remove(coord)
             plants.append(PlantIntent(coord, crop))
+            row_key = _physical_crop_row_key(coord)
+            crop_row_occupancy[row_key] = (
+                crop_row_occupancy.get(row_key, 0) + 1
+            )
             empty_filled[crop] += 1
             deficit -= 1
         while deficit > 0 and weed_tiles:
             # Reclaim a WEED tile: DIG then PLANT. Cheaper in sunk investment
             # than digging a living crop of another type (issue #7).
-            coord = weed_tiles.pop(0)
+            coord = _select_row_compact_coord(
+                weed_tiles, crop_occupancy=crop_row_occupancy,
+                anchor=anchor)
+            weed_tiles.remove(coord)
             digs.append(DigIntent(coord, "WEED"))
             plants.append(PlantIntent(coord, crop))
+            row_key = _physical_crop_row_key(coord)
+            crop_row_occupancy[row_key] = (
+                crop_row_occupancy.get(row_key, 0) + 1
+            )
             weed_filled[crop] += 1
             deficit -= 1
 

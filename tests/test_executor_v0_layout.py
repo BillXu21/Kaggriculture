@@ -15,6 +15,7 @@ import pytest
 from executor_v0.layout import (
     SacrificeConfig,
     plan_animal_layout,
+    plan_day_layouts,
     quadrant_of,
     reconcile_crops,
     sacrifice_score,
@@ -92,6 +93,19 @@ def structure(kind: str, animal: str | None = None, **extra) -> dict:
 
 def coords(placements) -> list[tuple[int, int]]:
     return [p.coord for p in placements]
+
+
+def physical_crop_row(coord: tuple[int, int]) -> tuple[int, int]:
+    y, x = coord
+    return y, 0 if x < 5 else 5
+
+
+def row_occupancies(placements) -> list[int]:
+    by_row: dict[tuple[int, int], int] = {}
+    for intent in placements:
+        key = physical_crop_row(intent.coord)
+        by_row[key] = by_row.get(key, 0) + 1
+    return sorted(by_row.values(), reverse=True)
 
 
 # ------------------------------------------------------- sacrifice ordering
@@ -287,6 +301,146 @@ def test_reconcile_validates_targets():
     with pytest.raises(ValueError):
         reconcile_crops(board, unlocked_quadrants=("NW",),
                         crop_targets={"WHEAT": -1}, anchor=ANCHOR)
+
+
+def test_reconcile_compacts_twelve_new_crops_into_three_physical_rows():
+    result = reconcile_crops(
+        blank_board(), unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 12}, anchor=ANCHOR)
+
+    assert len(result.plants) == 12
+    assert row_occupancies(result.plants) == [5, 5, 2]
+
+
+def test_reconcile_fills_an_existing_crop_row_before_a_closer_empty_row():
+    board = blank_board()
+    board[0][3] = plant("WHEAT")
+
+    result = reconcile_crops(
+        board, unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 2}, anchor=(1, 0))
+
+    assert coords(result.plants) == [(0, 0)]
+    assert result.plants[0].coord != (1, 0)
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_rows"),
+    [(4, [4]), (6, [5, 1])],
+)
+def test_reconcile_fills_each_new_row_before_opening_another(
+    target: int,
+    expected_rows: list[int],
+):
+    result = reconcile_crops(
+        blank_board(), unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": target}, anchor=ANCHOR)
+
+    assert len(result.plants) == target
+    assert row_occupancies(result.plants) == expected_rows
+
+
+def test_reconcile_compacts_across_crop_types():
+    result = reconcile_crops(
+        blank_board(), unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 3, "CARROT": 2}, anchor=ANCHOR)
+
+    assert [intent.crop for intent in result.plants] == [
+        "WHEAT", "WHEAT", "WHEAT", "CARROT", "CARROT",
+    ]
+    assert row_occupancies(result.plants) == [5]
+
+
+def test_reconcile_preserves_preferred_slot_then_compacts_generic_placement():
+    preferred = (4, 4)
+    result = reconcile_crops(
+        blank_board(), unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 2}, anchor=ANCHOR,
+        preferred_crop_slots={"WHEAT": (preferred,)})
+
+    assert coords(result.plants) == [preferred, (4, 0)]
+    assert row_occupancies(result.plants) == [2]
+
+
+def test_plan_day_layouts_masks_animal_claim_before_crop_compaction():
+    result = plan_day_layouts(
+        blank_board(), unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 5}, animals_needed={"GOOSE": 1})
+
+    animal_coords = {slot.coord for slot in result.animals.placements}
+    crop_coords = set(coords(result.crops.plants))
+    assert (4, 4) in animal_coords  # nearest crop candidate to shed anchor
+    assert not (animal_coords & crop_coords)
+    assert (4, 4) not in crop_coords
+
+
+def test_reconcile_treats_west_and_east_strips_at_same_y_as_distinct_rows():
+    board = blank_board()
+    board[0][0] = plant("WHEAT")
+
+    result = reconcile_crops(
+        board, unlocked_quadrants=("NW", "NE"),
+        crop_targets={"WHEAT": 2}, anchor=(0, 5))
+
+    assert coords(result.plants) == [(0, 4)]
+    assert physical_crop_row(result.plants[0].coord) == (0, 0)
+    assert physical_crop_row((0, 0)) != physical_crop_row((0, 5))
+
+
+def test_reconcile_keeps_empty_before_weed_then_compacts_weed_reclaims():
+    board = filled_board(open_coords={(0, 0), (0, 1), (1, 0)})
+    board[0][0] = plant("WHEAT")
+    board[0][1] = "WEED"
+    board[1][0] = None
+
+    empty_result = reconcile_crops(
+        board, unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 2}, anchor=ANCHOR)
+    assert coords(empty_result.plants) == [(1, 0)]
+    assert empty_result.digs == ()
+
+    weeds = filled_board(open_coords={
+        (4, 4), (0, 2), (0, 3), (1, 0), (1, 1),
+    })
+    weeds[4][4] = plant("WHEAT")
+    weeds[0][2] = "WEED"
+    weeds[0][3] = "WEED"
+    weeds[1][0] = "WEED"
+    weeds[1][1] = "WEED"
+    weed_result = reconcile_crops(
+        weeds, unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 3}, anchor=ANCHOR)
+    assert [dig.coord for dig in weed_result.digs] == [(0, 2), (0, 3)]
+    assert row_occupancies(weed_result.plants) == [2]
+
+
+def test_reconcile_does_not_relocate_existing_scattered_crops():
+    board = blank_board()
+    board[0][0] = plant("WHEAT")
+    board[1][1] = plant("WHEAT")
+    board[2][2] = plant("CARROT")
+
+    result = reconcile_crops(
+        board, unlocked_quadrants=("NW",),
+        crop_targets={"WHEAT": 2, "CARROT": 1}, anchor=ANCHOR)
+
+    assert result.digs == ()
+    assert result.removals == ()
+    assert result.plants == ()
+
+
+def test_reconcile_row_compaction_is_deterministic():
+    board = blank_board()
+    kwargs = {
+        "unlocked_quadrants": ("NW",),
+        "crop_targets": {"WHEAT": 8, "CARROT": 3},
+        "anchor": ANCHOR,
+    }
+
+    first = reconcile_crops(board, **kwargs)
+    second = reconcile_crops(copy.deepcopy(board), **kwargs)
+
+    assert second == first
 
 
 # ------------------------------------------------------------- animal layout
