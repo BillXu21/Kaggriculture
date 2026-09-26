@@ -669,7 +669,7 @@ def _policy_core(
         context_values: tuple[jax.Array, ...], row_ids: jax.Array,
         config: Stage25ModelConfig, mode: str, use_explicit_context: bool,
         use_root_rng: bool = False,
-        rng_root: jax.Array = jnp.zeros((2,), dtype=jnp.uint32),
+        rng_root: jax.Array | None = None,
 ) -> dict[str, jax.Array | dict[str, jax.Array]]:
     """One jitted core shared by stochastic, greedy, and evaluation paths.
 
@@ -678,6 +678,8 @@ def _policy_core(
     the land and animal steps; it is never supplied by the caller.
     """
     if use_root_rng:
+        if rng_root is None:
+            rng_root = jnp.zeros((2,), dtype=jnp.uint32)
         rng_keys = jax.vmap(
             jax.random.fold_in, in_axes=(None, 0))(rng_root, row_ids)
     dropout_rng = None

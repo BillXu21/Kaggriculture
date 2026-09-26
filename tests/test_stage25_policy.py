@@ -29,6 +29,9 @@ from rl_manager.stage25_mechanics import (
 )
 from rl_manager.stage25_policy import (
     Stage25ModelConfig,
+    _host_contexts,
+    _host_inputs,
+    _stage25_jit,
     evaluate_actions,
     greedy_act,
     init_stage25_params,
@@ -454,6 +457,33 @@ def test_available_crop_slots_input_is_required_bounded_and_scalar_per_row():
         inputs["available_crop_slots"] = bad
         with pytest.raises(ValueError):
             greedy_act(params, inputs, config)
+
+
+def test_lazy_policy_rng_default_matches_explicit_zero_root():
+    config = _config()
+    inputs = _encoded(2, ledger=np.asarray(
+        [[3, 2, 1, 0, 0], [1, 0, 0, 0, 0]], dtype=np.int16))
+    prepared, capacity, batch = _host_inputs(inputs, config)
+    contexts = _host_contexts(_contexts()[:2], batch)
+    params = init_stage25_params(config, seed=19)
+    keys = jnp.zeros((batch, 2), dtype=jnp.uint32)
+    supplied_actions = jnp.zeros((batch, len(ACTION_CLASS_COUNTS)), dtype=jnp.int32)
+    row_ids = jnp.asarray([73, 991], dtype=jnp.int32)
+    common = (
+        params, prepared, capacity, keys, supplied_actions, contexts,
+        row_ids, config, "sample", True, True)
+
+    lazy_default = _stage25_jit(*common)
+    explicit_zero = _stage25_jit(
+        *common, jnp.zeros((2,), dtype=jnp.uint32))
+
+    for name, expected in explicit_zero.items():
+        observed = lazy_default[name]
+        if isinstance(expected, dict):
+            for field, expected_value in expected.items():
+                np.testing.assert_array_equal(observed[field], expected_value)
+        else:
+            np.testing.assert_array_equal(observed, expected)
 
 
 def test_nonzero_available_slot_conditioning_changes_policy_representation():

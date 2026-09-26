@@ -12,7 +12,10 @@ import numpy as np
 import pytest
 from importlib.util import find_spec
 
-from rl_manager.parallel import ParallelSelfPlayRunner
+from rl_manager.parallel import (
+    ParallelSelfPlayRunner,
+    _cleanup_worker_resources,
+)
 from rl_manager.parallel_worker import RemotePlanPolicy
 from rl_manager.parallel_protocol import (
     Stage25BootstrapRequest,
@@ -291,14 +294,55 @@ def test_stage25_worker_import_boundary_is_accelerator_free():
     script = """
 import sys
 import rl_manager.parallel_worker
-assert not any(name == 'jax' or name.startswith('jax.') or
-               name == 'torch' or name.startswith('torch.')
-               for name in sys.modules)
+forbidden = ('jax', 'jaxlib', 'torch_xla', 'bc_manager_jax', 'optax')
+assert not any(name == prefix or name.startswith(prefix + '.')
+               for name in sys.modules for prefix in forbidden)
 """
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_partial_worker_start_cleanup_skips_unstarted_processes():
+    class FakeProcess:
+        def __init__(self, pid, alive):
+            self.pid = pid
+            self.alive = alive
+            self.terminated = False
+            self.joined = False
+
+        def is_alive(self):
+            assert self.pid is not None
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+
+        def join(self, *, timeout):
+            assert timeout == 5
+            self.joined = True
+
+    class FakeQueue:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    started = FakeProcess(pid=123, alive=True)
+    not_started = FakeProcess(pid=None, alive=False)
+    queues = [FakeQueue() for _ in range(4)]
+    request_queue, result_queue = FakeQueue(), FakeQueue()
+
+    _cleanup_worker_resources(
+        [started, not_started], queues[:2], queues[2:],
+        request_queue, result_queue)
+
+    assert started.terminated and started.joined
+    assert not not_started.terminated and not not_started.joined
+    assert all(queue.closed for queue in queues)
+    assert request_queue.closed and result_queue.closed
 
 
 def test_stage25_row_reordering_does_not_change_owner_row_rng_tokens():

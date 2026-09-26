@@ -91,6 +91,24 @@ def _batch_key_sort_key(key: BatchKey) -> tuple[str, int]:
     return (key[0].identity_id(), int(key[1]))
 
 
+def _cleanup_worker_resources(processes: Sequence[Any],
+                              task_queues: Sequence[Any],
+                              response_queues: Sequence[Any],
+                              request_queue: Any,
+                              result_queue: Any) -> None:
+    """Stop started workers and close their IPC queues, including partial starts."""
+    for process in processes:
+        if process.pid is not None and process.is_alive():
+            process.terminate()
+    for process in processes:
+        if process.pid is not None:
+            process.join(timeout=5)
+    for queue in task_queues + response_queues:
+        queue.close()
+    request_queue.close()
+    result_queue.close()
+
+
 def pad_batch_to_physical(
         batch: Mapping[str, np.ndarray], physical_size: int
         ) -> tuple[dict[str, np.ndarray], int]:
@@ -450,27 +468,33 @@ class ParallelSelfPlayRunner:
             self._parent_profile_metrics["num_workers"] = self.num_workers
             self._parent_profile_metrics["envs_per_worker"] = int(self.config.num_envs)
             self._parent_profile_metrics["games_per_update"] = len(specs)
-        for worker_id in range(self.num_workers):
-            task = WorkerTask(
-                worker_id=worker_id,
-                episodes=tuple(groups[worker_id]),
-                runner_config=self.config,
-                executor_factory=factory_wire,
-                master_seed=self.master_seed,
-                trajectory_capacity=(shard_capacity
-                                     if self.buffer is not None else None),
-                owner_pid=owner_pid,
-                stage25_trajectory_capacity=(
-                    stage25_shard_capacity
-                    if self.stage25_trajectory is not None else None))
-            process = ctx.Process(
-                target=worker_main,
-                args=(task_queues[worker_id], request_queue,
-                      response_queues[worker_id], result_queue),
-                name=f"kaggriculture-rollout-{worker_id}")
-            processes.append(process)
-            task_queues[worker_id].put(task)
-            process.start()
+        try:
+            for worker_id in range(self.num_workers):
+                task = WorkerTask(
+                    worker_id=worker_id,
+                    episodes=tuple(groups[worker_id]),
+                    runner_config=self.config,
+                    executor_factory=factory_wire,
+                    master_seed=self.master_seed,
+                    trajectory_capacity=(shard_capacity
+                                         if self.buffer is not None else None),
+                    owner_pid=owner_pid,
+                    stage25_trajectory_capacity=(
+                        stage25_shard_capacity
+                        if self.stage25_trajectory is not None else None))
+                process = ctx.Process(
+                    target=worker_main,
+                    args=(task_queues[worker_id], request_queue,
+                          response_queues[worker_id], result_queue),
+                    name=f"kaggriculture-rollout-{worker_id}")
+                processes.append(process)
+                task_queues[worker_id].put(task)
+                process.start()
+        except BaseException:
+            _cleanup_worker_resources(
+                processes, task_queues, response_queues,
+                request_queue, result_queue)
+            raise
 
         pending: dict[BatchKey, list[InferenceRequest]] = \
             defaultdict(list)
@@ -591,15 +615,9 @@ class ParallelSelfPlayRunner:
             if pending:
                 raise ParallelRolloutError("inference requests remained pending")
         finally:
-            for process in processes:
-                if process.is_alive():
-                    process.terminate()
-            for process in processes:
-                process.join(timeout=5)
-            for queue in task_queues + response_queues:
-                queue.close()
-            request_queue.close()
-            result_queue.close()
+            _cleanup_worker_resources(
+                processes, task_queues, response_queues,
+                request_queue, result_queue)
 
         if self.stage25_trajectory is not None:
             for shard in shards:

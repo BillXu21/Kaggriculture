@@ -1002,7 +1002,7 @@ class Stage25PlanProvider:
         plan = _lower_plan(classes, goals)
         result = self._commit(
             key, classes, goals, plan, request.inputs,
-            request.daily_start, profile=profile)
+            request.daily_start, request.crop_capacity, profile=profile)
         self._pending_context = None
         return result
 
@@ -1010,7 +1010,8 @@ class Stage25PlanProvider:
         self, key: Stage25DecisionKey, classes: tuple[int, ...],
         goals: tuple[int, ...], plan: DailyPlan,
         inputs: Mapping[str, np.ndarray],
-        daily_start: tuple[int, float], *,
+        daily_start: tuple[int, float],
+        physical_baseline: tuple[int, ...], *,
         profile: Mapping[str, Any] | None = None,
     ) -> DailyPlan:
         # Compute every fallible value before mutating lifecycle fields so a
@@ -1079,7 +1080,7 @@ class Stage25PlanProvider:
         plan = _lower_plan(classes, goals)
         return self._commit(
             key, classes, goals, plan, inputs,
-            (day, float(obs["farms"][self.seat]["money"])))
+            (day, float(obs["farms"][self.seat]["money"])), initial)
 
     submit_classes = accept_classes
     accept_decision = accept_classes
@@ -1146,7 +1147,7 @@ class Stage25PlanProvider:
         plan = _lower_plan(classes_tuple, goals)
         return self._commit(
             key, classes_tuple, goals, plan, inputs,
-            (day, float(obs["farms"][self.seat]["money"])))
+            (day, float(obs["farms"][self.seat]["money"])), initial)
 
     def export_state(self) -> dict[str, Any]:
         """Export lifecycle state only; executor queues are deliberately absent."""
