@@ -22,6 +22,9 @@ Model-facing input arrays (all current-state features, stable order):
                                 (only with include_opponent=True; public
                                 state only — opponent shed/seeds/
                                 inventories/private are never read)
+- `opponent_summary`  float32 [N, 11] bounded public cash/land/workers plus
+                                physical crop/animal counts (only when the
+                                Stage 2.5 summary path requests it)
 - `scalars`           float32 [N, 4] money, hires_today,
                                 prev workers_hired, prev hire_cost
 - `shed_counts`       int32   [N, 12] RESOURCE_ORDER
@@ -98,7 +101,19 @@ from .economics import (
     E_HISTORY_CORRECTED_V1,
     ECONOMIC_CONTEXT_KEY,
     derive_economic_context,
+    signed_log_cash,
 )
+
+OPPONENT_SUMMARY_ORDER = (
+    "cash", "land", "workers", *CROP_ORDER, *ANIMAL_ORDER,
+)
+OPPONENT_SUMMARY_DIM = len(OPPONENT_SUMMARY_ORDER)
+MAX_PUBLIC_HANDS = 240
+MAX_PUBLIC_WORKERS = MAX_PUBLIC_HANDS + 1
+_PUBLIC_STATE_KEYS = frozenset({
+    "money", "board", "unlocked_quadrants", "farmer", "hands",
+    "hires_today",
+})
 
 # Dotted-path projection: PyArrow names each selected nested leaf column by
 # its last path component ("events.sells" -> "sells").
@@ -308,6 +323,103 @@ def _as_mapping(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     return {key: item for key, item in value}
+
+
+def opponent_summary_from_public_state(
+    state: Mapping[str, Any],
+) -> np.ndarray:
+    """Encode one normalized canonical opponent-public state as float32[11].
+
+    The accepted mapping is deliberately the canonical public schema, so
+    private shed, seed, or carried-inventory state cannot enter this feature.
+    Crop and animal channels count only currently placed physical board tiles;
+    crop age/maturity and ``hires_today`` do not affect the result.
+    """
+    if not isinstance(state, Mapping):
+        raise ValueError("opponent public state must be a mapping")
+    keys = set(state)
+    missing = sorted(_PUBLIC_STATE_KEYS - keys)
+    unexpected = sorted(keys - _PUBLIC_STATE_KEYS)
+    if missing or unexpected:
+        raise ValueError(
+            "opponent public state schema mismatch: "
+            f"missing={missing}, unexpected={unexpected}")
+
+    money = float(state["money"])
+    if not np.isfinite(money):
+        raise ValueError(f"opponent public money must be finite, got {money!r}")
+
+    unlocked = state["unlocked_quadrants"]
+    if (not isinstance(unlocked, Sequence)
+            or isinstance(unlocked, (str, bytes))):
+        raise ValueError("opponent unlocked_quadrants must be a sequence")
+    unlocked = tuple(unlocked)
+    if (not 1 <= len(unlocked) <= len(QUADRANT_ORDER)
+            or len(set(unlocked)) != len(unlocked)
+            or set(unlocked) != set(QUADRANT_ORDER[:len(unlocked)])):
+        raise ValueError(
+            "opponent unlocked_quadrants must be the canonical land prefix")
+
+    hands = state["hands"]
+    if not isinstance(hands, Sequence) or isinstance(hands, (str, bytes)):
+        raise ValueError("opponent hands must be a sequence")
+    if len(hands) > MAX_PUBLIC_HANDS:
+        raise ValueError(
+            f"opponent has {len(hands)} hands; maximum is {MAX_PUBLIC_HANDS}")
+    workers = 1 + len(hands)
+
+    board = state["board"]
+    if (not isinstance(board, Sequence) or isinstance(board, (str, bytes))
+            or len(board) != 10):
+        raise ValueError("opponent public board must contain 10 rows")
+    crop_counts = np.zeros(len(CROP_ORDER), dtype=np.int16)
+    animal_counts = np.zeros(len(ANIMAL_ORDER), dtype=np.int16)
+    for y, row in enumerate(board):
+        if (not isinstance(row, Sequence) or isinstance(row, (str, bytes))
+                or len(row) != 10):
+            raise ValueError(
+                f"opponent public board row {y} must contain 10 tiles")
+        for tile in row:
+            if not isinstance(tile, Mapping):
+                raise ValueError(
+                    "opponent public board must use normalized canonical tiles")
+            kind = tile.get("tile_kind")
+            crop = tile.get("crop")
+            animal = tile.get("animal")
+            if kind == "PLANT":
+                if crop not in CROP_ORDER:
+                    raise ValueError(
+                        f"unknown crop {crop!r} on opponent public board")
+                crop_counts[CROP_ORDER.index(crop)] += 1
+            elif crop is not None:
+                raise ValueError(
+                    f"non-plant opponent tile carries crop {crop!r}")
+            if kind in ("COOP", "PASTURE") and animal is not None:
+                if animal not in ANIMAL_ORDER:
+                    raise ValueError(
+                        f"unknown animal {animal!r} on opponent public board")
+                animal_counts[ANIMAL_ORDER.index(animal)] += 1
+            elif animal is not None:
+                raise ValueError(
+                    f"non-structure opponent tile carries animal {animal!r}")
+
+    summary = np.empty(OPPONENT_SUMMARY_DIM, dtype=np.float32)
+    summary[0] = signed_log_cash(money)
+    summary[1] = len(unlocked) / float(len(QUADRANT_ORDER))
+    summary[2] = workers / float(MAX_PUBLIC_WORKERS)
+    summary[3:3 + len(CROP_ORDER)] = crop_counts / float(BOARD_SIZE)
+    summary[3 + len(CROP_ORDER):] = animal_counts / float(BOARD_SIZE)
+    return summary
+
+
+def opponent_summary_arrays(
+    states: Sequence[Mapping[str, Any]],
+) -> np.ndarray:
+    """Batch :func:`opponent_summary_from_public_state` without drift."""
+    result = np.empty((len(states), OPPONENT_SUMMARY_DIM), dtype=np.float32)
+    for index, state in enumerate(states):
+        result[index] = opponent_summary_from_public_state(state)
+    return result
 
 
 def _column_rows(table: pa.Table, name: str) -> list[Any]:
