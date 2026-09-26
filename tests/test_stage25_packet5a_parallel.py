@@ -33,6 +33,7 @@ from rl_manager.stage25_provider import (
     Stage25TerminalError,
 )
 from rl_manager.stage25_types import (
+    STAGE25_OBSERVATION_SCHEMA_VERSION, STAGE25_POLICY_SCHEMA_VERSION,
     Stage25BehaviorIdentity, Stage25PolicyOutputs, stage25_row_token,
 )
 from rl_manager.stage25_trajectory import Stage25TrajectoryBuffer
@@ -42,7 +43,8 @@ from test_stage25_provider import HOLD, _obs
 
 IDENTITY = Stage25BehaviorIdentity(
     name="stage25-test", version="v1", parameter_fingerprint="f" * 64,
-    observation_schema_version="e_v1", policy_schema_version="stage25_policy_v1",
+    observation_schema_version=STAGE25_OBSERVATION_SCHEMA_VERSION,
+    policy_schema_version=STAGE25_POLICY_SCHEMA_VERSION,
     e_history_version="E_CORRECTED_V1", curriculum_version="stage25_curriculum_v1",
     curriculum_fingerprint="7282cd9c883618c0258b2105f40e3d7996c969853a5adc6db07a57a12da9d1ec")
 
@@ -70,6 +72,8 @@ class _Stage25Policy:
                 inputs["replaceable_today"], copy=True),
             "available_crop_slots": np.array(
                 inputs["available_crop_slots"], copy=True),
+            "opponent_summary": np.array(
+                inputs["opponent_summary"], copy=True),
         })
         batch = len(row_ids)
         classes = np.zeros((batch, 9), dtype=np.int16)
@@ -288,6 +292,12 @@ def test_stage25_parallel_batch_preserves_morning_crop_features():
     assert observed["replaceable_today"][0, 0] > 0
     assert observed["available_crop_slots"][0] != \
         observed["available_crop_slots"][1]
+    expected_summary = np.concatenate(
+        [requests[index].inputs["opponent_summary"] for index in (1, 0)],
+        axis=0)
+    np.testing.assert_array_equal(observed["opponent_summary"][:2],
+                                  expected_summary)
+    assert observed["opponent_summary"].dtype == np.float32
 
 
 def test_stage25_worker_import_boundary_is_accelerator_free():
@@ -415,8 +425,8 @@ def test_stage25_provider_binds_curriculum_to_behavior_identity():
     enabled = Stage25CurriculumConfig(enabled=True, max_positive_crop_delta=1)
     identity = Stage25BehaviorIdentity(
         name="stage25-test", version="v1", parameter_fingerprint="f" * 64,
-        observation_schema_version="e_v1",
-        policy_schema_version="stage25_policy_v1",
+        observation_schema_version=STAGE25_OBSERVATION_SCHEMA_VERSION,
+        policy_schema_version=STAGE25_POLICY_SCHEMA_VERSION,
         e_history_version="E_CORRECTED_V1",
         curriculum_version=enabled.version,
         curriculum_fingerprint=curriculum_fingerprint(enabled))
@@ -438,7 +448,8 @@ def test_stage25_worker_wire_adopts_checkpoint_curriculum_without_override():
     enabled = Stage25CurriculumConfig(enabled=True, max_positive_crop_delta=1)
     identity = Stage25BehaviorIdentity(
         name="stage25-test", version="v1", parameter_fingerprint="f" * 64,
-        observation_schema_version="e_v1", policy_schema_version="stage25_policy_v1",
+        observation_schema_version=STAGE25_OBSERVATION_SCHEMA_VERSION,
+        policy_schema_version=STAGE25_POLICY_SCHEMA_VERSION,
         e_history_version="E_CORRECTED_V1", curriculum_version=enabled.version,
         curriculum_fingerprint=curriculum_fingerprint(enabled))
     checkpoint = SimpleNamespace(load_config=lambda: SimpleNamespace(
@@ -456,7 +467,8 @@ def test_stage25_curriculum_mismatch_is_rejected_before_provider_mutation():
     enabled = Stage25CurriculumConfig(enabled=True, max_positive_crop_delta=1)
     identity = Stage25BehaviorIdentity(
         name="stage25-test", version="v1", parameter_fingerprint="f" * 64,
-        observation_schema_version="e_v1", policy_schema_version="stage25_policy_v1",
+        observation_schema_version=STAGE25_OBSERVATION_SCHEMA_VERSION,
+        policy_schema_version=STAGE25_POLICY_SCHEMA_VERSION,
         e_history_version="E_CORRECTED_V1", curriculum_version=enabled.version,
         curriculum_fingerprint=curriculum_fingerprint(enabled))
     checkpoint = SimpleNamespace(load_config=lambda: SimpleNamespace(
@@ -499,10 +511,13 @@ def test_stage25_acceptance_reuses_one_frozen_prepared_context(monkeypatch):
     calls = 0
     original = provider._stage_observation
 
-    def counted(observation, previous_execution, *, profile=None):
+    def counted(observation, previous_execution, *, behavior_identity=None,
+                 profile=None):
         nonlocal calls
         calls += 1
-        return original(observation, previous_execution, profile=profile)
+        return original(
+            observation, previous_execution,
+            behavior_identity=behavior_identity, profile=profile)
 
     monkeypatch.setattr(provider, "_stage_observation", counted)
     prepared = provider.prepare_inference_context(obs, behavior_identity=IDENTITY)
@@ -632,6 +647,8 @@ def test_stage25_spawned_worker_fast_engine_smoke(tmp_path):
     end_rows = arrays["terminated"] | arrays["truncated"]
     assert np.all(arrays["day"][end_rows] == arrays["day"][end_rows].max())
     assert np.all(arrays["bootstrap_patched"] == arrays["truncated"])
+    assert arrays["input_opponent_summary"].shape == (24, 11)
+    assert arrays["input_opponent_summary"].dtype == np.float32
     path = parallel.stage25_trajectory.save(tmp_path / "smoke")
     reloaded, _ = Stage25TrajectoryBuffer.load(path)
     assert len(reloaded) == 24

@@ -30,9 +30,9 @@ from rl_manager.stage25_policy import (
     evaluate_actions,
     greedy_act,
     init_stage25_params,
+    stochastic_act,
 )
 from rl_manager.stage25_mechanics import PhysicalContext
-from rl_manager.stage25_ppo import make_stage25_ppo_optimizer
 from rl_manager.stage25_bc import (
     Stage25BCBatch,
     Stage25BCConfig,
@@ -66,18 +66,25 @@ def _write_legacy_physical_bc(path: Path, architecture: str) -> tuple[dict, dict
     with np.load(path, allow_pickle=False) as archive:
         items = {key: archive[key] for key in archive.files}
     meta = json.loads(items.pop("__meta__").tobytes().decode("utf-8"))
-    missing = (["replaceable_conditioning",
-                "available_crop_slots_conditioning"]
-               if architecture == "stage25_policy_v1" else
-               ["available_crop_slots_conditioning"])
+    missing = {
+        "stage25_policy_v1": [
+            "replaceable_conditioning", "available_crop_slots_conditioning",
+            "opponent_conditioning"],
+        "stage25_policy_v2_replaceable_today": [
+            "available_crop_slots_conditioning", "opponent_conditioning"],
+        "stage25_policy_v3_crop_lifecycle_capacity": [
+            "opponent_conditioning"],
+    }[architecture]
     for name in missing:
         items.pop(f"param:{name}")
-    old_observation = (
-        "stage25_corrected_e_own_only_v1"
-        if architecture == "stage25_policy_v1" else
-        "stage25_corrected_e_own_only_replaceable_today_v2")
-    vocab = checkpoint.OBSERVATION_VOCABULARY[
-        :-2 if architecture == "stage25_policy_v1" else -1]
+    old_observation, vocab_end = {
+        "stage25_policy_v1": ("stage25_corrected_e_own_only_v1", -3),
+        "stage25_policy_v2_replaceable_today": (
+            "stage25_corrected_e_own_only_replaceable_today_v2", -2),
+        "stage25_policy_v3_crop_lifecycle_capacity": (
+            "stage25_corrected_e_own_only_crop_lifecycle_capacity_v3", -1),
+    }[architecture]
+    vocab = checkpoint.OBSERVATION_VOCABULARY[:vocab_end]
     meta.update({
         "architecture_version": architecture,
         "observation_schema_version": old_observation,
@@ -121,6 +128,9 @@ def _migration_inputs() -> dict[str, np.ndarray]:
         "crop_capacity": np.asarray([[2, 0, 0, 0, 0]], dtype=np.int16),
         "replaceable_today": np.asarray([[3, 0, 0, 0, 0]], dtype=np.int16),
         "available_crop_slots": np.asarray([61], dtype=np.int16),
+        "opponent_summary": np.asarray(
+            [[0.25, 0.5, 0.1, 0, 0, 0, 0, 0, 0, 0, 0]],
+            dtype=np.float32),
     }
 
 
@@ -232,10 +242,15 @@ def test_fresh_ppo_initialization_accepts_native_inference_and_bc(
     "architecture,zero_leaves,preserved",
     [
         ("stage25_policy_v1",
-         ["available_crop_slots_conditioning", "replaceable_conditioning"],
+         ["available_crop_slots_conditioning", "opponent_conditioning",
+          "replaceable_conditioning"],
          []),
         ("stage25_policy_v2_replaceable_today",
-         ["available_crop_slots_conditioning"], ["replaceable_conditioning"]),
+         ["available_crop_slots_conditioning", "opponent_conditioning"],
+         ["replaceable_conditioning"]),
+        ("stage25_policy_v3_crop_lifecycle_capacity",
+         ["opponent_conditioning"],
+         ["available_crop_slots_conditioning", "replaceable_conditioning"]),
     ],
 )
 def test_explicit_physical_bc_migration_is_weights_only_and_preserves_policy(
@@ -263,12 +278,16 @@ def test_explicit_physical_bc_migration_is_weights_only_and_preserves_policy(
     assert metadata["architecture_migration"][
         "preserved_conditioning_leaves"] == preserved
 
-    # v1 never observed either value; v2 already observed replaceable_today.
-    # The new observations are deliberately nonzero in `inputs`. With the
-    # missing conditioning leaves zero, all old policy outputs remain exact.
+    # Simulate only observations whose conditioning leaves were absent from
+    # the source architecture. The new observations are deliberately nonzero
+    # in `inputs`; with their missing conditioning leaves zero, all old policy
+    # outputs remain exact.
     inputs = _migration_inputs()
     reference_inputs = dict(inputs)
-    reference_inputs["available_crop_slots"] = np.asarray([0], dtype=np.int16)
+    if "available_crop_slots_conditioning" in zero_leaves:
+        reference_inputs["available_crop_slots"] = np.asarray(
+            [0], dtype=np.int16)
+    reference_inputs["opponent_summary"] = np.zeros((1, 11), dtype=np.float32)
     if "replaceable_conditioning" in zero_leaves:
         reference_inputs["replaceable_today"] = np.zeros((1, 5), dtype=np.int16)
     physical = (PhysicalContext(1, (25, 50, 75, 100), (0, 0, 0)),)
@@ -276,6 +295,9 @@ def test_explicit_physical_bc_migration_is_weights_only_and_preserves_policy(
         migrated, reference_inputs, config, physical_contexts=physical)
     new_output = greedy_act(
         migrated, inputs, config, physical_contexts=physical)
+    for key in ("classes", "component_logprobs", "joint_logprob", "value",
+                "decoded_goals", "valid", "masks", "diagnostics"):
+        assert key in old_output and key in new_output
     assert jax.tree_util.tree_structure(old_output) == \
         jax.tree_util.tree_structure(new_output)
     for old, new in zip(jax.tree_util.tree_leaves(old_output),
@@ -292,6 +314,19 @@ def test_explicit_physical_bc_migration_is_weights_only_and_preserves_policy(
     for old, new in zip(jax.tree_util.tree_leaves(old_eval),
                         jax.tree_util.tree_leaves(new_eval)):
         assert np.array_equal(np.asarray(old), np.asarray(new))
+
+    if architecture == "stage25_policy_v3_crop_lifecycle_capacity":
+        rng_keys = np.asarray([jax.random.PRNGKey(451)], dtype=np.uint32)
+        row_ids = np.asarray([0x25A17], dtype=np.int32)
+        old_sample = stochastic_act(
+            migrated, reference_inputs, config, rng_keys=rng_keys,
+            row_ids=row_ids, physical_contexts=physical)
+        new_sample = stochastic_act(
+            migrated, inputs, config, rng_keys=rng_keys,
+            row_ids=row_ids, physical_contexts=physical)
+        for old, new in zip(jax.tree_util.tree_leaves(old_sample),
+                            jax.tree_util.tree_leaves(new_sample)):
+            assert np.array_equal(np.asarray(old), np.asarray(new))
 
     ppo_config = Stage25PPOConfig(model=config, physical_batch_size=1,
                                   minibatch_size=1, epochs=1)

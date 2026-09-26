@@ -35,6 +35,8 @@ def _ppo_fixture(config: Stage25PPOConfig, rows: int = 2):
     inputs["unlocked"][:, 0] = 1
     inputs["days_remaining"][:] = 29
     inputs["scalars"][:, 1] = np.arange(rows, dtype=np.float32)
+    inputs["opponent_summary"][:, 0] = np.linspace(
+        0.25, 0.75, rows, dtype=np.float32)
     params = init_stage25_params(config.model, seed=23)
     keys = jax.random.split(jax.random.PRNGKey(5), rows)
     sampled = stochastic_act(
@@ -100,6 +102,7 @@ def test_policy_and_value_heads_both_update_on_real_objective():
     inputs["unlocked"][:, 0] = 1
     inputs["days_remaining"][:] = 29
     inputs["scalars"][1, :] = 1.0
+    inputs["opponent_summary"][:, 0] = np.asarray([0.25, 0.75], dtype=np.float32)
     params = init_stage25_params(config.model, seed=23)
     sampled = stochastic_act(
         params, inputs, config.model, jax.random.split(jax.random.PRNGKey(5), 2),

@@ -190,10 +190,13 @@ def _validate_inputs(inputs: Mapping[str, Any]) -> int:
                        if name in _INTEGER_INPUTS else
                        np.issubdtype(array.dtype, np.bool_)
                        if name in _BOOLEAN_INPUTS else
+                       array.dtype == np.dtype(np.float32)
+                       if name == "opponent_summary" else
                        np.issubdtype(array.dtype, np.floating))
         if array.dtype.hasobject or not valid_dtype:
             expected = ("an integer" if name in _INTEGER_INPUTS else
-                        "a boolean" if name in _BOOLEAN_INPUTS else "a float")
+                        "a boolean" if name in _BOOLEAN_INPUTS else
+                        "float32" if name == "opponent_summary" else "a float")
             raise ValueError(f"input {name!r} must have {expected} dtype")
         # Official canonical observations use NaN sentinels for nullable board
         # timing channels; the unchanged JAX encoder maps those channels

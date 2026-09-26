@@ -83,6 +83,7 @@ def _encoded(batch_size: int = 1, *, economics: float = 0.0,
                           if ledger is None else np.asarray(ledger)),
         "replaceable_today": np.zeros((b, 5), dtype=np.int16),
         "available_crop_slots": np.full((b,), 25, dtype=np.int16),
+        "opponent_summary": np.zeros((b, 11), dtype=np.float32),
     }
     return inputs
 
@@ -205,8 +206,26 @@ def test_exact_action_schema_and_parameter_tree_accounting():
         leaf.size for leaf in jax.tree_util.tree_leaves(spec))
     assert tuple(params["available_crop_slots_conditioning"].shape) == (
         config.d_model,)
+    assert tuple(params["opponent_conditioning"].shape) == (11, config.d_model)
     decoder = sum(ACTION_CLASS_COUNTS) * (2 * config.d_model + 1)
     assert decoder == 1312 * (2 * config.d_model + 1)
+
+
+@pytest.mark.parametrize(
+    "d_model,expected_increase",
+    [(256, 2816), (320, 3520), (384, 4224)],
+)
+def test_opponent_conditioner_is_the_only_parameter_count_increase(
+        d_model: int, expected_increase: int):
+    config = Stage25ModelConfig(
+        d_model=d_model, num_layers=1, num_heads=4, ffn_dim=3 * d_model)
+    params = init_stage25_params(config, seed=17)
+    old_tree = {name: value for name, value in params.items()
+                if name != "opponent_conditioning"}
+    assert tuple(params["opponent_conditioning"].shape) == (11, d_model)
+    assert int(np.prod(params["opponent_conditioning"].shape)) == expected_increase
+    assert stage25_parameter_count(params) - stage25_parameter_count(old_tree) \
+        == expected_increase
 
 
 def test_fresh_encoder_preserves_functional_layernorm_and_rejects_fractional_classes():
@@ -457,6 +476,44 @@ def test_available_crop_slots_input_is_required_bounded_and_scalar_per_row():
         inputs["available_crop_slots"] = bad
         with pytest.raises(ValueError):
             greedy_act(params, inputs, config)
+
+
+def test_opponent_summary_contract_and_zero_init_policy_parity():
+    config = _config()
+    params = init_stage25_params(config, seed=1073)
+    zero_summary = _encoded(1)
+    nonzero_summary = _encoded(1)
+    nonzero_summary["opponent_summary"][0, 0] = 1.0
+
+    omitted = _encoded(1)
+    del omitted["opponent_summary"]
+    with pytest.raises(ValueError, match="opponent_summary"):
+        greedy_act(params, omitted, config)
+    for bad in (np.zeros((1, 10), dtype=np.float32),
+                np.zeros((1, 11), dtype=np.float64),
+                np.zeros((1, 11), dtype=np.int32)):
+        inputs = _encoded(1)
+        inputs["opponent_summary"] = bad
+        with pytest.raises(ValueError, match="opponent_summary"):
+            greedy_act(params, inputs, config)
+
+    params["opponent_conditioning"] = jnp.zeros((11, config.d_model))
+    before = greedy_act(params, zero_summary, config)
+    same = greedy_act(params, nonzero_summary, config)
+    for left, right in zip(jax.tree_util.tree_leaves(before),
+                           jax.tree_util.tree_leaves(same)):
+        assert np.array_equal(np.asarray(left), np.asarray(right))
+
+    conditioning = jnp.zeros((11, config.d_model), dtype=jnp.float32)
+    conditioning = conditioning.at[0].set(jnp.ones(config.d_model))
+    params["opponent_conditioning"] = conditioning
+    params["value_head"] = {
+        "kernel": jnp.ones((config.d_model, 1), dtype=jnp.float32),
+        "bias": jnp.zeros((1,), dtype=jnp.float32),
+    }
+    changed = greedy_act(params, nonzero_summary, config)
+    assert not np.array_equal(np.asarray(before["value"]),
+                              np.asarray(changed["value"]))
 
 
 def test_lazy_policy_rng_default_matches_explicit_zero_root():
@@ -812,6 +869,8 @@ def test_teacher_forced_nll_has_finite_gradients_through_all_trainable_blocks():
                             ledger=np.full((1, 5), 4, dtype=np.int16))
     inputs["replaceable_today"] = np.full((1, 5), 3, dtype=np.int16)
     inputs["available_crop_slots"] = np.full((1,), 7, dtype=np.int16)
+    inputs["opponent_summary"] = np.linspace(
+        0.0, 1.0, 11, dtype=np.float32)[None, :]
     classes = jnp.asarray([[1, 1, 1, 1, 100, 100, 100, 100, 100]], dtype=jnp.int16)
 
     def loss(tree):
@@ -827,6 +886,7 @@ def test_teacher_forced_nll_has_finite_gradients_through_all_trainable_blocks():
     assert bool(jnp.any(grads["capacity_conditioning"] != 0))
     assert bool(jnp.any(grads["replaceable_conditioning"] != 0))
     assert bool(jnp.any(grads["available_crop_slots_conditioning"] != 0))
+    assert bool(jnp.any(grads["opponent_conditioning"] != 0))
     assert bool(jnp.any(grads["recurrent_decoder"]["Wz"] != 0))
     assert bool(jnp.any(jax.tree_util.tree_leaves(grads["output_projections"])[0] != 0))
 
@@ -878,6 +938,7 @@ out = greedy_act(p, {
 'crop_capacity': np.zeros((1, 5), dtype=np.int16),
 'replaceable_today': np.zeros((1, 5), dtype=np.int16),
 'available_crop_slots': np.full((1,), 25, dtype=np.int16),
+'opponent_summary': np.zeros((1, 11), dtype=np.float32),
 }, c)
 assert out['classes'].shape == (1, 9)
 """

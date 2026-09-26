@@ -27,8 +27,8 @@ def _identity(name: str) -> Stage25BehaviorIdentity:
     return Stage25BehaviorIdentity(
         name=name, version="v1", parameter_fingerprint=f"params-{name}",
         observation_schema_version=(
-            "stage25_corrected_e_own_only_crop_lifecycle_capacity_v3"),
-        policy_schema_version="stage25_policy_v3_crop_lifecycle_capacity",
+            "stage25_corrected_e_own_only_crop_lifecycle_capacity_opponent_summary_v4"),
+        policy_schema_version="stage25_policy_v4_opponent_summary",
         e_history_version="E_CORRECTED_V1",
         curriculum_version="stage25_curriculum_v1",
         curriculum_fingerprint=f"curriculum-{name}",
@@ -44,6 +44,7 @@ def _inputs(day: int = 4) -> dict[str, np.ndarray]:
     result["economic_context"] = np.arange(14, dtype=np.float32)
     result["crop_capacity"] = np.asarray([1, 2, 3, 4, 5], dtype=np.int16)
     result["available_crop_slots"] = np.asarray(7, dtype=np.int16)
+    result["opponent_summary"] = np.arange(11, dtype=np.float32) / 10
     result["unlocked"][0] = 1
     return result
 
@@ -77,10 +78,29 @@ def test_round_trip_preserves_inputs_outputs_identity_and_provenance(tmp_path: P
     assert sidecar["run_metadata"] == {"master_seed": 17}
     np.testing.assert_array_equal(loaded.finalize()["input_crop_capacity"], [[1, 2, 3, 4, 5], [1, 2, 3, 4, 5]])
     np.testing.assert_array_equal(loaded.finalize()["input_available_crop_slots"], [7, 7])
+    np.testing.assert_array_equal(
+        loaded.finalize()["input_opponent_summary"],
+        [np.arange(11, dtype=np.float32) / 10] * 2)
     np.testing.assert_array_equal(loaded.finalize()["classes"], [_row().classes, _row().classes])
     assert float(loaded.finalize()["reward"][1]) == pytest.approx(1.5)
     assert loaded.rows[0].learner_identity.identity_id() == _identity("learner").identity_id()
     assert loaded.rows[1].provenance["executor"]["name"] == "test-executor"
+
+
+def test_trajectory_requires_the_exact_opponent_summary_contract():
+    assert stage25_input_spec()["opponent_summary"] == (
+        (11,), np.dtype(np.float32))
+    for invalid in (
+            np.zeros((10,), dtype=np.float32),
+            np.zeros((11,), dtype=np.float64)):
+        row = _row()
+        row.inputs["opponent_summary"] = invalid
+        with pytest.raises(ValueError, match="opponent_summary"):
+            Stage25TrajectoryBuffer(1).append(row)
+    row = _row()
+    del row.inputs["opponent_summary"]
+    with pytest.raises(ValueError, match="exactly the canonical"):
+        Stage25TrajectoryBuffer(1).append(row)
 
 
 def test_append_can_consume_the_shared_one_row_policy_output_contract():

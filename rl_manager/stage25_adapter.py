@@ -592,7 +592,8 @@ def _load_streamed(
         starts = [row["start"] for row in arrow_rows]
         days = [int(row["day"]) for row in arrow_rows]
         batch_inputs = _input_arrays_from_starts(
-            starts, days, include_opponent=False)
+            starts, days, include_opponent=False,
+            include_opponent_summary=True)
         for name, value in batch_inputs.items():
             input_chunks.setdefault(name, []).append(value)
         for offset, arrow_row in enumerate(arrow_rows):
@@ -621,7 +622,8 @@ def _load_streamed(
             for name, chunks in input_chunks.items()
         }
     else:
-        inputs_all = _input_arrays_from_starts([], [], include_opponent=False)
+        inputs_all = _input_arrays_from_starts(
+            [], [], include_opponent=False, include_opponent_summary=True)
     # `crop_capacity` is the persisted legacy key for physical morning board
     # counts B_t. It is never the historical synthetic crop-goal ledger.
     inputs_all["crop_capacity"] = np.asarray(

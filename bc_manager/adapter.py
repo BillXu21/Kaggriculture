@@ -449,6 +449,7 @@ def _input_arrays_from_starts(
     start_rows: Sequence[Mapping[str, Any]],
     day_col: Sequence[int],
     include_opponent: bool = False,
+    include_opponent_summary: bool = False,
 ) -> dict[str, np.ndarray]:
     """Model-facing input arrays from canonical `start` rows (one per record).
 
@@ -507,6 +508,10 @@ def _input_arrays_from_starts(
     inputs["shop_counts"] = shops
     inputs["day"] = day
     inputs["days_remaining"] = np.full(n, TOTAL_DAYS - 1, dtype=np.int16) - day
+
+    if include_opponent_summary:
+        inputs["opponent_summary"] = opponent_summary_arrays(
+            [s["opponent_public"] for s in start_rows])
 
     if include_opponent:
         opp_boards = _board_arrays(

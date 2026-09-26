@@ -61,7 +61,11 @@ from .stage25_mechanics import (
     transition_crop_goal,
     unplaced_animal_counts,
 )
-from .stage25_types import Stage25BehaviorIdentity, stage25_row_token
+from .stage25_types import (
+    STAGE25_OBSERVATION_SCHEMA_VERSION,
+    Stage25BehaviorIdentity,
+    stage25_row_token,
+)
 
 STATE_VERSION = "stage25_provider_state_v3"
 SOURCE_TRANSFER = "encoder_only"
@@ -752,7 +756,8 @@ class Stage25PlanProvider:
 
     def _stage_observation(
         self, obs: Mapping[str, Any], previous_execution: Mapping[str, int] | None,
-        *, profile: Mapping[str, Any] | None = None,
+        *, behavior_identity: Stage25BehaviorIdentity | None = None,
+        profile: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, np.ndarray], PhysicalContext, tuple[int, ...]]:
         if not isinstance(obs, Mapping):
             raise Stage25ProviderError("obs must be a mapping")
@@ -779,6 +784,7 @@ class Stage25PlanProvider:
             phase_started = timer()
         farm = obs["farms"][self.seat]
         board = canonical_board(farm["tiles"], int(obs["day"]), step)
+        input_identity = behavior_identity or self.behavior_identity
         if profile is not None:
             profile["stage25_provider_canonical_board_seconds"] += (
                 timer() - phase_started)
@@ -788,6 +794,10 @@ class Stage25PlanProvider:
             economic_prev_start=self._e_history,
             e_history_version=self.e_history_version,
             canonical_self_board=board,
+            include_opponent_summary=(
+                input_identity is None or
+                input_identity.observation_schema_version ==
+                STAGE25_OBSERVATION_SCHEMA_VERSION),
         )
         if profile is not None:
             profile["stage25_provider_encode_live_inputs_seconds"] += (
@@ -896,7 +906,8 @@ class Stage25PlanProvider:
             profile["stage25_provider_prelude_seconds"] += (
                 timer() - phase_started)
         inputs, context, initial = self._stage_observation(
-            obs, previous_execution, profile=profile)
+            obs, previous_execution, behavior_identity=identity,
+            profile=profile)
         frozen_inputs = self._freeze_inputs(inputs, profile)
         if profile is not None:
             phase_started = timer()
@@ -954,7 +965,8 @@ class Stage25PlanProvider:
         # Bootstrap is a finalization seam, not a manager-boundary preparation,
         # so it deliberately does not contribute to the provider preparation
         # subphase timers (which partition `stage25_provider_prepare_seconds`).
-        inputs, context, initial = self._stage_observation(obs, previous_execution)
+        inputs, context, initial = self._stage_observation(
+            obs, previous_execution, behavior_identity=identity)
         frozen_inputs = self._freeze_inputs(inputs, None)
         return Stage25InferenceContext(
             decision_key=Stage25DecisionKey(
@@ -1075,7 +1087,9 @@ class Stage25PlanProvider:
         self._check_delivery(key)
         classes = _class_tuple(action_classes)
         curriculum = self.effective_curriculum()
-        inputs, context, initial = self._stage_observation(obs, previous_execution)
+        inputs, context, initial = self._stage_observation(
+            obs, previous_execution,
+            behavior_identity=expected_behavior_identity or self.behavior_identity)
         goals = _validate_action(classes, initial, context, curriculum)
         plan = _lower_plan(classes, goals)
         return self._commit(
@@ -1133,7 +1147,8 @@ class Stage25PlanProvider:
         # Bind the effective curriculum before sampling so a checkpoint/config
         # mismatch fails before inference or state mutation.
         curriculum = self.effective_curriculum()
-        inputs, context, initial = self._stage_observation(obs, previous_execution)
+        inputs, context, initial = self._stage_observation(
+            obs, previous_execution, behavior_identity=self.behavior_identity)
         native = self._native_policy
         if hasattr(native, "act"):
             sampled = native.act(

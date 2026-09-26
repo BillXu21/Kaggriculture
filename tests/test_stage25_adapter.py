@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 
 from replay_daily.constants import SCHEMA_VERSION
 from replay_daily.storage import records_to_table, write_parquet
+from bc_manager.economics import signed_log_cash
 from rl_manager.stage25_adapter import (
     PROJECTED_COLUMNS,
     SchemaVersionError,
@@ -156,10 +157,40 @@ def test_real_projected_parquet_returns_fixed_bc_arrays_and_diagnostics(tmp_path
     assert result["inputs"]["available_crop_slots"].shape == (1,)
     assert result["inputs"]["available_crop_slots"].dtype == np.int16
     assert result["inputs"]["available_crop_slots"].tolist() == [25]
+    assert result["inputs"]["opponent_summary"].shape == (1, 11)
+    assert result["inputs"]["opponent_summary"].dtype == np.float32
+    np.testing.assert_array_equal(
+        result["inputs"]["opponent_summary"][0],
+        np.asarray([signed_log_cash(3000), 0.25, 1 / 241,
+                    0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32))
     assert result["actions"][0].tolist() == [0, 0, 0, 0, 101, 100, 100, 100, 100]
     assert result["row_identities"][0]["source_row"] == 0
     assert result["diagnostics"]["support_validity"]["wheat"]["valid"] == 1
     assert result["diagnostics"]["hold_change_distributions"]["WHEAT"]["change"] == 1
+
+
+def test_offline_stage25_summary_reuses_canonical_opponent_public_state(tmp_path):
+    record = _record(0, "2026-08-17")
+    opponent = record["start"]["opponent_public"]
+    opponent["money"] = 1200.0
+    opponent["hands"] = [[1, 1]]
+    opponent["unlocked_quadrants"] = ["NW", "NE"]
+    opponent["board"] = _board(wheat=2)
+    opponent["board"][0][2] = {"kind": "PLANT", "crop": "CARROT"}
+    opponent["board"][1][0] = {"kind": "COOP", "animal": "GOOSE"}
+    opponent["board"][1][1] = {"kind": "PASTURE", "animal": "COW"}
+    opponent["board"][1][2] = {"kind": "PASTURE", "animal": "SHEEP"}
+    path = tmp_path / "canonical-opponent.parquet"
+    _write(path, [record])
+
+    result = load_dataset(path, dates=("2026-08-17",))
+    expected = np.asarray([
+        signed_log_cash(1200), 0.5, 2 / 241,
+        2 / 100, 1 / 100, 0, 0, 0,
+        1 / 100, 1 / 100, 1 / 100,
+    ], dtype=np.float32)
+    np.testing.assert_array_equal(result["inputs"]["opponent_summary"][0],
+                                  expected)
 
 
 def test_streamed_adapter_matches_in_memory_reference_semantics(tmp_path):

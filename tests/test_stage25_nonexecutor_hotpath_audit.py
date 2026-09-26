@@ -31,12 +31,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _identity():
-    from rl_manager.stage25_types import Stage25BehaviorIdentity
+    from rl_manager.stage25_types import (
+        STAGE25_OBSERVATION_SCHEMA_VERSION, STAGE25_POLICY_SCHEMA_VERSION,
+        Stage25BehaviorIdentity,
+    )
 
     return Stage25BehaviorIdentity(
         name="stage25-audit", version="v1", parameter_fingerprint="f" * 64,
-        observation_schema_version="e_v1",
-        policy_schema_version="stage25_policy_v1",
+        observation_schema_version=STAGE25_OBSERVATION_SCHEMA_VERSION,
+        policy_schema_version=STAGE25_POLICY_SCHEMA_VERSION,
         e_history_version="E_CORRECTED_V1",
         curriculum_version="stage25_curriculum_v1",
         curriculum_fingerprint=(

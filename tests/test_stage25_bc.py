@@ -52,6 +52,7 @@ def _inputs(rows: int = 2):
         "crop_capacity": np.zeros((rows, 5), np.int16),
         "replaceable_today": np.zeros((rows, 5), np.int16),
         "available_crop_slots": np.full((rows,), 25, np.int16),
+        "opponent_summary": np.zeros((rows, 11), np.float32),
     }
 
 

@@ -48,6 +48,7 @@ def _inputs(batch: int = 1) -> dict[str, np.ndarray]:
         "crop_capacity": np.zeros((batch, 5), dtype=np.int16),
         "replaceable_today": np.zeros((batch, 5), dtype=np.int16),
         "available_crop_slots": np.full((batch,), 25, dtype=np.int16),
+        "opponent_summary": np.zeros((batch, 11), dtype=np.float32),
     }
 
 
@@ -214,6 +215,10 @@ def test_validation_mode_rejects_unknown_values():
             board_mask=np.zeros((1, 100, 3), dtype=np.uint8)), "shape"),
         ("wrong economic_context shape", lambda values: values.update(
             economic_context=np.zeros((1, 13), dtype=np.float32)), "shape"),
+        ("wrong opponent_summary shape", lambda values: values.update(
+            opponent_summary=np.zeros((1, 10), dtype=np.float32)), "shape"),
+        ("wrong opponent_summary dtype", lambda values: values.update(
+            opponent_summary=np.zeros((1, 11), dtype=np.float64)), "dtype"),
         ("non-finite economic_context", lambda values: values.update(
             economic_context=np.full((1, 14), np.nan, dtype=np.float32)),
             "non-finite"),

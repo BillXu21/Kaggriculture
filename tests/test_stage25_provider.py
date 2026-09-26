@@ -11,6 +11,10 @@ import numpy as np
 import pytest
 
 from bc_manager.economics import E_HISTORY_CORRECTED_V1, E_HISTORY_LEGACY
+from bc_manager.adapter import MAX_PUBLIC_WORKERS, opponent_summary_from_public_state
+from replay_daily.extractor import opponent_public_state
+from replay_daily.storage import normalize_public_state
+from rl_manager.stage25_config import Stage25CurriculumConfig, curriculum_fingerprint
 from rl_manager.stage25_provider import (
     Stage25DecisionKey,
     Stage25DuplicateDecisionError,
@@ -18,6 +22,13 @@ from rl_manager.stage25_provider import (
     Stage25PlanProvider,
     Stage25ProviderError,
     Stage25TerminalError,
+)
+from rl_manager.stage25_types import (
+    STAGE25_OBSERVATION_SCHEMA_VERSION,
+    STAGE25_OBSERVATION_V3_SCHEMA_VERSION,
+    STAGE25_POLICY_SCHEMA_VERSION,
+    STAGE25_POLICY_V3_SCHEMA_VERSION,
+    Stage25BehaviorIdentity,
 )
 
 
@@ -60,6 +71,63 @@ def _obs(day: int = 3, money: float = 3000.0, wheat_count: int = 1) -> dict:
         "town": {"unlocked_shops": []},
         "private": {"shed": {}, "seeds": {}, "inventories": []},
     }
+
+
+def _identity(name: str, *, old_v3: bool = False) -> Stage25BehaviorIdentity:
+    curriculum = Stage25CurriculumConfig()
+    return Stage25BehaviorIdentity(
+        name=name, version="v1", parameter_fingerprint=name * 16,
+        observation_schema_version=(
+            STAGE25_OBSERVATION_V3_SCHEMA_VERSION if old_v3 else
+            STAGE25_OBSERVATION_SCHEMA_VERSION),
+        policy_schema_version=(STAGE25_POLICY_V3_SCHEMA_VERSION if old_v3 else
+                               STAGE25_POLICY_SCHEMA_VERSION),
+        e_history_version=E_HISTORY_CORRECTED_V1,
+        curriculum_version=curriculum.version,
+        curriculum_fingerprint=curriculum_fingerprint(curriculum),
+    )
+
+
+def test_live_provider_derives_float32_summary_from_opponent_public_state():
+    obs = _obs()
+    opponent = obs["farms"][1]
+    opponent["money"] = 1200.0
+    opponent["hands"] = [[3, 3]]
+    opponent["unlocked_quadrants"] = ["NW", "NE"]
+    opponent["tiles"][0][3] = {
+        "kind": "PLANT", "crop": "CARROT", "planted_day": 0,
+        "yield_units": 0, "watered_today": True,
+    }
+    opponent["private"] = {"shed": {"MELON": 999}, "seeds": {"WHEAT": 99}}
+    obs["private"] = {"shed": {"STRAWBERRY": 999}}
+
+    provider = Stage25PlanProvider(7, 0, 3)
+    inputs, _, _ = provider._stage_observation(obs, None)
+    public = normalize_public_state(
+        opponent_public_state(dict(obs), 0, 3, 72))
+    expected = opponent_summary_from_public_state(public)
+
+    assert inputs["opponent_summary"].shape == (1, 11)
+    assert inputs["opponent_summary"].dtype == np.float32
+    np.testing.assert_array_equal(inputs["opponent_summary"][0], expected)
+    assert inputs["opponent_summary"][0, 1] == 0.5
+    assert inputs["opponent_summary"][0, 2] == np.float32(2 / MAX_PUBLIC_WORKERS)
+    assert not any(name.startswith("opp_board_") for name in inputs)
+
+
+def test_v4_and_frozen_v3_policies_receive_their_own_input_vocabularies():
+    obs = _obs(day=4)
+    v4 = Stage25PlanProvider(7, 0, 4, behavior_identity=_identity("v4"))
+    v3 = Stage25PlanProvider(7, 1, 4,
+                             behavior_identity=_identity("v3", old_v3=True))
+    v4_inputs, _, _ = v4._stage_observation(obs, None)
+    v3_inputs, _, _ = v3._stage_observation(obs, None)
+
+    assert "opponent_summary" in v4_inputs
+    assert v4_inputs["opponent_summary"].shape == (1, 11)
+    assert "opponent_summary" not in v3_inputs
+    assert not any(name.startswith("opp_board_") for name in v4_inputs)
+    assert not any(name.startswith("opp_board_") for name in v3_inputs)
 
 
 class _FakeNativePolicy:

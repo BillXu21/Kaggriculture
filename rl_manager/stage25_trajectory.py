@@ -26,12 +26,15 @@ from bc_manager.constants import (
 )
 from bc_manager.model_spec import BOARD_BOOL_FIELDS, BOARD_NUMERIC_FIELDS
 from rl_manager.stage25_mechanics import ACTION_CLASS_COUNTS, ACTION_ORDER, ACTION_SCHEMA_VERSION
-from rl_manager.stage25_types import Stage25BehaviorIdentity, Stage25PolicyOutputs
+from rl_manager.stage25_types import (
+    STAGE25_OBSERVATION_SCHEMA_VERSION,
+    Stage25BehaviorIdentity,
+    Stage25PolicyOutputs,
+)
 
 
-STAGE25_TRAJECTORY_SCHEMA_VERSION = "stage25_trajectory_v3_crop_lifecycle_capacity"
+STAGE25_TRAJECTORY_SCHEMA_VERSION = "stage25_trajectory_v4_opponent_summary"
 TRAJECTORY_SCHEMA_VERSION = STAGE25_TRAJECTORY_SCHEMA_VERSION
-STAGE25_OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_crop_lifecycle_capacity_v3"
 # The metadata name is retained for checkpoint/trajectory compatibility.  The
 # carried crop_capacity value is the physical pre-decision baseline, not a
 # requested-goal ledger.
@@ -86,6 +89,7 @@ def stage25_input_spec() -> dict[str, tuple[tuple[int, ...], np.dtype]]:
         "crop_capacity": ((len(CROP_ORDER),), np.dtype(np.int16)),
         "replaceable_today": ((len(CROP_ORDER),), np.dtype(np.int16)),
         "available_crop_slots": ((), np.dtype(np.int16)),
+        "opponent_summary": ((11,), np.dtype(np.float32)),
     }
 
 

@@ -96,6 +96,7 @@ def encode_live_inputs(
     previous_execution: Mapping[str, int] | None = None,
     *,
     include_opponent: bool = False,
+    include_opponent_summary: bool = False,
     step: int | None = None,
     economic_history: EconomicHistory | None = None,
     economic_prev_start: tuple[int, float] | None = None,
@@ -184,11 +185,13 @@ def encode_live_inputs(
         **normalize_shared_state(shared_state(dict(obs)), "live"),
         "previous_execution": prev,
     }
-    if include_opponent:
+    if include_opponent or include_opponent_summary:
         start["opponent_public"] = normalize_public_state(
             opponent_public_state(dict(obs), seat, day, resolved_step))
     inputs = _input_arrays_from_starts([start], [day],
-                                       include_opponent=include_opponent)
+                                       include_opponent=include_opponent,
+                                       include_opponent_summary=
+                                       include_opponent_summary)
     if (economic_history is not None or economic_prev_start is not None
             or e_history_version is not None):
         money = float(start["self"]["money"])

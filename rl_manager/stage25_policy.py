@@ -47,6 +47,7 @@ __all__ = [
 
 _N_ACTIONS = len(ACTION_ORDER)
 _N_CROPS = len(CROP_ORDER)
+_OPPONENT_SUMMARY_DIM = 11
 _N_ANIMALS = 3
 _N_LAND = 4
 _N_ANIMAL_CLASSES = 101
@@ -87,6 +88,7 @@ _STAGE25_INPUT_SHAPES = {
     "economic_context": (14,),
     "replaceable_today": (5,),
     "available_crop_slots": (),
+    "opponent_summary": (_OPPONENT_SUMMARY_DIM,),
 }
 
 
@@ -234,6 +236,8 @@ def _empty_params(config: Stage25ModelConfig) -> dict[str, Any]:
         "capacity_conditioning": jnp.zeros((_N_CROPS, d), jnp.float32),
         "replaceable_conditioning": jnp.zeros((_N_CROPS, d), jnp.float32),
         "available_crop_slots_conditioning": jnp.zeros((d,), jnp.float32),
+        "opponent_conditioning": jnp.zeros(
+            (_OPPONENT_SUMMARY_DIM, d), jnp.float32),
         "recurrent_decoder": {
             "Wz": jnp.zeros((d, d), jnp.float32),
             "Wh": jnp.zeros((d, d), jnp.float32),
@@ -364,6 +368,8 @@ def init_stage25_params(
         "replaceable_conditioning": normal(leaves[5], (_N_CROPS, d)),
         "available_crop_slots_conditioning": normal(
             jax.random.fold_in(key, 25), (d,)),
+        "opponent_conditioning": normal(
+            jax.random.fold_in(key, 26), (_OPPONENT_SUMMARY_DIM, d)),
         "recurrent_decoder": {
             "Wz": normal(leaves[1], (d, d)),
             "Wh": normal(leaves[2], (d, d)),
@@ -433,12 +439,17 @@ def _validate_stage25_inputs(
         elif name == "board_bool":
             valid_dtype = np.issubdtype(array.dtype, np.bool_)
             target_dtype = np.float32
+        elif name == "opponent_summary":
+            valid_dtype = array.dtype == np.dtype(np.float32)
+            target_dtype = np.float32
         else:
             valid_dtype = np.issubdtype(array.dtype, np.floating)
             target_dtype = np.float32
         if array.dtype.hasobject or not valid_dtype:
             expected = ("an integer" if name in _STAGE25_INTEGER_INPUTS
-                        else "a boolean" if name == "board_bool" else "a float")
+                        else "a boolean" if name == "board_bool"
+                        else "float32" if name == "opponent_summary"
+                        else "a float")
             raise ValueError(f"input {name!r} must have {expected} dtype")
         # board_numeric intentionally carries the established nullable-NaN
         # sentinel. Every other float field is required to be finite.
@@ -690,7 +701,8 @@ def _policy_core(
         dropout_rng = jax.random.fold_in(rng_keys[0], 0x25)
     encoder_inputs = {key: value for key, value in inputs.items()
                       if key not in ("replaceable_today",
-                                     "available_crop_slots")}
+                                     "available_crop_slots",
+                                     "opponent_summary")}
     z = _manager_representation(
         params["encoder"], encoder_inputs, config.manager_config,
         _Dropout(config.dropout if mode == "train" else 0.0, dropout_rng), "E")
@@ -699,6 +711,7 @@ def _policy_core(
         params["replaceable_conditioning"]
     z = z + (jnp.clip(inputs["available_crop_slots"], 0, 100) / 100.0)[:, None] * \
         params["available_crop_slots_conditioning"][None, :]
+    z = z + inputs["opponent_summary"] @ params["opponent_conditioning"]
     value = (z @ params["value_head"]["kernel"] +
              params["value_head"]["bias"])[:, 0]
     derived_context = _physical_context_jax(inputs)

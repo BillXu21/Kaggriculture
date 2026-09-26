@@ -39,14 +39,20 @@ from rl_manager.stage25_mechanics import (
     ACTION_SCHEMA_VERSION,
 )
 from rl_manager.stage25_policy import Stage25ModelConfig, init_stage25_params
+from rl_manager.stage25_types import (
+    STAGE25_OBSERVATION_SCHEMA_VERSION,
+    STAGE25_OBSERVATION_V3_SCHEMA_VERSION,
+    STAGE25_POLICY_SCHEMA_VERSION,
+    STAGE25_POLICY_V3_SCHEMA_VERSION,
+)
 
 
 STAGE25_CHECKPOINT_VERSION = "stage25_native_checkpoint_v1"
 INFERENCE_PAYLOAD_KIND = "stage25_inference_params_v1"
 BC_TRAINING_PAYLOAD_KIND = "stage25_bc_training_state_v1"
 PPO_TRAINING_PAYLOAD_KIND = "stage25_ppo_training_state_v1"
-ARCHITECTURE_VERSION = "stage25_policy_v3_crop_lifecycle_capacity"
-OBSERVATION_SCHEMA_VERSION = "stage25_corrected_e_own_only_crop_lifecycle_capacity_v3"
+ARCHITECTURE_VERSION = STAGE25_POLICY_SCHEMA_VERSION
+OBSERVATION_SCHEMA_VERSION = STAGE25_OBSERVATION_SCHEMA_VERSION
 PERSISTENT_LEDGER_VERSION = "stage25_crop_capacity_ledger_v1"
 PHYSICAL_SUPPORT_VERSION = ACTION_SCHEMA_VERSION
 BC_TARGET_VERSION = "stage25_outcome_proxy_v2_physical_crop_baseline"
@@ -59,24 +65,32 @@ OBSERVATION_VOCABULARY = (
     "board_bool", "board_mask", "scalars", "shed_counts", "seed_counts",
     "carried_counts", "unlocked", "market_inventory", "market_prices",
     "shop_counts", "day", "days_remaining", "economic_context", "crop_capacity",
-    "replaceable_today", "available_crop_slots",
+    "replaceable_today", "available_crop_slots", "opponent_summary",
 )
 
 _LEGACY_PHYSICAL_BASELINE_SOURCES = {
     "stage25_policy_v1": {
         "observation_schema_version": "stage25_corrected_e_own_only_v1",
-        "observation_vocabulary": OBSERVATION_VOCABULARY[:-2],
+        "observation_vocabulary": OBSERVATION_VOCABULARY[:-3],
         "missing_conditioning": (
             "replaceable_conditioning",
             "available_crop_slots_conditioning",
+            "opponent_conditioning",
         ),
         "bc_targets": {BC_TARGET_VERSION},
     },
     "stage25_policy_v2_replaceable_today": {
         "observation_schema_version":
             "stage25_corrected_e_own_only_replaceable_today_v2",
+        "observation_vocabulary": OBSERVATION_VOCABULARY[:-2],
+        "missing_conditioning": (
+            "available_crop_slots_conditioning", "opponent_conditioning"),
+        "bc_targets": {BC_TARGET_VERSION},
+    },
+    STAGE25_POLICY_V3_SCHEMA_VERSION: {
+        "observation_schema_version": STAGE25_OBSERVATION_V3_SCHEMA_VERSION,
         "observation_vocabulary": OBSERVATION_VOCABULARY[:-1],
-        "missing_conditioning": ("available_crop_slots_conditioning",),
+        "missing_conditioning": ("opponent_conditioning",),
         "bc_targets": {BC_TARGET_VERSION},
     },
 }
@@ -1110,9 +1124,9 @@ def migrate_stage25_bc_checkpoint_for_ppo(
     """Explicitly migrate a physical-baseline BC checkpoint as weights only.
 
     General native checkpoint loading remains strict. This seam accepts only
-    the known v1/v2 BC architectures, requires explicit physical morning
+    the known v1/v2/v3 BC architectures, requires explicit physical morning
     baseline provenance, copies every compatible parameter leaf, and zeroes
-    only missing crop-observation conditioning leaves. BC optimizer state and
+    only missing observation-conditioning leaves. BC optimizer state and
     RNG are deliberately discarded; callers must create a fresh PPO state.
     """
     source_path = Path(source)
@@ -1223,7 +1237,7 @@ def migrate_stage25_bc_checkpoint_for_ppo(
             "source_identity": meta.get("source_identity", {}),
         },
         "architecture_migration": {
-            "kind": "stage25_bc_to_crop_lifecycle_capacity_v3",
+            "kind": "stage25_bc_to_opponent_summary_v4",
             "source_architecture_version": architecture,
             "target_architecture_version": ARCHITECTURE_VERSION,
             "source_observation_schema_version":
@@ -1231,9 +1245,8 @@ def migrate_stage25_bc_checkpoint_for_ppo(
             "target_observation_schema_version": OBSERVATION_SCHEMA_VERSION,
             "copied_parameter_leaves": len(source_params),
             "preserved_conditioning_leaves": sorted(
-                expected_missing.symmetric_difference(
-                    {"replaceable_conditioning",
-                     "available_crop_slots_conditioning"})),
+                {"replaceable_conditioning",
+                 "available_crop_slots_conditioning"} - missing_paths),
             "zero_initialized_conditioning_leaves": sorted(missing_paths),
         },
     }
