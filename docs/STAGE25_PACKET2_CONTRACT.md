@@ -35,24 +35,32 @@ mechanics and vocabularies remain authoritative.
   entropies invalid instead of substituting a repaired class.
 
 `inputs` contain the own-only corrected-E arrays plus the pre-decision physical
-crop baseline `crop_capacity` (`B`, integer `[B, 5]`, entries in `[0, 100]`)
-and the observation-only `replaceable_today` forecast (integer-compatible
+crop baseline `crop_capacity` (`B`, integer `[B, 5]`, entries in `[0, 100]`),
+the observation-only `replaceable_today` forecast (integer-compatible
 `[B, 5]`, canonical order `[WHEAT, CARROT, TOMATO, STRAWBERRY, MELON]`,
-entries in `[0, 100]`). The forecast is produced by the shared
+entries in `[0, 100]`), and `available_crop_slots` (integer `[B]`, entries in
+`[0, 100]`). Both new features are materialized at the morning boundary by
+the canonical replay/lifecycle and physical-mechanics helpers. The forecast is produced by the shared
 `replay_daily.lifecycle.replaceable_today` function in both the canonical
 offline adapter and live provider. One-shot crops must be harvest-releasable
 by h21; recurring crops must have their final useful production available for
 HARVEST -> DIG retirement with the final harvest no later than h20. TOMATO's
 final-retirement age is mechanics-derived from the engine constants, using the
 same rule as STRAWBERRY; it is not inferred from a Tetsuya removal sample.
-The policy clips/normalizes this bounded count vector by 100 and applies a
-learned five-crop projection before decoding. It adds no action head.
+The policy normalizes both new fields by 100 and applies learned side
+conditioning before the value head and decoder; neither field changes the
+corrected-E encoder dimensions or adds an action head. `available_crop_slots`
+is current morning free space and is distinct from autoregressive residual
+capacity after the sampled/teacher-forced land and animal prefix.
 
-The feature changes the native policy architecture and observation contract:
-the checkpoint metadata uses `stage25_policy_v2_replaceable_today` and
-`stage25_corrected_e_own_only_replaceable_today_v2`, and trajectories use the
-matching v2 schema. Older checkpoints/trajectories fail the explicit version
-checks rather than silently dropping this input.
+The lifecycle features change the native policy architecture and observation
+contract: checkpoint metadata uses
+`stage25_policy_v3_crop_lifecycle_capacity` and
+`stage25_corrected_e_own_only_crop_lifecycle_capacity_v3`; trajectories use
+`stage25_trajectory_v3_crop_lifecycle_capacity`. Older checkpoints and
+trajectories fail explicit version checks rather than silently dropping these
+inputs. The one-way physical-baseline BC migration is documented in
+`STAGE25_CROP_LIFECYCLE_CONTRACT.md`.
 The baseline is required and unambiguous: a scalar `[B]` baseline or an
 omitted baseline is rejected, there is no separate caller-supplied
 `crop_goals`, and the provider derives the baseline from current physical
