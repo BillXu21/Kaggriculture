@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 
 from executor_v0.plan import DailyPlan
-from executor_v0.strip_executor import StripExecutorController
+from executor_v0.strip_executor import StripExecutorConfig, StripExecutorController
 from executor_v0.strip_market import MarketBootstrapState, build_market_turn_plan
 from executor_v0.strip_work import (
     StripWorkPlan,
@@ -12,12 +12,18 @@ from executor_v0.strip_work import (
     WorkDiagnostics,
     WorkItem,
     RowSummary,
+    build_strip_work_plan,
     row_key_for_tile,
 )
 from replay_daily.constants import PRODUCTS
 
 
-def daily_plan(*, sells: dict[str, dict[int, int]] | None = None) -> DailyPlan:
+def daily_plan(
+    *,
+    sells: dict[str, dict[int, int]] | None = None,
+    crop_targets: dict[str, int] | None = None,
+    animal_targets: dict[str, int] | None = None,
+) -> DailyPlan:
     quantities = {
         product: {anchor: 0 for anchor in (0, 4, 8, 12, 16, 20)}
         for product in PRODUCTS
@@ -25,8 +31,10 @@ def daily_plan(*, sells: dict[str, dict[int, int]] | None = None) -> DailyPlan:
     for product, bins in (sells or {}).items():
         quantities[product].update(bins)
     return DailyPlan.create(
-        crop_targets={crop: 0 for crop in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")},
-        animal_targets={animal: 0 for animal in ("GOOSE", "COW", "SHEEP")},
+        crop_targets={crop: 0 for crop in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")}
+        | dict(crop_targets or {}),
+        animal_targets={animal: 0 for animal in ("GOOSE", "COW", "SHEEP")}
+        | dict(animal_targets or {}),
         land_count=1,
         fertilizer_by_crop={crop: 0 for crop in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")},
         care_by_animal={animal: 0 for animal in ("GOOSE", "COW", "SHEEP")},
@@ -59,7 +67,17 @@ def work(*items: WorkItem) -> StripWorkPlan:
     )
 
 
-def item(kind: str, *, crop=None, animal=None, product=None, quantity=1, supplies=(), tile=None):
+def item(
+    kind: str,
+    *,
+    crop=None,
+    animal=None,
+    product=None,
+    quantity=1,
+    supplies=(),
+    tile=None,
+    source="strip_forecast",
+):
     return WorkItem(
         id=f"{kind}:{crop or animal or product or quantity}",
         kind=kind,
@@ -69,10 +87,11 @@ def item(kind: str, *, crop=None, animal=None, product=None, quantity=1, supplie
         quantity=quantity,
         tile=tile,
         required_supplies=tuple(supplies),
+        source=source,
     )
 
 
-def observation(*, money=0, hour=0, step=None, shed=None, seeds=None, inventories=None, capacity=100, farmer=(0, 0)):
+def observation(*, money=0, hour=0, step=None, day=1, shed=None, seeds=None, inventories=None, capacity=100, farmer=(0, 0), tiles=None):
     farm = {
         "money": money,
         "unlocked_quadrants": ["NW"],
@@ -80,10 +99,12 @@ def observation(*, money=0, hour=0, step=None, shed=None, seeds=None, inventorie
         "hands": [],
         "tiles": [[None] * 10 for _ in range(10)],
     }
+    for (y, x), tile in (tiles or {}).items():
+        farm["tiles"][y][x] = tile
     prices = {product: 25 for product in PRODUCTS}
     inventory = {product: 10000 for product in PRODUCTS}
     return {
-        "day": 1,
+        "day": day,
         "hour": hour,
         "step": hour if step is None else step,
         "farms": [farm, copy.deepcopy(farm)],
@@ -107,6 +128,9 @@ def plan_market(
     max_orders=10,
     protected=None,
     aggressive=False,
+    purchases_enabled=True,
+    retry_animal_purchases=False,
+    retry_replacement_seed_purchases=False,
 ):
     return build_market_turn_plan(
         obs,
@@ -116,6 +140,9 @@ def plan_market(
         shed_capacity=capacity,
         max_orders=max_orders,
         protected_reservations=protected,
+        purchases_enabled=purchases_enabled,
+        retry_animal_purchases=retry_animal_purchases,
+        retry_replacement_seed_purchases=retry_replacement_seed_purchases,
         aggressive_sell_all=aggressive,
     )
 
@@ -253,6 +280,84 @@ def test_controller_keeps_workers_passed_until_animal_purchase_is_observed():
     assert second.diagnostics["market_diagnostics"]["buy_observed"]["BUY_ANIMAL:COW"] == 1
 
 
+def test_escaped_sheep_reuses_empty_pasture_and_places_after_confirmed_pickup():
+    pasture = {(4, 4): {"kind": "PASTURE"}}
+    targeted = daily_plan(animal_targets={"SHEEP": 1})
+    controller = StripExecutorController()
+
+    initial = controller.act(
+        observation(money=0, farmer=(4, 4), step=0, tiles=pasture), targeted
+    )
+    assert initial.market_actions == ()
+    forecast = build_strip_work_plan(
+        observation(money=0, farmer=(4, 4), step=0, tiles=pasture), targeted
+    )
+    assert not any(item.kind.startswith("BUILD") for item in forecast.items)
+
+    affordable = controller.act(
+        observation(money=1000, farmer=(4, 4), step=1, tiles=pasture), targeted
+    )
+    assert affordable.market_actions == (("BUY_ANIMAL", "SHEEP", 1),)
+
+    observed_purchase = controller.act(
+        observation(
+            money=900,
+            shed={"SHEEP": 1},
+            farmer=(4, 4),
+            step=2,
+            tiles=pasture,
+        ),
+        targeted,
+    )
+    assert observed_purchase.farmer_action == ("PICKUP", "SHEEP", 1)
+    assert observed_purchase.diagnostics["route_diagnostics"][0]["supply_plan"][
+        "demand"
+    ] == {"SHEEP": 1}
+
+    placed = controller.act(
+        observation(
+            money=900,
+            farmer=(4, 4),
+            inventories=[{"SHEEP": 1}],
+            step=3,
+            tiles=pasture,
+        ),
+        targeted,
+    )
+    assert placed.farmer_action == ("PLACE", "SHEEP", 1)
+
+
+def test_controller_refreshes_blocked_plant_after_observed_seed_purchase():
+    targeted = daily_plan(crop_targets={"WHEAT": 1})
+    controller = StripExecutorController()
+    first = controller.act(observation(money=16, farmer=(4, 4)), targeted)
+    assert first.market_actions == (("BUY_SEED", "WHEAT", 1),)
+    assert first.farmer_action == ("PASS",)
+
+    second = controller.act(
+        observation(money=6, step=1, seeds={"WHEAT": 1}, farmer=(4, 4)), targeted
+    )
+    assert second.market_actions == ()
+    assert second.farmer_action == ("PLANT", "WHEAT")
+
+    planted = observation(money=6, step=2, seeds={"WHEAT": 0}, farmer=(4, 4))
+    planted["farms"][0]["tiles"][4][4] = {
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "planted_day": 1,
+        "yield_units": 0,
+        "watered_today": False,
+        "fertilized_until_day": -1,
+        "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    third = controller.act(
+        planted,
+        targeted,
+    )
+    assert third.farmer_action == ("WATER",)
+
+
 def test_controller_bounds_no_progress_market_retries_before_finalization():
     def builder(obs, plan, **kwargs):
         del obs, plan, kwargs
@@ -268,7 +373,7 @@ def test_controller_bounds_no_progress_market_retries_before_finalization():
     assert "BUY_LAND:NE" in third.diagnostics["market_diagnostics"]["market_no_progress_failures"]
 
 
-def test_later_sell_cash_does_not_reopen_procurement_after_finalization():
+def test_later_cash_retries_persistent_animal_deficit_after_finalization():
     def builder(obs, plan, **kwargs):
         del obs, plan, kwargs
         return work(WorkItem(id="BUY_ANIMAL:COW:1", kind="BUY_ANIMAL", animal="COW"))
@@ -278,7 +383,19 @@ def test_later_sell_cash_does_not_reopen_procurement_after_finalization():
     assert first.market_actions == ()
     assert first.diagnostics["routes_finalized"] is True
     later = controller.act(observation(money=500, step=1), daily_plan())
-    assert later.market_actions == ()
+    assert later.market_actions == (("BUY_ANIMAL", "COW", 1),)
+
+
+def test_failed_animal_purchase_does_not_poison_the_next_day():
+    def builder(obs, plan, **kwargs):
+        del obs, plan, kwargs
+        return work(WorkItem(id="BUY_ANIMAL:COW:1", kind="BUY_ANIMAL", animal="COW"))
+
+    controller = StripExecutorController(work_builder=builder)
+    first = controller.act(observation(day=1, money=0, step=0), daily_plan())
+    assert first.market_actions == ()
+    later = controller.act(observation(day=2, money=500, step=24), daily_plan())
+    assert later.market_actions == (("BUY_ANIMAL", "COW", 1),)
 
 
 def test_land_unlock_is_an_observation_barrier_before_ne_route_generation():
@@ -402,6 +519,161 @@ def test_partial_seed_realization_keeps_remaining_plant_shortage_visible():
     assert result.orders == (("BUY_SEED", "WHEAT", 2),)
 
 
+def test_finalized_retry_buys_only_marked_retained_plant_shortage():
+    result = plan_market(
+        observation(money=1000, seeds={"WHEAT": 0}),
+        daily_plan(),
+        work(
+            item(
+                "PLANT",
+                crop="WHEAT",
+                tile=(0, 0),
+                quantity=3,
+                supplies=(SupplyRequirement("WHEAT", 3, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+            item(
+                "PLANT",
+                crop="WHEAT",
+                tile=(0, 1),
+                supplies=(SupplyRequirement("WHEAT", 1, "global_seed"),),
+            ),
+        ),
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    assert result.orders == (("BUY_SEED", "WHEAT", 3),)
+    assert result.diagnostics["buy_demand"] == {"BUY_SEED:WHEAT": 3}
+
+
+def test_finalized_retry_uses_authoritative_seed_inventory_and_crop_order():
+    result = plan_market(
+        observation(
+            money=1000,
+            seeds={"WHEAT": 2, "MELON": 0},
+        ),
+        daily_plan(),
+        work(
+            item(
+                "PLANT",
+                crop="MELON",
+                tile=(0, 1),
+                quantity=2,
+                supplies=(SupplyRequirement("MELON", 2, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+            item(
+                "PLANT",
+                crop="WHEAT",
+                tile=(0, 0),
+                quantity=4,
+                supplies=(SupplyRequirement("WHEAT", 4, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+        ),
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    assert result.orders == (
+        ("BUY_SEED", "WHEAT", 2),
+        ("BUY_SEED", "MELON", 2),
+    )
+
+
+def test_finalized_seed_retry_respects_market_order_cap():
+    result = plan_market(
+        observation(money=1000),
+        daily_plan(),
+        work(
+            item(
+                "PLANT",
+                crop="WHEAT",
+                tile=(0, 0),
+                supplies=(SupplyRequirement("WHEAT", 1, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+            item(
+                "PLANT",
+                crop="MELON",
+                tile=(0, 1),
+                supplies=(SupplyRequirement("MELON", 1, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+        ),
+        max_orders=1,
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    assert result.orders == (("BUY_SEED", "WHEAT", 1),)
+    assert result.diagnostics["market_blocked"]["BUY_SEED:MELON"]["block_reason"] == "ORDER_CAP"
+
+
+def test_finalized_retry_excludes_unresolved_and_non_retained_crops():
+    result = plan_market(
+        observation(money=1000),
+        daily_plan(),
+        work(
+            item(
+                "PLANT",
+                crop="WHEAT",
+                supplies=(SupplyRequirement("WHEAT", 3, "global_seed"),),
+                source="crop_unresolved",
+            ),
+            item(
+                "PLANT",
+                crop="TOMATO",
+                tile=(0, 0),
+                supplies=(SupplyRequirement("TOMATO", 1, "global_seed"),),
+                source="retained_crop_maintenance",
+            ),
+        ),
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    assert result.orders == ()
+    assert result.diagnostics["buy_demand"] == {}
+
+
+def test_finalized_seed_retry_is_bounded_when_cash_is_insufficient():
+    state = MarketBootstrapState()
+    forecast = work(
+        item(
+            "PLANT",
+            crop="WHEAT",
+            tile=(0, 0),
+            supplies=(SupplyRequirement("WHEAT", 1, "global_seed"),),
+            source="retained_crop_maintenance",
+        )
+    )
+    first = plan_market(
+        observation(money=0),
+        daily_plan(),
+        forecast,
+        state=state,
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    second = plan_market(
+        observation(money=0, step=1),
+        daily_plan(),
+        forecast,
+        state=state,
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    third = plan_market(
+        observation(money=0, step=2),
+        daily_plan(),
+        forecast,
+        state=state,
+        purchases_enabled=False,
+        retry_replacement_seed_purchases=True,
+    )
+    assert first.orders == second.orders == third.orders == ()
+    assert first.diagnostics["market_blocked"]["BUY_SEED:WHEAT"]["block_reason"] == "CASH"
+    assert third.diagnostics["market_blocked"]["BUY_SEED:WHEAT"]["block_reason"] == "FAILED"
+
+
 def test_fully_realized_purchase_produces_no_further_buy():
     state = MarketBootstrapState()
     state.buy_observed["BUY_PRODUCT:WHEAT"] = 3
@@ -452,18 +724,116 @@ def test_aggressive_selling_ignores_manager_sell_quantity_and_uses_observed_shed
     assert result.diagnostics["aggressive_sell_submitted_this_turn"] == {"MILK": 5}
 
 
-def test_aggressive_mode_never_sells_wheat_even_when_feed_demand_exists():
+def test_aggressive_sell_protects_observed_feed_purchase_until_pickup():
+    feed = work(
+        item(
+            "FEED",
+            tile=(4, 4),
+            supplies=(SupplyRequirement("WHEAT", 1, "inventory"),),
+        )
+    )
+
+    def builder(obs, plan, **kwargs):
+        del obs, plan, kwargs
+        return feed
+
+    controller = StripExecutorController(
+        config=StripExecutorConfig(aggressive_sell_all=True),
+        work_builder=builder,
+    )
+
+    purchase = controller.act(
+        observation(money=100, shed={}, farmer=(4, 4), hour=0),
+        daily_plan(),
+    )
+    assert purchase.market_actions == (("BUY_PRODUCT", "WHEAT", 1),)
+
+    observed = controller.act(
+        observation(money=75, shed={"WHEAT": 1}, farmer=(4, 4), hour=1),
+        daily_plan(),
+    )
+    assert observed.market_actions == ()
+    assert observed.farmer_action == ("PICKUP", "WHEAT", 1)
+
+    picked_up = controller.act(
+        observation(
+            money=75,
+            shed={},
+            inventories=[{"WHEAT": 1}],
+            farmer=(4, 4),
+            hour=2,
+        ),
+        daily_plan(),
+    )
+    assert picked_up.market_actions == ()
+    assert picked_up.farmer_action == ("FEED",)
+
+
+def test_bootstrap_protects_only_excess_over_feed_demand():
+    feed = work(
+        item(
+            "FEED",
+            tile=(4, 4),
+            supplies=(SupplyRequirement("WHEAT", 2, "inventory"),),
+        )
+    )
+
+    def builder(obs, plan, **kwargs):
+        del obs, plan, kwargs
+        return feed
+
+    result = StripExecutorController(
+        config=StripExecutorConfig(aggressive_sell_all=True),
+        work_builder=builder,
+    ).act(
+        observation(money=0, shed={"WHEAT": 5}, farmer=(4, 4)),
+        daily_plan(),
+    )
+    assert result.market_actions == (("SELL", "WHEAT", 3),)
+    assert result.diagnostics["market_diagnostics"]["aggressive_sell_protected"] == {
+        "WHEAT": 2
+    }
+
+
+def test_repeated_bootstrap_observations_do_not_grow_feed_reservation():
+    feed = work(
+        item(
+            "FEED",
+            tile=(4, 4),
+            supplies=(SupplyRequirement("WHEAT", 2, "inventory"),),
+        )
+    )
+
+    def builder(obs, plan, **kwargs):
+        del obs, plan, kwargs
+        return feed
+
+    controller = StripExecutorController(
+        config=StripExecutorConfig(aggressive_sell_all=True),
+        work_builder=builder,
+    )
+    for hour in (0, 1):
+        result = controller.act(
+            observation(money=0, shed={"WHEAT": 5}, farmer=(4, 4), hour=hour),
+            daily_plan(),
+        )
+        assert result.diagnostics["market_diagnostics"]["aggressive_sell_protected"] == {
+            "WHEAT": 2
+        }
+
+
+def test_aggressive_mode_sells_unreserved_wheat_even_when_feed_demand_exists():
     result = plan_market(
         observation(money=0, shed={"WHEAT": 5}, inventories=[{"WHEAT": 2}]),
         daily_plan(),
         work(item("FEED", supplies=(SupplyRequirement("WHEAT", 4, "inventory"),))),
         aggressive=True,
     )
-    assert result.orders == ()
+    assert result.orders == (("SELL", "WHEAT", 5),)
     assert result.diagnostics["aggressive_sell_observed"] == {"WHEAT": 5}
 
 
-def test_aggressive_mode_never_sells_fertilizer_even_with_route_reservation():
+def test_aggressive_mode_sells_excess_fertilizer_and_protects_reservation():
     fertilizer = plan_market(
         observation(money=0, shed={"FERTILIZER": 5}),
         daily_plan(),
@@ -471,7 +841,7 @@ def test_aggressive_mode_never_sells_fertilizer_even_with_route_reservation():
         protected={"FERTILIZER": 2},
         aggressive=True,
     )
-    assert fertilizer.orders == ()
+    assert fertilizer.orders == (("SELL", "FERTILIZER", 3),)
 
     wheat = plan_market(
         observation(money=0, shed={"WHEAT": 5}),
@@ -480,10 +850,10 @@ def test_aggressive_mode_never_sells_fertilizer_even_with_route_reservation():
         protected={"WHEAT": 3},
         aggressive=True,
     )
-    assert wheat.orders == ()
+    assert wheat.orders == (("SELL", "WHEAT", 2),)
 
 
-def test_aggressive_mode_sells_outputs_but_retains_wheat_and_fertilizer():
+def test_aggressive_mode_sells_all_canonical_products():
     result = plan_market(
         observation(
             money=0,
@@ -494,11 +864,12 @@ def test_aggressive_mode_sells_outputs_but_retains_wheat_and_fertilizer():
         aggressive=True,
     )
     assert result.orders == (
+        ("SELL", "WHEAT", 5),
         ("SELL", "CARROT", 2),
         ("SELL", "MELON", 4),
         ("SELL", "MILK", 1),
+        ("SELL", "FERTILIZER", 3),
     )
-    assert all(order[1] not in {"WHEAT", "FERTILIZER"} for order in result.orders)
 
 
 def test_aggressive_sell_proceeds_fund_buy_land_in_the_same_turn():
@@ -522,7 +893,7 @@ def test_aggressive_sales_and_purchases_respect_market_order_cap():
         aggressive=True,
     )
     assert len(result.orders) == 2
-    assert result.orders == (("SELL", "CARROT", 1), ("SELL", "MILK", 1))
+    assert result.orders == (("SELL", "WHEAT", 1), ("SELL", "CARROT", 1))
 
 
 def test_multiple_partial_observations_follow_current_stock_exactly():

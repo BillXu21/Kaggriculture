@@ -53,7 +53,7 @@ def _encoded(batch_size: int = 1, *, economics: float = 0.0,
              ledger: np.ndarray | None = None) -> dict[str, np.ndarray]:
     """Small corrected-E-shaped arrays; no Parquet or Torch dependency.
 
-    ``ledger`` is the persistent goal ledger ``K`` of shape ``[B, 5]``.  The
+    ``ledger`` is the physical crop baseline ``B`` of shape ``[B, 5]``.  The
     physical capacity ``C`` is not an input; it is derived from the encoded
     board / ``physical_contexts``.
     """
@@ -405,7 +405,7 @@ def test_zero_capacity_forces_contraction_and_remains_valid():
                           np.zeros((1, 5), dtype=np.int32))
 
 
-def test_ledger_input_is_required_and_rectangular():
+def test_physical_crop_baseline_input_is_required_and_rectangular():
     config = _config()
     params = init_stage25_params(config, seed=106)
     omitted = _encoded(1)
@@ -471,8 +471,6 @@ def test_nonzero_available_slot_conditioning_changes_policy_representation():
                               np.asarray(after["logits"]))
     assert not np.array_equal(np.asarray(before["value"]),
                               np.asarray(after["value"]))
-
-
 def test_sampled_and_teacher_forced_crop_masks_match_packet1():
     config = _config()
     params = init_stage25_params(config, seed=107)

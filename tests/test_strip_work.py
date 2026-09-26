@@ -3,6 +3,8 @@
 import copy
 import json
 
+import pytest
+
 from executor_v0.plan import DailyPlan
 from executor_v0.strip_work import (
     BlockReason,
@@ -57,15 +59,27 @@ def plant(
     }
 
 
-def animal(name="GOOSE", *, fed_today=False, cared_today=False):
+def animal(
+    name="GOOSE",
+    *,
+    yield_units=0,
+    fertilizer_available=None,
+    fed_today=False,
+    cared_today=False,
+):
     return {
         "kind": "COOP" if name == "GOOSE" else "PASTURE",
         "animal": name,
         "placed_day": 0,
-        "yield_units": 0,
+        "yield_units": yield_units,
         "fed_today": fed_today,
         "cared_today": cared_today,
         "consecutive_unfed": 0,
+        **(
+            {"fertilizer_available": fertilizer_available}
+            if fertilizer_available is not None
+            else {}
+        ),
     }
 
 
@@ -160,6 +174,65 @@ def test_new_crop_water_waits_for_plant_but_chain_counts_both():
     assert chain.interaction_turns == 2
 
 
+def test_retained_crop_preferred_slot_is_reserved_without_duplicate_plant():
+    result = build_strip_work_plan(
+        obs(seeds={"WHEAT": 1, "CARROT": 1}),
+        plan(crop_targets={"WHEAT": 1, "CARROT": 1}),
+        preferred_crop_slots={"WHEAT": ((0, 0),), "CARROT": ((0, 0),)},
+    )
+    plants = [item for item in result.items if item.kind == "PLANT"]
+    assert {item.crop: item.tile for item in plants} == {
+        "WHEAT": (0, 0),
+        "CARROT": (0, 4),
+    }
+    assert len({item.tile for item in plants}) == len(plants)
+    assert next(item for item in plants if item.crop == "WHEAT").source == (
+        "retained_crop_maintenance"
+    )
+
+
+def test_preferred_tomato_slot_does_not_get_retained_seed_retry_provenance():
+    result = build_strip_work_plan(
+        obs(seeds={"TOMATO": 1}),
+        plan(crop_targets={"TOMATO": 1}),
+        preferred_crop_slots={"TOMATO": ((0, 0),)},
+    )
+    planting = next(item for item in result.items if item.kind == "PLANT")
+    assert planting.tile == (0, 0)
+    assert planting.source == "crop_reconciliation"
+
+
+def test_seed_observation_unlocks_only_the_affordable_crop_stage():
+    initial = build_strip_work_plan(
+        obs(money=16),
+        plan(crop_targets={"WHEAT": 1, "STRAWBERRY": 17}),
+    )
+    initial_plants = [item for item in initial.items if item.kind == "PLANT"]
+    assert len([item for item in initial_plants if item.crop == "WHEAT"]) == 1
+    assert len([item for item in initial_plants if item.crop == "STRAWBERRY"]) == 17
+    assert all(
+        item.status == WorkStatus.BLOCKED
+        and item.block_reason == BlockReason.MISSING_GLOBAL_RESOURCE
+        for item in initial_plants
+    )
+
+    refreshed = build_strip_work_plan(
+        obs(money=6, seeds={"WHEAT": 1}),
+        plan(crop_targets={"WHEAT": 1, "STRAWBERRY": 17}),
+    )
+    wheat = next(
+        item for item in refreshed.items if item.kind == "PLANT" and item.crop == "WHEAT"
+    )
+    strawberries = [
+        item
+        for item in refreshed.items
+        if item.kind == "PLANT" and item.crop == "STRAWBERRY"
+    ]
+    assert wheat.status == WorkStatus.READY
+    assert all(item.block_reason == BlockReason.MISSING_GLOBAL_RESOURCE for item in strawberries)
+    assert refreshed.diagnostics.represented_crop_delta_dict["STRAWBERRY"] == 17
+
+
 def test_replacement_has_harvest_plant_water_but_reduction_has_no_replacement():
     board = [[None] * 10 for _ in range(10)]
     board[0][0] = plant("WHEAT", planted_day=0, yield_units=3)
@@ -189,10 +262,177 @@ def test_replacement_has_harvest_plant_water_but_reduction_has_no_replacement():
     board[0][1] = plant("WHEAT", planted_day=0, yield_units=1)
     reduced = build_strip_work_plan(obs(board, day=3), plan(crop_targets={"WHEAT": 1}))
     assert not kinds(reduced, "PLANT")
-    assert [(item.kind, item.tile) for item in kinds(reduced, "DIG")] == [
-        ("DIG", (0, 1))
+    assert [(item.kind, item.tile) for item in kinds(reduced, "HARVEST")] == [
+        ("HARVEST", (0, 0))
     ]
-    assert not [item for item in kinds(reduced, "WATER") if item.tile == (0, 1)]
+    assert not kinds(reduced, "DIG")
+    assert any(item.tile == (0, 1) for item in kinds(reduced, "WATER"))
+
+
+@pytest.mark.parametrize(
+    ("crop", "day"),
+    [("CARROT", 3), ("TOMATO", 8), ("STRAWBERRY", 10), ("MELON", 10)],
+)
+def test_retained_mature_non_wheat_crop_gets_one_routine_harvest(crop, day):
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant(crop, planted_day=0, yield_units=1)
+
+    result = build_strip_work_plan(
+        obs(board, day=day), plan(crop_targets={crop: 1})
+    )
+
+    harvests = kinds(result, "HARVEST")
+    assert [(item.id, item.tile, item.crop, item.source) for item in harvests] == [
+        ("HARVEST:0,0", (0, 0), crop, "routine_harvest")
+    ]
+
+
+def test_retained_immature_crop_does_not_get_routine_harvest():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("MELON", planted_day=2, yield_units=1)
+
+    result = build_strip_work_plan(
+        obs(board, day=3), plan(crop_targets={"MELON": 1})
+    )
+
+    assert not kinds(result, "HARVEST")
+
+
+def test_retained_wheat_uses_threshold_and_horizon_harvestability():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("WHEAT", planted_day=0, yield_units=2)
+    below_threshold = build_strip_work_plan(
+        obs(board, day=3, step=72), plan(crop_targets={"WHEAT": 1})
+    )
+    assert not kinds(below_threshold, "HARVEST")
+
+    board[0][0]["yield_units"] = 3
+    at_threshold = build_strip_work_plan(
+        obs(board, day=3, step=72), plan(crop_targets={"WHEAT": 1})
+    )
+    assert [item.source for item in kinds(at_threshold, "HARVEST")] == [
+        "routine_harvest"
+    ]
+
+    board[0][0]["yield_units"] = 0
+    terminal = build_strip_work_plan(
+        obs(board, day=29, step=718), plan(crop_targets={"WHEAT": 1})
+    )
+    assert [item.source for item in kinds(terminal, "HARVEST")] == [
+        "routine_harvest"
+    ]
+
+
+def test_replacement_and_reduction_harvests_are_not_duplicated_by_routine_scan():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("WHEAT", planted_day=0, yield_units=3)
+    for y in range(5):
+        for x in range(5):
+            if (y, x) != (0, 0):
+                board[y][x] = "LOCKED"
+    replacement = build_strip_work_plan(
+        obs(board, day=3, step=72, seeds={"TOMATO": 1}),
+        plan(crop_targets={"TOMATO": 1}),
+    )
+    replacement_harvests = kinds(replacement, "HARVEST")
+    assert len(replacement_harvests) == 1
+    assert replacement_harvests[0].source == "crop_replacement"
+
+    reduction = build_strip_work_plan(
+        obs(board, day=3, step=72), plan(crop_targets={"WHEAT": 0})
+    )
+    reduction_harvests = kinds(reduction, "HARVEST")
+    assert len(reduction_harvests) == 1
+    assert reduction_harvests[0].source == "crop_reduction"
+
+
+def test_routine_and_replacement_harvests_share_stable_unique_ids():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("WHEAT", planted_day=0, yield_units=3)
+    board[0][1] = plant("MELON", planted_day=0, yield_units=1)
+    for y in range(5):
+        for x in range(5):
+            if (y, x) not in {(0, 0), (0, 1)}:
+                board[y][x] = "LOCKED"
+    result = build_strip_work_plan(
+        obs(board, day=10, step=240, seeds={"TOMATO": 1}),
+        plan(crop_targets={"TOMATO": 1, "MELON": 1}),
+    )
+
+    harvests = {item.tile: item for item in kinds(result, "HARVEST")}
+    assert harvests[(0, 0)].source == "crop_replacement"
+    assert harvests[(0, 1)].source == "routine_harvest"
+    assert len({item.id for item in harvests.values()}) == len(harvests)
+
+
+def test_retained_harvest_output_is_deterministic():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("MELON", planted_day=0, yield_units=1)
+    observation = obs(board, day=10, step=240)
+    daily_plan = plan(crop_targets={"MELON": 1})
+
+    first = build_strip_work_plan(observation, daily_plan)
+    second = build_strip_work_plan(copy.deepcopy(observation), daily_plan)
+    assert first == second
+
+
+@pytest.mark.parametrize(
+    ("species", "product"),
+    [("GOOSE", "EGG"), ("COW", "MILK"), ("SHEEP", "WOOL")],
+)
+def test_routine_animal_harvest_maps_species_product_once(species, product):
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = animal(
+        species, yield_units=6, fed_today=True, cared_today=True
+    )
+
+    result = build_strip_work_plan(obs(board), plan())
+
+    harvests = kinds(result, "HARVEST")
+    assert len(harvests) == 1
+    harvest = harvests[0]
+    assert harvest.status == WorkStatus.READY
+    assert harvest.tile == (0, 0)
+    assert harvest.animal == species
+    assert harvest.product == product
+    assert harvest.source == "routine_animal_harvest"
+    assert result.diagnostics.work_counts_kind["HARVEST"] == 1
+    assert result.row_summary_by_key[row_key_for_tile((0, 0))].ready_interactions == 1
+
+
+def test_routine_animal_fertilizer_collection_requires_true_and_is_distinct():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = animal("SHEEP", fertilizer_available=True)
+    result = build_strip_work_plan(obs(board), plan())
+
+    harvests = kinds(result, "HARVEST")
+    collections = kinds(result, "COLLECT_FERTILIZER")
+    assert harvests == []
+    assert len(collections) == 1
+    collection = collections[0]
+    assert collection.status == WorkStatus.READY
+    assert collection.tile == (0, 0)
+    assert collection.animal == "SHEEP"
+    assert collection.product == "FERTILIZER"
+    assert collection.source == "routine_animal_fertilizer_collection"
+
+
+def test_routine_animal_outputs_expose_both_items_and_skip_zero_false():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = animal("SHEEP", yield_units=6, fertilizer_available=True)
+    both = build_strip_work_plan(obs(board), plan())
+    assert {item.kind for item in both.items if item.tile == (0, 0)} >= {
+        "HARVEST",
+        "COLLECT_FERTILIZER",
+    }
+    assert len(kinds(both, "HARVEST")) == 1
+    assert len(kinds(both, "COLLECT_FERTILIZER")) == 1
+    assert both.row_summary_by_key[row_key_for_tile((0, 0))].ready_interactions == 2
+
+    board[0][0] = animal("SHEEP", yield_units=0, fertilizer_available=False)
+    neither = build_strip_work_plan(obs(board), plan())
+    assert kinds(neither, "HARVEST") == []
+    assert kinds(neither, "COLLECT_FERTILIZER") == []
 
 
 def test_animal_build_and_place_are_retained_when_purchase_is_missing():
@@ -405,6 +645,19 @@ def test_routine_watering_uses_default_ages_and_stable_reasons():
     assert ((1, 2), "survival_weed_prevention") in water
 
 
+def test_wheat_threshold_harvest_suppresses_same_turn_routine_water():
+    for age in (2, 3, 4):
+        board = [[None] * 10 for _ in range(10)]
+        board[0][0] = plant("WHEAT", planted_day=15 - age, yield_units=3)
+        result = build_strip_work_plan(
+            obs(board, day=15, step=360), plan(crop_targets={"WHEAT": 1})
+        )
+        assert [item.kind for item in kinds(result, "HARVEST") if item.tile == (0, 0)] == [
+            "HARVEST"
+        ]
+        assert not [item for item in kinds(result, "WATER") if item.tile == (0, 0)]
+
+
 def test_wheat_harvest_uses_authoritative_terminal_exception():
     board = [["LOCKED"] * 5 + [None] * 5 for _ in range(10)]
     board[0][0] = plant("WHEAT", planted_day=0, yield_units=0)
@@ -464,6 +717,79 @@ def test_animal_purchase_is_blocked_by_authoritative_farm_money():
     place = kinds(result, "PLACE")[0]
     assert purchase.block_reason == BlockReason.MISSING_GLOBAL_RESOURCE
     assert place.block_reason == BlockReason.DEPENDENCY_BLOCKED
+
+
+def test_escaped_animal_deficit_reuses_empty_matching_structure():
+    board = [[None] * 10 for _ in range(10)]
+    board[4][4] = {"kind": "PASTURE"}
+    result = build_strip_work_plan(
+        obs(board, shed={}, money=1000), plan(animal_targets={"SHEEP": 1})
+    )
+    assert {item.kind for item in result.items} == {"BUY_ANIMAL", "PLACE"}
+    purchase = kinds(result, "BUY_ANIMAL")[0]
+    place = kinds(result, "PLACE")[0]
+    assert purchase.status == WorkStatus.READY
+    assert place.status == WorkStatus.BLOCKED
+    assert place.block_reason == BlockReason.MISSING_PURCHASE
+    assert place.tile == (4, 4)
+
+
+def test_observed_purchased_animal_makes_place_ready_without_duplicate_buy():
+    board = [[None] * 10 for _ in range(10)]
+    board[4][4] = {"kind": "PASTURE"}
+    result = build_strip_work_plan(
+        obs(board, shed={"SHEEP": 1}, money=1000),
+        plan(animal_targets={"SHEEP": 1}),
+    )
+    assert not kinds(result, "BUY_ANIMAL")
+    place = kinds(result, "PLACE")[0]
+    assert place.status == WorkStatus.READY
+    assert place.required_supply_dict == {"SHEEP": 1}
+
+
+def test_animal_target_counts_are_authoritative_and_structure_type_is_exact():
+    board = [[None] * 10 for _ in range(10)]
+    board[4][4] = {
+        "kind": "PASTURE", "animal": "SHEEP", "placed_day": 1,
+        "yield_units": 0, "fed_today": False, "cared_today": False,
+        "consecutive_unfed": 0,
+    }
+    retained = build_strip_work_plan(
+        obs(board, shed={"SHEEP": 1}, money=1000),
+        plan(animal_targets={"SHEEP": 1}),
+    )
+    assert not kinds(retained, "PLACE")
+    assert not kinds(retained, "BUY_ANIMAL")
+
+    wrong_structure = [[None] * 10 for _ in range(10)]
+    wrong_structure[4][4] = {"kind": "COOP"}
+    rebuilt = build_strip_work_plan(
+        obs(wrong_structure, shed={"SHEEP": 1}, money=1000),
+        plan(animal_targets={"SHEEP": 1}),
+    )
+    assert [item.kind for item in rebuilt.items] == ["BUILD_PASTURE", "PLACE"]
+
+
+def test_multiple_animal_deficits_use_canonical_deterministic_order():
+    board = [[None] * 10 for _ in range(10)]
+    board[4][4] = {"kind": "PASTURE"}
+    board[3][4] = {"kind": "PASTURE"}
+    result = build_strip_work_plan(
+        obs(board, shed={}, money=5000),
+        plan(animal_targets={"COW": 1, "SHEEP": 1}),
+    )
+    placements = [item for item in result.items if item.kind == "PLACE"]
+    assert [(item.animal, item.tile) for item in placements] == [
+        ("COW", (4, 4)), ("SHEEP", (3, 4))
+    ]
+
+
+def test_zero_animal_target_stops_replacement_attempts():
+    board = [[None] * 10 for _ in range(10)]
+    board[4][4] = {"kind": "PASTURE"}
+    result = build_strip_work_plan(obs(board, money=1000), plan())
+    assert not any(item.kind in {"BUY_ANIMAL", "PLACE", "BUILD_PASTURE"}
+                   for item in result.items)
 
 
 def test_coordinates_purity_determinism_and_json_safety():

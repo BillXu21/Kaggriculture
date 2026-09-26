@@ -2,7 +2,8 @@
 
 This module deliberately depends only on the Python standard library.  It is
 shared by later rollout and JAX packets, so sampled class indices, signed crop
-deltas, and decoded persistent goals remain separate at every public boundary.
+deltas, the physical pre-decision baseline, and decoded end-of-day goals remain
+separate at every public boundary.
 """
 
 from __future__ import annotations
@@ -82,24 +83,28 @@ def animal_target_to_class(target: int) -> int:
 
 
 def crop_class_to_delta(class_index: int) -> int:
-    """Decode a crop class index to its signed persistent-goal delta."""
+    """Decode a crop class index to its signed board-relative delta."""
     return _require_range(class_index, "crop class index", 0, 200) - 100
 
 
 def crop_delta_to_class(delta: int) -> int:
-    """Encode a signed persistent-goal delta as a crop class index."""
+    """Encode a signed board-relative delta as a crop class index."""
     return _require_range(delta, "crop delta", CROP_DELTA_MIN,
                           CROP_DELTA_MAX) + 100
 
 
 def initialize_crop_ledger(observed_crop_counts: Sequence[int]) \
         -> tuple[int, ...]:
-    """Initialize one seat's persistent goals from first-boundary occupancy."""
+    """Normalize one boundary's physical crop counts for model input.
+
+    The compatibility name is retained for the existing model-facing seam;
+    this value is not a persistent goal ledger.
+    """
     return _crop_goal_vector(observed_crop_counts, "observed crop count")
 
 
 def transition_crop_goal(previous_goal: int, sampled_delta: int) -> int:
-    """Apply one sampled delta exactly once, rejecting rather than repairing."""
+    """Apply one sampled delta to a supplied boundary baseline."""
     previous = _require_range(previous_goal, "previous crop goal",
                               CROP_GOAL_MIN, CROP_GOAL_MAX)
     delta = _require_range(sampled_delta, "sampled crop delta",
@@ -116,7 +121,11 @@ def transition_crop_ledger(
     previous_goals: Sequence[int],
     sampled_deltas: Sequence[int],
 ) -> tuple[int, ...]:
-    """Apply five sampled deltas exactly once to a persistent crop ledger."""
+    """Apply five sampled deltas to one supplied boundary baseline.
+
+    Callers must supply the physical board counts for each new decision; the
+    result is the requested end-of-day goal vector for that decision.
+    """
     previous = _crop_goal_vector(previous_goals, "previous crop goal")
     deltas = tuple(sampled_deltas)
     if len(deltas) != len(CROP_ORDER):

@@ -412,7 +412,6 @@ def _validate_stage25_inputs(
     if ledger is None:
         raise ValueError(
             "inputs must contain crop_capacity (physical crop baseline B [B,5])")
-
     arrays: dict[str, np.ndarray] = {}
     batch: int | None = None
     for name, expected_tail in _STAGE25_INPUT_SHAPES.items():
@@ -483,35 +482,6 @@ def _validate_stage25_inputs(
     canonical_ledger = (ledger_array if ledger_array.dtype == np.int32
                         else ledger_array.astype(np.int32, copy=False))
     return _ValidatedStage25Inputs(arrays, canonical_ledger, int(batch))
-
-
-def _prepare_stage25_inputs_validated(
-        validated: _ValidatedStage25Inputs,
-) -> tuple[dict[str, jax.Array], jax.Array, int]:
-    """Perform the one eager NumPy-to-JAX preparation after validation."""
-    prepared = {key: jnp.asarray(value) for key, value in validated.inputs.items()}
-    return prepared, jnp.asarray(validated.crop_capacity), validated.batch
-
-
-def _host_inputs(
-        inputs: Mapping[str, Any], config: Stage25ModelConfig,
-        crop_capacity: Any = None,
-) -> tuple[dict[str, jax.Array], jax.Array, int]:
-    """Public policy boundary: validate once, then prepare canonical inputs."""
-    validated = _validate_stage25_inputs(inputs, config, crop_capacity)
-    return _prepare_stage25_inputs_validated(validated)
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedPhysicalContexts:
-    source: tuple[Any, ...]
-    values: tuple[jax.Array, ...]
-
-    def __len__(self) -> int:
-        return len(self.source)
-
-    def __iter__(self):
-        return iter(self.source)
 
 
 def _prepare_stage25_inputs_validated(

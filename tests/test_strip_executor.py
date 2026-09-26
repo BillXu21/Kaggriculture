@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import copy
+from itertools import product
+
+import pytest
 
 from executor_v0.plan import DailyPlan
+from executor_v0.strip_cost import nearest_shed_access, simulate_route_cost
 from executor_v0.strip_executor import StripExecutorController
 from executor_v0.strip_routes import (
+    HorizontalRouteCandidate,
     RoutePhase,
+    RouteSegment,
     StripRoute,
     WorkerId,
+    _chain_plan_for_mask,
     assign_horizontal_routes,
     generate_horizontal_route_candidates,
+    remaining_day_action_slots,
+    route_cursor_invariants_hold,
 )
 from executor_v0.strip_work import (
     BlockReason,
@@ -23,6 +32,7 @@ from executor_v0.strip_work import (
     WorkDiagnostics,
     WorkItem,
     WorkStatus,
+    forecast_effective_interactions,
     row_key_for_tile,
 )
 
@@ -32,9 +42,9 @@ ANIMALS = ("GOOSE", "COW", "SHEEP")
 PRODUCTS = (*CROPS, "EGG", "MILK", "WOOL", "FERTILIZER")
 
 
-def plan() -> DailyPlan:
+def plan(*, crop_targets=None) -> DailyPlan:
     return DailyPlan.create(
-        crop_targets={crop: 0 for crop in CROPS},
+        crop_targets={crop: 0 for crop in CROPS} | dict(crop_targets or {}),
         animal_targets={animal: 0 for animal in ANIMALS},
         land_count=1,
         fertilizer_by_crop={crop: 0 for crop in CROPS},
@@ -46,8 +56,18 @@ def plan() -> DailyPlan:
     )
 
 
-def observation(*, hour=0, farmer=(0, 0), hands=(), inventories=None, day=3):
+def observation(
+    *,
+    hour=0,
+    farmer=(0, 0),
+    hands=(),
+    inventories=None,
+    day=3,
+    money=0,
+    seeds=None,
+):
     farm = {
+        "money": money,
         "farmer": [farmer[0], farmer[1]],
         "hands": [[x, y] for x, y in hands],
         "tiles": [[None] * 10 for _ in range(10)],
@@ -61,7 +81,7 @@ def observation(*, hour=0, farmer=(0, 0), hands=(), inventories=None, day=3):
         "farms": [farm, copy.deepcopy(farm)],
         "private": {
             "shed": {},
-            "seeds": {"WHEAT": 10},
+            "seeds": seeds if seeds is not None else {"WHEAT": 10},
             "inventories": inventories if inventories is not None else [{}, {}],
         },
     }
@@ -73,10 +93,12 @@ def work_item(
     *,
     status=WorkStatus.READY,
     crop=None,
+    animal=None,
     required_supplies=(),
     depends_on=(),
     block_reason=None,
     item_id=None,
+    source="strip_forecast",
 ) -> WorkItem:
     return WorkItem(
         id=item_id or f"{kind}:{tile[0]},{tile[1]}",
@@ -85,9 +107,11 @@ def work_item(
         block_reason=block_reason,
         tile=tile,
         crop=crop,
+        animal=animal,
         depends_on=tuple(depends_on),
         required_supplies=tuple(required_supplies),
         row_key=row_key_for_tile(tile),
+        source=source,
     )
 
 
@@ -109,6 +133,56 @@ def fake_plan(items: tuple[WorkItem, ...]) -> StripWorkPlan:
         diagnostics=WorkDiagnostics(),
         acting_seat=0,
     )
+
+
+def _run_static_controller_route(items: tuple[WorkItem, ...], *, shed=None):
+    remaining = list(items)
+    inventory: dict[str, int] = {}
+    observed_shed = dict(shed or {})
+
+    def builder(obs, daily_plan, **kwargs):
+        del obs, daily_plan, kwargs
+        return fake_plan(tuple(remaining))
+
+    controller = StripExecutorController(work_builder=builder)
+    position = (0, 0)  # canonical (y, x)
+    actions = []
+    route = None
+    for hour in range(24):
+        obs = observation(
+            hour=hour,
+            farmer=(position[1], position[0]),
+            inventories=[dict(inventory), {}],
+        )
+        obs["private"]["shed"] = dict(observed_shed)
+        result = controller.act(obs, plan())
+        assert result.market_actions == ()
+        route = controller._routes.get(WorkerId(0))
+        action = result.farmer_action
+        if action != ("PASS",):
+            actions.append(action)
+        if action == ("NORTH",):
+            position = (position[0] - 1, position[1])
+        elif action == ("SOUTH",):
+            position = (position[0] + 1, position[1])
+        elif action == ("WEST",):
+            position = (position[0], position[1] - 1)
+        elif action == ("EAST",):
+            position = (position[0], position[1] + 1)
+        elif action and action[0] == "PICKUP":
+            item, quantity = action[1], int(action[2])
+            inventory[item] = inventory.get(item, 0) + quantity
+            observed_shed[item] = max(0, observed_shed.get(item, 0) - quantity)
+        elif action and action[0] in {"WATER", "FEED"}:
+            remaining[:] = [
+                item
+                for item in remaining
+                if not (item.tile == position and item.kind == action[0])
+            ]
+        if route is not None and route.phase == RoutePhase.DONE:
+            break
+    assert route is not None and route.phase == RoutePhase.DONE
+    return controller, tuple(actions)
 
 
 def test_generic_route_accepts_non_horizontal_traversal():
@@ -148,6 +222,227 @@ def test_horizontal_generation_and_exclusive_row_assignment():
     )
 
 
+def test_retained_harvest_forecast_adds_two_continuations_per_crop_once():
+    harvests = tuple(
+        work_item(
+            "HARVEST",
+            (0, x),
+            crop=crop,
+            source="routine_harvest",
+            item_id=f"HARVEST:{x}",
+        )
+        for x, crop in enumerate(("WHEAT", "CARROT", "MELON"))
+    )
+    candidate = generate_horizontal_route_candidates(fake_plan(harvests))[0]
+
+    assert candidate.tile_interactions[:3] == (1, 1, 1)
+    assert candidate.tile_known_continuation_interactions[:3] == (2, 2, 2)
+    assert candidate.forecast_tile_interactions[:3] == (3, 3, 3)
+    assert candidate.represented_interactions == 3
+    assert candidate.known_continuation_interactions == 6
+    assert candidate.forecasted_workload_interactions == 9
+
+
+def test_retained_harvest_forecast_does_not_double_count_explicit_chain():
+    chain = (
+        work_item("HARVEST", (0, 0), crop="WHEAT", source="routine_harvest"),
+        work_item("PLANT", (0, 0), crop="WHEAT"),
+        work_item("WATER", (0, 0), crop="WHEAT"),
+    )
+    forecast = forecast_effective_interactions(chain)
+    candidate = generate_horizontal_route_candidates(fake_plan(chain))[0]
+
+    assert forecast.represented_interactions == 3
+    assert forecast.known_continuation_interactions == 0
+    assert candidate.forecasted_workload_interactions == 3
+
+
+def _overloaded_retained_row():
+    animals = tuple(
+        work_item(
+            kind,
+            (0, tile),
+            animal=animal,
+            item_id=f"{kind}:{tile}",
+            source=f"routine_animal_{kind.lower()}",
+        )
+        for tile, animal in ((0, "COW"), (1, "SHEEP"))
+        for kind in ("FEED", "CARE", "HARVEST", "COLLECT_FERTILIZER")
+    )
+    crops = tuple(
+        work_item(
+            "HARVEST",
+            (0, tile),
+            crop=crop,
+            source="routine_harvest",
+        )
+        for tile, crop in zip((2, 3, 4), ("WHEAT", "CARROT", "MELON"), strict=True)
+    )
+    return (*animals, *crops)
+
+
+def test_overloaded_row_gets_disjoint_contiguous_helper_suffix():
+    candidate = generate_horizontal_route_candidates(
+        fake_plan(_overloaded_retained_row())
+    )
+    assigned = assign_horizontal_routes(
+        candidate,
+        {WorkerId(0): (5, 0), WorkerId(1): (8, 4)},
+        assignment_hour=0,
+        remaining_action_slots=24,
+    )
+
+    row = assigned.row_diagnostics[0]
+    assert row["helper_required"] is True
+    assert row["row_overload_resolved"] is True
+    assert assigned.overloaded_rows_detected == 1
+    assert assigned.row_helpers_assigned == 1
+    primary = next(route for route in assigned.routes if route.owner == WorkerId(0))
+    helper = next(route for route in assigned.routes if route.owner == WorkerId(1))
+    assert set(primary.owned_tiles).isdisjoint(helper.owned_tiles)
+    assert set(primary.owned_tiles) | set(helper.owned_tiles) == set(candidate[0].owned_tiles)
+    assert all(route_cursor_invariants_hold(route) for route in assigned.routes)
+    assert len(
+        {segment.segment_id for route in assigned.routes for segment in route.segments}
+    ) == sum(len(route.segments) for route in assigned.routes)
+
+
+def test_helper_fragment_runs_retained_harvest_plant_water_continuation():
+    initial_items = _overloaded_retained_row()
+    harvest = next(
+        item
+        for item in initial_items
+        if item.kind == "HARVEST" and item.source == "routine_harvest"
+    )
+    crop_tile = harvest.tile
+    crop = harvest.crop
+    segment = RouteSegment(
+        "ROW:NW:0:0-4:HELPER:RETAINED",
+        (crop_tile,),
+        crop_tile,
+        0,
+        source_shape="horizontal_row_helper_fragment",
+        physical_row_id="ROW:NW:0:0-4",
+        represented_interactions=1,
+    )
+    helper = StripRoute(
+        segment.segment_id,
+        (crop_tile,),
+        (crop_tile,),
+        WorkerId(0),
+        crop_tile,
+        0,
+        0,
+        workload_interactions=1,
+        source_shape="horizontal_row_helper_fragment",
+        segments=(segment,),
+    )
+    controller = StripExecutorController()
+    obs = observation(day=3, hour=0, farmer=(crop_tile[1], crop_tile[0]))
+    harvest_action = controller._try_local_action(
+        helper, crop_tile, fake_plan((harvest,)), obs
+    )
+    plant = work_item(
+        "PLANT",
+        crop_tile,
+        crop=crop,
+        source="retained_crop_maintenance",
+    )
+    water = work_item(
+        "WATER",
+        crop_tile,
+        crop=crop,
+        status=WorkStatus.BLOCKED,
+        block_reason=BlockReason.DEPENDENCY_BLOCKED,
+        depends_on=(plant.id,),
+        source="planting_continuation",
+    )
+    plant_action = controller._try_local_action(
+        helper, crop_tile, fake_plan((plant, water)), observation(hour=1)
+    )
+    water_action = controller._try_local_action(
+        helper,
+        crop_tile,
+        fake_plan((work_item("WATER", crop_tile, crop=crop),)),
+        observation(hour=2),
+    )
+
+    assert helper.source_shape == "horizontal_row_helper_fragment"
+    assert (harvest_action, plant_action, water_action) == (
+        ("HARVEST",),
+        ("PLANT", crop),
+        ("WATER",),
+    )
+    assert helper.continuation_status == "COMPLETED"
+
+
+def test_row_split_uses_smallest_suffix_that_makes_both_workers_feasible():
+    candidate = HorizontalRouteCandidate(
+        "ROW:TEST:0:0-4",
+        RowKey("NW", 0, 0, 0, 4),
+        tuple((0, x) for x in range(5)),
+        13,
+        13,
+        0,
+        tile_interactions=(1, 1, 1, 8, 1),
+        forecast_tile_interactions=(1, 1, 1, 8, 1),
+        tile_hire_driving_interactions=(1, 1, 1, 8, 1),
+    )
+    assigned = assign_horizontal_routes(
+        (candidate,),
+        {WorkerId(0): (0, 0), WorkerId(1): (0, 4)},
+        assignment_hour=0,
+        remaining_action_slots=12,
+    )
+
+    row = assigned.row_diagnostics[0]
+    assert row["row_overload_resolved"] is True
+    assert len(row["helper_tiles"]) == 2
+    assert len(row["primary_tiles"]) == 3
+    primary_tiles = {tuple(tile) for tile in row["primary_tiles"]}
+    helper_tiles = {tuple(tile) for tile in row["helper_tiles"]}
+    assert primary_tiles.isdisjoint(helper_tiles)
+    assert primary_tiles | helper_tiles == set(candidate.owned_tiles)
+
+
+def test_feasible_normal_row_keeps_one_five_tile_route():
+    candidate = generate_horizontal_route_candidates(
+        fake_plan((work_item("WATER", (0, 0)),))
+    )
+    assigned = assign_horizontal_routes(
+        candidate,
+        {WorkerId(0): (0, 0), WorkerId(1): (0, 4)},
+        assignment_hour=0,
+        remaining_action_slots=24,
+    )
+
+    assert assigned.row_diagnostics[0]["helper_required"] is False
+    assert len(assigned.routes) == 1
+    assert assigned.routes[0].owned_tiles == candidate[0].owned_tiles
+
+
+def test_unresolvable_two_worker_row_reports_without_third_helper():
+    candidate = HorizontalRouteCandidate(
+        "ROW:TEST:0:0-4",
+        RowKey("NW", 0, 0, 0, 4),
+        tuple((0, x) for x in range(5)),
+        5000,
+        5000,
+        0,
+    )
+    assigned = assign_horizontal_routes(
+        (candidate,),
+        {WorkerId(0): (0, 0), WorkerId(1): (0, 4)},
+        assignment_hour=0,
+        remaining_action_slots=24,
+    )
+
+    assert assigned.row_diagnostics[0]["helper_required"] is True
+    assert assigned.row_diagnostics[0]["row_overload_resolved"] is False
+    assert assigned.unresolved_overloaded_rows == 1
+    assert len(assigned.routes) == 1
+
+
 def test_assignment_endpoint_is_nearest_and_tie_is_left():
     work = fake_plan((work_item("WATER", (2, 0)),))
     candidate = generate_horizontal_route_candidates(work)
@@ -185,9 +480,9 @@ def test_assignment_is_repeatable_and_dependency_blocked_rows_are_active():
     assert first.routes[0].to_json_dict() == second.routes[0].to_json_dict()
 
 
-def test_fixed_assignment_counts_excess_routes_and_workers():
+def test_packed_assignment_covers_excess_rows_without_extra_workers():
     work = fake_plan(
-        tuple(work_item("WATER", (row, 0)) for row in (0, 1, 2))
+        tuple(work_item("WATER", (row, 0)) for row in (0, 1, 2, 3))
     )
     candidates = generate_horizontal_route_candidates(work)
     assigned = assign_horizontal_routes(
@@ -196,7 +491,8 @@ def test_fixed_assignment_counts_excess_routes_and_workers():
         assignment_hour=0,
     )
     assert len(assigned.routes) == 2
-    assert [item.route_id for item in assigned.unassigned] == ["ROW:NW:2:0-4"]
+    assert not assigned.unassigned
+    assert sorted(len(route.segments) for route in assigned.routes) == [2, 2]
     work_one = fake_plan((work_item("WATER", (0, 0)),))
     assigned_one = assign_horizontal_routes(
         generate_horizontal_route_candidates(work_one),
@@ -204,6 +500,439 @@ def test_fixed_assignment_counts_excess_routes_and_workers():
         assignment_hour=0,
     )
     assert [worker.label for worker in assigned_one.idle_workers] == ["HAND:0", "HAND:1"]
+
+
+def _mechanical_rows(workloads=(1, 1, 1, 1)):
+    return tuple(
+        HorizontalRouteCandidate(
+            f"ROW:{row}",
+            RowKey("NW", row, row, 0, 4),
+            tuple((row, x) for x in range(5)),
+            workload,
+            workload,
+            0,
+        )
+        for row, workload in enumerate(workloads)
+    )
+
+
+def _large_mechanical_rows(count):
+    candidates = []
+    for index in range(count):
+        row = index // 2
+        x_start = 0 if index % 2 == 0 else 5
+        quadrant = ("N" if row < 5 else "S") + (
+            "W" if x_start == 0 else "E"
+        )
+        candidates.append(
+            HorizontalRouteCandidate(
+                f"ROW:{quadrant}:{row}",
+                RowKey(quadrant, row % 5, row, x_start, x_start + 4),
+                tuple((row, x) for x in range(x_start, x_start + 5)),
+                1,
+                1,
+                0,
+            )
+        )
+    return tuple(candidates)
+
+
+def _route_rows(route):
+    return tuple(segment.traversal[0][0] for segment in route.segments)
+
+
+def _route_movement(route):
+    return sum(
+        segment.entry_distance + len(segment.traversal) - 1
+        for segment in route.segments
+    )
+
+
+def _oracle_chain_plan(candidates, position, mask):
+    indices = tuple(index for index in range(len(candidates)) if mask & (1 << index))
+    orders = [indices]
+    if len({candidates[index].row_key.global_row for index in indices}) > 1:
+        orders.append(tuple(reversed(indices)))
+    best = None
+    for order in orders:
+        for orientations in product((0, 1), repeat=len(order)):
+            movement = 0
+            path = []
+            previous_end = position
+            for index, side in zip(order, orientations):
+                candidate = candidates[index]
+                traversal = (
+                    candidate.owned_tiles
+                    if side == 0
+                    else tuple(reversed(candidate.owned_tiles))
+                )
+                distance = abs(previous_end[0] - traversal[0][0]) + abs(
+                    previous_end[1] - traversal[0][1]
+                )
+                movement += distance
+                path.append((index, side, distance))
+                previous_end = traversal[-1]
+            key = (movement, tuple(path))
+            if best is None or key < best[0]:
+                best = (key, movement, tuple(path))
+    assert best is not None
+    movement, path = best[1:]
+    interactions = sum(candidates[index].workload_interactions for index, _, _ in path)
+    sweep = sum(len(candidates[index].owned_tiles) - 1 for index, _, _ in path)
+    return movement, movement + sweep + interactions, path
+
+
+def test_chain_plan_matches_allowed_order_orientation_oracle_for_all_small_masks():
+    candidates = tuple(
+        sorted(
+            (
+                HorizontalRouteCandidate(
+                    route_id,
+                    RowKey(quadrant, row % 5, row, x_start, x_start + 4),
+                    tuple((row, x) for x in range(x_start, x_start + 5)),
+                    workload,
+                    workload,
+                    0,
+                )
+                for route_id, quadrant, row, x_start, workload in (
+                    ("NW2", "NW", 2, 0, 2),
+                    ("NW3", "NW", 3, 0, 1),
+                    ("NE2", "NE", 2, 5, 3),
+                    ("NE3", "NE", 3, 5, 2),
+                    ("SW7", "SW", 7, 0, 1),
+                )
+            ),
+            key=lambda candidate: candidate.row_key,
+        )
+    )
+    for position in ((0, 0), (4, 4), (5, 5), (9, 9), (4, 7)):
+        for mask in range(1, 1 << len(candidates)):
+            production = _chain_plan_for_mask(candidates, position, mask)
+            movement, completion, path = _oracle_chain_plan(candidates, position, mask)
+            assert (production.movement_turns, production.completion_turns) == (
+                movement,
+                completion,
+            )
+            assert tuple(
+                (candidates.index(candidate), 0 if segment.traversal == candidate.owned_tiles else 1, segment.entry_distance)
+                for candidate, segment in production.assigned
+            ) == path
+
+
+def test_four_candidate_route_packer_fixture_is_complete_and_repeatable():
+    candidates = (
+        HorizontalRouteCandidate(
+            "NE3",
+            RowKey("NE", 3, 3, 5, 9),
+            tuple((3, x) for x in range(5, 10)),
+            2,
+            2,
+            0,
+        ),
+        HorizontalRouteCandidate(
+            "NE4",
+            RowKey("NE", 4, 4, 5, 9),
+            tuple((4, x) for x in range(5, 10)),
+            1,
+            1,
+            0,
+        ),
+        HorizontalRouteCandidate(
+            "NW2",
+            RowKey("NW", 2, 2, 0, 4),
+            tuple((2, x) for x in range(5)),
+            2,
+            2,
+            0,
+        ),
+        HorizontalRouteCandidate(
+            "NW3",
+            RowKey("NW", 3, 3, 0, 4),
+            tuple((3, x) for x in range(5)),
+            3,
+            3,
+            0,
+        ),
+    )
+    positions = {WorkerId(0): (4, 4)}
+    first = assign_horizontal_routes(candidates, positions, assignment_hour=0)
+    second = assign_horizontal_routes(candidates, positions, assignment_hour=0)
+    assigned = [segment for route in first.routes for segment in route.segments]
+    assert len(assigned) == len(candidates)
+    assert {segment.segment_id for segment in assigned} == {
+        candidate.route_id for candidate in candidates
+    }
+    assert first.unassigned == ()
+    assert all(route_cursor_invariants_hold(route) for route in first.routes)
+    assert [route.to_json_dict() for route in first.routes] == [
+        route.to_json_dict() for route in second.routes
+    ]
+
+
+def test_four_adjacent_rows_pack_into_contiguous_two_row_chains():
+    assigned = assign_horizontal_routes(
+        _mechanical_rows(),
+        {WorkerId(0): (0, 0), WorkerId(1): (0, 1)},
+        assignment_hour=0,
+    )
+    assert sorted(_route_rows(route) for route in assigned.routes) == [(0, 1), (2, 3)]
+    assert sum(_route_movement(route) for route in assigned.routes) == 21
+
+
+def test_opposite_worker_ends_receive_their_nearest_row_halves():
+    assigned = assign_horizontal_routes(
+        _mechanical_rows(),
+        {WorkerId(0): (0, 0), WorkerId(1): (3, 0)},
+        assignment_hour=0,
+    )
+    by_worker = {route.owner.index: _route_rows(route) for route in assigned.routes}
+    assert by_worker == {0: (0, 1), 1: (3, 2)}
+
+
+def test_four_rows_and_three_workers_leave_one_neighboring_pair():
+    assigned = assign_horizontal_routes(
+        _mechanical_rows(),
+        {WorkerId(0): (0, 0), WorkerId(1): (0, 1), WorkerId(2): (0, 2)},
+        assignment_hour=0,
+    )
+    assert sorted(len(route.segments) for route in assigned.routes) == [1, 1, 2]
+    paired = next(route for route in assigned.routes if len(route.segments) == 2)
+    assert _route_rows(paired) in ((0, 1), (1, 2), (2, 3))
+
+
+def test_interaction_load_can_justify_longer_travel():
+    assigned = assign_horizontal_routes(
+        _mechanical_rows((8, 1, 1, 1)),
+        {WorkerId(0): (0, 0), WorkerId(1): (3, 0)},
+        assignment_hour=0,
+    )
+    by_worker = {route.owner.index: _route_rows(route) for route in assigned.routes}
+    assert by_worker[0] == (0,)
+    assert by_worker[1] == (3, 2, 1)
+
+
+def test_geometric_assignment_ties_are_repeatable():
+    candidates = _mechanical_rows()
+    positions = {WorkerId(0): (1, 2), WorkerId(1): (2, 2)}
+    first = assign_horizontal_routes(candidates, positions, assignment_hour=0)
+    second = assign_horizontal_routes(candidates, positions, assignment_hour=0)
+    assert [route.to_json_dict() for route in first.routes] == [
+        route.to_json_dict() for route in second.routes
+    ]
+
+
+def test_large_assignment_spreads_thirteen_rows_across_eleven_workers_first():
+    candidates = _large_mechanical_rows(13)
+    positions = {WorkerId(index): (0, 0) for index in range(11)}
+    assigned = assign_horizontal_routes(
+        candidates, positions, assignment_hour=0
+    )
+
+    assert assigned.large_route_assignment_mode is True
+    assert assigned.primary_rows_assigned == 11
+    assert assigned.overflow_rows_assigned == 2
+    assert assigned.idle_workers_with_unassigned_feasible_rows == 0
+    assert len(assigned.routes) == 11
+    assert all(route.segments for route in assigned.routes)
+    assert sum(len(route.segments) for route in assigned.routes) == 13
+
+
+def test_large_assignment_uses_one_primary_row_per_worker_when_counts_match():
+    candidates = _large_mechanical_rows(15)
+    positions = {WorkerId(index): (index % 8, 0) for index in range(15)}
+    assigned = assign_horizontal_routes(
+        candidates, positions, assignment_hour=0
+    )
+
+    assert assigned.primary_rows_assigned == 15
+    assert assigned.overflow_rows_assigned == 0
+    assert len(assigned.routes) == 15
+    assert all(len(route.segments) == 1 for route in assigned.routes)
+    assert not assigned.idle_workers
+
+
+def test_large_assignment_spreads_nine_workers_before_six_overflow_rows():
+    candidates = _large_mechanical_rows(15)
+    positions = {WorkerId(index): (index % 8, 0) for index in range(9)}
+    assigned = assign_horizontal_routes(
+        candidates, positions, assignment_hour=0
+    )
+
+    assert assigned.primary_rows_assigned == 9
+    assert assigned.overflow_rows_assigned == 6
+    assert assigned.idle_workers_with_unassigned_feasible_rows == 0
+    assert len(assigned.routes) == 9
+    assert all(len(route.segments) >= 1 for route in assigned.routes)
+    assert sum(len(route.segments) for route in assigned.routes) == 15
+
+
+def test_eight_rows_keep_the_exact_packer_with_surplus_workers():
+    candidates = _large_mechanical_rows(8)
+    positions = {WorkerId(index): (0, 0) for index in range(12)}
+    assigned = assign_horizontal_routes(
+        candidates, positions, assignment_hour=0
+    )
+
+    assert assigned.large_route_assignment_mode is False
+    assert len(assigned.routes) <= len(candidates)
+    assert sum(len(route.segments) for route in assigned.routes) == 8
+    assert not assigned.unassigned
+    assert len(assigned.idle_workers) == 12 - len(assigned.routes)
+
+
+def test_remaining_day_slots_match_engine_terminal_boundary():
+    obs = observation(hour=22)
+    assert remaining_day_action_slots(obs) == 2
+    assert remaining_day_action_slots(obs, include_current_turn=False) == 1
+    terminal = observation(hour=23)
+    assert remaining_day_action_slots(terminal) == 1
+    assert remaining_day_action_slots(terminal, include_current_turn=False) == 0
+
+
+def test_deadline_order_prefers_useful_first_segment():
+    candidates = (
+        HorizontalRouteCandidate(
+            "R0", RowKey("NW", 0, 0, 0, 4), tuple((0, x) for x in range(5)),
+            1, 1, 0, tile_interactions=(1, 0, 0, 0, 0),
+        ),
+        HorizontalRouteCandidate(
+            "R3", RowKey("NW", 3, 3, 0, 4), tuple((3, x) for x in range(5)),
+            1, 1, 0, tile_interactions=(1, 0, 0, 0, 0),
+        ),
+    )
+    plan = _chain_plan_for_mask(candidates, (0, 0), 0b11, 7)
+    assert tuple(segment.segment_id for _, segment in plan.assigned) == ("R0", "R3")
+    assert plan.useful_interactions == 1
+
+
+def test_late_deadline_plan_completes_more_interactions_than_unbounded_plan():
+    candidates = tuple(
+        HorizontalRouteCandidate(
+            f"R{row}",
+            RowKey("NW", row, row, 0, 4),
+            tuple((row, x) for x in range(5)),
+            workload,
+            workload,
+            0,
+            tile_interactions=counts,
+        )
+        for row, (workload, counts) in enumerate(
+            (
+                (2, (2, 0, 0, 0, 0)),
+                (2, (0, 0, 0, 2, 0)),
+                (1, (1, 0, 0, 0, 0)),
+                (1, (0, 0, 0, 1, 0)),
+                (3, (3, 0, 0, 0, 0)),
+                (3, (3, 0, 0, 0, 0)),
+            )
+        )
+    )
+    positions = {WorkerId(0): (1, 0), WorkerId(1): (0, 0)}
+    before = assign_horizontal_routes(candidates, positions, assignment_hour=0)
+    after = assign_horizontal_routes(
+        candidates,
+        positions,
+        assignment_hour=14,
+        remaining_action_slots=3,
+    )
+
+    def useful(assignment):
+        by_id = {candidate.route_id: candidate for candidate in candidates}
+        completed = 0
+        for route in assignment.routes:
+            elapsed = 0
+            previous = positions[route.owner]
+            for segment in route.segments:
+                candidate = by_id[segment.segment_id]
+                elapsed += abs(previous[0] - segment.entry_tile[0]) + abs(
+                    previous[1] - segment.entry_tile[1]
+                )
+                counts = candidate.tile_interactions
+                if segment.traversal == tuple(reversed(candidate.owned_tiles)):
+                    counts = tuple(reversed(counts))
+                for index, count in enumerate(counts):
+                    if index:
+                        elapsed += 1
+                    completed += max(0, min(count, 3 - elapsed))
+                    elapsed += count
+                previous = segment.traversal[-1]
+        return completed
+
+    assert useful(after) > useful(before)
+
+
+def test_no_futile_final_hour_departure():
+    work = fake_plan((work_item("WATER", (3, 0)),))
+    controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: work)
+    result = controller.act(observation(hour=23, farmer=(0, 0)), plan())
+    assert result.farmer_action == ("PASS",)
+    assert result.diagnostics["actual_final_movement_only_turns"] == 0
+    segment = result.diagnostics["deadline_route_diagnostics"]["FARMER"][0]
+    assert {
+        "segment_id",
+        "estimated_arrival_turn",
+        "estimated_completion_turn",
+        "expected_useful_interactions_completed_before_deadline",
+        "expected_useful_interactions_left_after_deadline",
+    } <= segment.keys()
+    assert result.diagnostics["route_diagnostics"][0]["blocked_local_work"][
+        "DEADLINE_UNREACHABLE"
+    ] == 1
+
+
+def test_optional_tail_work_yields_to_feasible_feed():
+    work = fake_plan(
+        (
+            work_item("WATER", (0, 0), source="optional_deferrable"),
+            work_item(
+                "FEED",
+                (0, 4),
+                required_supplies=(SupplyRequirement("WHEAT", 1),),
+            ),
+        )
+    )
+    controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: work)
+    position = (0, 0)
+    actions = []
+    for hour in range(19, 24):
+        result = controller.act(
+            observation(
+                hour=hour,
+                farmer=(position[1], position[0]),
+                inventories=[{"WHEAT": 1}, {}],
+            ),
+            plan(),
+        )
+        actions.append(result.farmer_action)
+        if result.farmer_action == ("EAST",):
+            position = (position[0], position[1] + 1)
+    assert ("FEED",) in actions
+    assert ("WATER",) not in actions
+
+
+def test_optional_tail_work_yields_to_feasible_care():
+    work = fake_plan(
+        (
+            work_item("WATER", (0, 0), source="optional_deferrable"),
+            work_item("CARE", (0, 3), source="strip_care"),
+        )
+    )
+    controller = StripExecutorController(work_builder=lambda obs, plan, **kwargs: work)
+    position = (0, 0)
+    actions = []
+    for hour in range(20, 24):
+        result = controller.act(
+            observation(
+                hour=hour,
+                farmer=(position[1], position[0]),
+            ),
+            plan(),
+        )
+        actions.append(result.farmer_action)
+        if result.farmer_action == ("EAST",):
+            position = (position[0], position[1] + 1)
+    assert ("CARE",) in actions
+    assert ("WATER",) not in actions
 
 
 def test_vertical_first_travel_then_monotonic_sweep():
@@ -282,6 +1011,339 @@ def test_useful_water_is_selected_before_harvest_on_same_tile():
     assert result.farmer_action == ("WATER",)
 
 
+def test_controller_executes_retained_routine_harvest():
+    obs = observation(day=8, farmer=(0, 0))
+    obs["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT",
+        "crop": "TOMATO",
+        "planted_day": 0,
+        "yield_units": 1,
+        "watered_today": True,
+        "fertilized_until_day": -1,
+        "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    retained_plan = DailyPlan.create(
+        crop_targets={crop: (1 if crop == "TOMATO" else 0) for crop in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS},
+        land_count=1,
+        fertilizer_by_crop={crop: 0 for crop in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={
+            product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)}
+            for product in PRODUCTS
+        },
+    )
+
+    controller = StripExecutorController()
+    result = controller.act(obs, retained_plan)
+
+    assert result.farmer_action == ("HARVEST",)
+    assert any(
+        item.id == "HARVEST:0,0" and item.source == "routine_harvest"
+        for item in controller._plan.items
+    )
+
+
+def test_controller_collects_animal_outputs_across_refreshed_observations():
+    initial = observation(day=8, farmer=(0, 0))
+    initial["farms"][0]["tiles"][0][0] = {
+        "kind": "PASTURE",
+        "animal": "SHEEP",
+        "placed_day": 0,
+        "yield_units": 6,
+        "fertilizer_available": True,
+        "fed_today": True,
+        "cared_today": True,
+        "consecutive_unfed": 0,
+    }
+    target = plan()
+    controller = StripExecutorController()
+
+    collected_fertilizer = controller.act(initial, target)
+    assert collected_fertilizer.farmer_action == ("COLLECT_FERTILIZER",)
+    assert any(
+        item.id == "COLLECT_FERTILIZER:0,0"
+        and item.source == "routine_animal_fertilizer_collection"
+        for item in controller._plan.items
+    )
+
+    after_fertilizer = copy.deepcopy(initial)
+    after_fertilizer["hour"] = 1
+    after_fertilizer["step"] += 1
+    after_fertilizer["farms"][0]["tiles"][0][0]["fertilizer_available"] = False
+    after_fertilizer["private"]["inventories"][0] = {"FERTILIZER": 1}
+    harvested = controller.act(after_fertilizer, target)
+    assert harvested.farmer_action == ("HARVEST",)
+    assert any(
+        item.id == "HARVEST:0,0"
+        and item.animal == "SHEEP"
+        and item.product == "WOOL"
+        and item.source == "routine_animal_harvest"
+        for item in controller._plan.items
+    )
+
+    after_harvest = copy.deepcopy(after_fertilizer)
+    after_harvest["hour"] = 2
+    after_harvest["step"] += 1
+    after_harvest["farms"][0]["tiles"][0][0]["yield_units"] = 0
+    after_harvest["private"]["inventories"][0] = {
+        "FERTILIZER": 1,
+        "WOOL": 6,
+    }
+    finished = controller.act(after_harvest, target)
+    assert finished.farmer_action not in {
+        ("HARVEST",),
+        ("COLLECT_FERTILIZER",),
+    }
+    assert not any(
+        item.kind in {"HARVEST", "COLLECT_FERTILIZER"}
+        for item in controller._plan.items
+    )
+
+
+@pytest.mark.parametrize("crop,day", [("WHEAT", 3), ("CARROT", 3), ("MELON", 10)])
+def test_retained_one_shot_harvest_replants_and_waters_same_day(crop, day):
+    initial = observation(day=day, farmer=(0, 0))
+    initial["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT",
+        "crop": crop,
+        "planted_day": 0,
+        "yield_units": 3 if crop == "WHEAT" else 1,
+        "watered_today": True,
+        "fertilized_until_day": -1,
+        "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    target = plan()
+    target = DailyPlan.create(
+        crop_targets={name: int(name == crop) for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS},
+        land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={
+            product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)}
+            for product in PRODUCTS
+        },
+    )
+    initial["private"]["seeds"] = {crop: 1}
+    controller = StripExecutorController()
+
+    assert controller.act(initial, target).farmer_action == ("HARVEST",)
+
+    after_harvest = copy.deepcopy(initial)
+    after_harvest["hour"] = 1
+    after_harvest["step"] += 1
+    after_harvest["farms"][0]["tiles"][0][0] = None
+    planted = controller.act(after_harvest, target)
+    assert planted.farmer_action == ("PLANT", crop)
+    assert planted.diagnostics["route_diagnostics"][0]["continuation"]["status"] == (
+        "SUCCESSOR_WATER"
+    )
+    assert planted.diagnostics["route_diagnostics"][0]["continuation"]["source"] == (
+        "retained_crop_maintenance"
+    )
+
+    after_plant = copy.deepcopy(after_harvest)
+    after_plant["hour"] = 2
+    after_plant["step"] += 1
+    after_plant["private"]["seeds"][crop] = 0
+    after_plant["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT",
+        "crop": crop,
+        "planted_day": day,
+        "yield_units": 0,
+        "watered_today": False,
+        "fertilized_until_day": -1,
+        "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    watered = controller.act(after_plant, target)
+    assert watered.farmer_action == ("WATER",)
+    assert watered.diagnostics["route_diagnostics"][0]["continuation"]["status"] == (
+        "COMPLETED"
+    )
+
+
+def test_retained_harvest_target_reduction_does_not_replant():
+    initial = observation(day=3, farmer=(0, 0))
+    initial["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+        "yield_units": 3, "watered_today": True,
+        "fertilized_until_day": -1, "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    retained = plan()
+    retained = DailyPlan.create(
+        crop_targets={name: int(name == "WHEAT") for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS}, land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)} for product in PRODUCTS},
+    )
+    reduced = DailyPlan.create(
+        crop_targets={name: 0 for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS}, land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)} for product in PRODUCTS},
+    )
+    controller = StripExecutorController()
+    assert controller.act(initial, retained).farmer_action == ("HARVEST",)
+    after = copy.deepcopy(initial)
+    after["day"] = 4
+    after["hour"] = 0
+    after["step"] += 24
+    after["farms"][0]["tiles"][0][0] = None
+    result = controller.act(after, reduced)
+    assert result.farmer_action != ("PLANT", "WHEAT")
+
+
+def test_retained_harvest_seed_block_resumes_after_observed_seed():
+    initial = observation(day=3, farmer=(0, 0))
+    initial["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+        "yield_units": 3, "watered_today": True,
+        "fertilized_until_day": -1, "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    target = DailyPlan.create(
+        crop_targets={name: int(name == "WHEAT") for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS}, land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)} for product in PRODUCTS},
+    )
+    initial["private"]["seeds"] = {"WHEAT": 0}
+    controller = StripExecutorController()
+    assert controller.act(initial, target).farmer_action == ("HARVEST",)
+
+    blocked = copy.deepcopy(initial)
+    blocked["hour"] = 1
+    blocked["step"] += 1
+    blocked["farms"][0]["tiles"][0][0] = None
+    controller.act(blocked, target)
+    assert controller.routes[0].continuation_blocked_reason == "MISSING_GLOBAL_RESOURCE"
+
+    observed_seed = copy.deepcopy(blocked)
+    observed_seed["hour"] = 2
+    observed_seed["step"] += 1
+    observed_seed["farmer"] = [1, 0]
+    observed_seed["farms"][0]["farmer"] = [1, 0]
+    observed_seed["private"]["seeds"] = {"WHEAT": 1}
+    assert controller.act(observed_seed, target).farmer_action == ("WEST",)
+
+    resumed = copy.deepcopy(observed_seed)
+    resumed["hour"] = 3
+    resumed["step"] += 1
+    resumed["farmer"] = [0, 0]
+    resumed["farms"][0]["farmer"] = [0, 0]
+    assert controller.act(resumed, target).farmer_action == ("PLANT", "WHEAT")
+
+
+def test_retained_harvest_does_not_start_two_step_chain_at_day_boundary():
+    initial = observation(day=3, hour=22, farmer=(0, 0))
+    initial["farms"][0]["tiles"][0][0] = {
+        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+        "yield_units": 3, "watered_today": True,
+        "fertilized_until_day": -1, "max_lifespan_step": -1,
+        "consecutive_unwatered": 0,
+    }
+    initial["private"]["seeds"] = {"WHEAT": 1}
+    target = DailyPlan.create(
+        crop_targets={name: int(name == "WHEAT") for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS}, land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)} for product in PRODUCTS},
+    )
+    controller = StripExecutorController()
+    assert controller.act(initial, target).farmer_action == ("HARVEST",)
+
+    after = copy.deepcopy(initial)
+    after["hour"] = 23
+    after["step"] += 1
+    after["farms"][0]["tiles"][0][0] = None
+    result = controller.act(after, target)
+    assert result.farmer_action != ("PLANT", "WHEAT")
+    assert controller.routes[0].continuation_blocked_reason == "INSUFFICIENT_DAY_TIME"
+
+
+def test_retained_continuation_reopens_completed_final_tile():
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        if int(obs["hour"]) < 5:
+            return fake_plan(
+                (work_item("HARVEST", (0, 4), crop="WHEAT", source="routine_harvest"),)
+            )
+        if int(obs["hour"]) == 5:
+            return fake_plan((work_item(
+                "PLANT", (0, 4), crop="WHEAT",
+                status=WorkStatus.BLOCKED,
+                block_reason=BlockReason.DEPENDENCY_BLOCKED,
+            ),))
+        return fake_plan((work_item("PLANT", (0, 4), crop="WHEAT"),))
+
+    controller = StripExecutorController(work_builder=builder)
+    target = DailyPlan.create(
+        crop_targets={name: int(name == "WHEAT") for name in CROPS},
+        animal_targets={animal: 0 for animal in ANIMALS}, land_count=1,
+        fertilizer_by_crop={name: 0 for name in CROPS},
+        care_by_animal={animal: 0 for animal in ANIMALS},
+        sell_quantities={product: {hour: 0 for hour in (0, 4, 8, 12, 16, 20)} for product in PRODUCTS},
+    )
+    for hour in range(5):
+        position = (hour, 0)
+        result = controller.act(observation(hour=hour, farmer=position), target)
+    assert result.farmer_action == ("HARVEST",)
+
+    completed = controller.act(observation(hour=5, farmer=(4, 0)), target)
+    assert completed.farmer_action == ("PASS",)
+    assert controller.routes[0].phase == RoutePhase.DONE
+
+    reopened = controller.act(observation(hour=6, farmer=(4, 0)), target)
+    assert reopened.farmer_action == ("PLANT", "WHEAT")
+    assert controller.routes[0].phase == RoutePhase.SWEEP
+
+
+def test_retained_continuation_survives_worker_segment_change():
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        items = [work_item("WATER", (1, 0))]
+        if int(obs["hour"]) < 5:
+            items.append(
+                work_item(
+                    "HARVEST", (0, 4), crop="WHEAT", source="routine_harvest"
+                )
+            )
+        else:
+            items.append(work_item("PLANT", (0, 4), crop="WHEAT"))
+        return fake_plan(tuple(items))
+
+    controller = StripExecutorController(work_builder=builder)
+    for hour in range(5):
+        position = (hour, 0)
+        result = controller.act(observation(hour=hour, farmer=position), plan())
+    assert result.farmer_action == ("HARVEST",)
+
+    position = (4, 0)
+    for hour in range(5, 10):
+        result = controller.act(observation(hour=hour, farmer=position), plan())
+        if result.farmer_action == ("PLANT", "WHEAT"):
+            break
+        if result.farmer_action == ("WEST",):
+            position = (max(0, position[0] - 1), position[1])
+        elif result.farmer_action == ("SOUTH",):
+            position = (position[0], position[1] + 1)
+        elif result.farmer_action == ("NORTH",):
+            position = (position[0], position[1] - 1)
+        elif result.farmer_action == ("EAST",):
+            position = (position[0] + 1, position[1])
+    else:
+        pytest.fail("retained continuation was abandoned at a segment boundary")
+
+
 def test_missing_supply_does_not_pick_up_but_carried_supply_can_act():
     def builder(obs, plan, **kwargs):
         del obs, plan, kwargs
@@ -327,6 +1389,74 @@ def test_completed_route_passes_and_late_work_is_not_revisited():
     assert "WATER:0,0" in controller.routes[0].late_work_ids
     later = controller.act(observation(hour=6, farmer=(4, 0)), plan())
     assert later.farmer_action == ("PASS",)
+
+
+def test_observed_animal_purchase_revisits_a_passed_place_once():
+    place_id = "PLACE:SHEEP:0,0"
+
+    def builder(obs, daily_plan, **kwargs):
+        del daily_plan, kwargs
+        private = obs.get("private") or {}
+        shed = private.get("shed") or {}
+        inventory = (private.get("inventories") or [{}])[0]
+        observed = bool(shed.get("SHEEP") or inventory.get("SHEEP"))
+        place = WorkItem(
+            id=place_id,
+            kind="PLACE",
+            animal="SHEEP",
+            tile=(0, 0),
+            row_key=row_key_for_tile((0, 0)),
+            required_supplies=((SupplyRequirement("SHEEP", 1),) if observed else ()),
+            status=WorkStatus.READY if observed else WorkStatus.BLOCKED,
+            block_reason=None if observed else BlockReason.MISSING_PURCHASE,
+        )
+        if observed:
+            return fake_plan((place,))
+        return fake_plan((
+            WorkItem(id="BUY_ANIMAL:SHEEP:1", kind="BUY_ANIMAL", animal="SHEEP"),
+            place,
+        ))
+
+    controller = StripExecutorController(work_builder=builder)
+    position = (0, 0)
+    shed: dict[str, int] = {}
+    inventory: dict[str, int] = {}
+    purchase_observed = False
+    saw_late_place = False
+    placed = False
+    for step in range(24):
+        current = observation(
+            hour=step,
+            farmer=(position[1], position[0]),
+            inventories=[inventory, {}],
+        )
+        current["farms"][0]["money"] = 0 if step == 0 else 500
+        current["private"]["shed"] = shed
+        result = controller.act(current, plan())
+        route = result.diagnostics["route_diagnostics"][0]
+        saw_late_place |= place_id in route["late_work_ids"]
+        if result.market_actions and not purchase_observed:
+            purchase_observed = True
+            shed = {"SHEEP": 1}
+        if result.farmer_action == ("PICKUP", "SHEEP", 1):
+            shed = {}
+            inventory = {"SHEEP": 1}
+        if result.farmer_action == ("PLACE", "SHEEP", 1):
+            placed = True
+            break
+        y, x = position
+        if result.farmer_action == ("NORTH",):
+            y -= 1
+        elif result.farmer_action == ("SOUTH",):
+            y += 1
+        elif result.farmer_action == ("EAST",):
+            x += 1
+        elif result.farmer_action == ("WEST",):
+            x -= 1
+        position = (y, x)
+
+    assert saw_late_place
+    assert placed
 
 
 def test_day_boundary_discards_old_cursor_and_assignment():
@@ -402,6 +1532,333 @@ def test_work_appearing_before_confirmed_departure_is_executed():
     assert "WATER:0,0" not in route.late_work_ids
 
 
+def test_crop_chain_continuation_runs_before_departure():
+    """A newly ready local crop stage outranks advancing the frozen sweep."""
+
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        if hour == 0:
+            local = work_item("HARVEST", (0, 0), crop="WHEAT")
+        elif hour == 1:
+            local = work_item("PLANT", (0, 0), crop="TOMATO")
+        elif hour == 2:
+            local = work_item("WATER", (0, 0), crop="TOMATO")
+        else:
+            local = None
+        items = [work_item("WATER", (0, 4))]
+        if local is not None:
+            items.append(local)
+        return fake_plan(tuple(items))
+
+    controller = StripExecutorController(work_builder=builder)
+    route = None
+    for hour, expected in enumerate(("HARVEST", "PLANT", "WATER")):
+        result = controller.act(observation(hour=hour, farmer=(0, 0)), plan())
+        route = controller.routes[0]
+        assert result.farmer_action[0] == expected
+        assert route.cursor == 0
+        assert (0, 0) not in route.passed_tiles
+
+    result = controller.act(observation(hour=3, farmer=(0, 0)), plan())
+    assert result.farmer_action == ("EAST",)
+    assert route is not None
+    assert (0, 0) not in route.passed_tiles
+
+
+def test_actual_executor_turns_match_canonical_cost_without_supply():
+    items = tuple(work_item("WATER", (0, x)) for x in range(5))
+    controller, actions = _run_static_controller_route(items)
+    route = controller._routes[WorkerId(0)]
+    estimate = simulate_route_cost(
+        (0, 0),
+        tuple(segment.cost_segment for segment in route.segments),
+        remaining_action_slots=24,
+        shed_stock={},
+    )
+
+    assert estimate.total_turns == 9
+    assert len(actions) == estimate.total_turns
+    assert estimate.pickup_action_turns == 0
+
+
+def test_actual_executor_turns_match_canonical_cost_with_pickup():
+    feed = work_item(
+        "FEED",
+        (0, 0),
+        animal="COW",
+        required_supplies=(SupplyRequirement("WHEAT", 1),),
+    )
+    controller, actions = _run_static_controller_route((feed,), shed={"WHEAT": 1})
+    route = controller._routes[WorkerId(0)]
+    estimate = simulate_route_cost(
+        (0, 0),
+        tuple(segment.cost_segment for segment in route.segments),
+        remaining_action_slots=24,
+        shed_stock={"WHEAT": 1},
+        pickup_tile=nearest_shed_access((0, 0)),
+    )
+
+    assert actions.count(("PICKUP", "WHEAT", 1)) == 1
+    assert estimate.pickup_travel_turns == 8
+    assert estimate.pickup_action_turns == 1
+    assert len(actions) == estimate.total_turns
+
+
+def test_deadline_diagnostics_aggregate_the_canonical_missed_count():
+    work = fake_plan(tuple(work_item("WATER", (0, x)) for x in range(5)))
+    candidates = generate_horizontal_route_candidates(work)
+    worker = WorkerId(0)
+    positions = {worker: (0, 0)}
+    obs = observation(hour=22)
+    slots = remaining_day_action_slots(obs)
+    assignment = assign_horizontal_routes(
+        candidates,
+        positions,
+        assignment_hour=22,
+        worker_action_slots={worker: slots},
+        enable_row_helpers=False,
+    )
+    route = assignment.routes[0]
+    canonical = simulate_route_cost(
+        positions[worker],
+        tuple(segment.cost_segment for segment in route.segments),
+        remaining_action_slots=slots,
+        assignment_turn=22,
+    )
+    diagnostics = StripExecutorController()._deadline_assignment_diagnostics(
+        assignment, candidates, positions, obs
+    )
+
+    assert diagnostics["expected_useful_interactions_missed"] == (
+        canonical.effective_interactions_missed
+    )
+
+
+@pytest.mark.parametrize("crop", ("WHEAT", "CARROT", "MELON"))
+def test_finalized_retained_harvest_retries_seed_before_plant_and_water(crop):
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        harvest_id = "HARVEST:0,0"
+        plant_id = f"PLANT:{crop}:0,0"
+        if hour == 0:
+            items = (work_item("HARVEST", (0, 0), crop=crop, source="routine_harvest"),)
+        elif hour < 3:
+            items = (
+                work_item(
+                    "PLANT",
+                    (0, 0),
+                    crop=crop,
+                    status=(
+                        WorkStatus.BLOCKED
+                        if hour == 1
+                        else WorkStatus.READY
+                    ),
+                    block_reason=(
+                        BlockReason.MISSING_GLOBAL_RESOURCE if hour == 1 else None
+                    ),
+                    required_supplies=(SupplyRequirement(crop, 1, "global_seed"),),
+                    depends_on=(harvest_id,) if hour == 1 else (),
+                    item_id=plant_id,
+                    source="retained_crop_maintenance",
+                ),
+                work_item(
+                    "WATER",
+                    (0, 0),
+                    crop=crop,
+                    status=(
+                        WorkStatus.BLOCKED
+                        if hour == 1 or hour == 2
+                        else WorkStatus.READY
+                    ),
+                    block_reason=(
+                        BlockReason.DEPENDENCY_BLOCKED
+                        if hour == 1 or hour == 2
+                        else None
+                    ),
+                    depends_on=(plant_id,),
+                    item_id="WATER:0,0",
+                ),
+            )
+        else:
+            items = (work_item("WATER", (0, 0), crop=crop, item_id="WATER:0,0"),)
+        return fake_plan(items)
+
+    target = plan(crop_targets={crop: 1})
+    seeds = {crop: 0}
+    controller = StripExecutorController(work_builder=builder)
+
+    harvested = controller.act(
+        observation(hour=0, money=1000, seeds=seeds, farmer=(0, 0)), target
+    )
+    assert harvested.farmer_action == ("HARVEST",)
+    assert harvested.market_actions == ()
+
+    purchased = controller.act(
+        observation(hour=1, money=1000, seeds=seeds, farmer=(0, 0)), target
+    )
+    assert purchased.farmer_action == ("PASS",)
+    assert purchased.market_actions == (("BUY_SEED", crop, 1),)
+
+    planted = controller.act(
+        observation(hour=2, money=1000, seeds={crop: 1}, farmer=(0, 0)), target
+    )
+    assert planted.farmer_action == ("PLANT", crop)
+
+    watered = controller.act(
+        observation(hour=3, money=1000, seeds={crop: 0}, farmer=(0, 0)), target
+    )
+    assert watered.farmer_action == ("WATER",)
+
+
+def test_late_crop_successor_reopens_only_the_previous_owned_tile():
+    harvest_id = "HARVEST:0,0"
+    plant_id = "PLANT:TOMATO:0,0"
+    water_id = "WATER:0,0"
+
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        if hour == 0:
+            items = (
+                work_item("HARVEST", (0, 0), crop="WHEAT", item_id=harvest_id),
+                work_item(
+                    "PLANT",
+                    (0, 0),
+                    crop="TOMATO",
+                    status=WorkStatus.BLOCKED,
+                    depends_on=(harvest_id,),
+                    block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                    item_id=plant_id,
+                ),
+            )
+        elif hour == 1:
+            items = (
+                work_item(
+                    "PLANT",
+                    (0, 0),
+                    crop="TOMATO",
+                    status=WorkStatus.BLOCKED,
+                    depends_on=(harvest_id,),
+                    block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                    item_id=plant_id,
+                ),
+            )
+        elif hour == 2:
+            items = (
+                work_item("PLANT", (0, 0), crop="TOMATO", item_id=plant_id),
+                work_item(
+                    "WATER",
+                    (0, 0),
+                    crop="TOMATO",
+                    status=WorkStatus.BLOCKED,
+                    depends_on=(plant_id,),
+                    block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                    item_id=water_id,
+                ),
+            )
+        else:
+            items = (work_item("WATER", (0, 0), crop="TOMATO", item_id=water_id),)
+        return fake_plan(items + (work_item("WATER", (0, 4)),))
+
+    controller = StripExecutorController(work_builder=builder)
+    controller.act(observation(hour=0, farmer=(0, 0)), plan())
+    departure = controller.act(observation(hour=1, farmer=(0, 0)), plan())
+    assert departure.farmer_action == ("EAST",)
+
+    reopened = controller.act(observation(hour=2, farmer=(1, 0)), plan())
+    route = controller.routes[0]
+    assert reopened.farmer_action == ("WEST",)
+    assert route.cursor == 0
+    assert (0, 0) not in route.passed_tiles
+    assert plant_id not in route.late_work_ids
+
+    continuation = controller.act(observation(hour=3, farmer=(0, 0)), plan())
+    assert continuation.farmer_action == ("WATER",)
+
+
+def test_dig_replacement_chain_progresses_to_plant_and_water():
+    dig_id = "DIG:0,0"
+    plant_id = "PLANT:WHEAT:0,0"
+    water_id = "WATER:0,0"
+
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        hour = int(obs["hour"])
+        if hour == 0:
+            items = (
+                work_item("DIG", (0, 0), item_id=dig_id),
+                work_item(
+                    "PLANT",
+                    (0, 0),
+                    crop="WHEAT",
+                    status=WorkStatus.BLOCKED,
+                    depends_on=(dig_id,),
+                    block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                    item_id=plant_id,
+                ),
+            )
+        elif hour == 1:
+            items = (
+                work_item("PLANT", (0, 0), crop="WHEAT", item_id=plant_id),
+                work_item(
+                    "WATER",
+                    (0, 0),
+                    crop="WHEAT",
+                    status=WorkStatus.BLOCKED,
+                    depends_on=(plant_id,),
+                    block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                    item_id=water_id,
+                ),
+            )
+        else:
+            items = (work_item("WATER", (0, 0), crop="WHEAT", item_id=water_id),)
+        return fake_plan(items + (work_item("WATER", (0, 4)),))
+
+    controller = StripExecutorController(work_builder=builder)
+    for hour, expected in enumerate(("DIG", "PLANT", "WATER")):
+        result = controller.act(observation(hour=hour, farmer=(0, 0)), plan())
+        assert result.farmer_action == ((expected, "WHEAT") if expected == "PLANT" else (expected,))
+
+
+def test_crop_continuation_does_not_reopen_an_older_tile():
+    harvest_id = "HARVEST:0,0"
+    plant_id = "PLANT:TOMATO:0,0"
+
+    def builder(obs, plan, **kwargs):
+        del plan, kwargs
+        if int(obs["hour"]) == 0:
+            harvest = work_item("HARVEST", (0, 0), crop="WHEAT", item_id=harvest_id)
+        else:
+            harvest = work_item(
+                "PLANT",
+                (0, 0),
+                crop="TOMATO",
+                status=(
+                    WorkStatus.BLOCKED
+                    if int(obs["hour"]) < 3
+                    else WorkStatus.READY
+                ),
+                depends_on=(harvest_id,) if int(obs["hour"]) < 3 else (),
+                block_reason=(
+                    BlockReason.DEPENDENCY_BLOCKED
+                    if int(obs["hour"]) < 3
+                    else None
+                ),
+                item_id=plant_id,
+            )
+        return fake_plan((harvest, work_item("WATER", (0, 4))))
+
+    controller = StripExecutorController(work_builder=builder)
+    controller.act(observation(hour=0, farmer=(0, 0)), plan())
+    controller.act(observation(hour=1, farmer=(0, 0)), plan())
+    controller.act(observation(hour=2, farmer=(1, 0)), plan())
+    result = controller.act(observation(hour=3, farmer=(2, 0)), plan())
+    assert result.farmer_action == ("EAST",)
+    assert plant_id in controller.routes[0].late_work_ids
+
+
 def test_work_after_confirmed_departure_is_late_but_not_revisited():
     def builder(obs, plan, **kwargs):
         del plan, kwargs
@@ -475,3 +1932,177 @@ def test_post_completion_late_work_on_final_tile_is_recorded():
     assert later.farmer_action == ("PASS",)
     assert route.phase == RoutePhase.DONE
     assert "HARVEST:0,4" in route.late_work_ids
+
+
+def _row_segment(segment_id: str, row: int) -> RouteSegment:
+    traversal = tuple((row, col) for col in range(5))
+    return RouteSegment(segment_id, traversal, traversal[0], 0)
+
+
+def _chain_route(
+    route_id: str,
+    worker: WorkerId,
+    segments: tuple[RouteSegment, ...],
+    *,
+    cursor: int,
+    pending_cursor: int | None = None,
+    phase: RoutePhase = RoutePhase.SWEEP,
+) -> StripRoute:
+    traversal = tuple(tile for segment in segments for tile in segment.traversal)
+    return StripRoute(
+        route_id,
+        traversal,
+        traversal,
+        worker,
+        traversal[0],
+        0,
+        0,
+        cursor=cursor,
+        pending_cursor=pending_cursor,
+        phase=phase,
+        segments=tuple(segments),
+    )
+
+
+def _register_helping_routes(
+    controller: StripExecutorController, *routes: StripRoute
+) -> None:
+    controller._routes = {route.owner: route for route in routes}
+    controller._supply_plans = {}
+    controller._supply_states = {}
+
+
+def test_helping_never_steals_segment_a_donor_is_already_departing_toward():
+    """Regression: the official crash had donor.pending_cursor point into the
+    segment a completed neighbor stole, indexing past the shortened traversal."""
+
+    controller = StripExecutorController()
+    a = _row_segment("A", 0)
+    b = _row_segment("B", 1)
+    # Donor sits on A's final tile and has already emitted movement toward B.
+    donor = _chain_route(
+        "donor", WorkerId(0), (a, b), cursor=4, pending_cursor=5
+    )
+    own = _row_segment("OWN", 2)
+    receiver = _chain_route(
+        "receiver", WorkerId(1), (own,), cursor=4, phase=RoutePhase.DONE
+    )
+    _register_helping_routes(controller, donor, receiver)
+
+    result = controller._act_worker(
+        receiver,
+        own.traversal[-1],
+        fake_plan(()),
+        observation(hour=0, farmer=own.traversal[-1]),
+    )
+    assert result == ("PASS",)
+
+    # B was not transferred: the donor still owns it and both cursors are valid.
+    assert tuple(segment.segment_id for segment in donor.segments) == ("A", "B")
+    assert donor.traversal == a.traversal + b.traversal
+    assert donor.pending_cursor == 5
+    assert route_cursor_invariants_hold(donor)
+    assert not receiver.transferred_segment_ids
+
+    # The donor's next turn must not raise and must keep heading toward B.
+    follow = controller._act_worker(
+        donor,
+        a.traversal[-1],
+        fake_plan(()),
+        observation(hour=1, farmer=a.traversal[-1]),
+    )
+    assert follow == ("SOUTH",)
+    assert donor.pending_cursor == 5
+    assert route_cursor_invariants_hold(donor)
+
+
+def test_helping_takes_a_later_segment_the_donor_has_not_committed_to():
+    controller = StripExecutorController()
+    a = _row_segment("A", 0)
+    b = _row_segment("B", 1)
+    c = _row_segment("C", 2)
+    # pending_cursor points into B, so only the genuinely untouched C may move.
+    donor = _chain_route(
+        "donor", WorkerId(0), (a, b, c), cursor=4, pending_cursor=5
+    )
+    own = _row_segment("OWN", 3)
+    receiver = _chain_route(
+        "receiver", WorkerId(1), (own,), cursor=4, phase=RoutePhase.DONE
+    )
+    _register_helping_routes(controller, donor, receiver)
+
+    controller._act_worker(
+        receiver,
+        own.traversal[-1],
+        fake_plan(()),
+        observation(hour=0, farmer=own.traversal[-1]),
+    )
+
+    assert tuple(segment.segment_id for segment in donor.segments) == ("A", "B")
+    assert donor.traversal == a.traversal + b.traversal
+    assert donor.pending_cursor == 5
+    assert route_cursor_invariants_hold(donor)
+    assert "C" in receiver.transferred_segment_ids
+    assert c.traversal[0] in receiver.traversal
+    assert route_cursor_invariants_hold(receiver)
+
+
+def test_route_cursor_invariant_helper_flags_invalid_pending_cursor():
+    a = _row_segment("A", 0)
+    route = _chain_route("r", WorkerId(0), (a,), cursor=4)
+    assert route_cursor_invariants_hold(route)
+    route.pending_cursor = len(route.traversal)
+    assert not route_cursor_invariants_hold(route)
+    route.pending_cursor = -1
+    assert not route_cursor_invariants_hold(route)
+
+
+def test_preparatory_water_harvest_replacement_chain_executes_on_tile():
+    """A not-yet-harvestable one-shot crop still yields a same-tile chain.
+
+    The shared lifecycle helper represents WATER -> HARVEST -> PLANT -> WATER
+    at day start; the controller executes it, resuming the tile after the
+    preparatory WATER.
+    """
+
+    target = plan(crop_targets={"WHEAT": 0, "TOMATO": 1})
+
+    def locked_observation(hour, tile):
+        obs = observation(hour=hour, farmer=(0, 0), seeds={"TOMATO": 10})
+        obs["farms"][0]["tiles"] = [["LOCKED"] * 10 for _ in range(10)]
+        obs["farms"][0]["tiles"][0][0] = tile
+        obs["farms"][1] = copy.deepcopy(obs["farms"][0])
+        return obs
+
+    def wheat(yield_units, watered):
+        return {
+            "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+            "yield_units": yield_units, "watered_today": watered,
+            "consecutive_unwatered": 0, "fertilized_until_day": -1,
+            "max_lifespan_step": -1,
+        }
+
+    tomato = {
+        "kind": "PLANT", "crop": "TOMATO", "planted_day": 3,
+        "yield_units": 0, "watered_today": False,
+        "consecutive_unwatered": 0, "fertilized_until_day": -1,
+        "max_lifespan_step": -1,
+    }
+
+    controller = StripExecutorController()
+    # h0: ordinary preparatory WATER (engine applies it immediately).
+    assert controller.act(
+        locked_observation(0, wheat(2, False)), target
+    ).farmer_action == ("WATER",)
+    # h1: the same tile is now harvest-ready.
+    assert controller.act(
+        locked_observation(1, wheat(3, True)), target
+    ).farmer_action == ("HARVEST",)
+    # h2: tile empty, requested replacement is planted.
+    assert controller.act(
+        locked_observation(2, None), target
+    ).farmer_action == ("PLANT", "TOMATO")
+    # h3: replacement receives its WATER.
+    assert controller.act(
+        locked_observation(3, tomato), target
+    ).farmer_action == ("WATER",)

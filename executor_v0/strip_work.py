@@ -35,10 +35,10 @@ from typing import Any, Iterable
 
 from bc_manager.constants import ANIMAL_ORDER, CROP_ORDER
 from executor_v0.layout import (
+    SacrificeConfig,
     SHED_HUB_ANCHOR,
     plan_day_layouts,
     quadrant_of,
-    sacrifice_score,
     tile_role,
 )
 from executor_v0.plan import DailyPlan
@@ -55,6 +55,7 @@ __all__ = [
     "RowKey",
     "WorkStatus",
     "WorkItem",
+    "EffectiveInteractionForecast",
     "WorkChain",
     "SupplyRequirement",
     "SupplyDemand",
@@ -65,9 +66,13 @@ __all__ = [
     "StripWorkConfig",
     "StripWorkPlan",
     "StripWorkResult",
+    "forecast_effective_interactions",
     "row_key_for_tile",
     "build_strip_work_plan",
 ]
+
+
+_RETAINED_ONE_SHOT_CROPS = frozenset(("WHEAT", "CARROT", "MELON"))
 
 
 class WorkStatus(StrEnum):
@@ -230,6 +235,68 @@ class WorkItem:
         out["required_supplies"] = [r.to_json_dict() for r in self.required_supplies]
         out["row_key"] = self.row_key.to_json_dict() if self.row_key else None
         return out
+
+
+@dataclass(frozen=True)
+class EffectiveInteractionForecast:
+    """Represented work plus deterministic same-day continuation work."""
+
+    represented_interactions: int
+    known_continuation_interactions: int
+    continuation_stages_by_work_item: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+    @property
+    def effective_interactions(self) -> int:
+        return self.represented_interactions + self.known_continuation_interactions
+
+
+def forecast_effective_interactions(
+    items: Iterable[WorkItem],
+) -> EffectiveInteractionForecast:
+    """Return the shared deadline/hiring interaction forecast for ``items``.
+
+    Retained one-shot routine harvests are known to continue through PLANT and
+    WATER on the same day.  Those two interactions are forecast only when the
+    corresponding stages are not already represented on that tile.
+    """
+
+    represented = tuple(items)
+    kinds_by_tile: dict[tuple[int, int], set[str]] = defaultdict(set)
+    retained_harvest_by_tile: dict[tuple[int, int], str] = {}
+    for item in represented:
+        if item.tile is None:
+            continue
+        kinds_by_tile[item.tile].add(item.kind)
+        if (
+            item.kind == "HARVEST"
+            and item.source == "routine_harvest"
+            and item.crop in _RETAINED_ONE_SHOT_CROPS
+        ):
+            retained_harvest_by_tile.setdefault(item.tile, item.id)
+
+    continuation_stages = tuple(
+        (
+            work_id,
+            tuple(
+                stage
+                for stage in ("PLANT", "WATER")
+                if stage not in kinds_by_tile[tile]
+            ),
+        )
+        for tile, work_id in sorted(retained_harvest_by_tile.items())
+        if any(
+            stage not in kinds_by_tile[tile] for stage in ("PLANT", "WATER")
+        )
+    )
+    return EffectiveInteractionForecast(
+        represented_interactions=sum(
+            max(0, int(item.interaction_turns)) for item in represented
+        ),
+        known_continuation_interactions=sum(
+            len(stages) for _, stages in continuation_stages
+        ),
+        continuation_stages_by_work_item=continuation_stages,
+    )
 
 
 @dataclass(frozen=True)
@@ -498,6 +565,23 @@ _ROUTINE_WATER_AGES: dict[str, frozenset[int]] = {
 }
 
 
+def _removal_action_id(action: str, coord: tuple[int, int]) -> str:
+    """Stable id for one crop-removal lifecycle action on ``coord``.
+
+    A preparatory WATER that makes a not-yet-harvestable crop harvestable and
+    the later replacement WATER on the same tile are two distinct operations,
+    so the removal-owned WATER must not share the coordinate-only
+    ``WATER:y,x`` id used by routine upkeep and the planting continuation:
+    sharing it would merge the two into a single item and form a dependency
+    cycle (WATER depends on PLANT while PLANT depends on WATER).  Every other
+    removal action keeps the coordinate id so it dedupes with routine harvest
+    work exactly as before.
+    """
+    if action == "WATER":
+        return f"REMOVAL_WATER:{coord[0]},{coord[1]}"
+    return f"{action}:{coord[0]},{coord[1]}"
+
+
 def _routine_water_source(
     tile: Mapping[str, Any], crop: str, day: int, step: int
 ) -> str | None:
@@ -523,6 +607,8 @@ def _routine_water_source(
     if age_value is None:
         return None
     age = int(age_value)
+    if crop == "WHEAT" and wheat_harvest_eligibility(tile, day, step)[0]:
+        return None
     if age not in _ROUTINE_WATER_AGES[crop]:
         if crop == "TOMATO" and age >= CROPS[crop]["first_yield_day"]:
             held = int(tile.get("yield_units", 0) or 0)
@@ -534,9 +620,6 @@ def _routine_water_source(
     if age in (11, 12) and crop == "MELON" and not room:
         return None
     if crop == "WHEAT" and age == 4:
-        eligible, reason = wheat_harvest_eligibility(tile, day, step)
-        if eligible and reason == "threshold_met":
-            return None
         if not room:
             return None
     if age == 0:
@@ -561,42 +644,6 @@ def _unlocked_counts(
             if "animal" in tile and tile.get("animal") in animals:
                 animals[tile["animal"]] += 1
     return crops, animals
-
-
-def _excess_crop_coords(
-    board: list[list[Any]],
-    unlocked: tuple[str, ...],
-    targets: Mapping[str, int],
-    replacement_coords: set[tuple[int, int]],
-    anchor: tuple[int, int],
-) -> tuple[tuple[int, int], ...]:
-    """Select removal-only crop tiles in the layout's cheap-first order."""
-    candidates: dict[str, list[tuple[float, tuple[int, int]]]] = {
-        crop: [] for crop in CROP_ORDER
-    }
-    allowed = set(unlocked)
-    for y, row in enumerate(board):
-        for x, tile in enumerate(row):
-            if quadrant_of(y, x) not in allowed or tile_role(tile) != "plant":
-                continue
-            crop = tile.get("crop")
-            if crop in candidates:
-                candidates[crop].append(
-                    (sacrifice_score(tile, (y, x), anchor=anchor), (y, x))
-                )
-    selected: list[tuple[float, tuple[int, int]]] = []
-    for crop in CROP_ORDER:
-        entries = sorted(candidates[crop], key=lambda item: (item[0], item[1]))
-        excess = max(0, len(entries) - int(targets[crop]))
-        selected.extend(
-            item for item in entries[:excess] if item[1] not in replacement_coords
-        )
-    return tuple(
-        coord
-        for _, coord in sorted(
-            selected, key=lambda item: (item[0], item[1][0], item[1][1])
-        )
-    )
 
 
 class _Builder:
@@ -857,6 +904,10 @@ def build_strip_work_plan(
     *,
     acting_seat: int | None = None,
     seat: int | None = None,
+    preferred_crop_slots: Mapping[str, Iterable[tuple[int, int]]] | None = None,
+    allow_live_crop_sacrifice: bool = False,
+    allow_productive_recurring_crop_sacrifice: bool = False,
+    allow_older_crop_sacrifice: bool = False,
 ) -> StripWorkPlan:
     """Build a deterministic pure work forecast for one acting seat.
 
@@ -873,6 +924,10 @@ def build_strip_work_plan(
     cfg = _as_config(config)
     chosen_seat = _seat_for(obs, cfg, acting_seat, seat)
     board, unlocked, supply, day, money = _state(obs, chosen_seat)
+    preferred_slots = {
+        str(crop): tuple((int(coord[0]), int(coord[1])) for coord in coords)
+        for crop, coords in (preferred_crop_slots or {}).items()
+    }
     step = resolve_observation_step(obs)
     current_crops, current_animals = _unlocked_counts(board, unlocked)
     target_crops, target_animals = plan.crop_targets_dict, plan.animal_targets_dict
@@ -886,6 +941,14 @@ def build_strip_work_plan(
         crop_targets=target_crops,
         animals_needed=animal_need,
         anchor=cfg.anchor,
+        config=SacrificeConfig(
+            allow_live_crop_sacrifice=allow_live_crop_sacrifice,
+            allow_productive_recurring_crop_sacrifice=(
+                allow_productive_recurring_crop_sacrifice),
+            allow_older_crop_sacrifice=allow_older_crop_sacrifice),
+        preferred_crop_slots=preferred_slots,
+        current_day=day,
+        current_step=step,
     )
     builder = _Builder(supply, cfg)
     current_land = len(unlocked)
@@ -943,16 +1006,28 @@ def build_strip_work_plan(
         elif slot.source != "empty_structure":
             build_kind = "BUILD_COOP" if slot.structure == "COOP" else "BUILD_PASTURE"
             deps: tuple[str, ...] = ()
-            if slot.source == "crop_sacrifice":
-                dig_id = f"DIG:{y},{x}"
-                builder.add(
-                    id=dig_id,
-                    kind="DIG",
-                    tile=slot.coord,
-                    crop=tile.get("crop") if isinstance(tile, Mapping) else None,
-                    source="animal_layout",
+            if slot.source in ("crop_release", "crop_sacrifice"):
+                removal_actions = slot.removal_actions or (
+                    ("DIG",) if slot.source == "crop_sacrifice" else ()
                 )
-                deps, ids = (dig_id,), [dig_id]
+                previous: tuple[str, ...] = ()
+                for action in removal_actions:
+                    removal_id = _removal_action_id(action, slot.coord)
+                    builder.add(
+                        id=removal_id,
+                        kind=action,
+                        tile=slot.coord,
+                        crop=tile.get("crop") if isinstance(tile, Mapping) else None,
+                        depends_on=previous,
+                        source=(
+                            "animal_crop_release"
+                            if slot.source == "crop_release"
+                            else "animal_layout"
+                        ),
+                    )
+                    ids.append(removal_id)
+                    previous = (removal_id,)
+                deps = previous
             build_id = f"{build_kind}:{y},{x}"
             builder.add(
                 id=build_id,
@@ -1019,42 +1094,76 @@ def build_strip_work_plan(
         )
 
     represented_crops: Counter[str] = Counter()
+    for slot in layouts.animals.placements:
+        y, x = slot.coord
+        tile = board[y][x]
+        if (
+            slot.source in ("crop_release", "crop_sacrifice")
+            and isinstance(tile, Mapping)
+            and tile_role(tile) == "plant"
+        ):
+            represented_crops[str(tile.get("crop"))] -= 1
+    replacement_harvest_coords: set[tuple[int, int]] = set()
+    reduction_harvest_coords: set[tuple[int, int]] = set()
+    removal_coords: set[tuple[int, int]] = set()
+    handled_removal_coords: set[tuple[int, int]] = set()
     digs_by_coord = {d.coord: d for d in layouts.crops.digs}
+    removals_by_coord = {r.coord: r for r in layouts.crops.removals}
+    for slot in layouts.animals.placements:
+        if slot.source not in ("crop_release", "crop_sacrifice"):
+            continue
+        removal_coords.add(slot.coord)
+        if "HARVEST" in slot.removal_actions:
+            reduction_harvest_coords.add(slot.coord)
+
+    def add_removal_actions(
+        coord: tuple[int, int],
+        crop: str,
+        actions: tuple[str, ...],
+        *,
+        source: str,
+        replacement: bool,
+    ) -> list[str]:
+        ids: list[str] = []
+        previous: tuple[str, ...] = ()
+        for action in actions:
+            action_id = _removal_action_id(action, coord)
+            builder.add(
+                id=action_id,
+                kind=action,
+                tile=coord,
+                crop=crop,
+                depends_on=previous,
+                source=source,
+            )
+            ids.append(action_id)
+            previous = (action_id,)
+            removal_coords.add(coord)
+            if action == "HARVEST":
+                (replacement_harvest_coords if replacement else reduction_harvest_coords).add(coord)
+        return ids
+
     for intent in layouts.crops.plants:
         y, x = intent.coord
         old = board[y][x]
         ids: list[str] = []
+        removal = removals_by_coord.get(intent.coord)
         if isinstance(old, Mapping) and old.get("kind") == "PLANT":
-            if _tile_harvestable(old, day, step):
-                harvest_id = f"HARVEST:{y},{x}"
-                builder.add(
-                    id=harvest_id,
-                    kind="HARVEST",
-                    tile=intent.coord,
-                    crop=old.get("crop"),
-                    source="crop_replacement",
-                )
-                ids.append(harvest_id)
-            elif intent.coord in digs_by_coord:
-                dig_id = f"DIG:{y},{x}"
-                builder.add(
-                    id=dig_id,
-                    kind="DIG",
-                    tile=intent.coord,
-                    crop=old.get("crop"),
-                    source="crop_replacement",
-                )
-                ids.append(dig_id)
+            actions = removal.actions if removal is not None else ()
+            if not actions and intent.coord in digs_by_coord:
+                actions = ("DIG",)
+            if not actions and _tile_harvestable(old, day, step):
+                actions = ("HARVEST",)
+            if actions:
+                ids.extend(add_removal_actions(
+                    intent.coord, str(old.get("crop")), actions,
+                    source="crop_replacement", replacement=True))
+                represented_crops[str(old.get("crop"))] -= 1
+                handled_removal_coords.add(intent.coord)
         elif tile_role(old) == "weed":
-            dig_id = f"DIG:{y},{x}"
-            builder.add(
-                id=dig_id,
-                kind="DIG",
-                tile=intent.coord,
-                crop="WEED",
-                source="crop_replacement",
-            )
-            ids.append(dig_id)
+            ids.extend(add_removal_actions(
+                intent.coord, "WEED", ("DIG",),
+                source="crop_replacement", replacement=True))
         plant_id = f"PLANT:{intent.crop}:{y},{x}"
         builder.add(
             id=plant_id,
@@ -1063,7 +1172,12 @@ def build_strip_work_plan(
             crop=intent.crop,
             depends_on=ids,
             requirements=(SupplyRequirement(intent.crop, 1, "global_seed"),),
-            source="crop_reconciliation",
+            source=(
+                "retained_crop_maintenance"
+                if intent.crop in _RETAINED_ONE_SHOT_CROPS
+                and intent.coord in preferred_slots.get(intent.crop, ())
+                else "crop_reconciliation"
+            ),
         )
         ids.append(plant_id)
         water_id = f"WATER:{y},{x}"
@@ -1085,32 +1199,88 @@ def build_strip_work_plan(
         )
         represented_crops[intent.crop] += 1
 
-    replacement_coords = {intent.coord for intent in layouts.crops.plants}
-    removal_coords = _excess_crop_coords(
-        board, unlocked, target_crops, replacement_coords, cfg.anchor
-    )
-    for y, x in removal_coords:
-        tile = board[y][x]
-        crop = str(tile["crop"])
-        if _tile_harvestable(tile, day, step):
-            removal_id, removal_kind = f"HARVEST:{y},{x}", "HARVEST"
-        else:
-            removal_id, removal_kind = f"DIG:{y},{x}", "DIG"
-        builder.add(
-            id=removal_id,
-            kind=removal_kind,
-            tile=(y, x),
-            crop=crop,
-            source="crop_reduction",
-        )
+    for removal in layouts.crops.removals:
+        if removal.coord in handled_removal_coords:
+            continue
+        ids = add_removal_actions(
+            removal.coord, removal.crop, removal.actions,
+            source="crop_reduction", replacement=False)
         builder.chain(
-            f"CROP_REMOVE:{crop}:{y},{x}",
+            f"CROP_REMOVE:{removal.crop}:{removal.coord[0]},{removal.coord[1]}",
             "CROP_REMOVAL",
-            (removal_id,),
-            tile=(y, x),
-            crop=crop,
+            ids,
+            tile=removal.coord,
+            crop=removal.crop,
             source="crop_reduction",
         )
+        represented_crops[removal.crop] -= 1
+
+    # Compatibility for callers that still provide only the legacy ``digs``
+    # field in a hand-built reconciliation result.
+    for dig in layouts.crops.digs:
+        if dig.coord in handled_removal_coords or dig.coord in removal_coords:
+            continue
+        ids = add_removal_actions(
+            dig.coord, dig.crop, ("DIG",),
+            source="crop_reduction", replacement=False)
+        builder.chain(
+            f"CROP_REMOVE:{dig.crop}:{dig.coord[0]},{dig.coord[1]}",
+            "CROP_REMOVAL",
+            ids,
+            tile=dig.coord,
+            crop=dig.crop,
+            source="crop_reduction",
+        )
+        represented_crops[dig.crop] -= 1
+
+    claimed_harvest_coords = replacement_harvest_coords | reduction_harvest_coords
+    allowed_quadrants = set(unlocked)
+    for y, row in enumerate(board):
+        for x, tile in enumerate(row):
+            coord = (y, x)
+            if quadrant_of(y, x) not in allowed_quadrants:
+                continue
+            if coord in claimed_harvest_coords:
+                continue
+            if not isinstance(tile, Mapping) or tile_role(tile) != "plant":
+                continue
+            crop = tile.get("crop")
+            if crop not in CROPS or not _tile_harvestable(tile, day, step):
+                continue
+            builder.add(
+                id=f"HARVEST:{y},{x}",
+                kind="HARVEST",
+                tile=coord,
+                crop=str(crop),
+                source="routine_harvest",
+            )
+
+    for y, row in enumerate(board):
+        for x, tile in enumerate(row):
+            if quadrant_of(y, x) not in allowed_quadrants:
+                continue
+            if not isinstance(tile, Mapping) or tile.get("animal") not in ANIMALS:
+                continue
+            coord = (y, x)
+            animal = str(tile["animal"])
+            if tile.get("yield_units", 0) > 0:
+                builder.add(
+                    id=f"HARVEST:{y},{x}",
+                    kind="HARVEST",
+                    tile=coord,
+                    animal=animal,
+                    product=str(ANIMALS[animal]["product"]),
+                    source="routine_animal_harvest",
+                )
+            if tile.get("fertilizer_available") is True:
+                builder.add(
+                    id=f"COLLECT_FERTILIZER:{y},{x}",
+                    kind="COLLECT_FERTILIZER",
+                    tile=coord,
+                    animal=animal,
+                    product="FERTILIZER",
+                    source="routine_animal_fertilizer_collection",
+                )
 
     unresolved_space_reason = (
         BlockReason.LOCKED_LAND
@@ -1133,7 +1303,6 @@ def build_strip_work_plan(
     # plan.care_by_animal counts are deliberately ignored.  An unfed animal
     # needs FEED (supply-checked) before CARE; an already-fed animal gets a
     # standalone READY CARE.  Already-cared or no-payoff animals get nothing.
-    allowed_quadrants = set(unlocked)
     for animal in ANIMAL_ORDER:
         for y, row in enumerate(board):
             for x, tile in enumerate(row):
@@ -1209,11 +1378,18 @@ def build_strip_work_plan(
             for x, tile in enumerate(row):
                 if quadrant_of(y, x) not in allowed_quadrants:
                     continue
+                if (y, x) in removal_coords:
+                    # The removal chain already owns this tile (and any
+                    # preparatory WATER); do not fertilize or water a crop
+                    # that is being released today.
+                    continue
                 if not (
                     isinstance(tile, Mapping)
                     and tile.get("kind") == "PLANT"
                     and tile.get("crop") == crop
                 ):
+                    continue
+                if crop == "WHEAT" and wheat_harvest_eligibility(tile, day, step)[0]:
                     continue
                 if int(tile.get("fertilized_until_day", -1) or -1) >= day:
                     continue
@@ -1477,17 +1653,20 @@ def _diagnostics(
     target_animals = plan.animal_targets_dict
     seeds, shed, carried = builder.seeds, builder.shed, builder.carried
     unresolved_crops, unresolved_animals = (
-        Counter(dict(layouts.crops.unresolved_deficits)),
-        Counter(dict(layouts.animals.unresolved)),
+        Counter(), Counter(dict(layouts.animals.unresolved))
     )
     represented_crops, represented_animals = (
         Counter(represented_crops),
         Counter(represented_animals),
     )
-    for crop, need in crop_need.items():
-        unresolved_crops[crop] += max(
-            0, need - represented_crops[crop] - unresolved_crops[crop]
+    for crop in CROP_ORDER:
+        residual = (
+            plan.crop_targets_dict[crop]
+            - current_crops[crop]
+            - represented_crops[crop]
         )
+        if residual:
+            unresolved_crops[crop] = residual
     for animal, need in animal_need.items():
         unresolved_animals[animal] += max(
             0, need - represented_animals[animal] - unresolved_animals[animal]

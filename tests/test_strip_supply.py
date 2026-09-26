@@ -5,9 +5,19 @@ from __future__ import annotations
 import copy
 
 from executor_v0.plan import DailyPlan
+from executor_v0.strip_cost import route_cost_segment_from_items, simulate_route_cost
 from executor_v0.strip_executor import StripExecutorController
-from executor_v0.strip_routes import StripRoute, WorkerId
-from executor_v0.strip_supply import build_route_supply_plans, extract_route_supply_demand
+from executor_v0.strip_routes import (
+    StripRoute,
+    WorkerId,
+    assign_horizontal_routes,
+    generate_horizontal_route_candidates,
+)
+from executor_v0.strip_supply import (
+    RouteSupplyState,
+    build_route_supply_plans,
+    extract_route_supply_demand,
+)
 from executor_v0.strip_work import (
     RowKey,
     RowSummary,
@@ -112,6 +122,59 @@ def test_demand_extraction_excludes_global_seeds_and_uses_work_items_once():
     assert order == ("WHEAT", "FERTILIZER")
 
 
+def test_legacy_feed_place_demand_matches_candidates_planner_and_simulator():
+    feed = WorkItem(
+        id="FEED:0,0",
+        kind="FEED",
+        tile=(0, 0),
+        animal="COW",
+        quantity=2,
+        row_key=row_key_for_tile((0, 0)),
+    )
+    place = WorkItem(
+        id="PLACE:SHEEP:0,1",
+        kind="PLACE",
+        tile=(0, 1),
+        animal="SHEEP",
+        quantity=2,
+        row_key=row_key_for_tile((0, 1)),
+    )
+    current = work_plan(feed, place)
+    candidate = generate_horizontal_route_candidates(current)[0]
+    assigned = route(candidate.route_id, 0)
+    supply_plan = build_route_supply_plans(
+        (assigned,),
+        current,
+        {WorkerId(0): {}},
+        {"WHEAT": 2, "SHEEP": 1},
+        {WorkerId(0): (0, 0)},
+    )[0]
+    cost = simulate_route_cost(
+        (0, 0),
+        (
+            route_cost_segment_from_items(
+                candidate.route_id,
+                candidate.owned_tiles,
+                current.items,
+                physical_row_id=candidate.row_id,
+            ),
+        ),
+        remaining_action_slots=24,
+        shed_stock={"WHEAT": 2, "SHEEP": 1},
+        pickup_tile=supply_plan.pickup_tile,
+    )
+
+    assert candidate.tile_inventory_items[:2] == (("WHEAT",), ("SHEEP",))
+    assert dict(supply_plan.demand) == dict(cost.supply_quantities_required) == {
+        "SHEEP": 2,
+        "WHEAT": 2,
+    }
+    assert dict(supply_plan.reserved_from_shed) == dict(
+        cost.supply_quantities_requiring_pickup
+    ) == {"SHEEP": 1, "WHEAT": 2}
+    assert dict(cost.supply_shortage) == {"SHEEP": 1}
+
+
 def test_existing_inventory_is_worker_local_and_satisfies_first():
     current = work_plan(item("FERTILIZE", (0, 0), SupplyRequirement("FERTILIZER", 4)))
     plans = build_route_supply_plans(
@@ -127,22 +190,91 @@ def test_existing_inventory_is_worker_local_and_satisfies_first():
     assert plans[0].missing_stock == ()
 
 
+def test_late_observed_stock_is_reserved_from_route_demand():
+    current = work_plan(item("FEED", (0, 0), SupplyRequirement("WHEAT", 2)))
+    assigned = route("A", 0)
+    supply_plan = build_route_supply_plans(
+        [assigned],
+        current,
+        {WorkerId(0): {}},
+        {},
+        {WorkerId(0): (0, 0)},
+    )[0]
+    assert supply_plan.reserved_from_shed == ()
+    assert supply_plan.missing_stock == (("WHEAT", 2),)
+
+    controller = StripExecutorController()
+    controller._routes = {assigned.owner: assigned}
+    controller._supply_plans = {assigned.route_id: supply_plan}
+    controller._supply_states = {assigned.route_id: RouteSupplyState()}
+    assert controller._outstanding_reservations() == {"WHEAT": 2}
+
+
 def test_shared_shed_reservation_is_assignment_ordered_and_non_overbooked():
     current = work_plan(
-        item("FERTILIZE", (0, 0), SupplyRequirement("FERTILIZER", 2)),
-        item("FERTILIZE", (1, 0), SupplyRequirement("FERTILIZER", 2)),
+        item("FEED", (0, 0), SupplyRequirement("WHEAT", 2)),
+        item("FEED", (1, 0), SupplyRequirement("WHEAT", 2)),
     )
     plans = build_route_supply_plans(
         [route("A", 0, 0), route("B", 1, 1)],
         current,
         {WorkerId(0): {}, WorkerId(1): {}},
-        {"FERTILIZER": 3},
+        {"WHEAT": 3},
         {WorkerId(0): (0, 0), WorkerId(1): (1, 0)},
     )
-    assert plans[0].reserved_from_shed == (("FERTILIZER", 2),)
-    assert plans[1].reserved_from_shed == (("FERTILIZER", 1),)
-    assert plans[1].missing_stock == (("FERTILIZER", 1),)
-    assert sum(dict(plan.reserved_from_shed).get("FERTILIZER", 0) for plan in plans) == 3
+    assert plans[0].reserved_from_shed == (("WHEAT", 2),)
+    assert plans[1].reserved_from_shed == (("WHEAT", 1),)
+    assert plans[1].missing_stock == (("WHEAT", 1),)
+    assert sum(dict(plan.reserved_from_shed).get("WHEAT", 0) for plan in plans) == 3
+
+
+def test_helper_fragment_owns_its_supply_demand_exactly_once():
+    heavy = tuple(
+        WorkItem(
+            id=f"CARE:{tile}:{index}",
+            kind="CARE",
+            tile=(0, tile),
+            row_key=row_key_for_tile((0, tile)),
+        )
+        for tile in (0, 1)
+        for index in range(6)
+    ) + tuple(
+        WorkItem(
+            id=f"WATER:{index}",
+            kind="WATER",
+            tile=(0, 3),
+            row_key=row_key_for_tile((0, 3)),
+        )
+        for index in range(8)
+    )
+    feed = item("FEED", (0, 4), SupplyRequirement("WHEAT", 1))
+    current = work_plan(*heavy, feed)
+    candidate = generate_horizontal_route_candidates(current)
+    assignment = assign_horizontal_routes(
+        candidate,
+        {WorkerId(0): (0, 0), WorkerId(1): (9, 9)},
+        assignment_hour=0,
+        remaining_action_slots=24,
+    )
+    plans = build_route_supply_plans(
+        assignment.routes,
+        current,
+        {WorkerId(0): {}, WorkerId(1): {}},
+        {"WHEAT": 1},
+        {WorkerId(0): (0, 0), WorkerId(1): (9, 9)},
+    )
+
+    row = assignment.row_diagnostics[0]
+    helper = next(
+        route
+        for route in assignment.routes
+        if route.owner.label == row["helper_worker"]
+    )
+    by_route = {plan.route_id: plan for plan in plans}
+    assert (0, 4) in helper.owned_tiles
+    assert dict(by_route[helper.route_id].demand) == {"WHEAT": 1}
+    other = next(route for route in assignment.routes if route is not helper)
+    assert by_route[other.route_id].demand == ()
 
 
 def test_pickup_order_is_first_use_and_seed_demand_never_reserves():
@@ -198,7 +330,7 @@ def test_partial_observed_pickup_records_only_real_inventory_gain():
     assert state["failed_or_unfulfilled"] == {"WHEAT": 2}
 
 
-def test_unassigned_route_does_not_reserve_and_day_reset_rebuilds_ledger():
+def test_packed_route_reserves_chain_and_day_reset_rebuilds_ledger():
     current = work_plan(
         item("FEED", (0, 0), SupplyRequirement("WHEAT", 2)),
         item("FEED", (1, 0), SupplyRequirement("WHEAT", 2)),
@@ -215,7 +347,10 @@ def test_unassigned_route_does_not_reserve_and_day_reset_rebuilds_ledger():
     assert first.diagnostics["supply_diagnostics"]["total_reservations_by_item"] == {
         "WHEAT": 2
     }
-    assert first.diagnostics["unassigned_supply_demand"]
+    assert first.diagnostics["unassigned_supply_demand"] == {}
+    assert first.diagnostics["route_diagnostics"][0]["supply_plan"]["demand"] == {
+        "WHEAT": 4
+    }
 
     next_day = controller.act(
         observation(position=(0, 0), shed={}, day=4), plan()
@@ -249,6 +384,7 @@ def test_batched_pickup_is_confirmed_before_route_entry():
     state = confirmed.diagnostics["route_diagnostics"][0]["supply_state"]
     assert state["acquired"] == {"WHEAT": 3}
     assert state["pickup_turns"] == 1
+    assert controller._outstanding_reservations() == {}
 
 
 def test_failed_pickup_has_no_phantom_acquisition_and_continues():
@@ -268,3 +404,4 @@ def test_failed_pickup_has_no_phantom_acquisition_and_continues():
     state = failed.diagnostics["route_diagnostics"][0]["supply_state"]
     assert state["acquired"] == {}
     assert state["failed_or_unfulfilled"] == {"WHEAT": 2}
+    assert controller._outstanding_reservations() == {}

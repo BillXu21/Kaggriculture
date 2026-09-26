@@ -67,6 +67,9 @@ def test_threshold_wheat_is_ordinary_productive_harvest():
         harvest = next(t for t in result.tasks if t.kind == "HARVEST")
         assert harvest.priority == Priority.PRODUCTIVE
         assert harvest.source == "mechanical"
+        assert not any(
+            t.kind == "WATER" and t.tile == harvest.tile for t in result.tasks
+        )
         assert "wheat_harvest:0,0:eligible:threshold_met" in result.diagnostics
 
 
@@ -78,16 +81,22 @@ def test_subthreshold_wheat_is_allowed_when_no_growth_remains():
 
 
 def test_expiry_and_terminal_boundaries_are_inclusive_exceptions():
+    # Hold WHEAT at one so this isolates the boundary helper; an all-zero
+    # target is now a clean future WATER -> HARVEST contraction (the planner
+    # represents removals that become legal later in the day).
+    hold = make_plan(crop_targets={"WHEAT": 1})
     before = _result(age=3, yield_units=1, step=98,
-                     max_lifespan_step=100)
+                     max_lifespan_step=100, plan=hold)
     at_boundary = _result(age=3, yield_units=1, step=99,
-                          max_lifespan_step=100)
+                          max_lifespan_step=100, plan=hold)
     assert not any(t.kind == "HARVEST" for t in before.tasks)
     assert any(t.kind == "HARVEST" for t in at_boundary.tasks)
     assert "wheat_harvest:0,0:eligible:expiry" in at_boundary.diagnostics
 
-    terminal_before = _result(age=3, yield_units=1, step=FINAL_ACTIONABLE_STEP - 1)
-    terminal = _result(age=3, yield_units=1, step=FINAL_ACTIONABLE_STEP)
+    terminal_before = _result(age=3, yield_units=1,
+                              step=FINAL_ACTIONABLE_STEP - 1, plan=hold)
+    terminal = _result(age=3, yield_units=1, step=FINAL_ACTIONABLE_STEP,
+                       plan=hold)
     assert not any(t.kind == "HARVEST" for t in terminal_before.tasks)
     assert any(t.kind == "HARVEST" for t in terminal.tasks)
     assert "wheat_harvest:0,0:eligible:terminal_horizon" in terminal.diagnostics
@@ -106,7 +115,8 @@ def test_manager_requested_removal_and_feed_buy_survive_threshold():
         obs, 0, feasible_plan=make_plan(crop_targets={"WHEAT": 0,
                                                       "TOMATO": 1}),
         remaining_sells={}, wheat_harvest_threshold=True)
-    assert any(t.kind == "DIG" and t.tile == (0, 0) for t in result.tasks)
+    assert not any(t.kind == "DIG" and t.tile == (0, 0) for t in result.tasks)
+    assert "crop_reduction_unresolved:WHEAT:1" in result.unresolved
     assert any(t.kind == "FEED" and t.tile == (0, 1) for t in result.tasks)
     assert any(t.kind == "BUY_PRODUCT" and t.product == "WHEAT"
                for t in result.tasks)
@@ -134,6 +144,35 @@ def test_eligibility_helper_distinguishes_yield_from_plant_age():
     assert wheat_harvest_eligibility(tile, 20, 480) == (False, "future_growth")
     tile["yield_units"] = 3
     assert wheat_harvest_eligibility(tile, 20, 480) == (True, "threshold_met")
+
+
+def test_eligibility_fast_and_canonical_tile_shapes_agree():
+    canonical = _plant_for_water("WHEAT", age_days=3, yield_units=2)
+    fast = {
+        "crop": "WHEAT",
+        "yield_units": 2,
+        "watered_today": False,
+        "derived": {"age_days": 3},
+        "max_lifespan_step": -1,
+    }
+    assert wheat_harvest_eligibility(canonical, 20, 480) == (
+        False,
+        "future_growth",
+    )
+    assert wheat_harvest_eligibility(fast, 20, 480) == (
+        False,
+        "future_growth",
+    )
+    canonical["yield_units"] = 3
+    fast["yield_units"] = 3
+    assert wheat_harvest_eligibility(canonical, 20, 480) == (
+        True,
+        "threshold_met",
+    )
+    assert wheat_harvest_eligibility(fast, 20, 480) == (
+        True,
+        "threshold_met",
+    )
 
 
 def test_fast_engine_scripted_wheat_lifecycle_threshold_crossing():

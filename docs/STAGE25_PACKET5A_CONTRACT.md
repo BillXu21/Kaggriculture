@@ -71,11 +71,15 @@ dtype, row count, and identity metadata on load. Each row contains:
 
 Decoded goals are diagnostics only. Legacy CARE, fertilizer, selling action
 tensors, and any frozen quantity model are intentionally absent. Actions,
-ledger K, identities, and numeric values survive a save/load round trip.
+physical baselines, requested goals, identities, and numeric values survive a
+save/load round trip.
 
-The provider is the sole K ledger owner. The outgoing manager transition is
-closed before the next decision is recorded, and K is applied once by the
-provider. The trajectory buffer enforces this ordering when appending rows.
+The provider is the sole owner of the accepted current-day manager plan. The
+outgoing manager transition is
+closed before the next decision is recorded. The provider decodes the current
+physical baseline plus the selected deltas into that day's absolute goals; the
+next row carries the next boundary's physical baseline. The trajectory buffer
+enforces this ordering when appending rows.
 No manager row is created before the first opening/manager boundary. The
 current supported Stage 2.5 day contract is manager start day 4 through day
 29; another configured start day is rejected during `RunnerConfig` startup
@@ -115,8 +119,8 @@ pytest -q tests/test_stage25_trajectory.py tests/test_stage25_inference.py tests
 pytest -q tests/test_stage25_provider.py tests/test_stage25_packet4_boundary.py tests/test_rl_manager_parallel.py tests/test_rl_manager_runner.py tests/test_rl_manager_trajectory.py tests/test_rl_manager_gae.py
 ```
 
-The focused Packet 5A suite covers worker import isolation, one request/K
-transition per boundary, identity rejection, fixed padding, row-stable RNG,
+The focused Packet 5A suite covers worker import isolation, one request and
+board-relative crop transition per boundary, identity rejection, fixed padding, row-stable RNG,
 trajectory round-trip, seat/episode separation, terminal closure, truncation
 bootstrap without another plan, no pre-opening rows, and checkpoint/provider
 curriculum agreement. The fast-engine spawned-worker smoke exercises both

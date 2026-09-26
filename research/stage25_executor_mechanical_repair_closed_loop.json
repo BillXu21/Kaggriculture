@@ -1,0 +1,149 @@
+{
+  "accounting": {
+    "accepted_steps_per_episode": 719,
+    "canonical_terminal_step": 719,
+    "reset_observation": 1
+  },
+  "action_families_total": {
+    "farmer.BUILD_COOP": 2,
+    "farmer.CARE": 60,
+    "farmer.COLLECT_FERTILIZER": 58,
+    "farmer.EAST": 30,
+    "farmer.FEED": 52,
+    "farmer.FERTILIZE": 92,
+    "farmer.HARVEST": 86,
+    "farmer.NORTH": 126,
+    "farmer.PASS": 502,
+    "farmer.PICKUP": 116,
+    "farmer.PLACE": 2,
+    "farmer.PLANT": 86,
+    "farmer.SOUTH": 70,
+    "farmer.WATER": 120,
+    "farmer.WEST": 36,
+    "hands.EAST": 60,
+    "hands.FEED": 8,
+    "hands.FERTILIZE": 28,
+    "hands.HARVEST": 134,
+    "hands.NORTH": 248,
+    "hands.PASS": 882,
+    "hands.PICKUP": 86,
+    "hands.PLANT": 94,
+    "hands.SOUTH": 122,
+    "hands.WATER": 202,
+    "hands.WEST": 158,
+    "market.BUY_ANIMAL": 2,
+    "market.BUY_PRODUCT": 70,
+    "market.BUY_SEED": 140,
+    "market.HIRE": 88,
+    "market.SELL": 94
+  },
+  "agent": "executor_v0.ExecutorAgent + FixedPlanProvider",
+  "checkpoint_evidence": {
+    "available": true,
+    "repo_local_pt_files": [
+      "artifacts\\local\\bc-v1-E\\best.pt",
+      "data\\temp\\bc-train-smoke\\ckpt\\best.pt",
+      "data\\temp\\bc-train-smoke\\ckpt\\last.pt"
+    ],
+    "status": "repo-local checkpoint exists; this deterministic-plan report does not substitute for its real BC run"
+  },
+  "engine_pair": {
+    "fast": "fast_env Rust engine",
+    "official": "kaggle_environments 1.32.7"
+  },
+  "episodes": [
+    {
+      "action_families": {
+        "farmer.BUILD_COOP": 2,
+        "farmer.CARE": 60,
+        "farmer.COLLECT_FERTILIZER": 58,
+        "farmer.EAST": 30,
+        "farmer.FEED": 52,
+        "farmer.FERTILIZE": 92,
+        "farmer.HARVEST": 86,
+        "farmer.NORTH": 126,
+        "farmer.PASS": 502,
+        "farmer.PICKUP": 116,
+        "farmer.PLACE": 2,
+        "farmer.PLANT": 86,
+        "farmer.SOUTH": 70,
+        "farmer.WATER": 120,
+        "farmer.WEST": 36,
+        "hands.EAST": 60,
+        "hands.FEED": 8,
+        "hands.FERTILIZE": 28,
+        "hands.HARVEST": 134,
+        "hands.NORTH": 248,
+        "hands.PASS": 882,
+        "hands.PICKUP": 86,
+        "hands.PLANT": 94,
+        "hands.SOUTH": 122,
+        "hands.WATER": 202,
+        "hands.WEST": 158,
+        "market.BUY_ANIMAL": 2,
+        "market.BUY_PRODUCT": 70,
+        "market.BUY_SEED": 140,
+        "market.HIRE": 88,
+        "market.SELL": 94
+      },
+      "agent_calls": 2876,
+      "fast_rewards": [
+        221.0,
+        221.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "final_step": 719,
+      "observation_comparisons": 1440,
+      "official_rewards": [
+        221.0,
+        221.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 41001,
+      "steps_executed": 719,
+      "terminal_step": 719,
+      "wall_time_seconds": 15.859090800004196
+    }
+  ],
+  "real_checkpoint_executor_ab": {
+    "checkpoint": "artifacts\\local\\bc-v1-E\\best.pt",
+    "error": "C:\\Users\\liuyi\\VSCodeProjecs\\Kaggriculture\\Kaggriculture\\artifacts\\local\\bc-v1-E\\best.pt: checkpoint e_history_version 'E_LEGACY' does not match requested 'E_CORRECTED_V1'",
+    "error_type": "ValueError",
+    "status": "incompatible"
+  },
+  "runner": "oracle.run_closed_loop",
+  "schema_version": 1,
+  "seeds": [
+    41001
+  ],
+  "terminal_outcomes": [
+    {
+      "fast_rewards": [
+        221.0,
+        221.0
+      ],
+      "fast_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "official_rewards": [
+        221.0,
+        221.0
+      ],
+      "official_statuses": [
+        "DONE",
+        "DONE"
+      ],
+      "seed": 41001,
+      "steps": 719,
+      "terminal_step": 719
+    }
+  ],
+  "wall_time_seconds": 26.22096440000314
+}

@@ -19,6 +19,7 @@ from executor_v0.layout import (
     AnimalSlotPlan,
     CropReconciliationResult,
     DigIntent,
+    SacrificeConfig,
     plan_day_layouts,
 )
 from executor_v0.foreman import run_foreman
@@ -276,7 +277,10 @@ def test_dig_plant_dependency_and_seed_shortage_purchase():
     tiles[0][3] = plant_tile("WHEAT", planted_day=1)
     obs = make_obs(tiles=tiles, seeds={})
     plan = make_plan(crop_targets={"WHEAT": 1, "TOMATO": 2})
-    result = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
+    result = generate_tasks(
+        obs, 0, feasible_plan=plan, remaining_sells={},
+        allow_live_crop_sacrifice=True,
+        allow_older_crop_sacrifice=True)
     digs = by_kind(result, "DIG")
     plants = by_kind(result, "PLANT")
     # WHEAT excess 2 released (cheapest first), TOMATO deficit 2 filled.
@@ -788,9 +792,8 @@ def test_terminal_action_horizon_harvests_instead_of_waiting_for_water():
 
     result = generate_tasks(obs, 0, feasible_plan=make_plan(),
                             remaining_sells={})
-    water = next(t for t in result.tasks if t.kind == "WATER")
     harvest = next(t for t in result.tasks if t.kind == "HARVEST")
-    assert water.source == "water_yield_window"
+    assert not any(t.kind == "WATER" for t in result.tasks)
     assert harvest.depends_on == ()
     dispatch = run_foreman(obs, 0, result.sorted_tasks())
     assert dispatch.farmer_action == ("HARVEST",)
@@ -871,13 +874,23 @@ def test_animal_crop_sacrifice_clears_living_crop_before_build():
     layout = plan_day_layouts(
         tiles, unlocked_quadrants=("NW",),
         crop_targets=plan.crop_targets_dict,
-        animals_needed={"COW": 1})
+        animals_needed={"COW": 1},
+        config=SacrificeConfig(
+            allow_live_crop_sacrifice=True,
+            allow_productive_recurring_crop_sacrifice=True,
+            allow_older_crop_sacrifice=True),
+        current_day=WATER_TEST_DAY,
+        current_step=WATER_TEST_DAY * 24)
     assert len(layout.animals.placements) == 1
     slot = layout.animals.placements[0]
     assert slot.source == "crop_sacrifice"
     assert tiles[slot.coord[0]][slot.coord[1]]["kind"] == "PLANT"
 
-    result = generate_tasks(obs, 0, feasible_plan=plan, remaining_sells={})
+    result = generate_tasks(
+        obs, 0, feasible_plan=plan, remaining_sells={},
+        allow_live_crop_sacrifice=True,
+        allow_productive_recurring_crop_sacrifice=True,
+        allow_older_crop_sacrifice=True)
     y, x = slot.coord
     dig_key = f"DIG:{y},{x}"
     build_key = f"BUILD_PASTURE:{y},{x}"

@@ -1,4 +1,4 @@
-"""Focused tests for the persistent Stage 2.5 provider seam."""
+"""Focused tests for the Stage 2.5 provider lifecycle seam."""
 
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ class _FakeNativePolicy:
         return self.classes
 
 
-def test_first_boundary_initializes_observed_k_and_lowers_plan() -> None:
+def test_first_boundary_uses_observed_baseline_and_lowers_plan() -> None:
     provider = Stage25PlanProvider(episode_id="episode-1", seat=0,
                                    manager_start_day=3)
     plan = provider.accept_classes(_obs(), HOLD)
@@ -120,13 +120,76 @@ def test_sequential_crop_transition_and_corrected_e_history() -> None:
     next_classes = (0, 1, 0, 1, 101, 100, 100, 100, 100)
     provider.accept_classes(_obs(day=4, money=1250.0), next_classes)
 
-    assert provider.crop_capacity == (2, 0, 0, 0, 0)
+    assert provider.crop_capacity == (1, 0, 0, 0, 0)
+    assert provider.physical_crop_baseline == (1, 0, 0, 0, 0)
+    assert provider.crop_goals == (2, 0, 0, 0, 0)
     assert provider.e_history == (4, 1250.0)
     encoded = provider.encoded_inputs
     assert encoded is not None
     np.testing.assert_array_equal(encoded["crop_capacity"], [[1, 0, 0, 0, 0]])
     assert encoded["economic_context"][0, 13] == 1.0
     assert encoded["economic_context"][0, 12] > 0.0
+
+
+def test_board_relative_crop_baseline_ignores_stale_requested_goal() -> None:
+    provider = Stage25PlanProvider(7, 0, 3)
+    plus_eight = (0, 1, 0, 1, 108, 100, 100, 100, 100)
+    plus_three = (0, 1, 0, 1, 103, 100, 100, 100, 100)
+
+    first = provider.accept_classes(
+        _obs(day=3, wheat_count=10), plus_eight)
+    assert first.crop_targets_dict["WHEAT"] == 18
+    assert provider.physical_crop_baseline == (10, 0, 0, 0, 0)
+
+    second = provider.accept_classes(
+        _obs(day=4, wheat_count=15), plus_three)
+    assert provider.physical_crop_baseline == (15, 0, 0, 0, 0)
+    assert provider.crop_capacity == (15, 0, 0, 0, 0)
+    assert provider.crop_goals == (18, 0, 0, 0, 0)
+    assert second.crop_targets_dict["WHEAT"] == 18
+    assert provider.diagnostics["physical_crop_baseline"] == (15, 0, 0, 0, 0)
+    assert provider.diagnostics["requested_crop_goals"] == (18, 0, 0, 0, 0)
+    encoded = provider.encoded_inputs
+    assert encoded is not None
+    np.testing.assert_array_equal(encoded["crop_capacity"], [[15, 0, 0, 0, 0]])
+
+    # The physical baseline also widens the current support mask: +8 reaches
+    # the 23-cell crop capacity from 15, but would be rejected from stale K=18.
+    support_provider = Stage25PlanProvider(8, 0, 3)
+    support_provider.accept_classes(_obs(day=3, wheat_count=10), plus_eight)
+    support_plan = support_provider.accept_classes(
+        _obs(day=4, wheat_count=15), plus_eight)
+    assert support_plan.crop_targets_dict["WHEAT"] == 23
+
+
+def test_restored_provider_reobserves_board_after_requested_goal() -> None:
+    provider = Stage25PlanProvider(7, 0, 3)
+    provider.accept_classes(
+        _obs(day=3, wheat_count=10),
+        (0, 1, 0, 1, 108, 100, 100, 100, 100),
+    )
+
+    restored = Stage25PlanProvider(7, 0, 3)
+    restored.import_state(provider.export_json())
+    plan = restored.accept_classes(
+        _obs(day=4, wheat_count=15),
+        (0, 1, 0, 1, 103, 100, 100, 100, 100),
+    )
+
+    assert restored.physical_crop_baseline == (15, 0, 0, 0, 0)
+    assert restored.crop_goals == (18, 0, 0, 0, 0)
+    assert plan.crop_targets_dict["WHEAT"] == 18
+
+
+def test_first_decision_crop_delta_matches_physical_start_counts() -> None:
+    provider = Stage25PlanProvider(7, 0, 3)
+    action = (0, 1, 0, 1, 108, 100, 100, 100, 100)
+
+    plan = provider.accept_classes(_obs(wheat_count=10), action)
+
+    assert provider.physical_crop_baseline == (10, 0, 0, 0, 0)
+    assert provider.crop_goals == (18, 0, 0, 0, 0)
+    assert plan.crop_targets_dict["WHEAT"] == 18
 
 
 def test_duplicate_out_of_order_terminal_and_invalid_delivery_are_atomic() -> None:
@@ -170,6 +233,10 @@ def test_export_import_is_strict_and_preserves_cached_plan() -> None:
         7, 0, 3, source_history_version=E_HISTORY_LEGACY)
     provider.accept_classes(_obs(), HOLD)
     encoded = provider.export_json()
+    payload = json.loads(encoded)
+    assert payload["version"] == "stage25_provider_state_v3"
+    assert payload["physical_crop_baseline"] == [1, 0, 0, 0, 0]
+    assert "crop_capacity" not in payload
     restored = Stage25PlanProvider(7, 0, 3)
     restored.import_state(encoded)
 

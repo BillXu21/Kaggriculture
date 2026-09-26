@@ -18,17 +18,20 @@ The corresponding class counts are:
 
 Land and animal actions are absolute targets. Crop class `j` means delta
 `j - 100`, so class `100` is HOLD and the fixed crop vocabulary is
-`[-100, +100]`. The persistent crop-capacity ledger transitions exactly once as
-`K' = K + delta`; sampled classes are never clipped, projected, or repaired.
-There is no permanent `+25` cap.
+`[-100, +100]`. At every daily boundary, let `B[c]` be the physical count of
+crop `c` on the current board. A selected crop class requests the end-of-day
+goal `goal[c] = B[c] + delta[c]`; sampled classes are never clipped, projected,
+or repaired. There is no permanent `+25` cap and no unrealized crop intention
+is carried into the next boundary.
 
 ## Observation contract
 
 The manager makes one decision at each daily boundary. The policy observes
 only the acting seat's corrected-E inputs; opponent-private state and opponent
-actions are never inputs. Persistent `crop_capacity[5]` is an additional
-strategic-state input. It is stored pre-decision, before the nine classes are
-sampled, and is updated only by the sampled crop deltas after that decision.
+actions are never inputs. `crop_capacity[5]` remains the model-facing key for
+the physical current-board crop baseline `B`. It is stored pre-decision,
+before the nine classes are sampled, and is re-derived from the physical board
+at every daily boundary; it is not updated from the prior requested goals.
 
 For Packet 2/5 support evaluation, the stored own-only observation must retain
 the authoritative physical fields needed by Packet 1A: canonical 10x10 board
@@ -40,8 +43,9 @@ inventory counts. The current corrected-E trajectory-facing arrays are:
 `days_remaining`, and `economic_context`. Packet 2 must make the physical
 subset losslessly and deterministically decodable back to Packet 1A's board,
 unlocked prefix, and inventory representation. Therefore physical context is
-not redundantly stored when this round-trip guarantee is met; `K` alone is
-never sufficient. A round-trip test is an acceptance gate before rollout.
+not redundantly stored when this round-trip guarantee is met; crop baseline
+counts alone are never sufficient. A round-trip test is an acceptance gate
+before rollout.
 
 Economic channels may remain in corrected-E for the encoder, but money, prices,
 feed, labor, affordability, and profitability must not alter permanent
@@ -85,11 +89,11 @@ action-independent unless Packet 2 deliberately versions this contract.
 
 ## PPO likelihood and entropy
 
-For stored state `s`, persistent ledger `K`, physical context, and action prefix
-`a`, the joint likelihood is the raw sum of conditional logprobs:
+For stored state `s`, physical crop baseline `B`, physical context, and action
+prefix `a`, the joint likelihood is the raw sum of conditional logprobs:
 
 ```text
-log pi(a | s,K) = sum_i log pi_i(a_i | s,K,a_<i)
+log pi(a | s,B) = sum_i log pi_i(a_i | s,B,a_<i)
 ```
 
 Sampling and stored-action evaluation use the same conditional decoder
@@ -149,7 +153,7 @@ imputed, replaced with HOLD/zero/current counts, or marginalized over.
 Packet 2/5 must migrate the trajectory schema; Packet 1 does not perform that
 migration. The minimum stored behavior state is:
 
-- pre-decision `crop_capacity[5]`, `int16`;
+- pre-decision physical crop baseline `crop_capacity[5]`, `int16`;
 - sampled class indices `classes[9]`, `int16`, in the fixed action order;
 - the complete own-only corrected-E observation inputs listed above;
 - episode, seat, day, and an immutable row identity/decision seed;
@@ -171,7 +175,9 @@ logprob groups, while `InferenceRequest` carries encoded inputs plus
 episode/seat/day/policy/prng metadata and `QueuedPlanProvider` keys plans by
 day. These are inspection findings, not the Stage 2.5 schema. Packet 2/5 must
 replace/extend those seams so the nine class sequence, row identity, physical
-context, pre-decision ledger, and behavior fingerprint travel together.
+context, pre-decision physical crop baseline, and behavior fingerprint travel
+together. Goals are end-of-day requests; incomplete execution is allowed, and
+the next decision starts from whatever crop counts physically exist then.
 
 ## Row randomness, batching, and numerical acceptance
 
@@ -219,7 +225,8 @@ does not build a tracker or wire a provider/executor.
 Stage 2.5 is JAX-native. Packet 2/3 native checkpoint metadata must pin at least:
 
 `architecture_version`, `action_schema_version`, `observation_schema_version`,
-`persistent_ledger_version`, `physical_support_version`, curriculum
+the legacy metadata key `persistent_ledger_version` (retained for checkpoint
+compatibility), `physical_support_version`, curriculum
 version/settings, E-history version, ordered vocabularies, model dimensions,
 dtype/precision, executor profile identity where behavior depends on it,
 training stage/step, optimizer state/RNG for resumable snapshots, and the

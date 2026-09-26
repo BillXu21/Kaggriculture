@@ -170,6 +170,7 @@ def test_rollout_control_defaults_preserve_runner_defaults() -> None:
     args = cli._parser().parse_args([
         "--scratch", "--output-dir", "out"])
     assert args.checkpoint_every == 1
+    assert args.executor == "strip"
     runner_config = cli._runner_config(
         args, seed=17, reward_config=RewardConfig())
 
@@ -397,12 +398,22 @@ def test_executor_provenance_rejects_non_json_values(bad) -> None:
         _executor_factory_provenance(factory)
 
 
-def _legacy_resume_checkpoint(tmp_path):
+def test_executor_modes_have_distinct_canonical_provenance() -> None:
+    legacy = _executor_factory_provenance(
+        cli._resolve_executor_factory("legacy"))
+    strip = _executor_factory_provenance(
+        cli._resolve_executor_factory("strip"))
+    assert legacy != strip
+    for provenance in (legacy, strip):
+        assert json.loads(json.dumps(provenance, allow_nan=False)) == provenance
+
+
+def _write_resume_checkpoint(tmp_path, executor_name: str = "legacy"):
     args = cli._parser().parse_args([
-        "--resume", str(tmp_path / "source.npz"), "--executor", "legacy",
-        "--model-size", "tiny", "--physical-batch-size", "1",
-        "--minibatch-size", "1", "--epochs", "1", "--seed", "7",
-        "--output-dir", str(tmp_path)])
+        "--resume", str(tmp_path / f"{executor_name}-source.npz"),
+        "--executor", executor_name, "--model-size", "tiny",
+        "--physical-batch-size", "1", "--minibatch-size", "1",
+        "--epochs", "1", "--seed", "7", "--output-dir", str(tmp_path)])
     config = cli._config(args)
     fresh = ppo.init_stage25_ppo_state(config, seed=7)
     frozen = init_stage25_params(config.model, seed=8)
@@ -412,7 +423,8 @@ def _legacy_resume_checkpoint(tmp_path):
     opponent = Stage25InferenceAdapter(
         params=frozen, config=config.model, name="stage25_opponent",
         version="frozen-v1", seed=8, mode="stochastic")
-    executor = _executor_factory_provenance(cli._resolve_executor_factory("legacy"))
+    provenance = _executor_factory_provenance(
+        cli._resolve_executor_factory(executor_name))
     checkpoint.save_stage25_ppo_checkpoint(
         args.resume, fresh.params, fresh.optimizer_state, fresh.rng,
         config.model, seed=7, update_counter=70, rollout_seed=281,
@@ -421,20 +433,26 @@ def _legacy_resume_checkpoint(tmp_path):
         curriculum=config.model.curriculum,
         behavior_identity=learner.identity, opponent_params=frozen,
         opponent_identity=opponent.identity,
-        physical_contract=cli._physical_contract(config), executor=executor,
+        physical_contract=cli._physical_contract(config), executor=provenance,
         metadata={"training_contract": cli._training_contract(args)})
-    return args, config, fresh, frozen, learner, opponent, executor
+    return args, config, fresh, frozen, learner, opponent, provenance
 
 
-def test_legacy_ppo_checkpoint_resumes_with_exact_state(tmp_path) -> None:
-    args, config, fresh, frozen, learner, opponent, executor = (
-        _legacy_resume_checkpoint(tmp_path))
+@pytest.mark.parametrize("executor_name", ("legacy", "strip"))
+def test_ppo_checkpoint_resumes_with_exact_state(tmp_path, executor_name) -> None:
+    args, config, fresh, frozen, learner, opponent, provenance = (
+        _write_resume_checkpoint(tmp_path, executor_name))
     with np.load(args.resume, allow_pickle=False) as archive:
         stored_executor = json.loads(
             archive["__meta__"].tobytes().decode("utf-8"))["executor"]
-    assert stored_executor == executor
-    assert stored_executor["effective_profile"]["agent_config"]["foreman"][
-        "shed_access_tiles"] == [[4, 4], [5, 4], [4, 5], [5, 5]]
+    assert stored_executor == provenance
+    if executor_name == "legacy":
+        assert stored_executor["effective_profile"]["agent_config"]["foreman"][
+            "shed_access_tiles"] == [[4, 4], [5, 4], [4, 5], [5, 5]]
+    else:
+        strip_profile = stored_executor["effective_profile"]["strip_config"]
+        assert strip_profile["max_market_orders"] == 10
+        assert strip_profile["aggressive_sell_all"] is True
 
     state, meta = cli._new_state(args, config)
     assert _same_tree(state.params, fresh.params)
@@ -450,19 +468,33 @@ def test_legacy_ppo_checkpoint_resumes_with_exact_state(tmp_path) -> None:
     assert meta["ppo_config"] == config.to_dict()
     assert meta["optimizer_config"] == config.to_dict()
     assert meta["physical_contract"] == cli._physical_contract(config)
-    assert meta["executor"] == executor
+    assert meta["executor"] == provenance
     assert meta["training_contract"] == cli._training_contract(args)
 
 
-def test_legacy_ppo_resume_rejects_changed_executor_setting(
-        tmp_path, monkeypatch) -> None:
-    args, config, *_ = _legacy_resume_checkpoint(tmp_path)
+def test_resume_rejects_changed_executor_setting(tmp_path, monkeypatch) -> None:
+    args, config, *_ = _write_resume_checkpoint(tmp_path, "legacy")
     original = cli._resolve_executor_factory("legacy")
     changed = make_default_executor_factory(
         replace(original.agent_config, tasks_per_worker=11))
     monkeypatch.setattr(cli, "_resolve_executor_factory", lambda _: changed)
     with pytest.raises(ValueError, match="executor provenance does not match"):
         cli._new_state(args, config)
+
+@pytest.mark.parametrize(("saved_as", "resume_as"), [
+    ("legacy", "strip"), ("strip", "legacy")])
+def test_checkpoint_cross_resume_between_executor_modes_is_rejected(
+        tmp_path, saved_as, resume_as) -> None:
+    saved_args, _, *_ = _write_resume_checkpoint(tmp_path, saved_as)
+    resume_args = cli._parser().parse_args([
+        "--resume", str(saved_args.resume), "--executor", resume_as,
+        "--model-size", "tiny", "--physical-batch-size", "1",
+        "--minibatch-size", "1", "--epochs", "1", "--seed", "7",
+        "--output-dir", str(tmp_path)])
+    config = cli._config(resume_args)
+
+    with pytest.raises(ValueError, match="executor provenance does not match"):
+        cli._new_state(resume_args, config)
 
 
 @pytest.mark.parametrize(

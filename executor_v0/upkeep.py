@@ -5,42 +5,19 @@ executor's first-available harvest behavior, not an optimized harvest policy.
 """
 from collections.abc import Mapping
 from replay_daily.constants import ANIMALS, CROPS
-from replay_daily.lifecycle import animal_placed_day
-
-WHEAT_HARVEST_THRESHOLD = 3
-FINAL_ACTIONABLE_STEP = 718
+from replay_daily.lifecycle import (
+    FINAL_ACTIONABLE_STEP,
+    WHEAT_HARVEST_THRESHOLD,
+    animal_placed_day,
+    wheat_harvest_eligibility as _lifecycle_wheat_harvest_eligibility,
+)
 
 
 def wheat_harvest_eligibility(
     tile: Mapping, day: int, step: int,
 ) -> tuple[bool, str]:
-    """Return threshold eligibility and its auditable reason for one wheat.
-
-    Productive watering is possible on an unwatered day in wheat's exact
-    single-harvest growth window. Expiry is read from the engine-provided
-    lifespan step rather than inferred from age. The step immediately before
-    expiry is the last action that can avoid the day-boundary decay.
-    """
-    held = int(tile.get("yield_units", 0) or 0)
-    if held >= WHEAT_HARVEST_THRESHOLD:
-        return True, "threshold_met"
-    if step >= FINAL_ACTIONABLE_STEP:
-        return True, "terminal_horizon"
-    lifespan = int(tile.get("max_lifespan_step", -1) or -1)
-    if lifespan >= 0 and step >= lifespan - 1:
-        return True, "expiry"
-
-    data = CROPS["WHEAT"]
-    age = day - int(tile["planted_day"])
-    room = held < data["max_yield"]
-    useful_today = (
-        room and tile.get("watered_today") is not True
-        and (data["max_yield_day"] + 1) // 2 <= age <= data["max_yield_day"]
-    )
-    future_productive_day = room and age < data["max_yield_day"] and day < 29
-    if useful_today or future_productive_day:
-        return False, "future_growth"
-    return True, "no_further_growth"
+    """Shared WHEAT eligibility used by routine and removal planning."""
+    return _lifecycle_wheat_harvest_eligibility(tile, day, step)
 
 
 def care_has_payoff(tile: Mapping, day: int) -> bool:

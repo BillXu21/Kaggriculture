@@ -28,6 +28,7 @@ from typing import Any
 
 from bc_manager.constants import ANIMAL_ORDER, CROP_ORDER
 from executor_v0.layout import (
+    SacrificeConfig,
     SHED_HUB_ANCHOR,
     AnimalLayoutResult,
     CropReconciliationResult,
@@ -332,6 +333,9 @@ def generate_tasks(
     heuristic_care: bool = False,
     heuristic_fertilizer: bool = False,
     wheat_harvest_threshold: bool = False,
+    allow_live_crop_sacrifice: bool = False,
+    allow_productive_recurring_crop_sacrifice: bool = False,
+    allow_older_crop_sacrifice: bool = False,
 ) -> GenerationResult:
     """Regenerate the full V0 task set from the current observation.
 
@@ -357,6 +361,7 @@ def generate_tasks(
     # all day as workers walked around (issue #7).
     anchor = SHED_HUB_ANCHOR
     hour = int(obs["hour"])
+    current_step = int(obs.get("step", int(obs["day"]) * _TURNS_PER_DAY + hour))
     unresolved: list[str] = []
     diagnostics: list[str] = []
     tasks: list[Task] = []
@@ -379,7 +384,13 @@ def generate_tasks(
                           - current_animals[name])
                 for name in ANIMAL_ORDER
             },
-            anchor=anchor)
+            anchor=anchor,
+            config=SacrificeConfig(
+                allow_live_crop_sacrifice=allow_live_crop_sacrifice,
+                allow_productive_recurring_crop_sacrifice=(
+                    allow_productive_recurring_crop_sacrifice),
+                allow_older_crop_sacrifice=allow_older_crop_sacrifice),
+            current_day=int(obs["day"]), current_step=current_step)
         assert day_layout is not None
         reconcile_result = day_layout.crops
         animal_layout_result = day_layout.animals
@@ -387,7 +398,13 @@ def generate_tasks(
         if reconcile_result is None:
             reconcile_result = reconcile_crops(
                 board, unlocked_quadrants=unlocked,
-                crop_targets=feasible_plan.crop_targets_dict, anchor=anchor)
+                crop_targets=feasible_plan.crop_targets_dict, anchor=anchor,
+                config=SacrificeConfig(
+                    allow_live_crop_sacrifice=allow_live_crop_sacrifice,
+                    allow_productive_recurring_crop_sacrifice=(
+                        allow_productive_recurring_crop_sacrifice),
+                    allow_older_crop_sacrifice=allow_older_crop_sacrifice),
+                current_day=int(obs["day"]), current_step=current_step)
         if animal_layout_result is None:
             animal_layout_result = plan_animal_layout(
                 board, unlocked_quadrants=unlocked,
@@ -396,7 +413,13 @@ def generate_tasks(
                               - current_animals[name])
                     for name in ANIMAL_ORDER
                 },
-                anchor=anchor)
+                anchor=anchor,
+                config=SacrificeConfig(
+                    allow_live_crop_sacrifice=allow_live_crop_sacrifice,
+                    allow_productive_recurring_crop_sacrifice=(
+                        allow_productive_recurring_crop_sacrifice),
+                    allow_older_crop_sacrifice=allow_older_crop_sacrifice),
+                current_day=int(obs["day"]), current_step=current_step)
 
     # ---- scan the canonical board once -------------------------------
     water_must_targets: list[tuple[int, int]] = []
@@ -432,6 +455,15 @@ def generate_tasks(
                     care_eligible[species].append(coord)
             elif tile.get("kind") == "PLANT":
                 urgency = _water_urgency(tile)
+                if tile.get("crop") == "WHEAT":
+                    from executor_v0.upkeep import wheat_harvest_eligibility
+                    current_step = int(obs.get(
+                        "step", int(obs["day"]) * _TURNS_PER_DAY
+                        + int(obs["hour"])))
+                    if wheat_harvest_eligibility(
+                        tile, int(obs["day"]), current_step
+                    )[0]:
+                        urgency = None
                 if urgency == "must":
                     water_must_targets.append(coord)
                 elif urgency == "yield":
@@ -521,18 +553,37 @@ def generate_tasks(
                           source="mechanical"))
 
     # ---- MANAGER: crop reconciliation ---------------------------------
-    dig_keys_by_coord: dict[tuple[int, int], str] = {}
+    action_keys_by_coord: dict[tuple[int, int], tuple[str, ...]] = {}
+    for removal in reconcile_result.removals:
+        previous: tuple[str, ...] = ()
+        keys: list[str] = []
+        for action in removal.actions:
+            action_key = f"{action}:{removal.coord[0]},{removal.coord[1]}"
+            if not any(task.key == action_key for task in tasks):
+                tasks.append(Task(
+                    key=action_key, kind=action, priority=Priority.MANAGER,
+                    tile=removal.coord, crop=removal.crop,
+                    depends_on=previous,
+                    source=(
+                        "crop_sacrifice"
+                        if removal.sacrifice else "manager_reconciliation"
+                    )))
+            keys.append(action_key)
+            previous = (action_key,)
+        action_keys_by_coord[removal.coord] = tuple(keys)
+
+    # Preserve hand-built Packet 1 results that still expose only ``digs``.
     for dig in reconcile_result.digs:
+        if dig.coord in action_keys_by_coord:
+            continue
         dig_key = f"DIG:{dig.coord[0]},{dig.coord[1]}"
-        if dig.coord not in dig_keys_by_coord:
+        if not any(task.key == dig_key for task in tasks):
             tasks.append(Task(key=dig_key, kind="DIG", priority=Priority.MANAGER,
                               tile=dig.coord, crop=dig.crop,
                               source="manager_reconciliation"))
-            dig_keys_by_coord[dig.coord] = dig_key
+        action_keys_by_coord[dig.coord] = (dig_key,)
     for intent in reconcile_result.plants:
-        depends = []
-        if any(d.coord == intent.coord for d in reconcile_result.digs):
-            depends.append(f"DIG:{intent.coord[0]},{intent.coord[1]}")
+        depends = list(action_keys_by_coord.get(intent.coord, ()))
         # Planting consumes the GLOBAL own seed pool (`private.seeds[crop]`)
         # atomically at the engine; seeds are never picked up or carried.
         # Seed sufficiency is enforced/reserved by the foreman per turn and
@@ -545,6 +596,8 @@ def generate_tasks(
             source="manager_reconciliation"))
     for crop, count in reconcile_result.unresolved_deficits:
         unresolved.append(f"crop_deficit_unresolved:{crop}:{count}")
+    for crop, count in reconcile_result.unresolved_reductions:
+        unresolved.append(f"crop_reduction_unresolved:{crop}:{count}")
 
     # ---- MANAGER: animal deficits --------------------------------------
     # Each emitted PLACE reserves one specific animal observed in the shed or
@@ -576,13 +629,13 @@ def generate_tasks(
         build_deps: list[str] = []
         if slot.source == "weed_reclaim":
             dig_key = f"DIG:{slot.coord[0]},{slot.coord[1]}"
-            if slot.coord not in dig_keys_by_coord:
+            if slot.coord not in action_keys_by_coord:
                 tasks.append(Task(key=dig_key, kind="DIG",
                                   priority=Priority.MANAGER, tile=slot.coord,
                                   crop="WEED", source="weed_reclaim"))
-                dig_keys_by_coord[slot.coord] = dig_key
-            build_deps.append(dig_key)
-        elif slot.source == "crop_sacrifice":
+                action_keys_by_coord[slot.coord] = (dig_key,)
+            build_deps.append(action_keys_by_coord[slot.coord][-1])
+        elif slot.source in ("crop_release", "crop_sacrifice"):
             current_tile = _tile_at(board, slot.coord)
             if tile_role(current_tile) != "plant" \
                     or not current_tile.get("crop"):
@@ -590,15 +643,31 @@ def generate_tasks(
                     f"animal_crop_sacrifice_stale:{slot.animal}:"
                     f"{slot.coord[0]},{slot.coord[1]}")
                 continue
-            dig_key = dig_keys_by_coord.get(slot.coord)
-            if dig_key is None:
-                dig_key = f"DIG:{slot.coord[0]},{slot.coord[1]}"
-                tasks.append(Task(key=dig_key, kind="DIG",
-                                  priority=Priority.MANAGER, tile=slot.coord,
-                                  crop=current_tile["crop"],
-                                  source="crop_sacrifice"))
-                dig_keys_by_coord[slot.coord] = dig_key
-            build_deps.append(dig_key)
+            removal_keys = action_keys_by_coord.get(slot.coord)
+            if removal_keys is None:
+                actions = slot.removal_actions or (
+                    ("DIG",) if slot.source == "crop_sacrifice" else ()
+                )
+                previous: tuple[str, ...] = ()
+                keys: list[str] = []
+                for action in actions:
+                    action_key = f"{action}:{slot.coord[0]},{slot.coord[1]}"
+                    if not any(task.key == action_key for task in tasks):
+                        tasks.append(Task(
+                            key=action_key, kind=action,
+                            priority=Priority.MANAGER, tile=slot.coord,
+                            crop=current_tile["crop"], depends_on=previous,
+                            source=(
+                                "animal_crop_release"
+                                if slot.source == "crop_release"
+                                else "crop_sacrifice"
+                            )))
+                    keys.append(action_key)
+                    previous = (action_key,)
+                removal_keys = tuple(keys)
+                action_keys_by_coord[slot.coord] = removal_keys
+            if removal_keys:
+                build_deps.append(removal_keys[-1])
         remaining_owned_animals[slot.animal] -= 1
         build_kind = ("BUILD_COOP" if slot.structure == "COOP"
                       else "BUILD_PASTURE")

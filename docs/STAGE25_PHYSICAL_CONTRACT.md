@@ -1,8 +1,11 @@
 # Stage 2.5 Packet 1A: physical mechanics contract
 
 This document is authoritative for the Stage 2.5 land, animal-housing, crop
-capacity, and persistent crop-goal helpers. Later policy/training packets must
-reproduce these rules exactly; they should not infer them from executor code.
+capacity, and board-relative crop-delta helpers. Later policy/training packets
+must reproduce these rules exactly; they should not infer them from executor
+code. Compatibility-named crop-ledger helpers apply deltas to a supplied
+boundary baseline; the live provider re-derives that baseline from the current
+physical board on every daily decision.
 The public framework-free implementation is
 `rl_manager.stage25_mechanics`.
 
@@ -102,8 +105,8 @@ pasture reuse pool when their heads are reached.
 ## Crop residual support
 
 After land and all three animal targets determine `C`, crops are decoded in
-the fixed order above. For crop `i`, previous persistent goal `K_i`, and
-earlier newly decoded goals, define:
+the fixed order above. At the current decision boundary, let `B_i` be the
+physical count of crop `i`; for earlier newly decoded goals, define:
 
 ```text
 R_i = C - sum(decoded_goal_j for earlier j)
@@ -112,41 +115,43 @@ R_i = C - sum(decoded_goal_j for earlier j)
 The valid signed delta interval is:
 
 ```text
-max(-100, -K_i) <= delta_i <= min(100, R_i) - K_i
+max(-100, -B_i) <= delta_i <= min(100, R_i) - B_i
 ```
 
-Equivalently, `-K_i <= delta_i <= min(100, R_i) - K_i` intersected with the
+Equivalently, `-B_i <= delta_i <= min(100, R_i) - B_i` intersected with the
 fixed `-100..+100` vocabulary. A future species' old goal is not reserved;
 later heads may contract it. Therefore HOLD can become unavailable when an
 earlier choice consumes residual capacity, while full contraction
-`delta_i = -K_i` remains possible whenever the residual is nonnegative.
+`delta_i = -B_i` remains possible whenever the residual is nonnegative.
 The final decoded goal sum is never greater than `C`. Fixed-order allocation
 asymmetry is intentional; there is no random order, solver, allocator, or
 economic safeguard.
 
-## Persistent crop ledger
+## Board-relative crop goals
 
-At the first manager boundary after opening, initialize the five integer goals
-from observed planted counts. At every later daily decision, apply the five
-sampled signed deltas exactly once and retain the resulting goals in
-`0..100`. The ledger is per episode/seat and is independent of current
-occupancy.
+At every manager boundary, derive the five integer crop baselines from the
+physical board currently observed. Decode the sampled signed deltas exactly
+once into that boundary's requested end-of-day goals in `0..100`.
 
-Harvests, crop loss, unfinished planting, worker backlog, and temporary
-vacancies do not rewrite the ledger. For example, a wheat goal of `60` with
-only `30` observed wheat and delta `0` means “maintain a strategic goal of
-60”; it may require planting 30. A negative delta lowers the maintenance goal
-and releases strategic capacity; it is not an immediate destruction command.
+Goals are requests, not guaranteed execution results; incomplete execution is
+allowed. Harvests, crop loss, unfinished planting, worker backlog, and
+temporary vacancies therefore affect the next physical baseline. For example,
+with `30` observed wheat, delta `0` requests an end-of-day wheat count of `30`,
+not a carried-forward strategic goal from an earlier day. No unrealized crop
+intention is carried forward automatically.
 
-Future resume/checkpoint wiring is outside Packet 1A, but must preserve this
-ledger. Later integrations should store sampled class indices as `int16
-[B,9]` and pre-decision crop capacity as `int16 [B,5]`, while keeping class
-indices, signed deltas, and decoded goals distinct.
+Future resume/checkpoint wiring is outside Packet 1A, but must preserve the
+physical pre-decision baseline for the accepted boundary when current-day
+diagnostics require it; it must not use requested goals as the next boundary's
+baseline. Later integrations should store sampled class indices as `int16
+[B,9]` and the model-facing pre-decision crop capacity as `int16 [B,5]`, while
+keeping class indices, signed deltas, physical baselines, and decoded goals
+distinct.
 
 ## Authoritative implementation boundary
 
 Later JAX/PPO code must reproduce the constants, decode mappings, support
-intervals, prefix ordering, no-clipping behavior, and ledger transition
+intervals, prefix ordering, no-clipping behavior, and board-relative goal
 semantics above. It must not import executor internals to rediscover physical
 rules, and economic state must not affect the permanent physical masks.
 

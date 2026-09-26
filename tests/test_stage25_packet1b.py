@@ -309,8 +309,8 @@ def test_outcome_proxy_labels_initialize_first_k_and_propagate_adjacent_rows():
     assert all(isinstance(value, int) and value == 0
                for value in invalid.values())
 
-    # The first K boundary is initialized from observed state, while exact
-    # adjacency propagates the prior K plus the sampled signed delta.
+    # The first offline baseline comes from observed state, while exact
+    # adjacency propagates the prior baseline plus the sampled signed delta.
     assert labels[0].provenance.prior_source == "first_boundary_start_occupancy"
     assert labels[0].provenance.prior_crop_goals == (2, 0, 0, 0, 0)
     assert labels[1].provenance.prior_source == "previous_synthetic_desired_end_goal"
