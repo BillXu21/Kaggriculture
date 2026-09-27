@@ -10,7 +10,7 @@ injected plan provider, so swapping the factory does not change RL semantics.
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Mapping, Protocol
 
 from rl_manager.provider import QueuedPlanProvider
@@ -76,13 +76,15 @@ class Stage25StripExecutorAgent:
     """
 
     def __init__(self, *, provider: Any, seat: int, strip_config: Any,
-                 profile: Mapping[str, Any]) -> None:
+                 profile: Mapping[str, Any], low_telemetry: bool = False) -> None:
         from executor_v0.strip_executor import StripExecutorController
 
         self.provider = provider
         self.seat = int(seat)
+        self.low_telemetry = bool(low_telemetry)
         self.config = replace(strip_config, acting_seat=self.seat)
-        self.controller = StripExecutorController(config=self.config)
+        self.controller = StripExecutorController(
+            config=self.config, low_telemetry=self.low_telemetry)
         self.effective_profile = copy.deepcopy(dict(profile))
         self._day: int | None = None
         self._plan: Any | None = None
@@ -94,7 +96,8 @@ class Stage25StripExecutorAgent:
             self._plan = self.provider.daily_plan(obs, self.seat)
             self._day = day
         result = self.controller.act(obs, self._plan)
-        self._days[str(day)] = copy.deepcopy(result.diagnostics)
+        if not self.low_telemetry:
+            self._days[str(day)] = copy.deepcopy(result.diagnostics)
         return result.action_dict()
 
     def diagnostics_json(self) -> dict[str, Any]:
@@ -106,6 +109,9 @@ class Stage25StripExecutorAgent:
             "days": copy.deepcopy(self._days),
             "fallback_errors": [],
         }
+        if self.low_telemetry:
+            diagnostics["telemetry_mode"] = "reduced"
+            diagnostics["diagnostics_reduced"] = True
         provider_diagnostics = getattr(self.provider, "diagnostics_json", None)
         if callable(provider_diagnostics):
             diagnostics["provider_diagnostics"] = provider_diagnostics()
@@ -117,6 +123,7 @@ class Stage25ExecutorFactory:
     """Factory carrying the complete Stage 2.5 profile across rollouts."""
 
     profile: Stage25ExecutorProfile
+    low_telemetry: bool = field(default=False, compare=False, repr=False)
 
     @property
     def name(self) -> str:
@@ -152,11 +159,14 @@ class Stage25ExecutorFactory:
             provider=provider, seat=seat,
             strip_config=self.profile.strip_config,
             profile=self.profile.to_json_dict(),
+            low_telemetry=self.low_telemetry,
         )
 
 
 def make_stage25_executor_factory(
     strip_config: Any | None = None,
+    *,
+    low_telemetry: bool = False,
 ) -> RlExecutorFactory:
     """Build the explicit Stage 2.5 fixed-strip executor profile."""
     from executor_v0.strip_executor import StripExecutorConfig
@@ -165,7 +175,8 @@ def make_stage25_executor_factory(
         aggressive_sell_all=True)
     _validate_stage25_config(resolved_config, StripExecutorConfig)
     return Stage25ExecutorFactory(
-        profile=Stage25ExecutorProfile(strip_config=resolved_config))
+        profile=Stage25ExecutorProfile(strip_config=resolved_config),
+        low_telemetry=bool(low_telemetry))
 
 
 class RlExecutorFactory(Protocol):

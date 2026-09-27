@@ -9,6 +9,7 @@ from executor_v0.plan import DailyPlan
 from executor_v0.strip_work import (
     BlockReason,
     StripWorkConfig,
+    WorkDiagnostics,
     WorkStatus,
     build_strip_work_plan,
     row_key_for_tile,
@@ -18,6 +19,28 @@ from executor_v0.strip_work import (
 CROPS = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")
 ANIMALS = ("GOOSE", "COW", "SHEEP")
 PRODUCTS = (*CROPS, "EGG", "MILK", "WOOL", "FERTILIZER")
+
+
+def test_low_diagnostic_collection_preserves_behavioral_work_plan(monkeypatch):
+    import executor_v0.strip_work as strip_work_module
+
+    observation = obs(seeds={"WHEAT": 1})
+    daily_plan = plan(crop_targets={"WHEAT": 1})
+    full = build_strip_work_plan(observation, daily_plan)
+
+    def unexpected_diagnostics(*args, **kwargs):
+        raise AssertionError("low diagnostic mode constructed WorkDiagnostics")
+
+    monkeypatch.setattr(strip_work_module, "_diagnostics", unexpected_diagnostics)
+    low = build_strip_work_plan(
+        observation, daily_plan, collect_diagnostics=False)
+
+    assert low.items == full.items
+    assert low.chains == full.chains
+    assert low.row_summaries == full.row_summaries
+    assert low.supply == full.supply
+    assert low.acting_seat == full.acting_seat
+    assert low.diagnostics == WorkDiagnostics()
 
 
 def plan(**changes):

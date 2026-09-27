@@ -74,7 +74,7 @@ def test_stage25_factory_wire_reconstructs_strip_factory():
     wire = _factory_wire(factory)
     rebuilt = _factory_from_wire(wire)
 
-    assert wire[0] == "stage25_strip_executor@config:v1"
+    assert wire[0] == "stage25_strip_executor@config:v2"
     assert rebuilt.name == factory.name
     assert rebuilt.version == factory.version
     assert rebuilt.strip_config == factory.strip_config
@@ -82,6 +82,16 @@ def test_stage25_factory_wire_reconstructs_strip_factory():
         rebuilt.create(backend_name="fast", seat=0, configuration={},
                        provider=Stage25PlanProvider(8, 0, 3)),
         Stage25StripExecutorAgent)
+
+    low_factory = make_stage25_executor_factory(low_telemetry=True)
+    low_wire = _factory_wire(low_factory)
+    low_rebuilt = _factory_from_wire(low_wire)
+    assert low_wire[2] is True
+    assert low_rebuilt.low_telemetry is True
+    assert low_rebuilt.effective_profile == factory.effective_profile
+
+    propagated_wire = _factory_wire(factory, low_telemetry=True)
+    assert propagated_wire[2] is True
 
 
 def test_strip_factory_wire_reconstruction_stays_accelerator_free():

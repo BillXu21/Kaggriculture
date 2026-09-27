@@ -88,6 +88,8 @@ def test_profile_is_carried_into_actual_executor_diagnostics_and_upkeep():
     assert agent.effective_profile == factory.effective_profile
     diagnostics = agent.diagnostics_json()
     assert diagnostics["effective_profile"] == factory.effective_profile
+    assert "telemetry_mode" not in diagnostics
+    assert "diagnostics_reduced" not in diagnostics
     json.dumps(diagnostics, allow_nan=False)
     assert isinstance(agent.controller, StripExecutorController)
     market = diagnostics["days"]["9"]["market_diagnostics"]
@@ -241,3 +243,81 @@ def test_provider_executor_uses_strip_and_reuses_one_daily_plan():
     assert agent.provider is provider
     assert provider.last_accepted_day == 3
     assert agent.diagnostics_json()["days"]["3"]["market_diagnostics"]
+
+
+def test_low_telemetry_matches_full_actions_for_both_seats():
+    plan = simple_plan(crop_targets={
+        "WHEAT": 3, "CARROT": 0, "TOMATO": 0,
+        "STRAWBERRY": 0, "MELON": 0,
+    })
+    for seat in (0, 1):
+        full = make_stage25_executor_factory().create(
+            backend_name="fixture", seat=seat, configuration={},
+            provider=recording_provider(plan))
+        low = make_stage25_executor_factory(low_telemetry=True).create(
+            backend_name="fixture", seat=seat, configuration={},
+            provider=recording_provider(plan))
+        for hour in range(24):
+            observation = agent_obs(
+                day=3, hour=hour, farmer=(0, 0), hands=((0, 1), (0, 2)),
+                seeds={"WHEAT": 3}, unlocked=("NW",), step=72 + hour)
+            assert low(observation) == full(observation)
+            assert low.controller._plan.items == full.controller._plan.items
+            assert low.controller._plan.chains == full.controller._plan.chains
+            assert low.controller._plan.row_summaries == full.controller._plan.row_summaries
+            assert low.controller._plan.supply == full.controller._plan.supply
+
+
+def test_low_telemetry_skips_full_diagnostics_and_wrapper_copy(monkeypatch):
+    import rl_manager.executor_factory as factory_module
+    from executor_v0.strip_work import WorkDiagnostics
+
+    agent = make_stage25_executor_factory(low_telemetry=True).create(
+        backend_name="fixture", seat=0, configuration={},
+        provider=recording_provider(simple_plan(crop_targets={
+            "WHEAT": 1, "CARROT": 0, "TOMATO": 0,
+            "STRAWBERRY": 0, "MELON": 0,
+        })),
+    )
+    observation = agent_obs(day=3, hour=2, farmer=(0, 0),
+                            seeds={"WHEAT": 1}, unlocked=("NW",))
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("full diagnostics work ran in low telemetry mode")
+
+    monkeypatch.setattr(agent.controller, "_diagnostics", unexpected)
+    monkeypatch.setattr(factory_module.copy, "deepcopy", unexpected)
+    action = agent(observation)
+
+    assert set(action) == {"farmer", "hands", "market"}
+    assert agent._days == {}
+    assert agent.controller._plan.diagnostics == WorkDiagnostics()
+    assert agent.controller.diagnostics["telemetry_mode"] == "reduced"
+
+    monkeypatch.undo()
+    reduced = agent.diagnostics_json()
+    assert reduced["telemetry_mode"] == "reduced"
+    assert reduced["diagnostics_reduced"] is True
+    assert reduced["days"] == {}
+    json.dumps(reduced, allow_nan=False)
+
+
+def test_stage25_runner_propagates_low_telemetry_without_changing_identity():
+    from rl_manager.runner import RunnerConfig, SelfPlayRunner
+
+    full = SelfPlayRunner(
+        RunnerConfig(stage25_enabled=True, low_telemetry=True,
+                     record_executor_full_diagnostics=True),
+        executor_factory=make_stage25_executor_factory())
+    low = SelfPlayRunner(
+        RunnerConfig(stage25_enabled=True, low_telemetry=True),
+        executor_factory=make_stage25_executor_factory())
+    explicitly_low = SelfPlayRunner(
+        RunnerConfig(stage25_enabled=True),
+        executor_factory=make_stage25_executor_factory(low_telemetry=True))
+
+    assert full.executor_factory.low_telemetry is False
+    assert low.executor_factory.low_telemetry is True
+    assert explicitly_low.executor_factory.low_telemetry is True
+    assert full.provenance["executor_factory"].effective_profile == \
+        low.provenance["executor_factory"].effective_profile

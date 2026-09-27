@@ -882,6 +882,7 @@ def build_strip_work_plan(
     *,
     acting_seat: int | None = None,
     seat: int | None = None,
+    collect_diagnostics: bool = True,
 ) -> StripWorkPlan:
     """Build a deterministic pure work forecast for one acting seat.
 
@@ -1434,22 +1435,26 @@ def build_strip_work_plan(
     items = tuple(sorted(builder.items.values(), key=lambda i: i.id))
     chains = tuple(sorted(builder.chains, key=lambda c: c.id))
     rows = _row_summaries(board, items, chains)
-    diagnostics = _diagnostics(
-        plan,
-        target_crops,
-        target_animals,
-        current_crops,
-        current_animals,
-        current_land,
-        crop_need,
-        animal_need,
-        layouts,
-        represented_crops,
-        represented_animals,
-        items,
-        supply,
-        builder,
-        rows,
+    diagnostics = (
+        _diagnostics(
+            plan,
+            target_crops,
+            target_animals,
+            current_crops,
+            current_animals,
+            current_land,
+            crop_need,
+            animal_need,
+            layouts,
+            represented_crops,
+            represented_animals,
+            items,
+            supply,
+            builder,
+            rows,
+        )
+        if collect_diagnostics
+        else WorkDiagnostics()
     )
     return StripWorkPlan(items, chains, rows, supply, diagnostics, chosen_seat)
 

@@ -107,7 +107,11 @@ def pad_batch_to_physical(
 def _factory_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
     """Use a child-local default factory with its complete config."""
     if (getattr(factory, "name", None) == "stage25_strip_executor"):
-        return ("stage25_strip_executor@config:v1", factory.strip_config)
+        return (
+            "stage25_strip_executor@config:v2",
+            factory.strip_config,
+            bool(low_telemetry or getattr(factory, "low_telemetry", False)),
+        )
     if (getattr(factory, "name", None) == "executor_v0"
             and getattr(factory, "version", None) == EXECUTOR_FACTORY_VERSION):
         del low_telemetry
@@ -272,6 +276,14 @@ class ParallelSelfPlayRunner:
                                 optional_spare_watering=True))
             else:
                 executor_factory = make_default_executor_factory()
+        if getattr(executor_factory, "name", None) == "stage25_strip_executor":
+            executor_factory = dataclasses.replace(
+                executor_factory,
+                low_telemetry=(
+                    (config.low_telemetry
+                     or getattr(executor_factory, "low_telemetry", False))
+                    and not config.record_executor_full_diagnostics),
+            )
         self.executor_factory = executor_factory
         self.master_seed = master_seed
         self.request_queue_size = int(request_queue_size or max(4, num_workers * 4))
@@ -347,7 +359,13 @@ class ParallelSelfPlayRunner:
                     continue
                 policy_by_identity[policy.identity] = policy
         factory_wire = _factory_wire(
-            self.executor_factory, low_telemetry=self.config.low_telemetry)
+            self.executor_factory,
+            low_telemetry=(
+                (self.config.low_telemetry
+                 or getattr(self.executor_factory, "low_telemetry", False))
+                and not self.config.record_executor_full_diagnostics
+            ),
+        )
         ctx = mp.get_context("spawn")
         request_queue = ctx.Queue(maxsize=self.request_queue_size)
         result_queue = ctx.Queue()

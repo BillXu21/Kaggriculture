@@ -218,7 +218,10 @@ def instrument(metrics: Metrics, *, sample_limit: int = 0):
         yield
 
 
-def run_games(seeds: Sequence[int], *, max_turns: int):
+def run_games(
+    seeds: Sequence[int], *, max_turns: int, low_telemetry: bool = False,
+    trajectory_buffer: Any | None = None,
+):
     policy = ScriptedPolicy()
     runner = SelfPlayRunner(
         RunnerConfig(
@@ -227,8 +230,9 @@ def run_games(seeds: Sequence[int], *, max_turns: int):
             max_turns=max_turns,
             num_envs=1,
             record_rollout=True,
-            low_telemetry=False,
+            low_telemetry=low_telemetry,
         ),
+        trajectory_buffer=trajectory_buffer,
         executor_factory=make_stage25_executor_factory(),
         master_seed=25,
     )

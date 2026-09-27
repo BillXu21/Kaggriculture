@@ -96,9 +96,11 @@ class StripExecutorController:
         *,
         config: StripExecutorConfig = StripExecutorConfig(),
         work_builder: WorkPlanBuilder = build_strip_work_plan,
+        low_telemetry: bool = False,
     ) -> None:
         self.config = config
         self._work_builder = work_builder
+        self._low_telemetry = bool(low_telemetry)
         self._day: int | None = None
         self._routes: dict[WorkerId, StripRoute] = {}
         self._retired_routes: list[StripRoute] = []
@@ -140,7 +142,7 @@ class StripExecutorController:
 
     @property
     def diagnostics(self) -> dict[str, Any]:
-        return self._diagnostics()
+        return self._result_diagnostics()
 
     def _finalize_day(
         self,
@@ -235,30 +237,33 @@ class StripExecutorController:
             "supply_diagnostics": self._supply_daily_diagnostics(
                 self._initial_shed
             ),
-        }
-        if bootstrap_diagnostics is not None:
-            self._daily["hiring_diagnostics"] = bootstrap_diagnostics
-        if hire_stop_reason is not None:
-            self._daily["hire_stop_reason"] = hire_stop_reason
-        self._daily["worker_count_before_hiring"] = self._worker_count_before_hiring
-        self._daily["worker_count_final"] = len(positions)
-        self._daily["candidate_routes"] = [candidate.route_id for candidate in candidates]
-        estimates = {
-            estimate.route_id: estimate
-            for estimate in (self._hire_plan.route_estimates if self._hire_plan else ())
-        }
-        self._daily["unassigned_hire_driving_routes"] = [
-            candidate.route_id
-            for candidate in self._queued_candidates
-            if estimates.get(candidate.route_id, None)
-            and estimates[candidate.route_id].hire_driving
-        ]
-        self._daily["unassigned_fertilizer_only_routes"] = [
-            candidate.route_id
-            for candidate in self._queued_candidates
-            if estimates.get(candidate.route_id, None)
-            and estimates[candidate.route_id].fertilizer_only
-        ]
+        } if not self._low_telemetry else {}
+        if not self._low_telemetry:
+            if bootstrap_diagnostics is not None:
+                self._daily["hiring_diagnostics"] = bootstrap_diagnostics
+            if hire_stop_reason is not None:
+                self._daily["hire_stop_reason"] = hire_stop_reason
+            self._daily["worker_count_before_hiring"] = self._worker_count_before_hiring
+            self._daily["worker_count_final"] = len(positions)
+            self._daily["candidate_routes"] = [candidate.route_id for candidate in candidates]
+            estimates = {
+                estimate.route_id: estimate
+                for estimate in (
+                    self._hire_plan.route_estimates if self._hire_plan else ()
+                )
+            }
+            self._daily["unassigned_hire_driving_routes"] = [
+                candidate.route_id
+                for candidate in self._queued_candidates
+                if estimates.get(candidate.route_id, None)
+                and estimates[candidate.route_id].hire_driving
+            ]
+            self._daily["unassigned_fertilizer_only_routes"] = [
+                candidate.route_id
+                for candidate in self._queued_candidates
+                if estimates.get(candidate.route_id, None)
+                and estimates[candidate.route_id].fertilizer_only
+            ]
         return work_plan
 
     def reset_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
@@ -319,7 +324,8 @@ class StripExecutorController:
                     # Reconciliation always clears the pending record on this path.
                     self._reconcile_hire_observation(obs)
                 if self._hiring_blocked:
-                    self._daily["hire_stop_reason"] = "FAILED"
+                    if not self._low_telemetry:
+                        self._daily["hire_stop_reason"] = "FAILED"
                 else:
                     candidates = generate_horizontal_route_candidates(work_plan)
                     positions = self._worker_positions(obs)
@@ -338,8 +344,9 @@ class StripExecutorController:
                         max_orders=self._max_market_orders(obs),
                         farm_hand_cost_mult=self._hire_cost_mult(obs),
                     )
-                    self._daily["hiring_diagnostics"] = self._hire_plan.to_json_dict()
-                    self._daily["hire_stop_reason"] = self._hire_plan.stop_reason.value
+                    if not self._low_telemetry:
+                        self._daily["hiring_diagnostics"] = self._hire_plan.to_json_dict()
+                        self._daily["hire_stop_reason"] = self._hire_plan.stop_reason.value
                     if self._hire_plan.orders:
                         submitted = len(self._hire_plan.orders)
                         farm = obs["farms"][self.config.acting_seat]
@@ -402,7 +409,7 @@ class StripExecutorController:
             farmer_action=farmer_action,
             hands_actions=hands_actions,
             market_actions=market_plan.orders,
-            diagnostics=self._diagnostics(),
+            diagnostics=self._result_diagnostics(),
         )
 
     next_worker_actions = act
@@ -437,7 +444,10 @@ class StripExecutorController:
         self._hire_observed = 0
         self._hire_failures = 0
         self._observation_for_diagnostics = obs
-        self._daily = {"day": self._day, "assignment_hour": int(obs.get("hour", 0))}
+        self._daily = (
+            {"day": self._day, "assignment_hour": int(obs.get("hour", 0))}
+            if not self._low_telemetry else {}
+        )
 
     def _shed_capacity(self, obs: Mapping[str, Any]) -> int:
         configuration = obs.get("configuration")
@@ -482,7 +492,7 @@ class StripExecutorController:
             farmer_action=actions[0] if actions else ("PASS",),
             hands_actions=actions[1:],
             market_actions=tuple(tuple(order) for order in market_actions),
-            diagnostics=self._diagnostics(),
+            diagnostics=self._result_diagnostics(),
         )
 
     def _reconcile_hire_observation(self, obs: Mapping[str, Any]) -> None:
@@ -502,8 +512,9 @@ class StripExecutorController:
             self._hire_no_progress += 1
             if self._hire_no_progress >= 2:
                 self._hiring_blocked = True
-        self._daily["hires_observed"] = self._hire_observed
-        self._daily["failed_hires"] = self._hire_failures
+        if not self._low_telemetry:
+            self._daily["hires_observed"] = self._hire_observed
+            self._daily["failed_hires"] = self._hire_failures
 
     def _reconcile_market_observation(self, obs: Mapping[str, Any]) -> None:
         """Confirm pending buys from observed deltas, with two no-progress tries."""
@@ -580,12 +591,25 @@ class StripExecutorController:
     def _build_work_plan(
         self, obs: Mapping[str, Any], plan: DailyPlan
     ) -> StripWorkPlan:
+        if self._low_telemetry and self._work_builder is build_strip_work_plan:
+            return self._work_builder(
+                obs,
+                plan,
+                config=self.config.work_config,
+                acting_seat=self.config.acting_seat,
+                collect_diagnostics=False,
+            )
         return self._work_builder(
             obs,
             plan,
             config=self.config.work_config,
             acting_seat=self.config.acting_seat,
         )
+
+    def _result_diagnostics(self) -> dict[str, Any]:
+        if self._low_telemetry:
+            return {"schema_version": 1, "telemetry_mode": "reduced"}
+        return self._diagnostics()
 
     def _worker_positions(self, obs: Mapping[str, Any]) -> dict[WorkerId, tuple[int, int]]:
         farm = obs["farms"][self.config.acting_seat]
@@ -893,17 +917,18 @@ class StripExecutorController:
                 if supply_plan.requires_pickup
                 else RoutePhase.TRAVEL_TO_ENTRY
             )
-            self._daily["unassigned_routes"] = len(self._queued_candidates)
-            self._daily["assigned_routes"] = int(
-                self._daily.get("assigned_routes", 0)
-            ) + 1
-            self._daily["unassigned_active_routes"] = list(self._unassigned_ids)
-            self._daily["unassigned_supply_demand"] = {
-                queued.route_id: dict(
-                    extract_tile_supply_demand(queued.owned_tiles, work_plan)
-                )
-                for queued in self._queued_candidates
-            }
+            if not self._low_telemetry:
+                self._daily["unassigned_routes"] = len(self._queued_candidates)
+                self._daily["assigned_routes"] = int(
+                    self._daily.get("assigned_routes", 0)
+                ) + 1
+                self._daily["unassigned_active_routes"] = list(self._unassigned_ids)
+                self._daily["unassigned_supply_demand"] = {
+                    queued.route_id: dict(
+                        extract_tile_supply_demand(queued.owned_tiles, work_plan)
+                    )
+                    for queued in self._queued_candidates
+                }
             self._sharing_diagnostics["queued_rows_reassigned"] += 1
             return route
         return None
