@@ -3,6 +3,8 @@
 import copy
 import json
 
+import pytest
+
 from executor_v0.plan import DailyPlan
 from executor_v0.strip_work import (
     BlockReason,
@@ -35,6 +37,63 @@ def plan(**changes):
                 {**value[key], **update} if isinstance(value[key], dict) else update
             )
     return DailyPlan.create(**value)
+
+
+def test_work_build_materializes_daily_plan_views_once(monkeypatch):
+    daily_plan = plan(sell_quantities={"WHEAT": {0: 2, 4: 1}})
+    accesses = {
+        "crop_targets_dict": 0,
+        "animal_targets_dict": 0,
+        "sell_quantities_dict": 0,
+    }
+    for name in accesses:
+        original = getattr(DailyPlan, name).fget
+
+        def counted(value, *, property_name=name, getter=original):
+            accesses[property_name] += 1
+            return getter(value)
+
+        monkeypatch.setattr(DailyPlan, name, property(counted))
+
+    result = build_strip_work_plan(obs(), daily_plan)
+
+    assert accesses == {
+        "crop_targets_dict": 1,
+        "animal_targets_dict": 1,
+        "sell_quantities_dict": 1,
+    }
+    assert next(item for item in result.items if item.id == "SELL:WHEAT").quantity == 3
+
+
+def test_daily_plan_sales_view_remains_fresh_and_mutable():
+    daily_plan = plan()
+    first = daily_plan.sell_quantities_dict
+    second = daily_plan.sell_quantities_dict
+
+    assert first is not second
+    assert first["0"] is not second["0"]
+    first["0"]["WHEAT"] = 17
+    assert second["0"]["WHEAT"] == 0
+
+
+def test_row_key_geometry_is_precomputed_and_preserves_validation():
+    for y in range(10):
+        for x in range(10):
+            first = row_key_for_tile((y, x))
+            assert first is row_key_for_tile((y, x))
+            assert first.global_row == y
+            assert first.local_row == y % 5
+            assert (first.x_start, first.x_end) == (
+                (0, 4) if x < 5 else (5, 9)
+            )
+
+    float_key = row_key_for_tile((6.0, 7.0))
+    assert type(float_key.global_row) is float
+    assert float_key.quadrant == "SE"
+
+    for tile in ((-1, 0), (10, 0), (0, 10)):
+        with pytest.raises(ValueError, match="tile must be a board"):
+            row_key_for_tile(tile)
 
 
 def plant(

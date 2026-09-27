@@ -202,6 +202,9 @@ def plan_animal_layout(
             raise ValueError(f"animals_needed[{name!r}] must be a "
                              f"nonnegative integer, got {value!r}")
 
+    if all(animals_needed.get(animal, 0) == 0 for animal in ANIMAL_ORDER):
+        return AnimalLayoutResult(placements=(), unresolved=())
+
     empty_structures: dict[str, list[tuple[int, int]]] = {
         "COOP": [], "PASTURE": []}
     empty_tiles: list[tuple[int, int]] = []

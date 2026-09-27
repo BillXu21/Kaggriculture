@@ -99,12 +99,37 @@ class RowKey:
         return asdict(self)
 
 
+_ROW_KEYS: tuple[tuple[RowKey, ...], ...] = tuple(
+    tuple(
+        RowKey(
+            quadrant_of(y, x),
+            y % 5,
+            y,
+            0 if x < 5 else 5,
+            4 if x < 5 else 9,
+        )
+        for x in range(10)
+    )
+    for y in range(10)
+)
+_ROW_SUMMARY_GEOMETRY: tuple[tuple[RowKey, int], ...] = tuple(sorted({
+    (_ROW_KEYS[y][x], 5)
+    for y in range(10)
+    for x in (0, 5)
+}))
+
+
 def row_key_for_tile(tile: tuple[int, int]) -> RowKey:
     """Return the stable five-tile row segment containing ``(y, x)``."""
     y, x = tile
     if not (0 <= y < 10 and 0 <= x < 10):
         raise ValueError(f"tile must be a board (y, x) coordinate, got {tile!r}")
-    return RowKey(quadrant_of(y, x), y % 5, y, 0 if x < 5 else 5, 4 if x < 5 else 9)
+    if type(y) is int and type(x) is int:
+        return _ROW_KEYS[y][x]
+    return RowKey(
+        quadrant_of(y, x), y % 5, y,
+        0 if x < 5 else 5, 4 if x < 5 else 9,
+    )
 
 
 @dataclass(frozen=True, order=True)
@@ -602,11 +627,14 @@ def _excess_crop_coords(
 class _Builder:
     def __init__(self, supply: SupplySnapshot, config: StripWorkConfig):
         self.supply, self.config = supply, config
+        self.seeds = supply.seeds_dict
+        self.shed = supply.shed_dict
+        self.carried = supply.carried_dict
         self.items: dict[str, WorkItem] = {}
         self.chains: list[WorkChain] = []
-        self.seed_remaining = dict(supply.seeds_dict)
-        self.inventory_remaining = dict(supply.shed_dict)
-        for item, amount in supply.carried_dict.items():
+        self.seed_remaining = self.seeds.copy()
+        self.inventory_remaining = self.shed.copy()
+        for item, amount in self.carried.items():
             self.inventory_remaining[item] = (
                 self.inventory_remaining.get(item, 0) + amount
             )
@@ -822,7 +850,7 @@ def _supply_item(
     block_reason=None,
     source="strip_forecast",
 ) -> WorkItem:
-    carried = builder.supply.carried_dict
+    carried = builder.carried
     pickup = sum(
         ceil(
             max(0, r.quantity - carried.get(r.item, 0))
@@ -1331,9 +1359,10 @@ def build_strip_work_plan(
                 source="routine_harvest",
             )
 
+    sell_quantities = plan.sell_quantities_dict
     sell_totals = {
         p: sum(
-            int(plan.sell_quantities_dict[str(anchor)].get(p, 0))
+            int(sell_quantities[str(anchor)].get(p, 0))
             for anchor in (0, 4, 8, 12, 16, 20)
         )
         for p in PRODUCTS
@@ -1342,10 +1371,8 @@ def build_strip_work_plan(
         quantity = sell_totals[product]
         if not quantity:
             continue
-        shed_amount, carried_amount = (
-            supply.shed_dict.get(product, 0),
-            supply.carried_dict.get(product, 0),
-        )
+        shed_amount = builder.shed.get(product, 0)
+        carried_amount = builder.carried.get(product, 0)
         delivery_quantity = min(carried_amount, max(0, quantity - shed_amount))
         deps: tuple[str, ...] = ()
         if delivery_quantity:
@@ -1409,6 +1436,8 @@ def build_strip_work_plan(
     rows = _row_summaries(board, items, chains)
     diagnostics = _diagnostics(
         plan,
+        target_crops,
+        target_animals,
         current_crops,
         current_animals,
         current_land,
@@ -1428,25 +1457,19 @@ def build_strip_work_plan(
 def _row_summaries(
     board, items: tuple[WorkItem, ...], chains: tuple[WorkChain, ...]
 ) -> tuple[RowSummary, ...]:
-    rows: dict[RowKey, dict[str, Any]] = {}
-    for y, row in enumerate(board):
-        for x, _ in enumerate(row):
-            key = row_key_for_tile((y, x))
-            rows.setdefault(
-                key,
-                {
-                    "tile_count": 0,
-                    "ready": 0,
-                    "future": 0,
-                    "turns": 0,
-                    "feed": 0,
-                    "fert": 0,
-                    "animal": 0,
-                    "seed": 0,
-                    "chains": 0,
-                    "reasons": Counter(),
-                },
-            )["tile_count"] += 1
+    rows: dict[RowKey, dict[str, Any]]
+    if len(board) == 10 and all(len(row) == 10 for row in board):
+        rows = {
+            key: _new_row_summary_data(tile_count)
+            for key, tile_count in _ROW_SUMMARY_GEOMETRY
+        }
+    else:
+        rows = {}
+        for y, row in enumerate(board):
+            for x, _ in enumerate(row):
+                key = row_key_for_tile((y, x))
+                data = rows.setdefault(key, _new_row_summary_data())
+                data["tile_count"] += 1
     for chain in chains:
         if chain.row_key is not None:
             rows[chain.row_key]["chains"] += 1
@@ -1491,8 +1514,25 @@ def _row_summaries(
     )
 
 
+def _new_row_summary_data(tile_count: int = 0) -> dict[str, Any]:
+    return {
+        "tile_count": tile_count,
+        "ready": 0,
+        "future": 0,
+        "turns": 0,
+        "feed": 0,
+        "fert": 0,
+        "animal": 0,
+        "seed": 0,
+        "chains": 0,
+        "reasons": Counter(),
+    }
+
+
 def _diagnostics(
     plan,
+    target_crops,
+    target_animals,
     current_crops,
     current_animals,
     current_land,
@@ -1527,26 +1567,17 @@ def _diagnostics(
         Counter(i.status.value for i in items),
     )
     counts_reason = Counter(i.block_reason.value for i in items if i.block_reason)
-    demand = tuple(
-        SupplyDemand(
-            item,
-            amount,
-            supply.seeds_dict.get(item, 0)
+    demand_rows = []
+    for (item, scope), amount in sorted(builder.demands.items()):
+        available = (
+            builder.seeds.get(item, 0)
             if scope == "global_seed"
-            else supply.inventory_amount(item),
-            max(
-                0,
-                amount
-                - (
-                    supply.seeds_dict.get(item, 0)
-                    if scope == "global_seed"
-                    else supply.inventory_amount(item)
-                ),
-            ),
-            scope,
+            else builder.shed.get(item, 0) + builder.carried.get(item, 0)
         )
-        for (item, scope), amount in sorted(builder.demands.items())
-    )
+        demand_rows.append(
+            SupplyDemand(item, amount, available, max(0, amount - available), scope)
+        )
+    demand = tuple(demand_rows)
     workload = tuple(
         RowWorkload(
             r.row_key,
@@ -1559,11 +1590,11 @@ def _diagnostics(
         if r.ready_interactions or r.future_interactions
     )
     return WorkDiagnostics(
-        _pairs({c: plan.crop_targets_dict[c] - current_crops[c] for c in CROP_ORDER}),
+        _pairs({c: target_crops[c] - current_crops[c] for c in CROP_ORDER}),
         _pairs(represented_crops),
         _pairs(unresolved_crops),
         _pairs(
-            {a: plan.animal_targets_dict[a] - current_animals[a] for a in ANIMAL_ORDER}
+            {a: target_animals[a] - current_animals[a] for a in ANIMAL_ORDER}
         ),
         _pairs(represented_animals),
         _pairs(unresolved_animals),

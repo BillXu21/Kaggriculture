@@ -142,13 +142,19 @@ class StripExecutorController:
     def diagnostics(self) -> dict[str, Any]:
         return self._diagnostics()
 
-    def _finalize_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
+    def _finalize_day(
+        self,
+        obs: Mapping[str, Any],
+        plan: DailyPlan,
+        work_plan: StripWorkPlan | None = None,
+    ) -> StripWorkPlan:
         """Freeze Packet 2 ownership and Packet 3 reservations once."""
 
         day = int(obs.get("day", 0))
         bootstrap_diagnostics = self._daily.get("hiring_diagnostics")
         hire_stop_reason = self._daily.get("hire_stop_reason")
-        work_plan = self._build_work_plan(obs, plan)
+        if work_plan is None:
+            work_plan = self._build_work_plan(obs, plan)
         positions = self._worker_positions(obs)
         candidates = generate_horizontal_route_candidates(work_plan)
         assignment = assign_horizontal_routes(
@@ -346,7 +352,9 @@ class StripExecutorController:
                         self._hire_submitted += submitted
                         return self._bootstrap_pass_result(obs, self._hire_plan.orders)
                 self._bootstrap_stage = "FINALIZED"
-            work_plan = self._finalize_day(obs, active_plan)
+            work_plan = self._finalize_day(
+                obs, active_plan, work_plan=work_plan
+            )
             self._routes_finalized = True
             self._market_state.finalized_hour = int(obs.get("hour", 0))
         else:

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from executor_v0.layout import (
+    AnimalLayoutResult,
     SacrificeConfig,
     plan_animal_layout,
     quadrant_of,
@@ -387,6 +388,30 @@ def test_animal_layout_validates_requests():
     with pytest.raises(ValueError):
         plan_animal_layout(board, unlocked_quadrants=("NW",),
                            animals_needed={"GOOSE": -1}, anchor=ANCHOR)
+
+
+def test_zero_animal_deficits_skip_candidate_scan_after_validation(monkeypatch):
+    board = blank_board()
+
+    def fail_if_scanned(*args, **kwargs):
+        raise AssertionError("zero deficits must not scan placement candidates")
+
+    monkeypatch.setattr("executor_v0.layout._in_unlocked", fail_if_scanned)
+    result = plan_animal_layout(
+        board,
+        unlocked_quadrants=("NW",),
+        animals_needed={"GOOSE": 0, "COW": 0, "SHEEP": 0},
+        anchor=ANCHOR,
+    )
+    assert result == AnimalLayoutResult(placements=(), unresolved=())
+
+    with pytest.raises(ValueError, match="unknown animal"):
+        plan_animal_layout(
+            board,
+            unlocked_quadrants=("NW",),
+            animals_needed={"DRAGON": 0},
+            anchor=ANCHOR,
+        )
 
 
 # ---------------------------------------------------------------- real smoke
