@@ -174,6 +174,86 @@ def test_replacement_has_harvest_plant_water_but_reduction_has_no_replacement():
     assert not [item for item in kinds(reduced, "WATER") if item.tile == (0, 1)]
 
 
+def test_retained_mature_crops_get_one_routine_harvest_for_each_crop():
+    mature = {
+        "WHEAT": (2, 3),
+        "CARROT": (2, 1),
+        "TOMATO": (8, 1),
+        "STRAWBERRY": (10, 1),
+        "MELON": (10, 1),
+    }
+    for crop, (day, yield_units) in mature.items():
+        board = [[None] * 10 for _ in range(10)]
+        board[0][0] = plant(crop, planted_day=0, yield_units=yield_units)
+        result = build_strip_work_plan(
+            obs(board, day=day), plan(crop_targets={crop: 1})
+        )
+        harvests = [item for item in kinds(result, "HARVEST") if item.tile == (0, 0)]
+        assert len(harvests) == 1
+        assert harvests[0].id == "HARVEST:0,0"
+        assert harvests[0].source == "routine_harvest"
+
+
+def test_retained_immature_crop_has_no_routine_harvest():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("CARROT", planted_day=0, yield_units=1)
+    result = build_strip_work_plan(
+        obs(board, day=1), plan(crop_targets={"CARROT": 1})
+    )
+    assert not [item for item in kinds(result, "HARVEST") if item.tile == (0, 0)]
+
+
+def test_retained_wheat_respects_threshold_and_horizon():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("WHEAT", planted_day=0, yield_units=1)
+    below = build_strip_work_plan(
+        obs(board, day=2, step=48), plan(crop_targets={"WHEAT": 1})
+    )
+    assert not kinds(below, "HARVEST")
+
+    board[0][0]["yield_units"] = 3
+    at_threshold = build_strip_work_plan(
+        obs(board, day=2, step=48), plan(crop_targets={"WHEAT": 1})
+    )
+    assert [item.id for item in kinds(at_threshold, "HARVEST")] == [
+        "HARVEST:0,0"
+    ]
+
+
+def test_excess_mature_crop_uses_one_reduction_harvest_without_routine_duplicate():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("CARROT", planted_day=0, yield_units=1)
+    board[0][1] = plant("CARROT", planted_day=0, yield_units=1)
+    result = build_strip_work_plan(
+        obs(board, day=2), plan(crop_targets={"CARROT": 1})
+    )
+    harvests = [item for item in kinds(result, "HARVEST") if item.crop == "CARROT"]
+    assert {item.tile for item in harvests} == {(0, 0), (0, 1)}
+    assert next(item for item in harvests if item.tile == (0, 0)).source == (
+        "routine_harvest"
+    )
+    assert next(item for item in harvests if item.tile == (0, 1)).source == (
+        "crop_reduction"
+    )
+    assert not kinds(result, "PLANT")
+
+
+def test_retained_routine_harvest_plan_is_deterministic():
+    board = [[None] * 10 for _ in range(10)]
+    board[0][0] = plant("TOMATO", planted_day=0, yield_units=1)
+    observation = obs(board, day=8)
+    first = build_strip_work_plan(
+        observation, plan(crop_targets={"TOMATO": 1})
+    )
+    second = build_strip_work_plan(
+        copy.deepcopy(observation), plan(crop_targets={"TOMATO": 1})
+    )
+    assert [item.id for item in first.items] == [item.id for item in second.items]
+    assert [item.to_json_dict() for item in first.items] == [
+        item.to_json_dict() for item in second.items
+    ]
+
+
 def test_animal_build_and_place_are_retained_when_purchase_is_missing():
     result = build_strip_work_plan(obs(), plan(animal_targets={"GOOSE": 1}))
     assert {x.kind for x in result.items} == {"BUILD_COOP", "BUY_ANIMAL", "PLACE"}

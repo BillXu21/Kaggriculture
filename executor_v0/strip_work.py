@@ -1294,6 +1294,43 @@ def build_strip_work_plan(
                 source=source,
             )
 
+    # Harvest is executor-owned routine work, not a request to change the
+    # manager's crop target.  Reconciliation already owns tiles that will be
+    # replaced, removed, or sacrificed for an animal slot; every other
+    # mechanically harvestable crop keeps one stable HARVEST identity.
+    reconciled_crop_coords = replacement_coords | set(removal_coords) | {
+        slot.coord
+        for slot in layouts.animals.placements
+        if slot.source == "crop_sacrifice"
+    }
+    for y, row in enumerate(board):
+        for x, tile in enumerate(row):
+            coord = (y, x)
+            if (
+                quadrant_of(y, x) not in allowed_quadrants
+                or coord in reconciled_crop_coords
+                or not isinstance(tile, Mapping)
+                or not _tile_harvestable(tile, day, step)
+            ):
+                continue
+            crop = str(tile["crop"])
+            harvest_id = f"HARVEST:{y},{x}"
+            builder.add(
+                id=harvest_id,
+                kind="HARVEST",
+                tile=coord,
+                crop=crop,
+                source="routine_harvest",
+            )
+            builder.chain(
+                f"ROUTINE_HARVEST:{crop}:{y},{x}",
+                "ROUTINE_HARVEST",
+                (harvest_id,),
+                tile=coord,
+                crop=crop,
+                source="routine_harvest",
+            )
+
     sell_totals = {
         p: sum(
             int(plan.sell_quantities_dict[str(anchor)].get(p, 0))
