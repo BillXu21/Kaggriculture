@@ -212,6 +212,85 @@ print(json.dumps({"action": actual, "agent_origin": str(Path(rl_manager.__file__
     assert Path(report["agent_origin"]).is_relative_to(extracted)
 
 
+def test_fresh_archive_runs_day4_inference_without_bc_manager_jax(
+        inference_checkpoint: Path, tmp_path: Path) -> None:
+    archive = tmp_path / "stage25-no-bc-manager-jax.tar.gz"
+    build_submission(inference_checkpoint, archive, label="no-bc-manager-jax")
+    extracted = tmp_path / "stage25-no-bc-manager-jax"
+    extracted.mkdir()
+    members = extract_fresh(archive, extracted)
+
+    assert not any(name.startswith("bc_manager_jax/") for name in members)
+    vendored_model = extracted / "rl_manager" / "_submission_bc_manager_jax_model.py"
+    assert vendored_model.read_bytes() == (ROOT / "bc_manager_jax" / "model.py").read_bytes()
+    manifest = json.loads((extracted / "submission_manifest.json").read_text())
+    assert "bc_manager_jax" not in manifest["runtime_packages"]
+    assert manifest["vendored_bc_manager_jax_model"]["helper_member"] == (
+        "rl_manager/_submission_bc_manager_jax_model.py")
+
+    observation = _observation(4)
+    code = r'''
+import importlib.abc
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+repository_root = Path(sys.argv[2]).resolve()
+observation = json.loads(sys.argv[3])
+def under(path, parent):
+    path = Path(path).resolve()
+    parent = Path(parent).resolve()
+    return path == parent or parent in path.parents
+sys.path[:] = [entry for entry in sys.path if not entry or
+               not under(entry, repository_root)]
+sys.path.insert(0, str(root))
+assert not (root / "bc_manager_jax").exists()
+class BlockBcManagerJax(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        del path, target
+        if fullname == "bc_manager_jax" or fullname.startswith("bc_manager_jax."):
+            raise ModuleNotFoundError(f"blocked package: {fullname}")
+        return None
+sys.meta_path.insert(0, BlockBcManagerJax())
+from kaggle_environments.agent import get_last_callable
+main_path = root / "main.py"
+candidate = get_last_callable(main_path.read_text(encoding="utf-8"),
+                              path=str(main_path))
+assert "bc_manager_jax" not in sys.modules
+action = candidate(observation)
+runtime_agent = candidate.__globals__["_agent"]
+assert runtime_agent.provider._native_policy._loaded
+assert runtime_agent.provider._native_policy.mode == "deterministic"
+diagnostics = runtime_agent.diagnostics_json()
+assert diagnostics["manager_inference_latency_s"]
+vendored = sys.modules[
+    "rl_manager._submission_bc_manager_jax_model"]
+assert Path(vendored.__file__).resolve().is_relative_to(root)
+assert not any(name == "bc_manager_jax" or
+               name.startswith("bc_manager_jax.") for name in sys.modules)
+print(json.dumps({"action": action, "diagnostics": diagnostics,
+                  "checkpoint_loaded": runtime_agent.provider._native_policy._loaded,
+                  "bc_manager_jax_modules": sorted(
+                      name for name in sys.modules
+                      if name == "bc_manager_jax" or
+                      name.startswith("bc_manager_jax."))}))
+'''
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(extracted), str(ROOT),
+         json.dumps(observation)],
+        cwd=extracted, env=environment, capture_output=True, text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stderr[-6000:] + result.stdout[-1000:]
+    report = json.loads(result.stdout.splitlines()[-1])
+    assert report["checkpoint_loaded"] is True
+    assert report["diagnostics"]["manager_inference_latency_s"]
+    assert report["bc_manager_jax_modules"] == []
+
+
 @pytest.mark.parametrize("seat", [0, 1])
 def test_opening_handoff_and_realized_labor_rollover(seat: int,
                                                       tmp_path: Path) -> None:
@@ -380,7 +459,9 @@ def _fake_child_report(parity_game: dict, *, archive: bool) -> dict:
         "checkpoint_metadata": {},
         "training_only_modules_imported": [],
         "vendored_market_price_probe": 25 if archive else None,
-        "games": [],
+        "games": [{"manager_decision_reached": True}],
+        "bc_manager_jax_import_blocked": archive,
+        "bc_manager_jax_modules_loaded": [],
         "manifest": {},
     }
     if archive:

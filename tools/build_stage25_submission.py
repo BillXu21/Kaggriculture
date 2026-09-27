@@ -26,12 +26,11 @@ from rl_manager.stage25_checkpoint import (  # noqa: E402
     load_stage25_inference_checkpoint,
 )
 
-BUILDER_VERSION = "stage25_submission_builder_v1"
+BUILDER_VERSION = "stage25_submission_builder_v2"
 MANIFEST_VERSION = "kaggriculture_stage25_submission_v1"
 RUNTIME_PACKAGES = (
     "executor_v0",
     "bc_manager",
-    "bc_manager_jax",
     "opening_book",
     "replay_daily",
     "rl_manager",
@@ -39,6 +38,17 @@ RUNTIME_PACKAGES = (
 EXTERNAL_RUNTIME_MODULES = ("jax", "jaxlib", "numpy", "pyarrow")
 _MARKET_IMPORT = "from fast_env.market import market_price"
 _VENDORED_IMPORT = "from executor_v0._submission_market import market_price"
+_BC_MANAGER_JAX_MODEL_IMPORT = "from bc_manager_jax.model import"
+_VENDORED_MODEL_IMPORT = (
+    "from rl_manager._submission_bc_manager_jax_model import"
+)
+_VENDORED_MODEL_MEMBER = "rl_manager/_submission_bc_manager_jax_model.py"
+_STAGE25_MODEL_IMPORT_MEMBERS = (
+    "rl_manager/stage25_checkpoint.py",
+    "rl_manager/stage25_inference.py",
+    "rl_manager/stage25_policy.py",
+    "rl_manager/stage25_provider.py",
+)
 
 
 class BuildError(ValueError):
@@ -157,6 +167,38 @@ def _vendor_market_imports(members: dict[str, bytes], root: Path) -> dict[str, s
     }
 
 
+def _vendor_stage25_model(members: dict[str, bytes], root: Path) -> dict[str, Any]:
+    source_path = root / "bc_manager_jax" / "model.py"
+    if not source_path.is_file():
+        raise FileNotFoundError(
+            f"pure-JAX Stage 2.5 encoder model is missing: {source_path}")
+    source_bytes = source_path.read_bytes()
+    patched: list[str] = []
+    for member in _STAGE25_MODEL_IMPORT_MEMBERS:
+        if member not in members:
+            raise BuildError(f"runtime archive is missing {member}")
+        try:
+            source = members[member].decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise BuildError(f"runtime source is not UTF-8: {member}") from exc
+        count = source.count(_BC_MANAGER_JAX_MODEL_IMPORT)
+        if count != 1:
+            raise BuildError(
+                f"expected one bc_manager_jax model import in {member}, got {count}")
+        members[member] = source.replace(
+            _BC_MANAGER_JAX_MODEL_IMPORT, _VENDORED_MODEL_IMPORT,
+        ).encode("utf-8")
+        patched.append(member)
+    members[_VENDORED_MODEL_MEMBER] = source_bytes
+    return {
+        "source": _BC_MANAGER_JAX_MODEL_IMPORT,
+        "replacement": _VENDORED_MODEL_IMPORT,
+        "patched_members": patched,
+        "helper_member": _VENDORED_MODEL_MEMBER,
+        "helper_sha256": sha256_bytes(source_bytes),
+    }
+
+
 def build_submission(
     checkpoint_path: str | Path,
     output_path: str | Path,
@@ -189,6 +231,7 @@ def build_submission(
         path.relative_to(root).as_posix(): path.read_bytes() for path in files
     }
     vendor_info = _vendor_market_imports(members, root)
+    vendored_model_info = _vendor_stage25_model(members, root)
     members["main.py"] = template.read_bytes()
     members["stage25.npz"] = checkpoint.read_bytes()
 
@@ -230,6 +273,7 @@ def build_submission(
         "required_external_runtime_modules": list(EXTERNAL_RUNTIME_MODULES),
         "jax_versions_at_build": _jax_versions(),
         "vendored_market_imports": vendor_info,
+        "vendored_bc_manager_jax_model": vendored_model_info,
         "members": [
             {"path": name, "sha256": sha256_bytes(payload),
              "bytes": len(payload)}

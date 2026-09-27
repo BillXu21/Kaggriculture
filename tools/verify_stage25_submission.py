@@ -102,6 +102,19 @@ if MODE == "archive":
     sys.path[:] = [entry for entry in sys.path if not entry or (
         not under(entry, ROOT) and not under(entry, REPOSITORY_ROOT))]
     sys.path.insert(0, str(ROOT))
+    for name in tuple(sys.modules):
+        if name == "bc_manager_jax" or name.startswith("bc_manager_jax."):
+            del sys.modules[name]
+
+    class _BlockBcManagerJax:
+        def find_spec(self, fullname, path=None, target=None):
+            del path, target
+            if fullname == "bc_manager_jax" or fullname.startswith("bc_manager_jax."):
+                raise ModuleNotFoundError(
+                    f"archive verifier blocks unavailable package {fullname!r}")
+            return None
+
+    sys.meta_path.insert(0, _BlockBcManagerJax())
 elif MODE == "source":
     sys.path[:] = [entry for entry in sys.path
                    if not entry or not under(entry, ROOT)]
@@ -109,8 +122,12 @@ elif MODE == "source":
 else:
     fail(f"unknown verifier mode: {MODE}")
 
-required = ("executor_v0", "bc_manager", "bc_manager_jax", "opening_book",
+required = ("executor_v0", "bc_manager", "opening_book",
             "replay_daily", "rl_manager")
+
+def bc_manager_jax_modules():
+    return sorted(name for name in sys.modules
+                  if name == "bc_manager_jax" or name.startswith("bc_manager_jax."))
 
 def module_origins():
     result = {}
@@ -156,6 +173,8 @@ if startup_jax_loaded:
     fail("ordinary submission startup imported JAX before the first manager decision")
 if startup_training_modules:
     fail(f"training-only modules imported during ordinary startup: {startup_training_modules}")
+if MODE == "archive" and bc_manager_jax_modules():
+    fail(f"bc_manager_jax is unavailable in the submission runtime: {bc_manager_jax_modules()}")
 
 # Probe JAX before any checkpoint loader imports it so an unavailable native
 # runtime is reported explicitly and cannot be mistaken for an archive failure.
@@ -224,6 +243,8 @@ if MODE == "archive":
                 or "\\" in member_name or "/".join(manifest_path.parts) != member_name):
             fail(f"unsafe manifest member path: {member_name!r}")
         expected_paths.add(member_name)
+        if member_name == "bc_manager_jax" or member_name.startswith("bc_manager_jax/"):
+            fail(f"archive must not package top-level bc_manager_jax: {member_name}")
         member_path = ROOT.joinpath(*manifest_path.parts)
         if not member_path.is_file():
             fail(f"manifest member is missing from extraction: {member_name}")
@@ -240,6 +261,8 @@ if MODE == "archive":
         fail("extracted archive member set differs from manifest inventory: "
              f"missing={sorted(expected_paths - actual_paths)}, "
              f"extra={sorted(actual_paths - expected_paths)}")
+    if "bc_manager_jax" in manifest.get("runtime_packages", []):
+        fail("manifest declares unavailable top-level bc_manager_jax runtime package")
 
 if MODE == "archive":
     market_module = importlib.import_module("executor_v0.strip_market")
@@ -311,6 +334,8 @@ def play(seed, seat, want_trace=True):
     if forbidden_training_modules():
         fail(f"training-only modules imported by first inference: {forbidden_training_modules()}")
     if MODE == "archive":
+        if bc_manager_jax_modules():
+            fail(f"bc_manager_jax appeared in sys.modules during inference: {bc_manager_jax_modules()}")
         ensure_no_repository_modules(REPOSITORY_ROOT)
     return {
         "seed": seed,
@@ -324,6 +349,7 @@ def play(seed, seat, want_trace=True):
         "runtime_seconds": runtime_s,
         "first_call_latency_seconds": diagnostics.get("first_call_latency_s"),
         "manager_inference_latency_seconds": inference_latencies,
+        "manager_decision_reached": bool(inference_latencies),
         "final_status": final_status,
         "terminal": True,
     }
@@ -364,6 +390,8 @@ report = {
     },
     "jax_runtime": jax_report,
     "training_only_modules_imported": forbidden_training_modules(),
+    "bc_manager_jax_import_blocked": MODE == "archive",
+    "bc_manager_jax_modules_loaded": bc_manager_jax_modules(),
     "vendored_market_price_probe": price if MODE == "archive" else None,
     "games": games,
     "parity_game": parity_game,
@@ -489,6 +517,20 @@ def verify_archive(
         archive_report = _run_child(
             extracted, root, mode="archive",
             checkpoint=extracted / "stage25.npz", seeds=seeds)
+        if archive_report.get("bc_manager_jax_import_blocked") is not True:
+            raise VerificationError(
+                "archive verifier did not block the bc_manager_jax package")
+        loaded_bc_modules = archive_report.get("bc_manager_jax_modules_loaded")
+        if loaded_bc_modules != []:
+            raise VerificationError(
+                "archive runtime imported bc_manager_jax modules: "
+                f"{loaded_bc_modules!r}")
+        games = archive_report.get("games")
+        if not isinstance(games, list) or not games or any(
+                game.get("manager_decision_reached") is not True
+                for game in games):
+            raise VerificationError(
+                "archive smoke did not reach deterministic Stage 2.5 inference")
         # Source parity uses the same freshly extracted checkpoint bytes while
         # importing repository source modules explicitly from the checkout.
         source_report = _run_child(
@@ -510,6 +552,10 @@ def verify_archive(
             "checkpoint_metadata": archive_report["checkpoint_metadata"],
             "training_only_modules_imported": archive_report[
                 "training_only_modules_imported"],
+            "bc_manager_jax_import_blocked": archive_report[
+                "bc_manager_jax_import_blocked"],
+            "bc_manager_jax_modules_loaded": archive_report[
+                "bc_manager_jax_modules_loaded"],
             "vendored_market_price_probe": archive_report[
                 "vendored_market_price_probe"],
             "games": archive_report["games"],
