@@ -12,17 +12,20 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from executor_v0.layout import quadrant_of, tile_role
 from executor_v0.plan import DailyPlan
 from executor_v0.strip_market import (
     MarketBootstrapState,
     build_market_turn_plan,
 )
 from executor_v0.strip_routes import (
+    HorizontalRouteCandidate,
     RouteAssignment,
     RoutePhase,
     StripRoute,
     WorkerId,
     assign_horizontal_routes,
+    build_horizontal_route,
     generate_horizontal_route_candidates,
 )
 from executor_v0.strip_hiring import StripHiringPlan, plan_strip_hiring
@@ -98,8 +101,14 @@ class StripExecutorController:
         self._work_builder = work_builder
         self._day: int | None = None
         self._routes: dict[WorkerId, StripRoute] = {}
+        self._retired_routes: list[StripRoute] = []
         self._assignment: RouteAssignment | None = None
         self._unassigned_ids: tuple[str, ...] = ()
+        self._queued_candidates: list[HorizontalRouteCandidate] = []
+        self._helper_route_ids: set[str] = set()
+        self._weed_cleanup_targets: dict[WorkerId, tuple[int, int]] = {}
+        self._sharing_diagnostics: dict[str, int] = {}
+        self._work_by_tile: dict[tuple[int, int], tuple[WorkItem, ...]] = {}
         self._plan: StripWorkPlan | None = None
         self._passed_work: dict[str, dict[str, str]] = {}
         self._supply_plans: dict[str, RouteSupplyPlan] = {}
@@ -124,7 +133,10 @@ class StripExecutorController:
 
     @property
     def routes(self) -> tuple[StripRoute, ...]:
-        return tuple(sorted(self._routes.values(), key=lambda route: route.route_id))
+        return tuple(sorted(
+            (*self._retired_routes, *self._routes.values()),
+            key=lambda route: route.route_id,
+        ))
 
     @property
     def diagnostics(self) -> dict[str, Any]:
@@ -146,9 +158,24 @@ class StripExecutorController:
         )
         self._day = day
         self._plan = work_plan
+        self._work_by_tile = _index_work_by_tile(work_plan)
         self._assignment = assignment
         self._routes = {route.owner: route for route in assignment.routes}
-        self._unassigned_ids = tuple(route.route_id for route in assignment.unassigned)
+        self._retired_routes = []
+        self._queued_candidates = list(assignment.unassigned)
+        self._unassigned_ids = tuple(
+            candidate.route_id for candidate in self._queued_candidates
+        )
+        self._helper_route_ids = set()
+        self._weed_cleanup_targets = {}
+        self._sharing_diagnostics = {
+            "queued_rows_reassigned": 0,
+            "helper_suffix_transfers": 0,
+            "helper_tiles_transferred": 0,
+            "productive_help_interactions": 0,
+            "idle_weed_cleanup_assignments": 0,
+            "idle_weed_digs": 0,
+        }
         self._passed_work = {route.route_id: {} for route in assignment.routes}
         self._latest_inventories = {
             worker: self._worker_inventory(obs, worker) for worker in positions
@@ -190,7 +217,7 @@ class StripExecutorController:
                 candidate.route_id: dict(
                     extract_tile_supply_demand(candidate.owned_tiles, work_plan)
                 )
-                for candidate in assignment.unassigned
+                for candidate in self._queued_candidates
             },
             "route_workload": {
                 candidate.route_id: candidate.workload_interactions
@@ -216,13 +243,13 @@ class StripExecutorController:
         }
         self._daily["unassigned_hire_driving_routes"] = [
             candidate.route_id
-            for candidate in assignment.unassigned
+            for candidate in self._queued_candidates
             if estimates.get(candidate.route_id, None)
             and estimates[candidate.route_id].hire_driving
         ]
         self._daily["unassigned_fertilizer_only_routes"] = [
             candidate.route_id
-            for candidate in assignment.unassigned
+            for candidate in self._queued_candidates
             if estimates.get(candidate.route_id, None)
             and estimates[candidate.route_id].fertilizer_only
         ]
@@ -254,6 +281,7 @@ class StripExecutorController:
         active_plan = self._daily_plan
         work_plan = self._build_work_plan(obs, active_plan)
         self._plan = work_plan
+        self._work_by_tile = _index_work_by_tile(work_plan)
         self._confirm_pending_supply_pickups(obs)
 
         if not self._routes_finalized:
@@ -354,7 +382,9 @@ class StripExecutorController:
         for worker in sorted(positions):
             route = self._routes.get(worker)
             if route is None:
-                actions.append(("PASS",))
+                actions.append(self._act_idle_worker(
+                    worker, positions[worker], work_plan, obs
+                ))
                 continue
             actions.append(self._act_worker(route, positions[worker], work_plan, obs))
 
@@ -373,8 +403,14 @@ class StripExecutorController:
         self._day = int(obs.get("day", 0))
         self._daily_plan = plan
         self._routes = {}
+        self._retired_routes = []
         self._assignment = None
         self._unassigned_ids = ()
+        self._queued_candidates = []
+        self._helper_route_ids = set()
+        self._weed_cleanup_targets = {}
+        self._sharing_diagnostics = {}
+        self._work_by_tile = {}
         self._passed_work = {}
         self._supply_plans = {}
         self._supply_states = {}
@@ -592,8 +628,7 @@ class StripExecutorController:
         # missed by the one-pass sweep stays visible without reopening the route.
         self._record_late_work(route, work_plan)
         if route.phase == RoutePhase.DONE:
-            route.pass_turns_after_completion += 1
-            return ("PASS",)
+            return self._act_idle_worker(route.owner, position, work_plan, obs, route)
 
         if route.pending_cursor is not None:
             expected = route.traversal[route.pending_cursor]
@@ -640,7 +675,7 @@ class StripExecutorController:
             return action
 
         inventory = self._worker_inventory(obs, route.owner)
-        local_items = tuple(item for item in work_plan.items if item.tile == target)
+        local_items = self._work_by_tile.get(target, ())
         self._record_skipped_work(route, local_items, inventory)
         self._snapshot_tile_work(route, target, local_items)
         if route.cursor + 1 >= len(route.traversal):
@@ -736,7 +771,7 @@ class StripExecutorController:
         """Execute one supported local item on ``tile``, else return ``None``."""
 
         inventory = self._worker_inventory(obs, route.owner)
-        local_items = tuple(item for item in work_plan.items if item.tile == tile)
+        local_items = self._work_by_tile.get(tile, ())
         item = self._select_local_item(local_items, inventory)
         if item is None:
             return None
@@ -747,7 +782,332 @@ class StripExecutorController:
             route.actions_performed.get(item.kind, 0) + 1
         )
         route.interaction_turns += item.interaction_turns
+        if route.route_id in self._helper_route_ids:
+            self._sharing_diagnostics["productive_help_interactions"] += (
+                item.interaction_turns
+            )
         return action
+
+    def _act_idle_worker(
+        self,
+        worker: WorkerId,
+        position: tuple[int, int],
+        work_plan: StripWorkPlan,
+        obs: Mapping[str, Any],
+        completed_route: StripRoute | None = None,
+    ) -> tuple:
+        """Give a completed or otherwise unassigned worker useful day-local work."""
+
+        hour = int(obs.get("hour", 0))
+        best_help = self._best_helper_suffix(worker, position, work_plan, hour)
+        if best_help is not None and best_help[4] > 0:
+            helper = self._transfer_helper_suffix(
+                worker, position, work_plan, hour, best_help
+            )
+            if completed_route is not None:
+                self._retired_routes.append(completed_route)
+            self._routes[worker] = helper
+            return self._act_worker(helper, position, work_plan, obs)
+
+        queued = self._assign_queued_row(worker, position, work_plan, obs)
+        if queued is not None:
+            if completed_route is not None:
+                self._retired_routes.append(completed_route)
+            self._routes[worker] = queued
+            return self._act_worker(queued, position, work_plan, obs)
+
+        if best_help is not None:
+            helper = self._transfer_helper_suffix(
+                worker, position, work_plan, hour, best_help
+            )
+            if completed_route is not None:
+                self._retired_routes.append(completed_route)
+            self._routes[worker] = helper
+            return self._act_worker(helper, position, work_plan, obs)
+
+        cleanup = self._idle_weed_cleanup(worker, position, obs)
+        if cleanup is not None:
+            return cleanup
+        if completed_route is not None:
+            completed_route.pass_turns_after_completion += 1
+        return ("PASS",)
+
+    def _assign_queued_row(
+        self,
+        worker: WorkerId,
+        position: tuple[int, int],
+        work_plan: StripWorkPlan,
+        obs: Mapping[str, Any],
+    ) -> StripRoute | None:
+        """Take the first queued row whose real work is still reachable today."""
+
+        if not self._queued_candidates:
+            return None
+        private = obs.get("private") or {}
+        shed = private.get("shed") or {}
+        protected = self._outstanding_reservations()
+        available_shed = {
+            str(item): max(0, int(amount) - protected.get(str(item), 0))
+            for item, amount in shed.items()
+        }
+        inventory = self._worker_inventory(obs, worker)
+        hour = int(obs.get("hour", 0))
+        for index, candidate in enumerate(self._queued_candidates):
+            route = build_horizontal_route(
+                candidate, worker, position, assignment_hour=hour
+            )
+            supply_plan = build_route_supply_plans(
+                (route,), work_plan, {worker: inventory}, available_shed,
+                {worker: position},
+            )[0]
+            if supply_plan.pickup_tile is not None:
+                route = build_horizontal_route(
+                    candidate, worker, supply_plan.pickup_tile,
+                    assignment_hour=hour,
+                )
+                supply_plan = build_route_supply_plans(
+                    (route,), work_plan, {worker: inventory}, available_shed,
+                    {worker: position},
+                )[0]
+            if not _route_has_reachable_work(
+                route, work_plan, position, hour, supply_plan,
+                self._work_by_tile,
+            ):
+                continue
+            self._queued_candidates.pop(index)
+            self._unassigned_ids = tuple(
+                item.route_id for item in self._queued_candidates
+            )
+            self._supply_plans[route.route_id] = supply_plan
+            self._supply_states[route.route_id] = RouteSupplyState()
+            route.phase = (
+                RoutePhase.PREPARE_SUPPLIES
+                if supply_plan.requires_pickup
+                else RoutePhase.TRAVEL_TO_ENTRY
+            )
+            self._daily["unassigned_routes"] = len(self._queued_candidates)
+            self._daily["assigned_routes"] = int(
+                self._daily.get("assigned_routes", 0)
+            ) + 1
+            self._daily["unassigned_active_routes"] = list(self._unassigned_ids)
+            self._daily["unassigned_supply_demand"] = {
+                queued.route_id: dict(
+                    extract_tile_supply_demand(queued.owned_tiles, work_plan)
+                )
+                for queued in self._queued_candidates
+            }
+            self._sharing_diagnostics["queued_rows_reassigned"] += 1
+            return route
+        return None
+
+    def _best_helper_suffix(
+        self,
+        worker: WorkerId,
+        position: tuple[int, int],
+        work_plan: StripWorkPlan,
+        hour: int,
+    ) -> tuple[StripRoute, int, tuple[tuple[int, int], ...], int, int, int] | None:
+        """Find the highest-priority reachable suffix without inventory work."""
+
+        items_by_id = {item.id: item for item in work_plan.items}
+        turns_left = max(0, 24 - hour)
+        choices = []
+        for donor in sorted(self._routes.values(), key=lambda route: route.route_id):
+            if (
+                donor.owner == worker
+                or donor.phase in (RoutePhase.DONE, RoutePhase.INVALID)
+                or donor.route_id in self._helper_route_ids
+            ):
+                continue
+            boundary = max(
+                donor.cursor,
+                donor.pending_cursor
+                if donor.pending_cursor is not None
+                else donor.cursor,
+            )
+            passed_indexes = [
+                index for index, tile in enumerate(donor.traversal)
+                if tile in donor.passed_tiles
+            ]
+            if passed_indexes:
+                boundary = max(boundary, max(passed_indexes))
+            last_supply_index = max(
+                (
+                    index
+                    for index, tile in enumerate(donor.traversal)
+                    if any(
+                        requirement.scope == "inventory"
+                        and requirement.quantity > 0
+                        for item in self._work_by_tile.get(tile, ())
+                        for requirement in item.required_supplies
+                    )
+                ),
+                default=-1,
+            )
+            start = max(boundary + 1, last_supply_index + 1)
+            if start >= len(donor.traversal):
+                continue
+            suffix = donor.traversal[start:]
+            help_items = [
+                item
+                for tile in suffix
+                for item in self._work_by_tile.get(tile, ())
+                if _is_helpable_item(item, items_by_id)
+            ]
+            interactions = sum(item.interaction_turns for item in help_items)
+            if interactions <= 0:
+                continue
+            remaining_interactions = sum(
+                item.interaction_turns
+                for tile in donor.traversal
+                if tile not in donor.passed_tiles
+                for item in self._work_by_tile.get(tile, ())
+                if _is_helpable_item(item, items_by_id)
+            )
+            urgency = sum(
+                item.interaction_turns
+                for item in help_items
+                if item.kind == "WATER"
+                and item.source == "survival_weed_prevention"
+            )
+            helper_traversal = tuple(reversed(suffix))
+            entry = helper_traversal[0]
+            useful_costs = [
+                abs(position[0] - entry[0])
+                + abs(position[1] - entry[1])
+                + index
+                + 1
+                for index, tile in enumerate(helper_traversal)
+                if any(
+                    _is_helpable_item(item, items_by_id)
+                    for item in self._work_by_tile.get(tile, ())
+                )
+            ]
+            if not useful_costs or min(useful_costs) > turns_left:
+                continue
+            choices.append((
+                -urgency, -remaining_interactions, donor.route_id, suffix[0],
+                donor, start, suffix, interactions, urgency,
+                remaining_interactions,
+            ))
+        if not choices:
+            return None
+        choice = min(choices, key=lambda item: item[:4])
+        return choice[4], choice[5], choice[6], choice[7], choice[8], choice[9]
+
+    def _transfer_helper_suffix(
+        self,
+        worker: WorkerId,
+        position: tuple[int, int],
+        work_plan: StripWorkPlan,
+        hour: int,
+        selection: tuple[
+            StripRoute, int, tuple[tuple[int, int], ...], int, int, int
+        ],
+    ) -> StripRoute:
+        """Move a donor's safe tail to one worker, preserving exclusive ownership.
+
+        Inventory-scoped work is never transferred. Its original route reservation
+        and acquired stock stay with the donor; water and other supply-free work
+        can be shared without modifying the reservation ledger.
+        """
+
+        donor, start, suffix, interactions, _urgency, _remaining = selection
+        helper_traversal = tuple(reversed(suffix))
+        suffix_set = set(suffix)
+        donor.traversal = donor.traversal[:start]
+        donor.owned_tiles = tuple(
+            tile for tile in donor.owned_tiles if tile not in suffix_set
+        )
+        donor.workload_interactions = max(
+            0, donor.workload_interactions - interactions
+        )
+        helper = StripRoute(
+            route_id=(
+                f"HELP:{donor.route_id}:{worker.label}:"
+                f"{helper_traversal[0][0]},{helper_traversal[0][1]}"
+            ),
+            owned_tiles=tuple(sorted(suffix_set)),
+            traversal=helper_traversal,
+            owner=worker,
+            entry_tile=helper_traversal[0],
+            entry_distance=(
+                abs(position[0] - helper_traversal[0][0])
+                + abs(position[1] - helper_traversal[0][1])
+            ),
+            assignment_hour=hour,
+            workload_interactions=interactions,
+            source_shape="helper_suffix",
+            phase=RoutePhase.TRAVEL_TO_ENTRY,
+        )
+        helper_supply = build_route_supply_plans(
+            (helper,), work_plan,
+            {worker: self._worker_inventory(self._observation_for_diagnostics, worker)},
+            {},
+            {worker: position},
+        )[0]
+        # The suffix selector guarantees no inventory demand, so this assertion
+        # documents the reservation-transfer invariant at the ownership boundary.
+        if helper_supply.demand:
+            raise AssertionError("helper suffix unexpectedly requires inventory")
+        self._supply_plans[helper.route_id] = helper_supply
+        self._supply_states[helper.route_id] = RouteSupplyState()
+        self._helper_route_ids.add(helper.route_id)
+        self._sharing_diagnostics["helper_suffix_transfers"] += 1
+        self._sharing_diagnostics["helper_tiles_transferred"] += len(suffix)
+        return helper
+
+    def _idle_weed_cleanup(
+        self,
+        worker: WorkerId,
+        position: tuple[int, int],
+        obs: Mapping[str, Any],
+    ) -> tuple | None:
+        """Walk to and dig one visible unlocked weed after productive work."""
+
+        farm = obs["farms"][self.config.acting_seat]
+        board = farm.get("tiles") or ()
+        unlocked = set(farm.get("unlocked_quadrants") or ())
+        weeds = {
+            (y, x)
+            for y, row in enumerate(board[:10])
+            for x, tile in enumerate(row[:10])
+            if quadrant_of(y, x) in unlocked and tile_role(tile) == "weed"
+        }
+        for owner, tile in tuple(self._weed_cleanup_targets.items()):
+            if tile not in weeds:
+                del self._weed_cleanup_targets[owner]
+        target = self._weed_cleanup_targets.get(worker)
+        if target is None:
+            claimed = set(self._weed_cleanup_targets.values())
+            choices = sorted(
+                weeds - claimed,
+                key=lambda tile: (
+                    abs(position[0] - tile[0]) + abs(position[1] - tile[1]),
+                    tile,
+                ),
+            )
+            turns_left = max(0, 24 - int(obs.get("hour", 0)))
+            target = next(
+                (
+                    tile for tile in choices
+                    if abs(position[0] - tile[0])
+                    + abs(position[1] - tile[1]) + 1 <= turns_left
+                ),
+                None,
+            )
+            if target is None:
+                return None
+            self._weed_cleanup_targets[worker] = target
+            self._sharing_diagnostics["idle_weed_cleanup_assignments"] += 1
+        distance = abs(position[0] - target[0]) + abs(position[1] - target[1])
+        if distance + 1 > max(0, 24 - int(obs.get("hour", 0))):
+            self._weed_cleanup_targets.pop(worker, None)
+            return None
+        if position == target:
+            self._sharing_diagnostics["idle_weed_digs"] += 1
+            return ("DIG",)
+        return _vertical_first_step(position, target)
 
     def _select_local_item(
         self, items: tuple[WorkItem, ...], inventory: Mapping[str, int]
@@ -946,6 +1306,15 @@ class StripExecutorController:
                 "future_action_slots": (
                     self._hire_plan.future_action_slots if self._hire_plan else 0
                 ),
+                **self._sharing_diagnostics,
+                "queued_row_ids": [
+                    candidate.route_id for candidate in self._queued_candidates
+                ],
+                "helper_route_ids": sorted(self._helper_route_ids),
+                "idle_weed_targets": {
+                    worker.label: list(tile)
+                    for worker, tile in sorted(self._weed_cleanup_targets.items())
+                },
             }
         )
         if self._supply_plans:
@@ -959,6 +1328,103 @@ class StripExecutorController:
 
 def _supported_kind(kind: str) -> bool:
     return kind in _LOCAL_PRIORITY
+
+
+def _index_work_by_tile(
+    work_plan: StripWorkPlan,
+) -> dict[tuple[int, int], tuple[WorkItem, ...]]:
+    indexed: dict[tuple[int, int], list[WorkItem]] = {}
+    for item in work_plan.items:
+        if item.tile is not None:
+            indexed.setdefault(item.tile, []).append(item)
+    return {tile: tuple(items) for tile, items in indexed.items()}
+
+
+def _is_helpable_item(
+    item: WorkItem,
+    items_by_id: Mapping[str, WorkItem],
+    visiting: frozenset[str] = frozenset(),
+) -> bool:
+    """Accept ready work and same-tile dependency chains that can become ready."""
+
+    if (
+        not _supported_kind(item.kind)
+        or _interaction_action(item) is None
+        or item.id in visiting
+    ):
+        return False
+    if item.status == WorkStatus.READY:
+        return True
+    if (
+        item.status != WorkStatus.BLOCKED
+        or item.block_reason != BlockReason.DEPENDENCY_BLOCKED
+        or not item.depends_on
+    ):
+        return False
+    next_visiting = visiting | {item.id}
+    return all(
+        (dependency := items_by_id.get(dependency_id)) is not None
+        and dependency.tile == item.tile
+        and _is_helpable_item(dependency, items_by_id, next_visiting)
+        for dependency_id in item.depends_on
+    )
+
+
+def _route_has_reachable_work(
+    route: StripRoute,
+    work_plan: StripWorkPlan,
+    position: tuple[int, int],
+    hour: int,
+    supply_plan: RouteSupplyPlan,
+    work_by_tile: Mapping[tuple[int, int], tuple[WorkItem, ...]],
+) -> bool:
+    """Check whether this row can reach one executable interaction today."""
+
+    items_by_id = {item.id: item for item in work_plan.items}
+    carried = dict(supply_plan.already_carried)
+    reserved = dict(supply_plan.reserved_from_shed)
+    available = {
+        item: carried.get(item, 0) + reserved.get(item, 0)
+        for item in set(carried) | set(reserved)
+    }
+    pickup_turns = len(supply_plan.pickup_sequence)
+    if supply_plan.pickup_tile is None:
+        supply_distance = 0
+        travel_position = position
+    else:
+        supply_distance = (
+            abs(position[0] - supply_plan.pickup_tile[0])
+            + abs(position[1] - supply_plan.pickup_tile[1])
+        )
+        travel_position = supply_plan.pickup_tile
+    entry_distance = (
+        abs(travel_position[0] - route.entry_tile[0])
+        + abs(travel_position[1] - route.entry_tile[1])
+    )
+    actions_before_route = supply_distance + pickup_turns + entry_distance
+    turns_left = max(0, 24 - hour)
+
+    for index, tile in enumerate(route.traversal):
+        local_items = sorted(
+            (
+                work_plan_item
+                for work_plan_item in work_by_tile.get(tile, ())
+                if _is_helpable_item(work_plan_item, items_by_id)
+            ),
+            key=lambda item: (_LOCAL_PRIORITY.get(item.kind, 1000), item.id),
+        )
+        for item in local_items:
+            if not all(
+                requirement.scope != "inventory"
+                or available.get(requirement.item, 0) >= requirement.quantity
+                for requirement in item.required_supplies
+            ):
+                continue
+            for requirement in item.required_supplies:
+                if requirement.scope == "inventory":
+                    available[requirement.item] -= requirement.quantity
+            return actions_before_route + index + 1 <= turns_left
+    return False
 
 
 def _has_worker_supplies(item: WorkItem, inventory: Mapping[str, int]) -> bool:

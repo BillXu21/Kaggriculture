@@ -21,6 +21,7 @@ __all__ = [
     "StripRoute",
     "WorkerId",
     "assign_horizontal_routes",
+    "build_horizontal_route",
     "generate_horizontal_route_candidates",
 ]
 
@@ -192,25 +193,12 @@ def assign_horizontal_routes(
     ordered_workers = tuple(sorted(worker_positions))
     routes: list[StripRoute] = []
     for worker, candidate in zip(ordered_workers, ordered_candidates):
-        position = worker_positions[worker]
-        left_to_right = candidate.owned_tiles
-        left, right = left_to_right[0], left_to_right[-1]
-        left_distance = abs(position[0] - left[0]) + abs(position[1] - left[1])
-        right_distance = abs(position[0] - right[0]) + abs(position[1] - right[1])
-        traversal = left_to_right if left_distance <= right_distance else tuple(
-            reversed(left_to_right)
-        )
         routes.append(
-            StripRoute(
-                route_id=candidate.route_id,
-                owned_tiles=candidate.owned_tiles,
-                traversal=traversal,
-                owner=worker,
-                entry_tile=traversal[0],
-                entry_distance=min(left_distance, right_distance),
+            build_horizontal_route(
+                candidate,
+                worker,
+                worker_positions[worker],
                 assignment_hour=assignment_hour,
-                workload_interactions=candidate.workload_interactions,
-                source_shape=candidate.source_shape,
             )
         )
     assigned_count = len(routes)
@@ -218,4 +206,35 @@ def assign_horizontal_routes(
         routes=tuple(routes),
         unassigned=ordered_candidates[assigned_count:],
         idle_workers=ordered_workers[assigned_count:],
+    )
+
+
+def build_horizontal_route(
+    candidate: HorizontalRouteCandidate,
+    worker: WorkerId,
+    position: tuple[int, int],
+    *,
+    assignment_hour: int,
+) -> StripRoute:
+    """Build one deterministic candidate route for an available worker."""
+
+    left_to_right = candidate.owned_tiles
+    left, right = left_to_right[0], left_to_right[-1]
+    left_distance = abs(position[0] - left[0]) + abs(position[1] - left[1])
+    right_distance = abs(position[0] - right[0]) + abs(position[1] - right[1])
+    traversal = (
+        left_to_right
+        if left_distance <= right_distance
+        else tuple(reversed(left_to_right))
+    )
+    return StripRoute(
+        route_id=candidate.route_id,
+        owned_tiles=candidate.owned_tiles,
+        traversal=traversal,
+        owner=worker,
+        entry_tile=traversal[0],
+        entry_distance=min(left_distance, right_distance),
+        assignment_hour=assignment_hour,
+        workload_interactions=candidate.workload_interactions,
+        source_shape=candidate.source_shape,
     )

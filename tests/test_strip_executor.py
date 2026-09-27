@@ -77,6 +77,7 @@ def work_item(
     depends_on=(),
     block_reason=None,
     item_id=None,
+    source="strip_forecast",
 ) -> WorkItem:
     return WorkItem(
         id=item_id or f"{kind}:{tile[0]},{tile[1]}",
@@ -88,6 +89,7 @@ def work_item(
         depends_on=tuple(depends_on),
         required_supplies=tuple(required_supplies),
         row_key=row_key_for_tile(tile),
+        source=source,
     )
 
 
@@ -475,3 +477,269 @@ def test_post_completion_late_work_on_final_tile_is_recorded():
     assert later.farmer_action == ("PASS",)
     assert route.phase == RoutePhase.DONE
     assert "HARVEST:0,4" in route.late_work_ids
+
+
+def _finished_light_row_controller(items, *, shed=None):
+    def builder(obs, daily_plan, **kwargs):
+        del obs, daily_plan, kwargs
+        return fake_plan(tuple(items))
+
+    controller = StripExecutorController(work_builder=builder)
+    obs = observation(farmer=(0, 0), hands=((0, 1),))
+    if shed:
+        obs["private"]["shed"] = dict(shed)
+    controller.act(obs, plan())
+    light = next(route for route in controller.routes if route.owner == WorkerId(0))
+    donor = next(route for route in controller.routes if route.owner == WorkerId(1))
+    light.phase = RoutePhase.DONE
+    light.completion_hour = 5
+    donor.phase = RoutePhase.SWEEP
+    donor.cursor = 1
+    return controller, light, donor
+
+
+def test_finished_worker_takes_safe_row_tail_and_rescues_survival_water():
+    items = [work_item("WATER", (0, 0))]
+    items.extend(
+        work_item(
+            "WATER", (1, x),
+            source="survival_weed_prevention" if x >= 3 else "routine",
+        )
+        for x in range(5)
+    )
+    controller, _light, donor = _finished_light_row_controller(items)
+    original_tiles = set(donor.owned_tiles)
+
+    result = controller.act(
+        observation(hour=6, farmer=(4, 1), hands=((1, 1),)), plan()
+    )
+
+    helper = next(route for route in controller.routes
+                  if route.source_shape == "helper_suffix")
+    assert result.farmer_action == ("WATER",)
+    assert helper.traversal == ((1, 4), (1, 3), (1, 2))
+    assert set(donor.owned_tiles).isdisjoint(helper.owned_tiles)
+    assert set(donor.owned_tiles) | set(helper.owned_tiles) == original_tiles
+    assert controller.diagnostics["helper_suffix_transfers"] == 1
+    assert controller.diagnostics["productive_help_interactions"] == 1
+
+
+def test_helper_cannot_steal_current_or_pending_cursor_tiles():
+    items = [work_item("WATER", (0, 0))]
+    items.extend(work_item("WATER", (1, x)) for x in range(5))
+    controller, _light, donor = _finished_light_row_controller(items)
+    donor.pending_cursor = 2
+
+    controller.act(
+        observation(hour=6, farmer=(4, 1), hands=((1, 1),)), plan()
+    )
+
+    helper = next(route for route in controller.routes
+                  if route.source_shape == "helper_suffix")
+    assert donor.current_tile == (1, 1)
+    assert donor.pending_cursor == 2
+    assert donor.traversal[donor.pending_cursor] == (1, 2)
+    assert helper.owned_tiles == ((1, 3), (1, 4))
+    assert {donor.current_tile, donor.traversal[donor.pending_cursor]}.isdisjoint(
+        helper.owned_tiles
+    )
+
+
+def test_finished_worker_continues_onto_unassigned_row():
+    items = [work_item("WATER", (row, 0)) for row in range(3)]
+    controller = StripExecutorController(
+        work_builder=lambda *args, **kwargs: fake_plan(tuple(items))
+    )
+    controller.act(
+        observation(farmer=(0, 0), hands=((0, 1),)), plan()
+    )
+    farmer_route = next(route for route in controller.routes
+                        if route.owner == WorkerId(0) and not route.completed)
+    farmer_route.phase = RoutePhase.DONE
+    for route in controller.routes:
+        if route.owner == WorkerId(1):
+            route.phase = RoutePhase.DONE
+
+    result = controller.act(
+        observation(hour=1, farmer=(0, 0), hands=((0, 1),)), plan()
+    )
+
+    farmer_route = next(route for route in controller.routes
+                        if route.owner == WorkerId(0) and not route.completed)
+    assert result.farmer_action == ("SOUTH",)
+    assert farmer_route.route_id == "ROW:NW:2:0-4"
+    assert controller.diagnostics["queued_rows_reassigned"] == 1
+    assert controller.diagnostics["queued_row_ids"] == []
+
+
+def test_helper_choice_and_actions_are_deterministic():
+    items = [work_item("WATER", (0, 0))]
+    items.extend(work_item("WATER", (1, x)) for x in range(5))
+    outputs = []
+    for _ in range(2):
+        controller, _light, _donor = _finished_light_row_controller(items)
+        result = controller.act(
+            observation(hour=6, farmer=(4, 1), hands=((1, 1),)), plan()
+        )
+        outputs.append((
+            result.action_dict(),
+            [route.to_json_dict() for route in controller.routes],
+        ))
+    assert outputs[0] == outputs[1]
+
+
+def _three_route_help_result(*, urgent_short_row):
+    items = [work_item("WATER", (0, 0))]
+    items.extend(work_item("WATER", (1, x)) for x in (2, 3, 4))
+    items.append(work_item(
+        "WATER", (2, 4),
+        source=("survival_weed_prevention" if urgent_short_row else "routine"),
+    ))
+    controller = StripExecutorController(
+        work_builder=lambda *args, **kwargs: fake_plan(tuple(items))
+    )
+    controller.act(
+        observation(farmer=(0, 0), hands=((0, 1), (0, 2))), plan()
+    )
+    for route in controller.routes:
+        if route.owner == WorkerId(0):
+            route.phase = RoutePhase.DONE
+        else:
+            route.phase = RoutePhase.SWEEP
+            route.cursor = 0
+    result = controller.act(
+        observation(hour=6, farmer=(4, 2), hands=((0, 1), (0, 2))), plan()
+    )
+    helper = next(route for route in controller.routes
+                  if route.source_shape == "helper_suffix")
+    return result, helper
+
+
+def test_helper_prefers_largest_remaining_route_when_urgency_ties():
+    result, helper = _three_route_help_result(urgent_short_row=False)
+
+    assert "ROW:NW:1:0-4" in helper.route_id
+    assert result.farmer_action == ("NORTH",)
+
+
+def test_survival_water_boundary_outweighs_larger_nonurgent_route():
+    result, helper = _three_route_help_result(urgent_short_row=True)
+
+    assert "ROW:NW:2:0-4" in helper.route_id
+    assert result.farmer_action == ("WATER",)
+
+
+def test_inventory_work_stays_with_donor_and_reservation_is_not_duplicated():
+    items = [work_item("WATER", (0, 0))]
+    items.extend(work_item("WATER", (1, x)) for x in range(3))
+    items.append(work_item(
+        "FERTILIZE", (1, 3), required_supplies=(
+            SupplyRequirement("FERTILIZER", 1),
+        ),
+    ))
+    items.append(work_item("WATER", (1, 4)))
+    controller, _light, donor = _finished_light_row_controller(
+        items, shed={"FERTILIZER": 1}
+    )
+    initial_route = next(item for item in controller.diagnostics["route_diagnostics"]
+                         if item["route_id"] == donor.route_id)
+    assert initial_route["supply_plan"]["reserved_from_shed"] == {
+        "FERTILIZER": 1
+    }
+
+    controller.act(
+        observation(hour=6, farmer=(4, 1), hands=((1, 1),)), plan()
+    )
+
+    helper = next(route for route in controller.routes
+                  if route.source_shape == "helper_suffix")
+    assert helper.owned_tiles == ((1, 4),)
+    assert (1, 3) in donor.owned_tiles
+    diagnostics = controller.diagnostics
+    assert diagnostics["supply_diagnostics"]["total_reservations_by_item"] == {
+        "FERTILIZER": 1
+    }
+    helper_supply = next(item for item in diagnostics["route_diagnostics"]
+                         if item["route_id"] == helper.route_id)["supply_plan"]
+    assert helper_supply["demand"] == {}
+
+
+def test_idle_worker_cleans_unlocked_weed_after_productive_work():
+    controller = StripExecutorController(
+        work_builder=lambda *args, **kwargs: fake_plan(())
+    )
+    obs = observation(farmer=(0, 0))
+    obs["farms"][0]["tiles"][0][2] = "WEED"
+
+    first = controller.act(obs, plan())
+    second_obs = observation(hour=1, farmer=(1, 0))
+    second_obs["farms"][0]["tiles"][0][2] = "WEED"
+    second = controller.act(second_obs, plan())
+    third_obs = observation(hour=2, farmer=(2, 0))
+    third_obs["farms"][0]["tiles"][0][2] = "WEED"
+    third = controller.act(third_obs, plan())
+
+    assert first.farmer_action == ("EAST",)
+    assert second.farmer_action == ("EAST",)
+    assert third.farmer_action == ("DIG",)
+    assert controller.diagnostics["idle_weed_cleanup_assignments"] == 1
+    assert controller.diagnostics["idle_weed_digs"] == 1
+
+
+def test_queued_productive_row_preempts_idle_weed_cleanup():
+    items = [work_item("WATER", (0, 0)), work_item("WATER", (1, 0))]
+    controller = StripExecutorController(
+        work_builder=lambda *args, **kwargs: fake_plan(tuple(items))
+    )
+    obs = observation(farmer=(0, 0))
+    obs["farms"][0]["tiles"][0][2] = "WEED"
+    controller.act(obs, plan())
+    controller.routes[0].phase = RoutePhase.DONE
+
+    result = controller.act(
+        observation(hour=1, farmer=(0, 0)), plan()
+    )
+
+    assert result.farmer_action == ("SOUTH",)
+    assert controller.diagnostics["queued_rows_reassigned"] == 1
+    assert controller.diagnostics["idle_weed_cleanup_assignments"] == 0
+
+
+def test_idle_workers_claim_distinct_weeds_and_skip_late_unreachable_cleanup():
+    controller = StripExecutorController(
+        work_builder=lambda *args, **kwargs: fake_plan(())
+    )
+    obs = observation(farmer=(0, 0), hands=((4, 0),))
+    obs["farms"][0]["tiles"][0][1] = "WEED"
+    obs["farms"][0]["tiles"][0][3] = {"kind": "WEED"}
+
+    assigned = controller.act(obs, plan())
+    assert assigned.farmer_action == ("EAST",)
+    assert assigned.hands_actions == (("WEST",),)
+    assert controller.diagnostics["idle_weed_targets"] == {
+        "FARMER": [0, 1], "HAND:0": [0, 3]
+    }
+
+    late = StripExecutorController(
+        work_builder=lambda *args, **kwargs: fake_plan(())
+    )
+    late_obs = observation(hour=23, farmer=(0, 0))
+    late_obs["farms"][0]["tiles"][0][4] = "WEED"
+    result = late.act(late_obs, plan())
+    assert result.farmer_action == ("PASS",)
+    assert late.diagnostics["idle_weed_cleanup_assignments"] == 0
+
+
+def test_helper_does_not_start_suffix_travel_without_time_to_interact():
+    items = [work_item("WATER", (0, 0))]
+    items.extend(work_item("WATER", (1, x)) for x in range(5))
+    controller, _light, donor = _finished_light_row_controller(items)
+
+    result = controller.act(
+        observation(hour=23, farmer=(9, 9), hands=((1, 1),)), plan()
+    )
+
+    assert result.farmer_action == ("PASS",)
+    assert not any(route.source_shape == "helper_suffix"
+                   for route in controller.routes)
+    assert len(donor.owned_tiles) == 5
