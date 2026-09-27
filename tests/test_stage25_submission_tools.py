@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
+import tarfile
 
 import jax
 import numpy as np
@@ -34,7 +36,11 @@ from rl_manager.stage25_submission_observation import (
     executor_observation,
 )
 from tools.build_stage25_submission import build_submission
-from tools.verify_stage25_submission import extract_fresh
+from tools.verify_stage25_submission import (
+    VerificationError,
+    extract_fresh,
+    verify_archive,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -351,3 +357,103 @@ assert not any(name.startswith('rl_manager.ppo') for name in sys.modules)
         capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _write_minimal_verifier_archive(path: Path) -> None:
+    with tarfile.open(path, mode="w:gz") as archive:
+        for name, payload in (
+                ("main.py", b"def agent(obs): return {}\n"),
+                ("stage25.npz", b"test-checkpoint"),
+                ("submission_manifest.json", b"{}\n")):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+
+def _fake_child_report(parity_game: dict, *, archive: bool) -> dict:
+    report = {
+        "checkpoint_sha256": parity_game["checkpoint_sha256"],
+        "parity_game": dict(parity_game),
+        "runtime_import_origins": {},
+        "jax_runtime": {"import_success": True},
+        "official_engine_version": "1.32.7",
+        "checkpoint_metadata": {},
+        "training_only_modules_imported": [],
+        "vendored_market_price_probe": 25 if archive else None,
+        "games": [],
+        "manifest": {},
+    }
+    if archive:
+        # A stale self-comparison from the archive process must never stand in
+        # for the independently executed source report.
+        report["source_vs_archive_trace_parity"] = {
+            "exact_match": True,
+            "source_action_trace_sha256": parity_game["action_trace_sha256"],
+            "archive_action_trace_sha256": parity_game["action_trace_sha256"],
+        }
+    return report
+
+
+def _install_fake_verifier_children(monkeypatch, archive_game: dict,
+                                    source_game: dict) -> list[str]:
+    from tools import verify_stage25_submission as verifier
+
+    reports = {
+        "archive": _fake_child_report(archive_game, archive=True),
+        "source": _fake_child_report(source_game, archive=False),
+    }
+    modes: list[str] = []
+
+    def run_child(_root, _repository_root, *, mode, **_kwargs):
+        modes.append(mode)
+        return reports[mode]
+
+    monkeypatch.setattr(verifier, "_run_child", run_child)
+    return modes
+
+
+def test_verifier_rejects_mismatched_source_archive_trace(
+        tmp_path: Path, monkeypatch) -> None:
+    archive_path = tmp_path / "mismatch.tar.gz"
+    _write_minimal_verifier_archive(archive_path)
+    checkpoint_hash = "c" * 64
+    archive_game = {
+        "seed": 7, "seat": 0, "checkpoint_sha256": checkpoint_hash,
+        "action_trace_sha256": "a" * 64,
+    }
+    source_game = {
+        **archive_game,
+        "action_trace_sha256": "b" * 64,
+    }
+    modes = _install_fake_verifier_children(
+        monkeypatch, archive_game, source_game)
+
+    with pytest.raises(VerificationError, match="source/archive parity mismatch"):
+        verify_archive(archive_path, repository_root=tmp_path, seeds=(7,))
+
+    assert modes == ["archive", "source"]
+
+
+def test_verifier_accepts_exact_source_archive_trace_parity(
+        tmp_path: Path, monkeypatch) -> None:
+    archive_path = tmp_path / "exact.tar.gz"
+    _write_minimal_verifier_archive(archive_path)
+    parity_game = {
+        "seed": 7, "seat": 0, "checkpoint_sha256": "c" * 64,
+        "action_trace_sha256": "a" * 64,
+    }
+    modes = _install_fake_verifier_children(
+        monkeypatch, parity_game, parity_game)
+
+    report = verify_archive(
+        archive_path, repository_root=tmp_path, seeds=(7,))
+
+    assert modes == ["archive", "source"]
+    assert report["source_vs_archive_trace_parity"] == {
+        "seed": 7,
+        "seat": 0,
+        "checkpoint_sha256": "c" * 64,
+        "source_action_trace_sha256": "a" * 64,
+        "archive_action_trace_sha256": "a" * 64,
+        "exact_match": True,
+    }

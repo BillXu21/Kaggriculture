@@ -335,22 +335,19 @@ if MODE == "archive":
             games.append(play(seed, seat))
     if PARITY_SEED not in SEEDS:
         games.append(play(PARITY_SEED, PARITY_SEAT))
-    parity_archive = next(
+    parity_game_result = next(
         row for row in games
         if row["seed"] == PARITY_SEED and row["seat"] == PARITY_SEAT)
-    parity_source = play(PARITY_SEED, PARITY_SEAT)
-    source_vs_archive_parity = {
-        "seed": PARITY_SEED,
-        "seat": PARITY_SEAT,
-        "source_action_trace_sha256": parity_source["action_trace_sha256"],
-        "archive_action_trace_sha256": parity_archive["action_trace_sha256"],
-        "exact_match": parity_source["action_trace_sha256"] == parity_archive["action_trace_sha256"],
-    }
-    if not source_vs_archive_parity["exact_match"]:
-        fail(f"source/archive action trace mismatch: {source_vs_archive_parity}")
 else:
-    games.append(play(PARITY_SEED, PARITY_SEAT))
-    source_vs_archive_parity = None
+    parity_game_result = play(PARITY_SEED, PARITY_SEAT)
+    games.append(parity_game_result)
+
+parity_game = {
+    "seed": PARITY_SEED,
+    "seat": PARITY_SEAT,
+    "checkpoint_sha256": checkpoint_hash,
+    "action_trace_sha256": parity_game_result["action_trace_sha256"],
+}
 
 if MODE == "archive":
     ensure_no_repository_modules(Path(sys.argv[7]).resolve())
@@ -369,7 +366,7 @@ report = {
     "training_only_modules_imported": forbidden_training_modules(),
     "vendored_market_price_probe": price if MODE == "archive" else None,
     "games": games,
-    "source_vs_archive_trace_parity": source_vs_archive_parity,
+    "parity_game": parity_game,
     "manifest": manifest,
 }
 print(json.dumps(report, sort_keys=True, allow_nan=False))
@@ -427,6 +424,45 @@ def _run_child(
     return child_report
 
 
+def _compare_parity_games(
+    archive_report: dict[str, Any], source_report: dict[str, Any]
+) -> dict[str, Any]:
+    """Require one archive run and one source run to fingerprint the same game."""
+    fingerprint_fields = (
+        "seed", "seat", "checkpoint_sha256", "action_trace_sha256")
+    archive_game = archive_report.get("parity_game")
+    source_game = source_report.get("parity_game")
+    if not isinstance(archive_game, dict) or not isinstance(source_game, dict):
+        raise VerificationError(
+            "source/archive parity child report is missing its parity-game fingerprint")
+    for label, report, game in (
+            ("archive", archive_report, archive_game),
+            ("source", source_report, source_game)):
+        missing = [field for field in fingerprint_fields if field not in game]
+        if missing:
+            raise VerificationError(
+                f"{label} parity-game fingerprint is missing fields: {missing}")
+        if game["checkpoint_sha256"] != report.get("checkpoint_sha256"):
+            raise VerificationError(
+                f"{label} parity-game checkpoint SHA-256 differs from its child report")
+
+    parity = {
+        "seed": archive_game["seed"],
+        "seat": archive_game["seat"],
+        "checkpoint_sha256": archive_game["checkpoint_sha256"],
+        "source_action_trace_sha256": source_game["action_trace_sha256"],
+        "archive_action_trace_sha256": archive_game["action_trace_sha256"],
+        "exact_match": all(
+            source_game[field] == archive_game[field]
+            for field in fingerprint_fields),
+    }
+    if not parity["exact_match"]:
+        raise VerificationError(
+            "source/archive parity mismatch: "
+            f"{json.dumps({'source_parity_game': source_game, 'archive_parity_game': archive_game}, sort_keys=True)}")
+    return parity
+
+
 def verify_archive(
     archive_path: str | Path,
     *,
@@ -458,11 +494,7 @@ def verify_archive(
         source_report = _run_child(
             root, root, mode="source",
             checkpoint=extracted / "stage25.npz", seeds=())
-        if archive_report.get("checkpoint_sha256") != source_report.get("checkpoint_sha256"):
-            raise VerificationError("source/archive parity used different checkpoint bytes")
-        parity = archive_report.get("source_vs_archive_trace_parity")
-        if not isinstance(parity, dict) or not parity.get("exact_match"):
-            raise VerificationError(f"source/archive action trace mismatch: {parity!r}")
+        parity = _compare_parity_games(archive_report, source_report)
         return {
             "ok": True,
             "archive": str(archive),
