@@ -19,8 +19,10 @@ E_VS_PASS = "e_vs_pass"
 CANDIDATE_VS_FROZEN = "candidate_vs_frozen"
 FROZEN_VS_CANDIDATE = "frozen_vs_candidate"
 CURRENT_VS_CURRENT_ECONOMIC = "current_vs_current_economic"
+DUAL_POLICY_SELF_PLAY = "dual_policy_self_play"
 COMPOSITIONS = (E_VS_E, E_VS_PASS, CANDIDATE_VS_FROZEN,
-                 FROZEN_VS_CANDIDATE, CURRENT_VS_CURRENT_ECONOMIC)
+                 FROZEN_VS_CANDIDATE, CURRENT_VS_CURRENT_ECONOMIC,
+                 DUAL_POLICY_SELF_PLAY)
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,7 @@ def seat_policies(
     frozen: BatchedPlanPolicy,
     *,
     controlled_seat: int = 0,
+    episode_index: int | None = None,
 ) -> tuple[BatchedPlanPolicy, BatchedPlanPolicy]:
     """Resolve a composition name into (seat0_policy, seat1_policy)."""
     if composition == E_VS_E:
@@ -120,6 +123,15 @@ def seat_policies(
         return frozen, candidate
     if composition == CURRENT_VS_CURRENT_ECONOMIC:
         return candidate, candidate
+    if composition == DUAL_POLICY_SELF_PLAY:
+        if episode_index is None:
+            raise ValueError(
+                "dual_policy_self_play requires an explicit episode_index")
+        if candidate.identity == frozen.identity:
+            raise ValueError(
+                "dual_policy_self_play requires distinct behavior identities")
+        return ((candidate, frozen) if int(episode_index) % 2 == 0
+                else (frozen, candidate))
     raise ValueError(
         f"unknown composition {composition!r}; expected one of "
         f"{list(COMPOSITIONS)}")

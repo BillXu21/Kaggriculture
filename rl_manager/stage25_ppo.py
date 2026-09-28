@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+import hashlib
 import math
 import time
 from typing import Any
@@ -294,6 +295,74 @@ def build_stage25_ppo_batch(
         if not _identity_matches(row.learner_identity, learner_identity):
             raise ValueError("trainable trajectory row has an incompatible learner identity")
         selected.append(row)
+    return _build_stage25_ppo_batch_from_rows(
+        selected, learner_identity=learner_identity, gamma=gamma,
+        gae_lambda=gae_lambda,
+        normalize_advantages=normalize_advantages)
+
+
+def build_stage25_ppo_batch_for_identity(
+        trajectory: Stage25TrajectoryBuffer, *,
+        learner_identity: Stage25BehaviorIdentity,
+        gamma: float = 0.99, gae_lambda: float = 0.95,
+        normalize_advantages: bool = True,
+) -> Stage25PPOBatch:
+    """Select trainable dual-rollout rows owned by one immutable identity."""
+    if not isinstance(trajectory, Stage25TrajectoryBuffer):
+        raise TypeError("trajectory must be a Stage25TrajectoryBuffer")
+    if not isinstance(learner_identity, Stage25BehaviorIdentity):
+        raise TypeError("learner_identity must be Stage25BehaviorIdentity")
+    selected = [row for row in trajectory.iter_rows()
+                if row.trainable and _identity_matches(
+                    row.learner_identity, learner_identity)]
+    selected.sort(key=lambda row: (
+        row.episode_id, row.seat, row.day, str(row.row_id)))
+    return _build_stage25_ppo_batch_from_rows(
+        selected, learner_identity=learner_identity, gamma=gamma,
+        gae_lambda=gae_lambda,
+        normalize_advantages=normalize_advantages)
+
+
+def build_stage25_dual_ppo_batches(
+        trajectory: Stage25TrajectoryBuffer, *,
+        learner_identity_a: Stage25BehaviorIdentity,
+        learner_identity_b: Stage25BehaviorIdentity,
+        gamma: float = 0.99, gae_lambda: float = 0.95,
+        normalize_advantages: bool = True,
+) -> tuple[Stage25PPOBatch, Stage25PPOBatch]:
+    """Partition one dual rollout and prove disjoint, complete ownership."""
+    if _identity_matches(learner_identity_a, learner_identity_b):
+        raise ValueError("dual PPO learners require distinct behavior identities")
+    trainable = [row for row in trajectory.iter_rows() if row.trainable]
+    allowed = (learner_identity_a, learner_identity_b)
+    for row in trainable:
+        if not any(_identity_matches(row.learner_identity, identity)
+                   for identity in allowed):
+            raise ValueError(
+                "trainable dual trajectory row has an unknown learner identity")
+    all_ids = [str(row.row_id) for row in trainable]
+    if len(set(all_ids)) != len(all_ids):
+        raise ValueError("dual rollout contains duplicate trainable row IDs")
+    batch_a = build_stage25_ppo_batch_for_identity(
+        trajectory, learner_identity=learner_identity_a, gamma=gamma,
+        gae_lambda=gae_lambda, normalize_advantages=normalize_advantages)
+    batch_b = build_stage25_ppo_batch_for_identity(
+        trajectory, learner_identity=learner_identity_b, gamma=gamma,
+        gae_lambda=gae_lambda, normalize_advantages=normalize_advantages)
+    ids_a = set(batch_a.source_row_ids or ())
+    ids_b = set(batch_b.source_row_ids or ())
+    if ids_a & ids_b:
+        raise ValueError("dual PPO batches contain overlapping trajectory rows")
+    if ids_a | ids_b != set(all_ids):
+        raise ValueError("dual PPO batches do not cover all trainable rollout rows")
+    return batch_a, batch_b
+
+
+def _build_stage25_ppo_batch_from_rows(
+        selected: Sequence[Any], *, learner_identity: Stage25BehaviorIdentity,
+        gamma: float, gae_lambda: float,
+        normalize_advantages: bool,
+) -> Stage25PPOBatch:
     if not selected:
         raise ValueError("trajectory contains no trainable learner rows")
     inputs = {name: np.stack([row.inputs[name] for row in selected]) for name in selected[0].inputs}
@@ -721,6 +790,128 @@ def init_stage25_ppo_state(
         behavior_identity=behavior_identity)
 
 
+def _dual_seed(seed: int, namespace: str) -> int:
+    payload = f"stage25-dual-ppo-v1:{int(seed)}:{namespace}".encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:4], "little") & 0x7fffffff
+
+
+def _copy_parameter_tree(params: Mapping[str, Any]) -> Mapping[str, Any]:
+    return jax.tree_util.tree_map(
+        lambda leaf: jnp.asarray(np.array(leaf, copy=True)), params)
+
+
+@dataclass(frozen=True)
+class Stage25DualPPOTrainState:
+    """Two independently optimized policies at a completed-generation boundary."""
+
+    policy_a: Stage25PPOTrainState
+    policy_b: Stage25PPOTrainState
+    generation: int = 0
+    rollout_seed: int = 0
+    rollout_progression: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.generation, bool)
+                or not isinstance(self.generation, (int, np.integer))
+                or self.generation < 0):
+            raise ValueError("generation must be a nonnegative integer")
+        if (isinstance(self.rollout_seed, bool)
+                or not isinstance(self.rollout_seed, (int, np.integer))
+                or self.rollout_seed < 0):
+            raise ValueError("rollout_seed must be a nonnegative integer")
+        if (self.policy_a.update_counter != int(self.generation)
+                or self.policy_b.update_counter != int(self.generation)):
+            raise ValueError(
+                "dual generation must equal both policy update counters")
+        if (self.policy_a.behavior_identity is None
+                or self.policy_b.behavior_identity is None):
+            raise ValueError("both dual learners require behavior identities")
+        if _identity_matches(
+                self.policy_a.behavior_identity,
+                self.policy_b.behavior_identity):
+            raise ValueError("dual learners require distinct behavior identities")
+        if self.policy_a.params is self.policy_b.params:
+            raise ValueError("dual learner parameter trees must be independent objects")
+        if self.policy_a.optimizer_state is self.policy_b.optimizer_state:
+            raise ValueError("dual learner optimizer states must be independent objects")
+        if np.array_equal(np.asarray(self.policy_a.rng), np.asarray(self.policy_b.rng)):
+            raise ValueError("dual learners require independent PPO RNG streams")
+        progression = ({} if self.rollout_progression is None
+                       else dict(self.rollout_progression))
+        if progression.get("completed_rollouts", int(self.generation)) \
+                != int(self.generation):
+            raise ValueError(
+                "dual rollout progression disagrees with generation")
+        next_episode = progression.get("next_episode_index", 0)
+        if (isinstance(next_episode, bool)
+                or not isinstance(next_episode, (int, np.integer))
+                or next_episode < 0):
+            raise ValueError(
+                "dual next_episode_index must be a nonnegative integer")
+        object.__setattr__(self, "generation", int(self.generation))
+        object.__setattr__(self, "rollout_seed", int(self.rollout_seed))
+        object.__setattr__(self, "rollout_progression", progression)
+
+
+def init_stage25_dual_ppo_state(
+        config: Stage25PPOConfig, *, seed: int = 0,
+        params: Mapping[str, Any] | None = None,
+        behavior_identity_a: Stage25BehaviorIdentity | None = None,
+        behavior_identity_b: Stage25BehaviorIdentity | None = None,
+        rollout_seed: int | None = None,
+        rollout_progression: Mapping[str, Any] | None = None,
+) -> Stage25DualPPOTrainState:
+    """Initialize two independent learners from one optional BC parameter tree."""
+    if (behavior_identity_a is None) != (behavior_identity_b is None):
+        raise ValueError("both dual behavior identities must be supplied together")
+    source_params = (init_stage25_params(config.model, seed=seed)
+                     if params is None else params)
+    params_a = _copy_parameter_tree(source_params)
+    params_b = _copy_parameter_tree(source_params)
+    seed_a, seed_b = _dual_seed(seed, "policy_a"), _dual_seed(seed, "policy_b")
+    if seed_a == seed_b:
+        raise RuntimeError("dual PPO seed derivation produced a collision")
+    if behavior_identity_a is None:
+        from rl_manager.stage25_inference import Stage25InferenceAdapter
+        behavior_identity_a = Stage25InferenceAdapter(
+            params=params_a, config=config.model, name="stage25_dual_a",
+            version="ppo-native-v1", seed=seed_a,
+            mode="stochastic").identity
+        behavior_identity_b = Stage25InferenceAdapter(
+            params=params_b, config=config.model, name="stage25_dual_b",
+            version="ppo-native-v1", seed=seed_b,
+            mode="stochastic").identity
+    from rl_manager.stage25_inference import parameter_fingerprint
+    if (behavior_identity_a.parameter_fingerprint
+            != parameter_fingerprint(params_a)
+            or behavior_identity_b.parameter_fingerprint
+            != parameter_fingerprint(params_b)):
+        raise ValueError("dual behavior identity does not match initial parameters")
+    compatible_fields = (
+        "observation_schema_version", "policy_schema_version",
+        "e_history_version", "curriculum_version",
+        "curriculum_fingerprint", "physical_support_version")
+    if any(getattr(behavior_identity_a, field)
+           != getattr(behavior_identity_b, field)
+           for field in compatible_fields):
+        raise ValueError("dual behavior identities have incompatible contracts")
+    state_a = init_stage25_ppo_state(
+        config, seed=seed_a, params=params_a,
+        behavior_identity=behavior_identity_a)
+    state_b = init_stage25_ppo_state(
+        config, seed=seed_b, params=params_b,
+        behavior_identity=behavior_identity_b)
+    progression = (dict(rollout_progression)
+                   if rollout_progression is not None else {
+                       "completed_rollouts": 0,
+                       "next_episode_index": 0,
+                   })
+    return Stage25DualPPOTrainState(
+        policy_a=state_a, policy_b=state_b, generation=0,
+        rollout_seed=seed if rollout_seed is None else rollout_seed,
+        rollout_progression=progression)
+
+
 def _validate_update_output(output: Mapping[str, Any], batch: Stage25PPOBatch) -> None:
     if not np.all(np.asarray(output["valid"], dtype=bool)):
         raise ValueError("PPO objective produced invalid policy diagnostics")
@@ -735,15 +926,24 @@ def ppo_update(
         state: Stage25PPOTrainState, batch: Stage25PPOBatch,
         config: Stage25PPOConfig) -> tuple[Stage25PPOTrainState, dict[str, Any]]:
     """Run all PPO epochs on one frozen rollout, atomically on validation failure."""
+    audit_started = time.perf_counter()
+    audit = audit_stage25_ppo_rollout(state.params, batch, config)
+    audit_seconds = time.perf_counter() - audit_started
+    return _ppo_update_after_audit(
+        state, batch, config, audit=audit, audit_seconds=audit_seconds)
+
+
+def _ppo_update_after_audit(
+        state: Stage25PPOTrainState, batch: Stage25PPOBatch,
+        config: Stage25PPOConfig, *, audit: Mapping[str, Any],
+        audit_seconds: float) -> tuple[Stage25PPOTrainState, dict[str, Any]]:
+    """Apply PPO after the caller audited this exact frozen state and batch."""
     if ((batch.behavior_identity is None) != (state.behavior_identity is None)
             or (batch.behavior_identity is not None
                 and not _identity_matches(batch.behavior_identity,
                                           state.behavior_identity))):
         raise ValueError("PPO batch behavior identity does not match the frozen state identity")
     ppo_started = time.perf_counter()
-    audit_started = time.perf_counter()
-    audit = audit_stage25_ppo_rollout(state.params, batch, config)
-    audit_seconds = time.perf_counter() - audit_started
     params = state.params
     opt_state = state.optimizer_state
     key = _normal_key(state.rng)
@@ -798,6 +998,105 @@ def ppo_update(
         "total_seconds": time.perf_counter() - ppo_started,
     }
     return next_state, summary
+
+
+def _validate_dual_policy_output(
+        previous: Stage25PPOTrainState, updated: Stage25PPOTrainState,
+        identity: Stage25BehaviorIdentity) -> None:
+    if updated.update_counter != previous.update_counter + 1:
+        raise ValueError("dual PPO policy update counter did not advance once")
+    if updated.behavior_identity is None:
+        raise ValueError("dual PPO update lost its behavior identity")
+    from rl_manager.stage25_inference import parameter_fingerprint
+    if updated.behavior_identity.parameter_fingerprint != parameter_fingerprint(
+            updated.params):
+        raise ValueError("dual PPO update identity does not match updated parameters")
+    if (updated.behavior_identity.name != identity.name
+            or updated.behavior_identity.version != identity.version):
+        raise ValueError("dual PPO update changed policy behavior identity namespace")
+    for leaf in jax.tree_util.tree_leaves((updated.params, updated.optimizer_state)):
+        value = np.asarray(leaf)
+        if not np.all(np.isfinite(value)):
+            raise ValueError("dual PPO update produced nonfinite policy or optimizer state")
+
+
+def ppo_update_dual(
+        state: Stage25DualPPOTrainState, batch_a: Stage25PPOBatch,
+        batch_b: Stage25PPOBatch, config: Stage25PPOConfig, *,
+        rollout_size: int,
+) -> tuple[Stage25DualPPOTrainState, dict[str, Any]]:
+    """Audit both frozen learners, then commit both PPO updates as one generation."""
+    if not isinstance(state, Stage25DualPPOTrainState):
+        raise TypeError("state must be Stage25DualPPOTrainState")
+    if isinstance(rollout_size, bool) or not isinstance(rollout_size, int) \
+            or rollout_size < 1:
+        raise ValueError("rollout_size must be a positive integer")
+    if (state.policy_a.update_counter != state.generation
+            or state.policy_b.update_counter != state.generation):
+        raise ValueError("dual policy counters disagree with generation")
+    for batch, policy in ((batch_a, state.policy_a), (batch_b, state.policy_b)):
+        if (batch.behavior_identity is None or policy.behavior_identity is None
+                or not _identity_matches(
+                    batch.behavior_identity, policy.behavior_identity)):
+            raise ValueError("dual PPO batch identity does not match its policy")
+
+    audit_a_started = time.perf_counter()
+    audit_a = audit_stage25_ppo_rollout(state.policy_a.params, batch_a, config)
+    audit_a_seconds = time.perf_counter() - audit_a_started
+    audit_b_started = time.perf_counter()
+    audit_b = audit_stage25_ppo_rollout(state.policy_b.params, batch_b, config)
+    audit_b_seconds = time.perf_counter() - audit_b_started
+
+    update_a_started = time.perf_counter()
+    next_a, metrics_a = _ppo_update_after_audit(
+        state.policy_a, batch_a, config, audit=audit_a,
+        audit_seconds=audit_a_seconds)
+    update_a_seconds = time.perf_counter() - update_a_started
+    update_b_started = time.perf_counter()
+    next_b, metrics_b = _ppo_update_after_audit(
+        state.policy_b, batch_b, config, audit=audit_b,
+        audit_seconds=audit_b_seconds)
+    update_b_seconds = time.perf_counter() - update_b_started
+
+    identity_a = state.policy_a.behavior_identity
+    identity_b = state.policy_b.behavior_identity
+    assert identity_a is not None and identity_b is not None
+    _validate_dual_policy_output(state.policy_a, next_a, identity_a)
+    _validate_dual_policy_output(state.policy_b, next_b, identity_b)
+    next_generation = state.generation + 1
+    if (next_a.update_counter != next_generation
+            or next_b.update_counter != next_generation):
+        raise ValueError("dual generation cannot commit mismatched policy counters")
+    next_episode_index = int(state.rollout_progression.get(
+        "next_episode_index", 0)) + rollout_size
+    progression = {
+        **dict(state.rollout_progression),
+        "completed_rollouts": next_generation,
+        "next_episode_index": next_episode_index,
+    }
+    next_a = replace(next_a, rollout_progression=dict(progression))
+    next_b = replace(next_b, rollout_progression=dict(progression))
+    next_state = Stage25DualPPOTrainState(
+        policy_a=next_a, policy_b=next_b, generation=next_generation,
+        rollout_seed=state.rollout_seed + rollout_size,
+        rollout_progression=progression)
+    metrics = {
+        "generation": next_generation,
+        "rows_A": len(batch_a.classes),
+        "rows_B": len(batch_b.classes),
+        "ppo_A": metrics_a,
+        "ppo_B": metrics_b,
+        "audit_A": audit_a,
+        "audit_B": audit_b,
+        "timing": {
+            "audit_A_seconds": audit_a_seconds,
+            "audit_B_seconds": audit_b_seconds,
+            "ppo_A_seconds": update_a_seconds,
+            "ppo_B_seconds": update_b_seconds,
+            "total_ppo_seconds": update_a_seconds + update_b_seconds,
+        },
+    }
+    return next_state, metrics
 
 
 update_stage25_ppo = ppo_update

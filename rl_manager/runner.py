@@ -74,6 +74,7 @@ from rl_manager.trajectory import TrajectoryBuffer, Transition, \
 from rl_manager.types import (
     CANDIDATE_VS_FROZEN,
     CURRENT_VS_CURRENT_ECONOMIC,
+    DUAL_POLICY_SELF_PLAY,
     E_VS_E,
     E_VS_PASS,
     FROZEN_VS_CANDIDATE,
@@ -261,17 +262,19 @@ def build_episode_spec(
     """Resolve a composition into seat policies + trainable ownership.
 
     Seat resolution goes through the single authoritative
-    `rl_manager.types.seat_policies` resolver so the E-vs-E identical-
-    identity guard cannot be bypassed by this entry point.
+    `rl_manager.types.seat_policies` resolver so composition invariants and
+    deterministic dual seat alternation cannot be bypassed by this entry point.
     """
     policies = seat_policies(
-        composition, candidate, frozen, controlled_seat=controlled_seat)
+        composition, candidate, frozen, controlled_seat=controlled_seat,
+        episode_index=episode_index)
     trainable = {
         E_VS_E: (),
         E_VS_PASS: (),
         CANDIDATE_VS_FROZEN: (0,),
         FROZEN_VS_CANDIDATE: (1,),
         CURRENT_VS_CURRENT_ECONOMIC: (0, 1),
+        DUAL_POLICY_SELF_PLAY: (0, 1),
     }[composition]
     return EpisodeSpec(
         episode_index=episode_index, seed=seed, composition=composition,

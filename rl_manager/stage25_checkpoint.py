@@ -51,6 +51,7 @@ STAGE25_CHECKPOINT_VERSION = "stage25_native_checkpoint_v1"
 INFERENCE_PAYLOAD_KIND = "stage25_inference_params_v1"
 BC_TRAINING_PAYLOAD_KIND = "stage25_bc_training_state_v1"
 PPO_TRAINING_PAYLOAD_KIND = "stage25_ppo_training_state_v1"
+DUAL_PPO_TRAINING_PAYLOAD_KIND = "stage25_dual_ppo_training_state_v1"
 ARCHITECTURE_VERSION = STAGE25_POLICY_SCHEMA_VERSION
 OBSERVATION_SCHEMA_VERSION = STAGE25_OBSERVATION_SCHEMA_VERSION
 PERSISTENT_LEDGER_VERSION = "stage25_crop_capacity_ledger_v1"
@@ -59,6 +60,7 @@ BC_TARGET_VERSION = "stage25_outcome_proxy_v2_physical_crop_baseline"
 PHYSICAL_CROP_BASELINE_SEMANTICS = "physical_morning_board_counts"
 RESUME_BOUNDARY = "after_completed_update_before_next_batch"
 PPO_RESUME_BOUNDARY = "after_completed_rollout_update_before_next_rollout"
+DUAL_PPO_RESUME_BOUNDARY = "after_both_policy_updates_before_next_rollout"
 
 OBSERVATION_VOCABULARY = (
     "board_kind", "board_crop", "board_animal", "board_numeric",
@@ -122,7 +124,7 @@ _OWNED_META = _REQUIRED_META | frozenset({
     "update_counter", "rollout_seed", "rollout_progression",
     "behavior_identity", "physical_contract",
     "opponent_identity", "opponent_leaf_count", "opponent_leaf_manifest",
-    "opponent_tree",
+    "opponent_tree", "dual_state",
 })
 
 _PPO_REQUIRED_META = frozenset({
@@ -425,7 +427,8 @@ def _validate_meta(meta: Mapping[str, Any], path: Path, expected_kind: str) -> N
             raise Stage25CheckpointError(
                 f"{path}: invalid source E history version") from exc
     if meta.get("resume_boundary") not in (None, RESUME_BOUNDARY,
-                                            PPO_RESUME_BOUNDARY):
+                                            PPO_RESUME_BOUNDARY,
+                                            DUAL_PPO_RESUME_BOUNDARY):
         raise Stage25CheckpointError(f"{path}: unsupported resume boundary")
     if expected_kind == BC_TRAINING_PAYLOAD_KIND:
         for key in ("step", "epoch", "data_order_position", "optimizer_leaf_count",
@@ -493,6 +496,105 @@ def _validate_meta(meta: Mapping[str, Any], path: Path, expected_kind: str) -> N
                 or opponent_count < 1):
             raise Stage25CheckpointError(
                 f"{path}: PPO opponent_leaf_count must be a positive integer")
+    if expected_kind == DUAL_PPO_TRAINING_PAYLOAD_KIND:
+        dual = meta.get("dual_state")
+        if not isinstance(dual, Mapping):
+            raise Stage25CheckpointError(f"{path}: dual_state must be an object")
+        required_dual = {
+            "generation", "rollout_seed", "rollout_progression",
+            "resume_boundary", "ppo_config", "optimizer_config",
+            "physical_contract", "training_contract", "policies",
+        }
+        missing = sorted(required_dual - set(dual))
+        if missing:
+            raise Stage25CheckpointError(
+                f"{path}: dual checkpoint is missing fields {missing}")
+        if dual.get("resume_boundary") != DUAL_PPO_RESUME_BOUNDARY:
+            raise Stage25CheckpointError(
+                f"{path}: unsupported dual PPO resume boundary "
+                f"{dual.get('resume_boundary')!r}")
+        generation = dual.get("generation")
+        if (isinstance(generation, bool) or not isinstance(generation, int)
+                or generation < 0):
+            raise Stage25CheckpointError(
+                f"{path}: dual generation must be a nonnegative integer")
+        rollout_seed = dual.get("rollout_seed")
+        if (isinstance(rollout_seed, bool)
+                or not isinstance(rollout_seed, int) or rollout_seed < 0):
+            raise Stage25CheckpointError(
+                f"{path}: dual rollout_seed must be a nonnegative integer")
+        progression = dual.get("rollout_progression")
+        if not isinstance(progression, Mapping):
+            raise Stage25CheckpointError(
+                f"{path}: dual rollout_progression must be an object")
+        if progression.get("completed_rollouts") != generation:
+            raise Stage25CheckpointError(
+                f"{path}: dual progression disagrees with generation")
+        next_episode_index = progression.get("next_episode_index")
+        if (isinstance(next_episode_index, bool)
+                or not isinstance(next_episode_index, int)
+                or next_episode_index < 0):
+            raise Stage25CheckpointError(
+                f"{path}: dual next_episode_index is invalid")
+        for name in ("ppo_config", "optimizer_config", "physical_contract",
+                     "training_contract"):
+            if not isinstance(dual.get(name), Mapping):
+                raise Stage25CheckpointError(
+                    f"{path}: dual {name} must be an object")
+        if dual["training_contract"].get(
+                "training_composition") != "dual_policy_self_play":
+            raise Stage25CheckpointError(
+                f"{path}: dual training contract has incompatible composition")
+        if not isinstance(meta.get("executor"), Mapping) or not meta["executor"]:
+            raise Stage25CheckpointError(
+                f"{path}: dual executor provenance is missing")
+        policies = dual.get("policies")
+        if not isinstance(policies, Mapping) or set(policies) != {"a", "b"}:
+            raise Stage25CheckpointError(
+                f"{path}: dual policies must contain exactly a and b")
+        identities = []
+        for name in ("a", "b"):
+            policy = policies[name]
+            if not isinstance(policy, Mapping):
+                raise Stage25CheckpointError(
+                    f"{path}: dual policy {name} metadata must be an object")
+            for key in ("behavior_identity", "parameter_fingerprint",
+                        "parameter_manifest", "optimizer_leaf_count",
+                        "optimizer_leaf_manifest", "optimizer_tree",
+                        "update_counter", "ppo_seed"):
+                if key not in policy:
+                    raise Stage25CheckpointError(
+                        f"{path}: dual policy {name} is missing {key!r}")
+            if not isinstance(policy["behavior_identity"], Mapping):
+                raise Stage25CheckpointError(
+                    f"{path}: dual policy {name} behavior identity must be an object")
+            if policy["parameter_fingerprint"] != policy["behavior_identity"].get(
+                    "parameter_fingerprint"):
+                raise Stage25CheckpointError(
+                    f"{path}: dual policy {name} fingerprint and identity disagree")
+            if not isinstance(policy["parameter_manifest"], Mapping) \
+                    or not isinstance(policy["optimizer_leaf_manifest"], Mapping) \
+                    or not isinstance(policy["optimizer_tree"], str):
+                raise Stage25CheckpointError(
+                    f"{path}: dual policy {name} parameter/optimizer manifest is invalid")
+            count = policy["optimizer_leaf_count"]
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise Stage25CheckpointError(
+                    f"{path}: dual policy {name} optimizer leaf count is invalid")
+            counter = policy["update_counter"]
+            if (isinstance(counter, bool) or not isinstance(counter, int)
+                    or counter < 0 or counter != generation):
+                raise Stage25CheckpointError(
+                    f"{path}: dual policy {name} counter disagrees with generation")
+            if (isinstance(policy["ppo_seed"], bool)
+                    or not isinstance(policy["ppo_seed"], int)
+                    or policy["ppo_seed"] < 0):
+                raise Stage25CheckpointError(
+                    f"{path}: dual policy {name} PPO seed is invalid")
+            identities.append(policy["behavior_identity"])
+        if identities[0] == identities[1]:
+            raise Stage25CheckpointError(
+                f"{path}: dual policy identities must be distinct")
 
 
 def _check_history(meta: Mapping[str, Any], *, expected: str | None,
@@ -1070,6 +1172,252 @@ def load_stage25_ppo_checkpoint(
     return result
 
 
+def save_stage25_dual_ppo_checkpoint(
+    path: str | Path, state: Any, ppo_config: Any, *,
+    seed: int = 0, training_contract: Mapping[str, Any],
+    physical_contract: Mapping[str, Any], executor: Mapping[str, Any],
+    metadata: Mapping[str, Any] | None = None,
+    provenance: Mapping[str, Any] | None = None,
+    source_identity: Mapping[str, Any] | None = None,
+    e_history_version: str = E_HISTORY_CORRECTED_V1,
+    source_history_version: str | None = None,
+) -> Path:
+    """Atomically save both complete PPO learners at a generation boundary."""
+    from rl_manager.stage25_inference import parameter_fingerprint
+    from rl_manager.stage25_ppo import (
+        Stage25DualPPOTrainState, Stage25PPOConfig)
+
+    if not isinstance(state, Stage25DualPPOTrainState):
+        raise TypeError("state must be Stage25DualPPOTrainState")
+    if not isinstance(ppo_config, Stage25PPOConfig):
+        raise TypeError("ppo_config must be Stage25PPOConfig")
+    if (state.policy_a.update_counter != state.generation
+            or state.policy_b.update_counter != state.generation):
+        raise Stage25CheckpointError(
+            "dual policy counters must equal generation before checkpointing")
+    model = ppo_config.model
+    template = init_stage25_params(model, seed=int(seed))
+    arrays: dict[str, np.ndarray] = {}
+    policy_meta: dict[str, Any] = {}
+    for name, policy in (("a", state.policy_a), ("b", state.policy_b)):
+        identity = policy.behavior_identity
+        if identity is None:
+            raise Stage25CheckpointError(
+                f"dual policy {name} is missing its behavior identity")
+        param_flat = validate_array_tree(policy.params, template,
+                                         what=f"policy_{name}_params")
+        fingerprint = parameter_fingerprint(policy.params)
+        if identity.parameter_fingerprint != fingerprint:
+            raise Stage25CheckpointError(
+                f"dual policy {name} identity fingerprint does not match params")
+        for key, value in param_flat.items():
+            arrays[f"{name}:param:{key}"] = value
+        try:
+            optimizer_leaves = jax.tree_util.tree_leaves(policy.optimizer_state)
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            raise Stage25CheckpointError(
+                f"dual policy {name} optimizer state is invalid") from exc
+        optimizer_arrays: dict[str, np.ndarray] = {}
+        for index, leaf in enumerate(optimizer_leaves):
+            value = np.asarray(leaf)
+            if value.dtype.hasobject:
+                raise Stage25CheckpointError(
+                    f"dual policy {name} optimizer leaf {index} has object dtype")
+            key = f"{index:05d}"
+            optimizer_arrays[key] = value
+            arrays[f"{name}:opt:{key}"] = value
+        rng = np.asarray(policy.rng)
+        if rng.shape != (2,) or rng.dtype != np.uint32:
+            raise Stage25CheckpointError(
+                f"dual policy {name} rng must be uint32 [2]")
+        arrays[f"{name}:rng"] = np.array(rng, copy=True)
+        policy_meta[name] = {
+            "behavior_identity": identity.to_json_dict(),
+            "parameter_fingerprint": fingerprint,
+            "parameter_manifest": _leaf_manifest(param_flat),
+            "optimizer_leaf_count": len(optimizer_arrays),
+            "optimizer_leaf_manifest": _leaf_manifest(optimizer_arrays),
+            "optimizer_tree": _tree_signature(policy.optimizer_state),
+            "update_counter": int(policy.update_counter),
+            "ppo_seed": int(policy.rollout_seed),
+        }
+    if state.policy_a.behavior_identity == state.policy_b.behavior_identity:
+        raise Stage25CheckpointError(
+            "dual checkpoint requires distinct policy identities")
+    ppo_payload = _metadata_object(ppo_config, what="PPO configuration")
+    physical_payload = _physical_contract_metadata(physical_contract)
+    training_payload = _metadata_object(
+        training_contract, what="dual training/reward contract")
+    if training_payload.get("training_composition") != "dual_policy_self_play":
+        raise Stage25CheckpointError(
+            "dual checkpoint requires training_composition='dual_policy_self_play'")
+    if not executor:
+        raise Stage25CheckpointError(
+            "dual checkpoint requires executor provenance")
+    meta = _metadata(
+        payload_kind=DUAL_PPO_TRAINING_PAYLOAD_KIND,
+        config=model, seed=int(seed), flat=arrays, metadata=metadata,
+        source_identity=source_identity, provenance=provenance,
+        executor=executor, e_history_version=e_history_version,
+        source_history_version=source_history_version,
+        optimizer_config=ppo_payload)
+    meta["dual_state"] = {
+        "generation": int(state.generation),
+        "rollout_seed": int(state.rollout_seed),
+        "rollout_progression": _jsonable(state.rollout_progression),
+        "resume_boundary": DUAL_PPO_RESUME_BOUNDARY,
+        "ppo_config": ppo_payload,
+        "optimizer_config": ppo_payload,
+        "physical_contract": physical_payload,
+        "training_contract": training_payload,
+        "policies": policy_meta,
+    }
+    return _write_archive(path, arrays, meta)
+
+
+def _dual_identity(payload: Mapping[str, Any], *, path: Path, name: str) -> Any:
+    from rl_manager.stage25_types import Stage25BehaviorIdentity
+
+    fields = (
+        "name", "version", "parameter_fingerprint",
+        "observation_schema_version", "policy_schema_version",
+        "e_history_version", "curriculum_version", "curriculum_fingerprint",
+        "physical_support_version")
+    if not all(field in payload for field in fields):
+        raise Stage25CheckpointError(
+            f"{path}: dual policy {name} identity is incomplete")
+    identity = Stage25BehaviorIdentity(**{
+        field: str(payload[field]) for field in fields})
+    if identity.to_json_dict() != dict(payload):
+        raise Stage25CheckpointError(
+            f"{path}: dual policy {name} identity fingerprint is invalid")
+    return identity
+
+
+def load_stage25_dual_ppo_checkpoint(
+    path: str | Path, *, ppo_config: Any,
+    optimizer_state_template_a: Any, optimizer_state_template_b: Any,
+    expected_training_contract: Mapping[str, Any] | None = None,
+    expected_physical_contract: Mapping[str, Any] | None = None,
+    expected_executor: Mapping[str, Any] | None = None,
+    expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
+    allow_legacy_e: bool = False,
+) -> tuple[Any, dict[str, Any]]:
+    """Load a dual checkpoint; single-policy PPO payloads are rejected explicitly."""
+    from rl_manager.stage25_inference import parameter_fingerprint
+    from rl_manager.stage25_ppo import (
+        Stage25DualPPOTrainState, Stage25PPOConfig,
+        init_stage25_ppo_state)
+
+    if not isinstance(ppo_config, Stage25PPOConfig):
+        raise TypeError("ppo_config must be Stage25PPOConfig")
+    path = Path(path)
+    flat, meta = _read_archive(path)
+    _validate_meta(meta, path, DUAL_PPO_TRAINING_PAYLOAD_KIND)
+    _check_history(meta, expected=expected_e_history_version,
+                   allow_legacy_e=allow_legacy_e, path=path)
+    model = _config_from_json(meta["config"])
+    if ppo_config.model != model:
+        raise Stage25CheckpointError(
+            "dual checkpoint model config is incompatible with requested config")
+    dual = meta["dual_state"]
+    ppo_payload = _metadata_object(ppo_config, what="PPO configuration")
+    if dual["ppo_config"] != ppo_payload or dual["optimizer_config"] != ppo_payload:
+        raise Stage25CheckpointError(
+            "dual checkpoint PPO/optimizer config does not match requested config")
+    if expected_training_contract is not None and _metadata_object(
+            expected_training_contract,
+            what="dual training/reward contract") != dual["training_contract"]:
+        raise Stage25CheckpointError(
+            "dual checkpoint training/reward contract does not match")
+    if expected_physical_contract is not None and _physical_contract_metadata(
+            expected_physical_contract) != dual["physical_contract"]:
+        raise Stage25CheckpointError(
+            "dual checkpoint physical/action contract does not match")
+    if expected_executor is not None and _metadata_object(
+            expected_executor, what="executor provenance") != meta["executor"]:
+        raise Stage25CheckpointError(
+            "dual checkpoint executor provenance does not match")
+    _validate_flat_against_manifest(flat, meta, path)
+    allowed = set()
+    for prefix in ("a", "b"):
+        allowed.update(key for key in flat if key.startswith(f"{prefix}:param:"))
+        allowed.update(key for key in flat if key.startswith(f"{prefix}:opt:"))
+        allowed.add(f"{prefix}:rng")
+    if set(flat) != allowed:
+        raise Stage25CheckpointError(
+            f"{path}: dual archive has unexpected leaves "
+            f"{sorted(set(flat) - allowed)}")
+
+    generation = int(dual["generation"])
+    progression = dict(dual["rollout_progression"])
+    params_template = init_stage25_params(
+        model, seed=int(meta["init_params"]["seed"]))
+    states = []
+    for name, optimizer_template in (
+            ("a", optimizer_state_template_a),
+            ("b", optimizer_state_template_b)):
+        policy_meta = dual["policies"][name]
+        identity = _dual_identity(
+            policy_meta["behavior_identity"], path=path, name=name)
+        param_prefix = f"{name}:param:"
+        param_flat = {key[len(param_prefix):]: value for key, value in flat.items()
+                      if key.startswith(param_prefix)}
+        _validate_flat_against_manifest(
+            param_flat, {"leaf_manifest": policy_meta["parameter_manifest"]}, path)
+        params = _rebuild(params_template, param_flat)
+        fingerprint = parameter_fingerprint(params)
+        if (fingerprint != policy_meta["parameter_fingerprint"]
+                or fingerprint != identity.parameter_fingerprint):
+            raise Stage25CheckpointError(
+                f"{path}: dual policy {name} parameter fingerprint is invalid")
+
+        if _tree_signature(optimizer_template) != policy_meta["optimizer_tree"]:
+            raise Stage25CheckpointError(
+                f"{path}: dual policy {name} optimizer tree is incompatible")
+        expected_optimizer_leaves = jax.tree_util.tree_leaves(optimizer_template)
+        optimizer_prefix = f"{name}:opt:"
+        optimizer_flat = {key[len(optimizer_prefix):]: value
+                          for key, value in flat.items()
+                          if key.startswith(optimizer_prefix)}
+        _validate_flat_against_manifest(
+            optimizer_flat,
+            {"leaf_manifest": policy_meta["optimizer_leaf_manifest"]}, path)
+        if len(expected_optimizer_leaves) != policy_meta["optimizer_leaf_count"] \
+                or set(optimizer_flat) != {
+                    f"{index:05d}" for index in range(len(expected_optimizer_leaves))}:
+            raise Stage25CheckpointError(
+                f"{path}: dual policy {name} optimizer leaf count is incompatible")
+        restored_optimizer = []
+        for index, template_leaf in enumerate(expected_optimizer_leaves):
+            value = optimizer_flat[f"{index:05d}"]
+            expected = np.asarray(template_leaf)
+            if value.shape != expected.shape or value.dtype != expected.dtype:
+                raise Stage25CheckpointError(
+                    f"{path}: dual policy {name} optimizer leaf {index} "
+                    "shape/dtype is incompatible")
+            restored_optimizer.append(jnp.asarray(value))
+        optimizer = jax.tree_util.tree_unflatten(
+            jax.tree_util.tree_structure(optimizer_template), restored_optimizer)
+        rng = flat.get(f"{name}:rng")
+        if rng is None or rng.shape != (2,) or rng.dtype != np.uint32:
+            raise Stage25CheckpointError(
+                f"{path}: dual policy {name} RNG is missing or invalid")
+        ppo_seed = int(policy_meta["ppo_seed"])
+        fresh = init_stage25_ppo_state(
+            ppo_config, seed=ppo_seed, params=params,
+            behavior_identity=identity)
+        states.append(dataclasses.replace(
+            fresh, optimizer_state=optimizer, rng=jnp.asarray(rng),
+            update_counter=generation, rollout_seed=ppo_seed,
+            rollout_progression=dict(progression)))
+    state = Stage25DualPPOTrainState(
+        policy_a=states[0], policy_b=states[1], generation=generation,
+        rollout_seed=int(dual["rollout_seed"]),
+        rollout_progression=progression)
+    return state, dict(meta)
+
+
 def initialize_stage25_ppo_from_checkpoint(
     source: str | Path, config: Stage25ModelConfig | None = None, *,
     seed: int | None = None,
@@ -1368,6 +1716,7 @@ __all__ = [
     "ACTION_ORDER", "ACTION_CLASS_COUNTS", "ARCHITECTURE_VERSION",
     "BC_TARGET_VERSION", "BC_TRAINING_PAYLOAD_KIND", "INFERENCE_PAYLOAD_KIND",
     "PHYSICAL_CROP_BASELINE_SEMANTICS",
+    "DUAL_PPO_RESUME_BOUNDARY", "DUAL_PPO_TRAINING_PAYLOAD_KIND",
     "PPO_RESUME_BOUNDARY", "PPO_TRAINING_PAYLOAD_KIND",
     "OBSERVATION_SCHEMA_VERSION", "OBSERVATION_VOCABULARY",
     "PERSISTENT_LEDGER_VERSION", "PHYSICAL_SUPPORT_VERSION", "RESUME_BOUNDARY",
@@ -1375,6 +1724,7 @@ __all__ = [
     "save_stage25_inference_checkpoint", "load_stage25_inference_checkpoint",
     "save_stage25_bc_checkpoint", "load_stage25_bc_checkpoint",
     "save_stage25_ppo_checkpoint", "load_stage25_ppo_checkpoint",
+    "save_stage25_dual_ppo_checkpoint", "load_stage25_dual_ppo_checkpoint",
     "initialize_stage25_ppo_from_checkpoint", "init_stage25_ppo_from_checkpoint",
     "migrate_stage25_bc_checkpoint_for_ppo",
     "save_inference_checkpoint", "load_inference_checkpoint", "save_bc_checkpoint",
