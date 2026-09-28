@@ -183,6 +183,15 @@ class ClaimBoard:
     carried_reserved: dict[WorkerId, dict[str, int]] = field(default_factory=dict)
     resource_shortfalls: dict[str, int] = field(default_factory=dict)
     claims_considered: int = 0
+    claim_source_by_bundle: dict[str, str] = field(default_factory=dict)
+    claim_type_by_bundle: dict[str, str] = field(default_factory=dict)
+    base_row_candidates: tuple[str, ...] = ()
+    base_assigned_row_ids_by_worker: dict[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
+    primary_import_failures: list[dict[str, Any]] = field(default_factory=list)
+    uncovered_required_bundles_after_primary_import: tuple[str, ...] = ()
+    tail_claims_added_after_primary_import: int = 0
 
     def __post_init__(self) -> None:
         for bundle_id in self.bundles:
@@ -252,6 +261,21 @@ class ClaimBoard:
             self.phase_by_bundle[bundle_id] = ClaimPhase.CLAIMED
         return True
 
+    def record_claim_source(self, bundle_ids: tuple[str, ...], source: str) -> None:
+        """Record scheduler provenance after an authoritative claim commits."""
+        for bundle_id in bundle_ids:
+            if bundle_id in self.owner_by_bundle:
+                self.claim_source_by_bundle[bundle_id] = source
+                bundle = self.bundles[bundle_id]
+                optional = bundle.service_class == ServiceClass.OPTIONAL
+                cleanup = any(item.kind == "DIG" and item.source == "dig_cleanup"
+                              for item in bundle.items)
+                self.claim_type_by_bundle[bundle_id] = (
+                    "OPTIONAL_CLEANUP" if optional and cleanup else
+                    "OPTIONAL" if optional else
+                    "REQUIRED_WITH_OPTIONAL_CLEANUP" if cleanup else "REQUIRED"
+                )
+
     def release(self, bundle_id: str) -> None:
         reservation = self.reservations.pop(bundle_id, None)
         if reservation is not None:
@@ -263,6 +287,8 @@ class ClaimBoard:
             for key, amount in reservation.carried:
                 local[key] = local.get(key, 0) - amount
         self.owner_by_bundle.pop(bundle_id, None)
+        self.claim_source_by_bundle.pop(bundle_id, None)
+        self.claim_type_by_bundle.pop(bundle_id, None)
         self.phase_by_bundle[bundle_id] = ClaimPhase.UNCLAIMED
 
     def confirm_pickup(self, worker: WorkerId, item: str, quantity: int) -> None:
@@ -412,6 +438,16 @@ class ClaimBoard:
         )
 
     def diagnostics(self) -> dict[str, Any]:
+        primary_bundles = sorted(
+            bundle_id for bundle_id, source in self.claim_source_by_bundle.items()
+            if source == "PRIMARY_TETSUYA"
+        )
+        source_counts: dict[str, int] = defaultdict(int)
+        type_counts: dict[str, int] = defaultdict(int)
+        for source in self.claim_source_by_bundle.values():
+            source_counts[source] += 1
+        for claim_type in self.claim_type_by_bundle.values():
+            type_counts[claim_type] += 1
         return {
             "schema_version": 1,
             "epoch_id": self.epoch_id,
@@ -425,6 +461,29 @@ class ClaimBoard:
             "remaining_shed": self.available_shed(),
             "remaining_global": self.available_global(),
             "resource_shortfalls": dict(self.resource_shortfalls),
+            "claim_source_by_bundle": dict(sorted(self.claim_source_by_bundle.items())),
+            "claim_source_counts": dict(sorted(source_counts.items())),
+            "claim_type_counts": dict(sorted(type_counts.items())),
+            "optional_cleanup_bundles": [
+                bundle_id for bundle_id, claim_type
+                in sorted(self.claim_type_by_bundle.items())
+                if claim_type in {"OPTIONAL_CLEANUP", "REQUIRED_WITH_OPTIONAL_CLEANUP"}
+            ],
+            "base_row_candidates": list(self.base_row_candidates),
+            "base_assigned_row_ids_by_worker": {
+                worker: list(row_ids)
+                for worker, row_ids in sorted(
+                    self.base_assigned_row_ids_by_worker.items()
+                )
+            },
+            "primary_bundles_imported": len(primary_bundles),
+            "primary_import_failures": list(self.primary_import_failures),
+            "uncovered_required_bundles_after_primary_import": list(
+                self.uncovered_required_bundles_after_primary_import
+            ),
+            "tail_claims_added_after_primary_import": (
+                self.tail_claims_added_after_primary_import
+            ),
         }
 
 

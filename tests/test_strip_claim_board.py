@@ -10,7 +10,10 @@ from executor_v0.strip_claim_scheduler import (
 )
 from executor_v0.strip_executor import StripExecutorConfig, StripExecutorController
 from executor_v0.plan import DailyPlan
-from executor_v0.strip_routes import WorkerId, route_cursor_invariants_hold
+from executor_v0.strip_routes import (
+    WorkerId, assign_horizontal_routes, generate_horizontal_route_candidates,
+    remaining_day_action_slots, route_cursor_invariants_hold,
+)
 from executor_v0.strip_work import (
     RowSummary, StripWorkPlan, SupplyRequirement, SupplySnapshot,
     WorkDiagnostics, WorkItem, row_key_for_tile,
@@ -49,6 +52,114 @@ def test_primary_is_full_horizontal_row_and_coverage_appends():
     )
     assert len(route.segments) == 2
     assert len(claim_board.owner_by_bundle) == 2
+    assert set(claim_board.claim_source_by_bundle.values()) == {"PRIMARY_TETSUYA"}
+
+
+def test_primary_tetsuya_preserves_exact_small_packing_and_multirow_order():
+    work = plan(item("WATER", (0, 0)), item("WATER", (2, 0)))
+    positions = {WorkerId(0): (0, 0)}
+    candidates = generate_horizontal_route_candidates(work)
+    base = assign_horizontal_routes(
+        candidates, positions, assignment_hour=0,
+        remaining_action_slots=24,
+        worker_action_slots={WorkerId(0): 24},
+        worker_inventories={}, shed_stock={}, global_resources={},
+    )
+    claim_board = build_claim_board(work, {}, {}, {}, epoch_id="test")
+    result = schedule_claim_board(claim_board, work, positions, 24, 0)
+
+    assert len(base.routes[0].segments) == 2
+    route = next(route for route in result.assignment.routes
+                 if route.owner == WorkerId(0))
+    assert [segment.segment_id for segment in route.segments[:2]] == [
+        segment.segment_id for segment in base.routes[0].segments
+    ]
+    assert [segment.traversal for segment in route.segments[:2]] == [
+        segment.traversal for segment in base.routes[0].segments
+    ]
+    assert claim_board.diagnostics()["base_row_candidates"] == [
+        candidate.route_id for candidate in candidates
+    ]
+    assert claim_board.diagnostics()["base_assigned_row_ids_by_worker"]["FARMER"] == [
+        segment.physical_row_id for segment in base.routes[0].segments
+    ]
+
+
+def test_primary_tetsuya_preserves_allocator_orientation():
+    work = plan(*(item("WATER", (0, x)) for x in range(5)))
+    positions = {WorkerId(0): (0, 9)}
+    base = assign_horizontal_routes(
+        generate_horizontal_route_candidates(work), positions,
+        assignment_hour=0, remaining_action_slots=24,
+        worker_action_slots={WorkerId(0): 24},
+        worker_inventories={}, shed_stock={}, global_resources={},
+    )
+    claim_board = build_claim_board(work, {}, {}, {}, epoch_id="test")
+    result = schedule_claim_board(claim_board, work, positions, 24, 0)
+    actual = next(route for route in result.assignment.routes
+                  if route.owner == WorkerId(0))
+
+    assert base.routes[0].segments[0].traversal == tuple(
+        (0, x) for x in range(4, -1, -1)
+    )
+    assert actual.segments[0].traversal == base.routes[0].segments[0].traversal
+
+
+def test_primary_import_conflict_reserves_resource_once_and_leaves_work_uncovered():
+    seed = (SupplyRequirement("WHEAT", 1, "global_seed"),)
+    work = plan(
+        item("WATER", (0, 0)),
+        item("UNROUTED", (0, 0), key="SEED:0", requirements=seed),
+        item("WATER", (2, 0)),
+        item("UNROUTED", (2, 0), key="SEED:2", requirements=seed),
+    )
+    worker = WorkerId(0)
+    positions = {worker: (0, 0)}
+    claim_board = build_claim_board(work, {worker: {}}, {}, {"WHEAT": 1},
+                                   epoch_id="test")
+    result = schedule_claim_board(claim_board, work, positions, 24, 0)
+
+    reserved = [reservation for reservation in claim_board.reservations.values()
+                if dict(reservation.global_resources).get("WHEAT", 0)]
+    assert len(reserved) == 1
+    assert sum(dict(value.global_resources).get("WHEAT", 0)
+               for value in claim_board.reservations.values()) == 1
+    assert len(claim_board.diagnostics()["base_assigned_row_ids_by_worker"]["FARMER"]) == 2
+    assert any(failure["reason"] == "RESOURCE_LEDGER_CONFLICT"
+               for failure in claim_board.diagnostics()["primary_import_failures"])
+    assert claim_board.diagnostics()["uncovered_required_bundles_after_primary_import"]
+    assert "TILE:2,0" in claim_board.diagnostics()["uncovered_required"]
+    assert result.assignment.routes
+
+
+def test_required_tail_appends_after_imported_base_assignment(monkeypatch):
+    work = plan(item("WATER", (0, 0)), item("WATER", (2, 0)))
+    positions = {WorkerId(0): (0, 0)}
+    normal_assign = assign_horizontal_routes
+
+    def leave_second_candidate_for_tail(candidates, *args, **kwargs):
+        candidates = tuple(candidates)
+        return normal_assign(
+            tuple(candidate for candidate in candidates
+                  if candidate.row_key.global_row == 0),
+            *args, **kwargs,
+        )
+
+    monkeypatch.setattr(
+        "executor_v0.strip_claim_scheduler.assign_horizontal_routes",
+        leave_second_candidate_for_tail,
+    )
+    claim_board = build_claim_board(work, {}, {}, {}, epoch_id="test")
+    result = schedule_claim_board(claim_board, work, positions, 24, 0)
+    route = result.assignment.routes[0]
+
+    assert claim_board.claim_source_by_bundle == {
+        "TILE:0,0": "PRIMARY_TETSUYA",
+        "TILE:2,0": "REQUIRED_TAIL",
+    }
+    assert len(route.segments) == 2
+    assert ":REQUIRED_TAIL:" in route.segments[1].segment_id
+    assert claim_board.tail_claims_added_after_primary_import == 1
 
 
 def test_harvest_continuation_and_seed_once():
@@ -98,7 +209,18 @@ def test_repeatable_schedule_and_no_duplicate_owners():
     assert [route.to_json_dict() for route in first.assignment.routes] == [
         route.to_json_dict() for route in second.assignment.routes
     ]
-    assert len(first_board.owner_by_bundle) == len(set(first_board.owner_by_bundle))
+    assert first_board.diagnostics() == second_board.diagnostics()
+    route_owner_by_bundle = {}
+    for route in first.assignment.routes:
+        for tile in route.traversal:
+            bundle_id = f"TILE:{tile[0]},{tile[1]}"
+            if first_board.owner_by_bundle.get(bundle_id) == route.owner:
+                assert bundle_id not in route_owner_by_bundle
+                route_owner_by_bundle[bundle_id] = route.owner
+    assert route_owner_by_bundle == first_board.owner_by_bundle
+    assert set(first_board.reservations) == set(first_board.owner_by_bundle)
+    assert all(first_board.reservations[bundle_id].worker == owner
+               for bundle_id, owner in first_board.owner_by_bundle.items())
 
 
 def test_enabled_controller_executes_claimed_route_without_hiring():
@@ -137,6 +259,37 @@ def test_enabled_controller_executes_claimed_route_without_hiring():
     assert result.diagnostics["submitted_hires"] == 0
 
 
+def test_feature_off_keeps_base_route_assignment_behavior():
+    from tests.test_executor_v0_idle_cleanup import empty_plan, make_obs
+
+    work = plan(item("WATER", (0, 0)), item("WATER", (2, 0)))
+    obs = make_obs(hour=0, farmer=(0, 9), unlocked=("NW",))
+    controller = StripExecutorController(
+        config=StripExecutorConfig(enable_row_claim_board=False),
+        work_builder=lambda _obs, _daily, **_kwargs: work,
+    )
+    positions = controller._worker_positions(obs)
+    inventories = {
+        worker: controller._worker_inventory(obs, worker) for worker in positions
+    }
+    slots = remaining_day_action_slots(obs)
+    expected = assign_horizontal_routes(
+        generate_horizontal_route_candidates(work), positions,
+        assignment_hour=0, remaining_action_slots=slots,
+        worker_action_slots={worker: slots for worker in positions},
+        worker_inventories=inventories,
+        shed_stock=obs["private"]["shed"],
+        global_resources=obs["private"]["seeds"],
+    )
+
+    controller._finalize_day(obs, empty_plan(), work)
+
+    assert controller._claim_board is None
+    assert [route.to_json_dict() for route in controller._assignment.routes] == [
+        route.to_json_dict() for route in expected.routes
+    ]
+
+
 def test_optional_on_primary_row_uses_existing_segment():
     work = plan(item("WATER", (0, 0)),
                 item("DIG", (0, 1), source="dig_cleanup"))
@@ -145,17 +298,38 @@ def test_optional_on_primary_row_uses_existing_segment():
     assert len(route.segments) == 1
     assert claim_board.owner_by_bundle["TILE:0,1"] == WorkerId(0)
     assert route.segments[0].represented_interactions == 2
+    assert claim_board.claim_source_by_bundle["TILE:0,1"] == "PRIMARY_TETSUYA"
+    assert claim_board.claim_type_by_bundle["TILE:0,1"] == "OPTIONAL_CLEANUP"
+    assert claim_board.diagnostics()["optional_cleanup_bundles"] == ["TILE:0,1"]
 
 
-def test_busy_row_can_have_three_disjoint_tail_owners():
+def test_primary_dense_row_matches_tetsuya_assignment():
     work = plan(*(item("CARE", (0, x), key=f"CARE:{x}:{n}")
                   for x in range(3) for n in range(8)))
     positions = {WorkerId(index): (index, 0) for index in range(3)}
+    base = assign_horizontal_routes(
+        generate_horizontal_route_candidates(work), positions,
+        assignment_hour=0, remaining_action_slots=12,
+        worker_action_slots={worker: 12 for worker in positions},
+        worker_inventories={}, shed_stock={}, global_resources={},
+    )
     claim_board = build_claim_board(work, {}, {}, {}, epoch_id="test")
     result = schedule_claim_board(claim_board, work, positions, 12, 0)
-    assert len(set(claim_board.owner_by_bundle.values())) == 3
-    assert all(len(segment.traversal) == 1
-               for route in result.assignment.routes for segment in route.segments)
+
+    assert [route.owner for route in result.assignment.routes] == [
+        route.owner for route in base.routes
+    ]
+    assert [
+        [segment.to_json_dict() for segment in route.segments]
+        for route in result.assignment.routes
+    ] == [
+        [segment.to_json_dict() for segment in route.segments]
+        for route in base.routes
+    ]
+    assert set(claim_board.owner_by_bundle.values()) == {
+        route.owner for route in base.routes
+    }
+    assert set(claim_board.claim_source_by_bundle.values()) == {"PRIMARY_TETSUYA"}
 
 
 def test_nearby_dense_fragment_beats_farther_higher_value():
@@ -182,20 +356,25 @@ def test_row_fragment_traverses_empty_tile_between_required_bundles():
     assert segment.traversal == fragment.traversal
 
 
-def test_weed_does_not_displace_required_work_with_no_slack():
+def test_primary_assignment_claims_required_and_cleanup_bundles_together():
     work = plan(item("WATER", (0, 1)), item("DIG", (0, 0),
                                             source="dig_cleanup"))
     claim_board = build_claim_board(work, {}, {}, {}, epoch_id="test")
     schedule_claim_board(claim_board, work, {WorkerId(0): (0, 0)}, 2, 0)
     assert claim_board.owner_by_bundle.get("TILE:0,1") == WorkerId(0)
-    assert "TILE:0,0" not in claim_board.owner_by_bundle
+    assert claim_board.owner_by_bundle.get("TILE:0,0") == WorkerId(0)
+    assert claim_board.claim_type_by_bundle["TILE:0,0"] == "OPTIONAL_CLEANUP"
 
 
-def test_distant_weed_does_not_trigger_dedicated_route():
+def test_distant_cleanup_keeps_the_base_horizontal_row_shape():
     work = plan(item("DIG", (9, 9), source="dig_cleanup"))
     claim_board, result = board(work, {WorkerId(0): (0, 0)})
-    assert result.assignment.routes == ()
-    assert claim_board.owner_by_bundle == {}
+    assert len(result.assignment.routes) == 1
+    segment = result.assignment.routes[0].segments[0]
+    assert segment.traversal == tuple((9, x) for x in range(5, 10))
+    assert claim_board.owner_by_bundle == {"TILE:9,9": WorkerId(0)}
+    assert claim_board.claim_source_by_bundle["TILE:9,9"] == "PRIMARY_TETSUYA"
+    assert claim_board.claim_type_by_bundle["TILE:9,9"] == "OPTIONAL_CLEANUP"
 
 
 def test_runtime_optional_claim_when_required_resource_is_unavailable():
@@ -211,15 +390,16 @@ def test_runtime_optional_claim_when_required_resource_is_unavailable():
     assert "TILE:2,0" not in claim_board.owner_by_bundle
 
 
-def test_explicit_liquidation_mode_skips_future_optional_water():
+def test_explicit_mode_preserves_base_assignment_of_optional_work():
     work = plan(item("WATER", (0, 0), source="water_optional_spare"))
     claim_board = build_claim_board(work, {}, {}, {}, epoch_id="test")
     result = schedule_claim_board(
         claim_board, work, {WorkerId(0): (0, 0)}, 20, 0,
         mode=SchedulerMode.LIQUIDATION,
     )
-    assert result.assignment.routes == ()
-    assert claim_board.owner_by_bundle == {}
+    assert len(result.assignment.routes) == 1
+    assert claim_board.owner_by_bundle == {"TILE:0,0": WorkerId(0)}
+    assert claim_board.claim_source_by_bundle["TILE:0,0"] == "PRIMARY_TETSUYA"
 
 
 def test_runtime_refill_appends_new_observed_work():
@@ -234,6 +414,7 @@ def test_runtime_refill_appends_new_observed_work():
     assert segment is not None
     assert segment.traversal == ((1, 0),)
     assert claim_board.owner_by_bundle["TILE:1,0"] == WorkerId(0)
+    assert claim_board.claim_source_by_bundle["TILE:1,0"] == "RUNTIME_REFILL"
 
 
 def test_confirmed_pickup_stays_worker_local_without_reserving_shed_twice():
@@ -446,15 +627,26 @@ def test_legitimate_pass_at_center_staging_is_recorded():
     assert reason["scheduler_miss"] is False
 
 
-def test_enabled_path_skips_legacy_hiring_and_subset_packer(monkeypatch):
+def test_enabled_path_reuses_base_row_allocator(monkeypatch):
     from tests.test_executor_v0_idle_cleanup import empty_plan, make_obs
 
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("legacy global route/hiring search was called")
+    base_assign = assign_horizontal_routes
+    calls = []
 
-    monkeypatch.setattr("executor_v0.strip_executor.plan_strip_hiring", forbidden)
-    monkeypatch.setattr("executor_v0.strip_executor.assign_horizontal_routes", forbidden)
-    monkeypatch.setattr("executor_v0.strip_routes._pack_small_route_sets", forbidden)
+    def tracked_assignment(candidates, *args, **kwargs):
+        candidates = tuple(candidates)
+        result = base_assign(candidates, *args, **kwargs)
+        calls.append((candidates, result))
+        return result
+
+    def forbidden_hiring(*_args, **_kwargs):
+        raise AssertionError("claim mode must use its unchanged claim-hiring path")
+
+    monkeypatch.setattr("executor_v0.strip_executor.plan_strip_hiring", forbidden_hiring)
+    monkeypatch.setattr(
+        "executor_v0.strip_claim_scheduler.assign_horizontal_routes",
+        tracked_assignment,
+    )
     controller = StripExecutorController(
         config=StripExecutorConfig(enable_row_claim_board=True),
         work_builder=lambda _obs, _daily, **_kwargs: plan(item("WATER", (0, 0))),
@@ -462,6 +654,9 @@ def test_enabled_path_skips_legacy_hiring_and_subset_packer(monkeypatch):
     result = controller.act(make_obs(hour=1, farmer=(0, 0),
                                      unlocked=("NW",)), empty_plan())
     assert result.farmer_action == ("WATER",)
+    assert len(calls) == 1
+    assert calls[0][0][0].source_shape == "horizontal_quadrant_row"
+    assert result.diagnostics["row_claim_board"]["primary_bundles_imported"] == 1
 
 
 def test_resource_blocked_required_row_gives_stable_positioning_target():

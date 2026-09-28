@@ -1,4 +1,4 @@
-"""Bounded three-pass horizontal-row scheduler over one shared claim board."""
+"""Tetsuya row assignment with bounded claim-board tail and cleanup passes."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ from time import perf_counter
 from typing import Mapping
 
 from executor_v0.strip_claim_board import (
-    ClaimBoard, RowFragment, SchedulerMode, ServiceClass, UncoveredRequiredWork,
+    ClaimBoard, ClaimPhase, RowFragment, SchedulerMode, ServiceClass,
+    UncoveredRequiredWork,
 )
 from executor_v0.strip_cost import (
     AppendCostEstimate, AppendCostState, estimate_append_cost,
@@ -15,6 +16,7 @@ from executor_v0.strip_cost import (
 )
 from executor_v0.strip_routes import (
     RouteAssignment, RoutePhase, RouteSegment, StripRoute, WorkerId,
+    assign_horizontal_routes, generate_horizontal_route_candidates,
 )
 from executor_v0.strip_work import StripWorkPlan
 
@@ -27,6 +29,7 @@ class WorkerPlanningState:
     segments: list[RouteSegment] = field(default_factory=list)
     claimed_bundle_ids: list[str] = field(default_factory=list)
     optional_on_route: list[str] = field(default_factory=list)
+    primary_segments: int = 0
 
 
 @dataclass(frozen=True)
@@ -93,7 +96,7 @@ def _candidate(board: ClaimBoard, worker: WorkerPlanningState,
 
 def _commit(board: ClaimBoard, worker: WorkerPlanningState,
             fragment: RowFragment, traversal: tuple[tuple[int, int], ...],
-            candidate) -> None:
+            candidate, *, claim_source: str | None = None) -> None:
     reservation, segment_id, cost, estimate = candidate
     if not board.claim(reservation):
         raise AssertionError("claim changed between trial and commit")
@@ -112,6 +115,11 @@ def _commit(board: ClaimBoard, worker: WorkerPlanningState,
     ))
     worker.prefix = estimate.next_state
     worker.claimed_bundle_ids.extend(fragment.bundle_ids)
+    board.record_claim_source(
+        fragment.bundle_ids,
+        claim_source or ("REQUIRED_TAIL" if fragment.role == "REQUIRED_TAIL"
+                         else "OPTIONAL_CLEANUP"),
+    )
 
 
 def _refresh_segment(board: ClaimBoard, state: WorkerPlanningState,
@@ -241,6 +249,7 @@ def _optional_pass(board: ClaimBoard, states: dict[WorkerId, WorkerPlanningState
         if on_route is not None:
             reservation = board.trial(on_route.worker, (bundle_id,))
             assert reservation is not None and board.claim(reservation)
+            board.record_claim_source((bundle_id,), _optional_claim_source(bundle))
             on_route.claimed_bundle_ids.append(bundle_id)
             on_route.optional_on_route.append(bundle_id)
             on_route.prefix = replace(
@@ -271,7 +280,178 @@ def _optional_pass(board: ClaimBoard, states: dict[WorkerId, WorkerPlanningState
                                 state, candidate))
         if choices:
             _, _, _, state, candidate = min(choices, key=lambda value: value[:3])
-            _commit(board, state, fragment, fragment.traversal, candidate)
+            _commit(board, state, fragment, fragment.traversal, candidate,
+                    claim_source=_optional_claim_source(bundle))
+
+
+def _optional_claim_source(bundle) -> str:
+    return ("OPTIONAL_CLEANUP" if any(
+        item.kind == "DIG" and item.source == "dig_cleanup" for item in bundle.items
+    ) else "OPTIONAL_COVERAGE")
+
+
+def _primary_bundle_ids(board: ClaimBoard, segment: RouteSegment) -> tuple[str, ...]:
+    ids = []
+    for tile in segment.traversal:
+        bundle_id = f"TILE:{tile[0]},{tile[1]}"
+        if bundle_id in board.bundles:
+            ids.append(bundle_id)
+    return tuple(ids)
+
+
+def _primary_import_failure_reason(
+    board: ClaimBoard, bundle_ids: tuple[str, ...],
+) -> str:
+    if any(board.phase_by_bundle.get(bundle_id) != ClaimPhase.UNCLAIMED
+           for bundle_id in bundle_ids):
+        return "OWNERSHIP_CONFLICT"
+    if any(not board.bundles[bundle_id].claimable for bundle_id in bundle_ids):
+        return "UNCLAIMABLE_BUNDLE"
+    return "RESOURCE_LEDGER_CONFLICT"
+
+
+def _primary_partial_segment(
+    board: ClaimBoard,
+    state: WorkerPlanningState,
+    original: RouteSegment,
+    bundle_ids: tuple[str, ...],
+    index: int,
+    work_plan: StripWorkPlan,
+) -> RouteSegment:
+    traversal = _span_traversal(tuple(board.bundles[b].tile for b in bundle_ids))
+    row = board.bundles[bundle_ids[0]].row_key
+    fragment = RowFragment(row, bundle_ids, traversal, "PRIMARY_TETSUYA")
+    segment_id, cost = _fragment_segment(board, fragment, traversal,
+                                         work_plan, index)
+    distance = _distance(state.prefix.position, traversal[0])
+    return RouteSegment(
+        segment_id, traversal, traversal[0], distance,
+        source_shape=original.source_shape,
+        physical_row_id=original.physical_row_id,
+        represented_interactions=sum(
+            work.represented_turns for tile in cost.work_by_tile for work in tile
+        ),
+        known_continuation_interactions=sum(
+            work.continuation_turns for tile in cost.work_by_tile for work in tile
+        ),
+        forecast_tile_interactions=tuple(
+            sum(work.effective_turns for work in tile) for tile in cost.work_by_tile
+        ),
+        cost_segment=cost,
+    )
+
+
+def _append_primary_segment(
+    board: ClaimBoard,
+    state: WorkerPlanningState,
+    segment: RouteSegment,
+    bundle_ids: tuple[str, ...],
+    work_plan: StripWorkPlan,
+) -> None:
+    cost = segment.cost_segment
+    if cost is None:
+        fragment = RowFragment(
+            board.bundles[bundle_ids[0]].row_key,
+            bundle_ids, segment.traversal, "PRIMARY_TETSUYA",
+        )
+        _, cost = _fragment_segment(
+            board, fragment, segment.traversal, work_plan,
+            len(state.segments),
+        )
+        segment = replace(segment, cost_segment=cost)
+    estimate = estimate_append_cost(state.prefix, cost)
+    state.segments.append(segment)
+    state.claimed_bundle_ids.extend(bundle_ids)
+    state.primary_segments += 1
+    state.prefix = estimate.next_state
+
+
+def _import_primary_assignment(
+    board: ClaimBoard,
+    work_plan: StripWorkPlan,
+    states: dict[WorkerId, WorkerPlanningState],
+    positions: Mapping[WorkerId, tuple[int, int]],
+    slots: int,
+    assignment_hour: int,
+) -> None:
+    candidates = generate_horizontal_route_candidates(work_plan)
+    board.base_row_candidates = tuple(candidate.route_id for candidate in candidates)
+    base = assign_horizontal_routes(
+        candidates,
+        positions,
+        assignment_hour=assignment_hour,
+        remaining_action_slots=slots,
+        worker_action_slots={worker: slots for worker in positions},
+        worker_inventories=board.worker_carried,
+        shed_stock=board.observed_shed,
+        global_resources=board.observed_global,
+    )
+    base_routes_by_worker = {route.owner: route for route in base.routes}
+    board.base_assigned_row_ids_by_worker = {
+        worker.label: tuple(
+            segment.physical_row_id or segment.segment_id
+            for segment in base_routes_by_worker[worker].segments
+        )
+        if worker in base_routes_by_worker else ()
+        for worker in sorted(positions)
+    }
+    for route in base.routes:
+        state = states[route.owner]
+        for original in route.segments:
+            bundle_ids = _primary_bundle_ids(board, original)
+            if not bundle_ids:
+                continue
+            reservation = board.trial(route.owner, bundle_ids)
+            imported: list[str] = []
+            failed: list[str] = []
+            if reservation is not None and board.claim(reservation):
+                imported.extend(bundle_ids)
+            else:
+                for bundle_id in bundle_ids:
+                    single = board.trial(route.owner, (bundle_id,))
+                    if single is not None and board.claim(single):
+                        imported.append(bundle_id)
+                    else:
+                        failed.append(bundle_id)
+                if failed:
+                    board.primary_import_failures.append({
+                        "worker": route.owner.label,
+                        "row_id": original.physical_row_id or original.segment_id,
+                        "segment_id": original.segment_id,
+                        "reason": _primary_import_failure_reason(
+                            board, tuple(failed)
+                        ),
+                        "bundle_ids": failed,
+                        "imported_bundle_ids": list(imported),
+                    })
+            if not imported:
+                continue
+            imported_ids = tuple(imported)
+            board.record_claim_source(imported_ids, "PRIMARY_TETSUYA")
+            if len(imported_ids) == len(bundle_ids):
+                _append_primary_segment(board, state, original, imported_ids,
+                                        work_plan)
+                continue
+            run: list[str] = []
+            part_index = 0
+            imported_set = set(imported_ids)
+            for bundle_id in bundle_ids:
+                if bundle_id in imported_set:
+                    run.append(bundle_id)
+                    continue
+                if run:
+                    part = _primary_partial_segment(
+                        board, state, original, tuple(run), part_index, work_plan
+                    )
+                    _append_primary_segment(board, state, part, tuple(run),
+                                            work_plan)
+                    run.clear()
+                    part_index += 1
+            if run:
+                part = _primary_partial_segment(
+                    board, state, original, tuple(run), part_index, work_plan
+                )
+                _append_primary_segment(board, state, part, tuple(run), work_plan)
 
 
 def _routes(states: Mapping[WorkerId, WorkerPlanningState], assignment_hour: int,
@@ -326,10 +506,10 @@ def _routes(states: Mapping[WorkerId, WorkerPlanningState], assignment_hour: int
         routes.append(route)
     return RouteAssignment(tuple(routes), (),
                            tuple(worker for worker in states
-                                 if worker not in {route.owner for route in routes}),
-                           primary_rows_assigned=sum(bool(state.segments and
-                                                          ":PRIMARY:" in state.segments[0].segment_id)
-                                                     for state in states.values()),
+                                  if worker not in {route.owner for route in routes}),
+                           primary_rows_assigned=sum(
+                               state.primary_segments for state in states.values()
+                           ),
                            overflow_rows_assigned=sum(max(0, len(state.segments) - 1)
                                                       for state in states.values()))
 
@@ -345,58 +525,18 @@ def schedule_claim_board(board: ClaimBoard, work_plan: StripWorkPlan,
                         tuple(sorted(board.worker_carried.get(worker, {}).items()))),
     ) for worker, position in sorted(positions.items())}
     built = perf_counter()
-    rows = []
-    for row in sorted(board.rows):
-        ids = tuple(bundle_id for bundle_id in board.rows[row].bundle_ids_by_tile
-                    if bundle_id and board.bundles[bundle_id].claimable
-                    and board.bundles[bundle_id].service_class != ServiceClass.OPTIONAL)
-        if ids:
-            rows.append((row, ids))
-    def row_order(pair):
-        row, ids = pair
-        full = board.rows[row].tiles
-        fragment = RowFragment(row, ids, full, "PRIMARY")
-        best_density = 0.0
-        for state in states.values():
-            for traversal in (full, full[::-1]):
-                candidate = _candidate(board, state, fragment, traversal,
-                                       work_plan, 0)
-                if candidate is not None:
-                    estimate = candidate[3]
-                    best_density = max(
-                        best_density,
-                        estimate.completed_interactions
-                        / max(1, estimate.incremental_turns),
-                    )
-        return (
-            0 if any(board.bundles[b].service_class == ServiceClass.HARD_REQUIRED
-                     for b in ids) else 1,
-            min(board.bundles[b].source_rank for b in ids),
-            -best_density,
-            -sum(board.bundles[b].effective_interactions for b in ids), row,
-        )
-    rows.sort(key=row_order)
-    unused = set(states)
-    for row, ids in rows:
-        choices = []
-        full = board.rows[row].tiles
-        fragment = RowFragment(row, ids, full, "PRIMARY")
-        for worker in sorted(unused):
-            for traversal in (full, full[::-1]):
-                candidate = _candidate(board, states[worker], fragment, traversal,
-                                       work_plan, 0)
-                if candidate is not None:
-                    estimate = candidate[3]
-                    choices.append((_score(estimate, worker, traversal), worker,
-                                    traversal, candidate))
-        if choices:
-            _, worker, traversal, candidate = min(choices, key=lambda value: value[0])
-            _commit(board, states[worker], fragment, traversal, candidate)
-            unused.remove(worker)
-        if not unused:
-            break
+    _import_primary_assignment(board, work_plan, states, positions, slots,
+                               assignment_hour)
     first = perf_counter()
+    board.uncovered_required_bundles_after_primary_import = tuple(
+        bundle_id for fragment in board.required_fragments()
+        for bundle_id in fragment.bundle_ids
+    )
     _required_pass(board, states, work_plan)
+    board.tail_claims_added_after_primary_import = sum(
+        source == "REQUIRED_TAIL"
+        for source in board.claim_source_by_bundle.values()
+    )
     second = perf_counter()
     _optional_pass(board, states, work_plan, mode)
     third = perf_counter()
@@ -676,5 +816,13 @@ def claim_runtime_fragment(board: ClaimBoard, work_plan: StripWorkPlan,
     if not choices:
         return None
     _, fragment, traversal, candidate = min(choices, key=lambda value: value[0])
-    _commit(board, state, fragment, traversal, candidate)
+    bundle = board.bundles[fragment.bundle_ids[0]]
+    source = (
+        "RUNTIME_REFILL" if fragment.role == "REQUIRED_TAIL"
+        else "RUNTIME_REFILL_OPTIONAL_CLEANUP"
+        if any(item.kind == "DIG" and item.source == "dig_cleanup"
+               for item in bundle.items)
+        else "RUNTIME_REFILL_OPTIONAL"
+    )
+    _commit(board, state, fragment, traversal, candidate, claim_source=source)
     return state.segments[0]

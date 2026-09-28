@@ -560,6 +560,7 @@ class StripExecutorController:
             if not board.claim(reservation):
                 stop_reason = "RESOURCE_RESERVATION_MISMATCH"
                 break
+            board.record_claim_source(bundle_ids, "HIRE_RESERVATION")
 
             record = _ClaimHireRecord(worker, spawn, coverage, route)
             planned.append(record)
