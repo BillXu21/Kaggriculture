@@ -83,6 +83,8 @@ __all__ = [
 
 
 _LOCAL_PRIORITY = LOCAL_ACTION_PRIORITY
+# Keep one claim-planning pass bounded even when the runtime order cap is raised.
+_MAX_CLAIM_HIRES_PER_BOOTSTRAP_PASS = 10
 
 
 @dataclass(frozen=True)
@@ -509,7 +511,12 @@ class StripExecutorController:
         considered = 0
         stop_reason = "NO_REQUIRED_LEFTOVERS"
 
-        limit = min(remaining_headcount, order_cap, len(snapshot.bundle_views))
+        limit = min(
+            remaining_headcount,
+            order_cap,
+            len(snapshot.bundle_views),
+            _MAX_CLAIM_HIRES_PER_BOOTSTRAP_PASS,
+        )
         if snapshot.fragments:
             stop_reason = "NO_MEANINGFUL_REQUIRED_COVERAGE"
         for hire_index in range(limit):
@@ -584,6 +591,9 @@ class StripExecutorController:
             stop_reason = "ORDER_CAP"
         elif snapshot.fragments and len(planned) >= remaining_headcount:
             stop_reason = "WORKER_LIMIT"
+        elif (snapshot.fragments
+              and len(planned) >= _MAX_CLAIM_HIRES_PER_BOOTSTRAP_PASS):
+            stop_reason = "HYPOTHETICAL_HIRE_BATCH_CAP"
 
         self._pending_claim_hires = tuple(planned)
         planned_workers = [
@@ -602,7 +612,7 @@ class StripExecutorController:
             for record in planned
         ]
         self._claim_hiring_diagnostics = {
-            "schema_version": 1,
+            "schema_version": 2,
             "existing_workers": int(previous_diagnostics.get(
                 "existing_workers", current_worker_count
             )),
@@ -616,6 +626,10 @@ class StripExecutorController:
             )),
             "cash_after_planned_hiring": remaining_cash,
             "future_action_slots": slots,
+            "hypothetical_hire_batch_cap": (
+                _MAX_CLAIM_HIRES_PER_BOOTSTRAP_PASS
+            ),
+            "hypothetical_hire_batch_limit": limit,
             "required_interactions_reserved": previous_reserved + sum(
                 record.coverage.effective_interactions for record in planned
             ),
