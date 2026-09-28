@@ -13,9 +13,13 @@ from typing import Any
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "ACTION_TENSOR_SHAPES": ("rl_manager.decode", "ACTION_TENSOR_SHAPES"),
+    "CHAMPION_REGISTRY_SCHEMA_VERSION": (
+        "rl_manager.stage25_champion", "CHAMPION_REGISTRY_SCHEMA_VERSION"),
     "ARTIFACT_METADATA_SCHEMA_VERSION": (
         "rl_manager.runner", "ARTIFACT_METADATA_SCHEMA_VERSION"),
     "BatchedPlanPolicy": ("rl_manager.types", "BatchedPlanPolicy"),
+    "ChampionRegistryError": (
+        "rl_manager.stage25_champion", "ChampionRegistryError"),
     "CANDIDATE_VS_FROZEN": ("rl_manager.types", "CANDIDATE_VS_FROZEN"),
     "DEBUG_TRACE_SCHEMA_VERSION": (
         "rl_manager.debug_trace", "DEBUG_TRACE_SCHEMA_VERSION"),
@@ -44,6 +48,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "EpisodeSpec": ("rl_manager.runner", "EpisodeSpec"),
     "PromotionConfig": ("rl_manager.evaluation", "PromotionConfig"),
     "PromotionDecision": ("rl_manager.evaluation", "PromotionDecision"),
+    "PromotionPolicy": (
+        "rl_manager.stage25_champion", "PromotionPolicy"),
     "FROZEN_VS_CANDIDATE": (
         "rl_manager.types", "FROZEN_VS_CANDIDATE"),
     "farm_utilization_snapshot": (
@@ -123,9 +129,15 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "rl_manager.decode", "decode_outputs_to_plans"),
     "evaluate_promotion": (
         "rl_manager.evaluation", "evaluate_promotion"),
+    "export_stage25_dual_policy_snapshot": (
+        "rl_manager.stage25_checkpoint", "export_stage25_dual_policy_snapshot"),
+    "initialize_champion_registry": (
+        "rl_manager.stage25_champion", "initialize_champion_registry"),
     "init_train_state": ("rl_manager.ppo", "init_train_state"),
     "load_ppo_checkpoint": (
         "rl_manager.ppo_checkpoint", "load_ppo_checkpoint"),
+    "load_champion_registry": (
+        "rl_manager.stage25_champion", "load_champion_registry"),
     "load_trace": ("rl_manager.debug_trace", "load_trace"),
     "load_trajectory": ("rl_manager.trajectory", "load_trajectory"),
     "make_default_executor_factory": (
@@ -140,6 +152,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "ppo_snapshot_from_state": (
         "rl_manager.ppo_adapter", "ppo_snapshot_from_state"),
     "ppo_update": ("rl_manager.ppo", "ppo_update"),
+    "promote_champion": (
+        "rl_manager.stage25_champion", "promote_champion"),
     "prng_key_from_id": ("rl_manager.ppo_adapter", "prng_key_from_id"),
     "recompute_stored_action_logprobs": (
         "rl_manager.ppo_adapter", "recompute_stored_action_logprobs"),
@@ -151,6 +165,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "rl_manager.ppo_checkpoint", "load_ppo_snapshot"),
     "save_trace": ("rl_manager.debug_trace", "save_trace"),
     "seat_policies": ("rl_manager.types", "seat_policies"),
+    "select_panel_opponents": (
+        "rl_manager.stage25_champion", "select_panel_opponents"),
     "select_ppo_subset": ("rl_manager.ppo_adapter", "select_ppo_subset"),
     "validate_trace": ("rl_manager.debug_trace", "validate_trace"),
     "summarize_evaluation": (

@@ -36,6 +36,8 @@ for module in (
     "rl_manager.stage25_inference",
     "rl_manager.stage25_ppo",
     "rl_manager.stage25_checkpoint",
+    "rl_manager.stage25_champion",
+    "rl_manager.stage25_panel_eval",
     "bc_manager_jax.model",
 ):
     importlib.import_module(module)

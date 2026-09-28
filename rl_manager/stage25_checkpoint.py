@@ -262,6 +262,7 @@ def _metadata(*, payload_kind: str, config: Stage25ModelConfig, seed: int,
               provenance: Mapping[str, Any] | None,
               executor: Mapping[str, Any] | None,
               e_history_version: str, source_history_version: str | None = None,
+              behavior_identity: Mapping[str, Any] | None = None,
               step: int | None = None,
               epoch: int | None = None, optimizer_config: Any = None,
               data_order_position: Any = None) -> dict[str, Any]:
@@ -302,6 +303,8 @@ def _metadata(*, payload_kind: str, config: Stage25ModelConfig, seed: int,
             "history_version": normalize_e_history_version(source_history_version),
             "transfer": "encoder_only",
         }
+    if behavior_identity is not None:
+        required["behavior_identity"] = _jsonable(behavior_identity)
     if step is not None:
         required["step"] = int(step)
     if epoch is not None:
@@ -690,6 +693,7 @@ def save_stage25_inference_checkpoint(
     source_identity: Mapping[str, Any] | None = None,
     provenance: Mapping[str, Any] | None = None,
     executor: Mapping[str, Any] | None = None,
+    behavior_identity: Mapping[str, Any] | None = None,
     e_history_version: str = E_HISTORY_CORRECTED_V1,
     source_history_version: str | None = None,
 ) -> Path:
@@ -701,7 +705,8 @@ def save_stage25_inference_checkpoint(
                      seed=int(seed), flat=flat, metadata=metadata,
                      source_identity=source_identity, provenance=provenance,
                      executor=executor, e_history_version=e_history_version,
-                     source_history_version=source_history_version)
+                     source_history_version=source_history_version,
+                     behavior_identity=behavior_identity)
     return _write_archive(path, flat, meta)
 
 
@@ -724,6 +729,102 @@ def load_stage25_inference_checkpoint(
     params = init_stage25_params(stored_config, seed=stored_seed)
     return _rebuild(params, {key[len("param:"):]: value for key, value in flat.items()
                              if key.startswith("param:")}), dict(meta)
+
+
+def export_stage25_dual_policy_snapshot(
+    source: str | Path,
+    destination: str | Path,
+    *,
+    policy: str,
+    expected_e_history_version: str | None = E_HISTORY_CORRECTED_V1,
+    allow_legacy_e: bool = False,
+) -> Path:
+    """Export exactly one A/B learner from a strict dual PPO checkpoint.
+
+    The output is the native inference-only payload. The source optimizer and
+    RNG leaves are never copied or reconstructed.
+    """
+    from rl_manager.stage25_inference import parameter_fingerprint
+
+    label = str(policy).upper()
+    if label not in {"A", "B"}:
+        raise ValueError("policy must be A or B")
+    source_path = Path(source)
+    flat, meta = _read_archive(source_path)
+    _validate_meta(meta, source_path, DUAL_PPO_TRAINING_PAYLOAD_KIND)
+    _check_history(
+        meta, expected=expected_e_history_version,
+        allow_legacy_e=allow_legacy_e, path=source_path)
+    _validate_flat_against_manifest(flat, meta, source_path)
+
+    key = label.lower()
+    dual = meta["dual_state"]
+    policy_meta = dual["policies"][key]
+    config = _config_from_json(meta["config"])
+    prefix = f"{key}:param:"
+    param_flat = {
+        name[len(prefix):]: value for name, value in flat.items()
+        if name.startswith(prefix)
+    }
+    _validate_flat_against_manifest(
+        param_flat, {"leaf_manifest": policy_meta["parameter_manifest"]},
+        source_path)
+    template = init_stage25_params(config, seed=int(meta["init_params"]["seed"]))
+    template_flat = _flatten_arrays(template)
+    _validate_flat_against_manifest(
+        param_flat, {"leaf_manifest": _leaf_manifest(template_flat)}, source_path)
+    params = _rebuild(template, param_flat)
+    fingerprint = parameter_fingerprint(params)
+    identity = _dual_identity(
+        policy_meta["behavior_identity"], path=source_path, name=key)
+    if (fingerprint != policy_meta["parameter_fingerprint"]
+            or fingerprint != identity.parameter_fingerprint):
+        raise Stage25CheckpointError(
+            f"{source_path}: dual policy {key} parameter fingerprint is invalid")
+
+    source_checkpoint_identity = _source_identity(source_path, meta)
+    generation = int(dual["generation"])
+    snapshot_payload = {
+        "schema_version": "stage25_evaluation_snapshot_v1",
+        "source_kind": "dual_policy",
+        "source_dual_checkpoint_identity": source_checkpoint_identity,
+        "source_generation": generation,
+        "source_policy": label,
+        "parameter_fingerprint": fingerprint,
+        "behavior_identity": identity.to_json_dict(),
+        "observation_action_contract": {
+            "architecture_version": meta["architecture_version"],
+            "observation_schema_version": meta["observation_schema_version"],
+            "action_schema_version": meta["action_schema_version"],
+            "physical_support_version": meta["physical_support_version"],
+            "physical_contract": dual["physical_contract"],
+        },
+        "e_history_identity": meta["e_identity"],
+        "curriculum_identity": {
+            "version": config.curriculum.version,
+            "config": meta["curriculum"],
+            "fingerprint": identity.curriculum_fingerprint,
+        },
+    }
+    return save_stage25_inference_checkpoint(
+        destination, params, config,
+        seed=int(meta["init_params"]["seed"]),
+        metadata={"evaluation_snapshot": snapshot_payload},
+        source_identity=source_checkpoint_identity,
+        provenance={
+            "export": {
+                "source": str(source_path),
+                "generation": generation,
+                "policy": label,
+            },
+            "source": meta.get("provenance", {}),
+        },
+        executor=meta.get("executor"),
+        behavior_identity=identity.to_json_dict(),
+        e_history_version=meta["e_history_version"],
+        source_history_version=(meta.get("source_e_identity") or {}).get(
+            "history_version"),
+    )
 
 
 def save_stage25_bc_checkpoint(
@@ -1725,6 +1826,7 @@ __all__ = [
     "save_stage25_bc_checkpoint", "load_stage25_bc_checkpoint",
     "save_stage25_ppo_checkpoint", "load_stage25_ppo_checkpoint",
     "save_stage25_dual_ppo_checkpoint", "load_stage25_dual_ppo_checkpoint",
+    "export_stage25_dual_policy_snapshot",
     "initialize_stage25_ppo_from_checkpoint", "init_stage25_ppo_from_checkpoint",
     "migrate_stage25_bc_checkpoint_for_ppo",
     "save_inference_checkpoint", "load_inference_checkpoint", "save_bc_checkpoint",
