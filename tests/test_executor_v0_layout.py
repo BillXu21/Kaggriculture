@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import executor_v0.layout as layout_module
 from executor_v0.layout import (
     SacrificeConfig,
     plan_animal_layout,
@@ -402,6 +403,34 @@ def test_animal_layout_validates_requests():
     with pytest.raises(ValueError):
         plan_animal_layout(board, unlocked_quadrants=("NW",),
                            animals_needed={"GOOSE": -1}, anchor=ANCHOR)
+
+
+def test_animal_layout_skips_board_scan_when_all_deficits_are_zero(monkeypatch):
+    def unexpected_scan(*_args, **_kwargs):
+        pytest.fail("zero animal deficits must not scan placement candidates")
+
+    monkeypatch.setattr(layout_module, "_in_unlocked", unexpected_scan)
+    result = plan_animal_layout(
+        filled_board(),
+        unlocked_quadrants=("NW",),
+        animals_needed={"GOOSE": 0, "COW": 0, "SHEEP": 0},
+        anchor=ANCHOR,
+    )
+
+    assert result.placements == ()
+    assert result.unresolved == ()
+
+
+def test_animal_layout_validates_zero_deficit_requests_before_fast_return():
+    board = filled_board()
+    with pytest.raises(ValueError, match="unknown animal"):
+        plan_animal_layout(
+            board, unlocked_quadrants=("NW",),
+            animals_needed={"DRAGON": 0}, anchor=ANCHOR)
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        plan_animal_layout(
+            board, unlocked_quadrants=("NW",),
+            animals_needed={"GOOSE": -1}, anchor=ANCHOR)
 
 
 # ---------------------------------------------------------------- real smoke

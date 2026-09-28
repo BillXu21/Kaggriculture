@@ -12,12 +12,13 @@ from rl_manager.executor_factory import (
     Stage25StripExecutorAgent,
     make_stage25_executor_factory,
 )
-from rl_manager.parallel import _factory_wire
+from rl_manager.parallel import ParallelSelfPlayRunner, _factory_wire
 from rl_manager.parallel_worker import _factory_from_wire
 from rl_manager.runner import _executor_factory_provenance
+from rl_manager.runner import RunnerConfig, SelfPlayRunner
 from rl_manager.stage25_provider import Stage25PlanProvider
 
-from test_executor_v0_agent import make_obs
+from test_executor_v0_agent import make_obs, recording_provider, simple_plan
 from test_stage25_provider import HOLD, _obs
 
 
@@ -74,7 +75,8 @@ def test_stage25_factory_wire_reconstructs_strip_factory():
     wire = _factory_wire(factory)
     rebuilt = _factory_from_wire(wire)
 
-    assert wire[0] == "stage25_strip_executor@config:v1"
+    assert wire[0] == "stage25_strip_executor@config:v2"
+    assert wire[2] is False
     assert rebuilt.name == factory.name
     assert rebuilt.version == factory.version
     assert rebuilt.strip_config == factory.strip_config
@@ -82,6 +84,96 @@ def test_stage25_factory_wire_reconstructs_strip_factory():
         rebuilt.create(backend_name="fast", seat=0, configuration={},
                        provider=Stage25PlanProvider(8, 0, 3)),
         Stage25StripExecutorAgent)
+
+
+def test_low_telemetry_preserves_actions_and_marks_reduced_diagnostics(
+        monkeypatch):
+    plan = simple_plan()
+    obs = make_obs(day=3, hour=0, step=72, unlocked=("NW",))
+    full = make_stage25_executor_factory().create(
+        backend_name="fixture", seat=0, configuration={},
+        provider=recording_provider(plan),
+    )
+    low_factory = make_stage25_executor_factory(low_telemetry=True)
+    low = low_factory.create(
+        backend_name="fixture", seat=0, configuration={},
+        provider=recording_provider(plan),
+    )
+
+    full_action = full(obs)
+    def unexpected_diagnostics(*_args, **_kwargs):
+        raise AssertionError("low telemetry must not serialize controller diagnostics")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            low.controller, "_diagnostics", unexpected_diagnostics)
+        patcher.setattr(
+            "rl_manager.executor_factory.copy.deepcopy",
+            unexpected_diagnostics,
+        )
+        assert low(obs) == full_action
+    full_diagnostics = full.diagnostics_json()
+    low_diagnostics = low.diagnostics_json()
+    assert "telemetry_mode" not in full_diagnostics
+    assert full_diagnostics["days"]["3"]
+    assert low_diagnostics["telemetry_mode"] == "reduced"
+    assert low_diagnostics["diagnostics_reduced"] is True
+    assert low_diagnostics["days"] == {}
+    assert low.controller.diagnostics == {
+        "schema_version": 1,
+        "telemetry_mode": "reduced",
+        "diagnostics_reduced": True,
+    }
+    json.dumps(low_diagnostics, allow_nan=False)
+    assert low_factory.version == make_stage25_executor_factory().version
+    assert low_factory.effective_profile == make_stage25_executor_factory().effective_profile
+
+
+def test_runner_low_telemetry_is_overridden_by_full_diagnostic_capture():
+    low = SelfPlayRunner(
+        RunnerConfig(stage25_enabled=True, low_telemetry=True),
+        master_seed=17,
+    )
+    capture = SelfPlayRunner(
+        RunnerConfig(
+            stage25_enabled=True,
+            low_telemetry=True,
+            record_executor_full_diagnostics=True,
+        ),
+        master_seed=17,
+    )
+    parallel_low = ParallelSelfPlayRunner(
+        RunnerConfig(stage25_enabled=True, low_telemetry=True),
+        num_workers=1,
+    )
+    parallel_capture = ParallelSelfPlayRunner(
+        RunnerConfig(
+            stage25_enabled=True,
+            low_telemetry=True,
+            record_executor_full_diagnostics=True,
+        ),
+        num_workers=1,
+    )
+
+    assert low.executor_factory.low_telemetry is True
+    assert capture.executor_factory.low_telemetry is False
+    assert parallel_low.executor_factory.low_telemetry is True
+    assert parallel_capture.executor_factory.low_telemetry is False
+    low_wire = _factory_wire(
+        parallel_low.executor_factory,
+        low_telemetry=parallel_low.config.low_telemetry,
+    )
+    full_wire = _factory_wire(
+        parallel_capture.executor_factory,
+        low_telemetry=(
+            parallel_capture.config.low_telemetry
+            and not parallel_capture.config.record_executor_full_diagnostics
+        ),
+    )
+    assert _factory_from_wire(low_wire).low_telemetry is True
+    assert _factory_from_wire(full_wire).low_telemetry is False
+    assert low.executor_factory.effective_profile == (
+        capture.executor_factory.effective_profile)
 
 
 def test_strip_factory_wire_reconstruction_stays_accelerator_free():

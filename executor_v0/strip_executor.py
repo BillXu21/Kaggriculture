@@ -103,9 +103,11 @@ class StripExecutorController:
         *,
         config: StripExecutorConfig = StripExecutorConfig(),
         work_builder: WorkPlanBuilder = build_strip_work_plan,
+        low_telemetry: bool = False,
     ) -> None:
         self.config = config
         self._work_builder = work_builder
+        self._low_telemetry = bool(low_telemetry)
         self._day: int | None = None
         self._routes: dict[WorkerId, StripRoute] = {}
         self._assignment: RouteAssignment | None = None
@@ -139,15 +141,21 @@ class StripExecutorController:
 
     @property
     def diagnostics(self) -> dict[str, Any]:
-        return self._diagnostics()
+        return self._result_diagnostics()
 
-    def _finalize_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
+    def _finalize_day(
+        self,
+        obs: Mapping[str, Any],
+        plan: DailyPlan,
+        work_plan: StripWorkPlan | None = None,
+    ) -> StripWorkPlan:
         """Freeze Packet 2 ownership and Packet 3 reservations once."""
 
         day = int(obs.get("day", 0))
         bootstrap_diagnostics = self._daily.get("hiring_diagnostics")
         hire_stop_reason = self._daily.get("hire_stop_reason")
-        work_plan = self._build_work_plan(obs, plan)
+        if work_plan is None:
+            work_plan = self._build_work_plan(obs, plan)
         positions = self._worker_positions(obs)
         inventories = {
             worker: self._worker_inventory(obs, worker) for worker in positions
@@ -197,6 +205,9 @@ class StripExecutorController:
                 route.phase = RoutePhase.TRAVEL_TO_ENTRY
             else:
                 route.phase = RoutePhase.PREPARE_SUPPLIES
+        if self._low_telemetry:
+            self._daily = {}
+            return work_plan
         self._daily = {
             "day": day,
             "assignment_hour": int(obs.get("hour", 0)),
@@ -492,7 +503,8 @@ class StripExecutorController:
                     # Reconciliation always clears the pending record on this path.
                     self._reconcile_hire_observation(obs)
                 if self._hiring_blocked:
-                    self._daily["hire_stop_reason"] = "FAILED"
+                    if not self._low_telemetry:
+                        self._daily["hire_stop_reason"] = "FAILED"
                 else:
                     candidates = generate_horizontal_route_candidates(work_plan)
                     positions = self._worker_positions(obs)
@@ -511,8 +523,11 @@ class StripExecutorController:
                         max_orders=self._max_market_orders(obs),
                         farm_hand_cost_mult=self._hire_cost_mult(obs),
                     )
-                    self._daily["hiring_diagnostics"] = self._hire_plan.to_json_dict()
-                    self._daily["hire_stop_reason"] = self._hire_plan.stop_reason.value
+                    if not self._low_telemetry:
+                        self._daily["hiring_diagnostics"] = (
+                            self._hire_plan.to_json_dict())
+                        self._daily["hire_stop_reason"] = (
+                            self._hire_plan.stop_reason.value)
                     if self._hire_plan.orders:
                         submitted = len(self._hire_plan.orders)
                         farm = obs["farms"][self.config.acting_seat]
@@ -527,7 +542,9 @@ class StripExecutorController:
                             obs, work_plan, self._hire_plan.orders
                         )
                 self._bootstrap_stage = "FINALIZED"
-            work_plan = self._finalize_day(obs, active_plan)
+            work_plan = self._finalize_day(
+                obs, active_plan, work_plan=work_plan
+            )
             self._routes_finalized = True
             self._market_state.finalized_hour = int(obs.get("hour", 0))
         else:
@@ -583,7 +600,7 @@ class StripExecutorController:
             farmer_action=farmer_action,
             hands_actions=hands_actions,
             market_actions=market_plan.orders,
-            diagnostics=self._diagnostics(),
+            diagnostics=self._result_diagnostics(),
         )
 
     next_worker_actions = act
@@ -613,7 +630,10 @@ class StripExecutorController:
         self._hire_failures = 0
         self._animal_revisit_tiles = {}
         self._observation_for_diagnostics = obs
-        self._daily = {"day": self._day, "assignment_hour": int(obs.get("hour", 0))}
+        self._daily = (
+            {"day": self._day, "assignment_hour": int(obs.get("hour", 0))}
+            if not self._low_telemetry else {}
+        )
 
     def _shed_capacity(self, obs: Mapping[str, Any]) -> int:
         configuration = obs.get("configuration")
@@ -658,7 +678,7 @@ class StripExecutorController:
             farmer_action=actions[0] if actions else ("PASS",),
             hands_actions=actions[1:],
             market_actions=tuple(tuple(order) for order in market_actions),
-            diagnostics=self._diagnostics(),
+            diagnostics=self._result_diagnostics(),
         )
 
     def _bootstrap_work_result(
@@ -702,9 +722,9 @@ class StripExecutorController:
             )
             for worker in sorted(positions)
         )
-        diagnostics = self._diagnostics()
-        diagnostics.update(
-            {
+        diagnostics = self._result_diagnostics()
+        if not self._low_telemetry:
+            diagnostics.update({
                 "assigned_routes": len(assignment.routes),
                 "unassigned_routes": len(assignment.unassigned),
                 "idle_workers": [
@@ -729,8 +749,7 @@ class StripExecutorController:
                 "row_helpers_required": assignment.overloaded_rows_detected,
                 "row_helpers_assigned": assignment.row_helpers_assigned,
                 "unresolved_overloaded_rows": assignment.unresolved_overloaded_rows,
-            }
-        )
+            })
         return StripExecutorResult(
             farmer_action=actions[0] if actions else ("PASS",),
             hands_actions=actions[1:],
@@ -789,8 +808,9 @@ class StripExecutorController:
             self._hire_no_progress += 1
             if self._hire_no_progress >= 2:
                 self._hiring_blocked = True
-        self._daily["hires_observed"] = self._hire_observed
-        self._daily["failed_hires"] = self._hire_failures
+        if not self._low_telemetry:
+            self._daily["hires_observed"] = self._hire_observed
+            self._daily["failed_hires"] = self._hire_failures
 
     def _reconcile_market_observation(self, obs: Mapping[str, Any]) -> None:
         """Confirm pending buys from observed deltas, with two no-progress tries."""
@@ -939,6 +959,15 @@ class StripExecutorController:
                 self.config.allow_productive_recurring_crop_sacrifice),
             allow_older_crop_sacrifice=self.config.allow_older_crop_sacrifice,
         )
+
+    def _result_diagnostics(self) -> dict[str, Any]:
+        if self._low_telemetry:
+            return {
+                "schema_version": 1,
+                "telemetry_mode": "reduced",
+                "diagnostics_reduced": True,
+            }
+        return self._diagnostics()
 
     def _refresh_route_supply_plans(
         self, obs: Mapping[str, Any], work_plan: StripWorkPlan

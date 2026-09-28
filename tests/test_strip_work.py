@@ -39,6 +39,17 @@ def plan(**changes):
     return DailyPlan.create(**value)
 
 
+def test_daily_plan_views_remain_fresh_and_mutable():
+    daily_plan = plan()
+    first = daily_plan.sell_quantities_dict
+    second = daily_plan.sell_quantities_dict
+
+    assert first is not second
+    assert first["0"] is not second["0"]
+    first["0"]["WHEAT"] = 17
+    assert second["0"]["WHEAT"] == 0
+
+
 def plant(
     crop="WHEAT",
     planted_day=0,
@@ -793,4 +804,10 @@ def test_coordinates_purity_determinism_and_json_safety():
     assert first == second and board == before
     assert next(x for x in first.items if x.kind == "PLANT").tile == (6, 4)
     assert row_key_for_tile((6, 7)).quadrant == "SE"
+    assert row_key_for_tile((6, 7)) is row_key_for_tile((6, 7))
+    float_key = row_key_for_tile((6.0, 7.0))
+    assert type(float_key.global_row) is float
+    assert float_key.quadrant == "SE"
+    with pytest.raises(ValueError, match=r"board \(y, x\) coordinate"):
+        row_key_for_tile((10, 0))
     json.dumps(first.to_json_dict())
