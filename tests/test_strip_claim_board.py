@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 
 from executor_v0.strip_claim_board import ClaimPhase, SchedulerMode, build_claim_board
 from executor_v0.strip_claim_scheduler import (
@@ -132,6 +133,66 @@ def test_primary_import_conflict_reserves_resource_once_and_leaves_work_uncovere
     assert result.assignment.routes
 
 
+def test_primary_import_conflict_reserves_scarce_resource_for_hard_required_service():
+    seed = (SupplyRequirement("WHEAT", 1, "global_seed"),)
+    work = plan(
+        item("UNROUTED", (0, 0), key="ROUTINE", requirements=seed),
+        item(
+            "UNROUTED", (0, 1), key="SURVIVAL", requirements=seed,
+            source="survival_weed_prevention",
+        ),
+    )
+    worker = WorkerId(0)
+    claim_board = build_claim_board(work, {worker: {}}, {}, {"WHEAT": 1},
+                                    epoch_id="test")
+
+    schedule_claim_board(claim_board, work, {worker: (0, 0)}, 24, 0)
+
+    assert claim_board.owner_by_bundle == {"TILE:0,1": worker}
+    assert claim_board.claim_source_by_bundle == {
+        "TILE:0,1": "PRIMARY_TETSUYA",
+    }
+    assert claim_board.diagnostics()["uncovered_required"] == ["TILE:0,0"]
+
+
+def test_primary_import_reserves_hard_service_before_earlier_routine_row(monkeypatch):
+    seed = (SupplyRequirement("WHEAT", 1, "global_seed"),)
+    work = plan(
+        item("UNROUTED", (0, 0), key="ROUTINE", requirements=seed),
+        item(
+            "UNROUTED", (1, 0), key="SURVIVAL", requirements=seed,
+            source="survival_weed_prevention",
+        ),
+    )
+    worker = WorkerId(0)
+    normal_assign = assign_horizontal_routes
+
+    def routine_row_first(candidates, *args, **kwargs):
+        kwargs["global_resources"] = {}
+        assignment = normal_assign(tuple(candidates), *args, **kwargs)
+        assert len(assignment.routes) == 1
+        route = assignment.routes[0]
+        route = replace(route, segments=tuple(sorted(
+            route.segments, key=lambda segment: segment.traversal[0][0],
+        )))
+        return replace(assignment, routes=(route,))
+
+    monkeypatch.setattr(
+        "executor_v0.strip_claim_scheduler.assign_horizontal_routes",
+        routine_row_first,
+    )
+    claim_board = build_claim_board(work, {worker: {}}, {}, {"WHEAT": 1},
+                                    epoch_id="test")
+
+    schedule_claim_board(claim_board, work, {worker: (0, 0)}, 24, 0)
+
+    assert claim_board.owner_by_bundle == {"TILE:1,0": worker}
+    assert claim_board.claim_source_by_bundle == {
+        "TILE:1,0": "PRIMARY_TETSUYA",
+    }
+    assert claim_board.diagnostics()["uncovered_required"] == ["TILE:0,0"]
+
+
 def test_required_tail_appends_after_imported_base_assignment(monkeypatch):
     work = plan(item("WATER", (0, 0)), item("WATER", (2, 0)))
     positions = {WorkerId(0): (0, 0)}
@@ -160,6 +221,34 @@ def test_required_tail_appends_after_imported_base_assignment(monkeypatch):
     assert len(route.segments) == 2
     assert ":REQUIRED_TAIL:" in route.segments[1].segment_id
     assert claim_board.tail_claims_added_after_primary_import == 1
+
+
+def test_required_tail_repairs_feasible_urgent_middle_of_fragment(monkeypatch):
+    work = plan(
+        item("WATER", (0, 0)),
+        item("DIG", (0, 1), source="survival_weed_prevention"),
+        item("WATER", (0, 2)),
+    )
+    worker = WorkerId(0)
+    normal_assign = assign_horizontal_routes
+
+    def leave_all_work_for_tail(_candidates, *args, **kwargs):
+        return normal_assign((), *args, **kwargs)
+
+    monkeypatch.setattr(
+        "executor_v0.strip_claim_scheduler.assign_horizontal_routes",
+        leave_all_work_for_tail,
+    )
+    claim_board = build_claim_board(work, {}, {}, {}, epoch_id="test")
+
+    result = schedule_claim_board(claim_board, work, {worker: (0, 1)}, 1, 0)
+
+    assert claim_board.owner_by_bundle == {"TILE:0,1": worker}
+    assert claim_board.claim_source_by_bundle == {"TILE:0,1": "REQUIRED_TAIL"}
+    assert result.assignment.routes[0].segments[0].traversal == ((0, 1),)
+    assert claim_board.diagnostics()["uncovered_required"] == [
+        "TILE:0,0", "TILE:0,2",
+    ]
 
 
 def test_harvest_continuation_and_seed_once():

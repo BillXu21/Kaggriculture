@@ -150,10 +150,22 @@ def _refresh_segment(board: ClaimBoard, state: WorkerPlanningState,
 
 
 def _score(estimate: AppendCostEstimate, worker: WorkerId,
-           traversal: tuple[tuple[int, int], ...], hard: bool = False):
+           traversal: tuple[tuple[int, int], ...], hard: bool = False,
+           source_rank: int = 1):
     density = estimate.completed_interactions / max(1, estimate.incremental_turns)
-    return (0 if hard else 1, -density, -estimate.completed_interactions,
-            estimate.incremental_turns, estimate.travel_turns, worker.index, traversal)
+    return (0 if hard else 1, source_rank, -density,
+            -estimate.completed_interactions, estimate.incremental_turns,
+            estimate.travel_turns, worker.index, traversal)
+
+
+def _service_priority(
+    board: ClaimBoard, bundle_ids: tuple[str, ...],
+) -> tuple[int, int]:
+    return (
+        0 if any(board.bundles[bundle_id].service_class == ServiceClass.HARD_REQUIRED
+                 for bundle_id in bundle_ids) else 1,
+        min(board.bundles[bundle_id].source_rank for bundle_id in bundle_ids),
+    )
 
 
 def _required_pass(board: ClaimBoard, states: dict[WorkerId, WorkerPlanningState],
@@ -182,34 +194,45 @@ def _required_pass(board: ClaimBoard, states: dict[WorkerId, WorkerPlanningState
         )
     fragments = tuple(sorted(fragments, key=fragment_order))
     for original in fragments:
+        original_bundle_ids = frozenset(original.bundle_ids)
         while True:
-            outstanding = tuple(bundle_id for bundle_id in original.bundle_ids
-                                if bundle_id in board.unclaimed())
-            if not outstanding:
+            outstanding_fragments = tuple(
+                fragment for fragment in board.required_fragments()
+                if (fragment.row_key == original.row_key
+                    and set(fragment.bundle_ids).issubset(original_bundle_ids))
+            )
+            if not outstanding_fragments:
                 break
             choices = []
-            # Largest feasible prefix or suffix from each end. A full row is
-            # evaluated once per direction; every shorter trial is local.
             for state in states.values():
-                for reverse in (False, True):
-                    ordered = outstanding[::-1] if reverse else outstanding
-                    for width in range(len(ordered), 0, -1):
-                        selected = ordered[:width]
-                        traversal = _span_traversal(
-                            tuple(board.bundles[b].tile for b in selected)
-                        )
-                        fragment = RowFragment(original.row_key, selected, traversal,
-                                               "REQUIRED_TAIL")
-                        candidate = _candidate(board, state, fragment, traversal,
-                                               work_plan, len(state.segments))
-                        if candidate is None:
-                            continue
-                        estimate = candidate[3]
-                        hard = any(board.bundles[b].service_class == ServiceClass.HARD_REQUIRED
-                                   for b in selected)
-                        choices.append((_score(estimate, state.worker, traversal, hard),
-                                        state, fragment, traversal, candidate))
-                        break
+                for outstanding in outstanding_fragments:
+                    for reverse in (False, True):
+                        ordered = (outstanding.bundle_ids[::-1]
+                                   if reverse else outstanding.bundle_ids)
+                        # RowKey fragments are at most five tiles wide.
+                        for start in range(len(ordered)):
+                            for stop in range(start + 1, len(ordered) + 1):
+                                selected = ordered[start:stop]
+                                traversal = _span_traversal(
+                                    tuple(board.bundles[b].tile for b in selected)
+                                )
+                                fragment = RowFragment(
+                                    outstanding.row_key, selected, traversal,
+                                    "REQUIRED_TAIL",
+                                )
+                                candidate = _candidate(
+                                    board, state, fragment, traversal, work_plan,
+                                    len(state.segments),
+                                )
+                                if candidate is None:
+                                    continue
+                                estimate = candidate[3]
+                                hard, source_rank = _service_priority(board, selected)
+                                choices.append((
+                                    _score(estimate, state.worker, traversal,
+                                           hard == 0, source_rank),
+                                    state, fragment, traversal, candidate,
+                                ))
             if not choices:
                 break
             _, state, fragment, traversal, candidate = min(choices, key=lambda value: value[0])
@@ -395,63 +418,86 @@ def _import_primary_assignment(
         if worker in base_routes_by_worker else ()
         for worker in sorted(positions)
     }
+    primary_segments: list[tuple[WorkerId, RouteSegment, tuple[str, ...]]] = []
     for route in base.routes:
-        state = states[route.owner]
         for original in route.segments:
             bundle_ids = _primary_bundle_ids(board, original)
-            if not bundle_ids:
+            if bundle_ids:
+                primary_segments.append((route.owner, original, bundle_ids))
+
+    imported_by_segment: dict[int, tuple[str, ...]] = {}
+    for segment_index in sorted(
+        range(len(primary_segments)),
+        key=lambda index: _service_priority(board, primary_segments[index][2]),
+    ):
+        owner, original, bundle_ids = primary_segments[segment_index]
+        reservation = board.trial(owner, bundle_ids)
+        imported: list[str] = []
+        failed: list[str] = []
+        if reservation is not None and board.claim(reservation):
+            imported.extend(bundle_ids)
+        else:
+            imported_set: set[str] = set()
+            failed_set: set[str] = set()
+            priority_order = sorted(
+                bundle_ids,
+                key=lambda bundle_id: _service_priority(board, (bundle_id,)),
+            )
+            for bundle_id in priority_order:
+                single = board.trial(owner, (bundle_id,))
+                if single is not None and board.claim(single):
+                    imported_set.add(bundle_id)
+                else:
+                    failed_set.add(bundle_id)
+            imported.extend(bundle_id for bundle_id in bundle_ids
+                            if bundle_id in imported_set)
+            failed.extend(bundle_id for bundle_id in bundle_ids
+                          if bundle_id in failed_set)
+            if failed:
+                board.primary_import_failures.append({
+                    "worker": owner.label,
+                    "row_id": original.physical_row_id or original.segment_id,
+                    "segment_id": original.segment_id,
+                    "reason": _primary_import_failure_reason(
+                        board, tuple(failed)
+                    ),
+                    "bundle_ids": failed,
+                    "imported_bundle_ids": list(imported),
+                })
+        imported_by_segment[segment_index] = tuple(imported)
+        if imported:
+            board.record_claim_source(tuple(imported), "PRIMARY_TETSUYA")
+
+    # Resource priority only changes reservation order; append in Tetsuya's
+    # original assignment order so route shape and tie breaks stay stable.
+    for segment_index, (owner, original, bundle_ids) in enumerate(primary_segments):
+        state = states[owner]
+        imported_ids = imported_by_segment[segment_index]
+        if not imported_ids:
+            continue
+        if len(imported_ids) == len(bundle_ids):
+            _append_primary_segment(board, state, original, imported_ids,
+                                    work_plan)
+            continue
+        run: list[str] = []
+        part_index = 0
+        imported_set = set(imported_ids)
+        for bundle_id in bundle_ids:
+            if bundle_id in imported_set:
+                run.append(bundle_id)
                 continue
-            reservation = board.trial(route.owner, bundle_ids)
-            imported: list[str] = []
-            failed: list[str] = []
-            if reservation is not None and board.claim(reservation):
-                imported.extend(bundle_ids)
-            else:
-                for bundle_id in bundle_ids:
-                    single = board.trial(route.owner, (bundle_id,))
-                    if single is not None and board.claim(single):
-                        imported.append(bundle_id)
-                    else:
-                        failed.append(bundle_id)
-                if failed:
-                    board.primary_import_failures.append({
-                        "worker": route.owner.label,
-                        "row_id": original.physical_row_id or original.segment_id,
-                        "segment_id": original.segment_id,
-                        "reason": _primary_import_failure_reason(
-                            board, tuple(failed)
-                        ),
-                        "bundle_ids": failed,
-                        "imported_bundle_ids": list(imported),
-                    })
-            if not imported:
-                continue
-            imported_ids = tuple(imported)
-            board.record_claim_source(imported_ids, "PRIMARY_TETSUYA")
-            if len(imported_ids) == len(bundle_ids):
-                _append_primary_segment(board, state, original, imported_ids,
-                                        work_plan)
-                continue
-            run: list[str] = []
-            part_index = 0
-            imported_set = set(imported_ids)
-            for bundle_id in bundle_ids:
-                if bundle_id in imported_set:
-                    run.append(bundle_id)
-                    continue
-                if run:
-                    part = _primary_partial_segment(
-                        board, state, original, tuple(run), part_index, work_plan
-                    )
-                    _append_primary_segment(board, state, part, tuple(run),
-                                            work_plan)
-                    run.clear()
-                    part_index += 1
             if run:
                 part = _primary_partial_segment(
                     board, state, original, tuple(run), part_index, work_plan
                 )
                 _append_primary_segment(board, state, part, tuple(run), work_plan)
+                run.clear()
+                part_index += 1
+        if run:
+            part = _primary_partial_segment(
+                board, state, original, tuple(run), part_index, work_plan
+            )
+            _append_primary_segment(board, state, part, tuple(run), work_plan)
 
 
 def _routes(states: Mapping[WorkerId, WorkerPlanningState], assignment_hour: int,
@@ -796,8 +842,12 @@ def claim_runtime_fragment(board: ClaimBoard, work_plan: StripWorkPlan,
                             board.bundles[b].service_class == ServiceClass.HARD_REQUIRED
                             for b in ids
                         )
-                        choices.append((_score(estimate, worker, traversal, hard),
-                                        part, traversal, candidate))
+                        source_rank = min(
+                            board.bundles[b].source_rank for b in ids
+                        )
+                        choices.append((_score(
+                            estimate, worker, traversal, hard, source_rank
+                        ), part, traversal, candidate))
                         break
         return choices
 
