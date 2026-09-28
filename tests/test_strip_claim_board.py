@@ -313,6 +313,41 @@ def test_uncovered_snapshot_hypothetical_worker_is_pure_and_resource_aware():
     assert claim_board.available_global()["WHEAT"] == 1
 
 
+def test_hypothetical_hire_charges_later_supply_pickup_before_first_row():
+    from executor_v0.strip_claim_scheduler import hypothetical_worker_route
+
+    work = plan(
+        item("WATER", (0, 0)),
+        item("FEED", (9, 9),
+             requirements=(SupplyRequirement("WHEAT", 1),)),
+    )
+    claim_board = build_claim_board(work, {}, {"WHEAT": 1}, {}, epoch_id="test")
+    coverage = evaluate_hypothetical_worker(
+        claim_board.uncovered_snapshot(24), (0, 0), 24
+    )
+    assert tuple(bundle for fragment in coverage.claimed_fragments
+                 for bundle in fragment.bundle_ids) == ("TILE:0,0",)
+    assert coverage.incremental_turns == 1
+    route = hypothetical_worker_route(
+        claim_board, work, WorkerId(1), (0, 0), coverage, 24, 0
+    )
+    assert route is not None
+
+    feed_only = plan(item("FEED", (9, 9),
+                          requirements=(SupplyRequirement("WHEAT", 1),)))
+    feed_board = build_claim_board(
+        feed_only, {}, {"WHEAT": 1}, {}, epoch_id="test"
+    )
+    feed_coverage = evaluate_hypothetical_worker(
+        feed_board.uncovered_snapshot(24), (0, 0), 24
+    )
+    assert feed_coverage.incremental_turns == 20
+    assert feed_coverage.reservation_shed == (("WHEAT", 1),)
+    assert hypothetical_worker_route(
+        feed_board, feed_only, WorkerId(1), (0, 0), feed_coverage, 24, 0
+    ) is not None
+
+
 def test_enabled_controller_cleans_convenient_weed_after_required_action():
     from tests.test_executor_v0_idle_cleanup import empty_plan, make_obs
 
@@ -383,7 +418,7 @@ def test_enabled_low_telemetry_preserves_actions_and_reduces_diagnostics():
     }
 
 
-def test_no_legal_work_may_pass_with_recorded_reason():
+def test_no_legal_work_moves_toward_center_staging_before_pass():
     from tests.test_executor_v0_idle_cleanup import empty_plan, make_obs
 
     controller = StripExecutorController(
@@ -392,9 +427,22 @@ def test_no_legal_work_may_pass_with_recorded_reason():
     )
     result = controller.act(make_obs(hour=1, farmer=(0, 0),
                                      unlocked=("NW",)), empty_plan())
+    assert result.farmer_action == ("SOUTH",)
+    assert "FARMER" not in result.diagnostics["row_claim_pass_reasons"]
+
+
+def test_legitimate_pass_at_center_staging_is_recorded():
+    from tests.test_executor_v0_idle_cleanup import empty_plan, make_obs
+
+    controller = StripExecutorController(
+        config=StripExecutorConfig(enable_row_claim_board=True),
+        work_builder=lambda _obs, _daily, **_kwargs: plan(),
+    )
+    result = controller.act(make_obs(hour=1, farmer=(4, 4),
+                                     unlocked=("NW",)), empty_plan())
     assert result.farmer_action == ("PASS",)
     reason = result.diagnostics["row_claim_pass_reasons"]["FARMER"]
-    assert reason["reason"] == "NO_LEGAL_REACHABLE_WORK"
+    assert reason["reason"] == "ALREADY_AT_STAGING_TARGET"
     assert reason["scheduler_miss"] is False
 
 
@@ -548,3 +596,204 @@ def test_replaced_claim_route_does_not_protect_stale_supply_demand():
     assert controller._outstanding_reservations() == {"WHEAT": 1}
     controller._routes.clear()
     assert controller._outstanding_reservations() == {}
+
+
+def _claim_hiring_case(work, obs):
+    from tests.test_executor_v0_idle_cleanup import empty_plan
+
+    controller = StripExecutorController(
+        config=StripExecutorConfig(enable_row_claim_board=True),
+        work_builder=lambda _obs, _daily, **_kwargs: work,
+    )
+    daily = empty_plan()
+    controller._start_day(obs, daily)
+    positions = controller._worker_positions(obs)
+    inventories = {
+        worker: controller._worker_inventory(obs, worker) for worker in positions
+    }
+    controller._finalize_claim_day(obs, work, positions, inventories)
+    orders = controller._plan_claim_hires(obs, work, positions)
+    return controller, orders
+
+
+def _intensive_row_work(*rows, interactions=12):
+    return plan(*(
+        item("CARE", (row, 0), key=f"CARE:{row}:{index}")
+        for row in rows for index in range(interactions)
+    ))
+
+
+def test_claim_hiring_noops_when_existing_workers_cover_required_work():
+    from tests.test_executor_v0_idle_cleanup import make_obs
+
+    work = plan(item("WATER", (0, 0)))
+    controller, orders = _claim_hiring_case(
+        work, make_obs(hour=0, farmer=(0, 0), money=100)
+    )
+    assert orders == ()
+    assert controller._claim_hiring_diagnostics["hire_stop_reason"] == "NO_REQUIRED_LEFTOVERS"
+    assert controller._claim_board is not None
+    assert not controller._claim_board.uncovered_snapshot(23).fragments
+
+
+def test_claim_hire_covers_contiguous_row_tail_and_is_observation_confirmed():
+    from tests.test_executor_v0_idle_cleanup import empty_plan, make_obs
+
+    work = plan(item("WATER", (0, 0)), item("WATER", (5, 5)))
+    controller = StripExecutorController(
+        config=StripExecutorConfig(enable_row_claim_board=True),
+        work_builder=lambda _obs, _daily, **_kwargs: work,
+    )
+    first_obs = make_obs(hour=19, farmer=(0, 0), money=100)
+    first = controller.act(first_obs, empty_plan())
+    assert first.market_actions == (("HIRE",),)
+    assert controller._claim_hiring_diagnostics["wanted_hires"] == 1
+    assert controller._claim_board is not None
+    assert controller._claim_board.owner_by_bundle["TILE:5,5"] == WorkerId(1)
+    hired_route = controller._routes[WorkerId(1)]
+    assert len(hired_route.segments) == 1
+    assert hired_route.segments[0].traversal == ((5, 5),)
+    assert ":REQUIRED_TAIL:" in hired_route.segments[0].segment_id
+
+    waiting = controller.act(first_obs, empty_plan())
+    assert waiting.farmer_action == ("PASS",)
+    assert waiting.diagnostics["row_claim_pass_reasons"]["FARMER"]["reason"] == (
+        "AWAITING_OBSERVATION_CONFIRMATION"
+    )
+
+    confirmed = make_obs(
+        hour=20, farmer=(0, 0), hands=((4, 4),), money=99
+    )
+    result = controller.act(confirmed, empty_plan())
+    assert controller._routes_finalized
+    assert WorkerId(1) in controller._routes
+    assert controller._claim_board.owner_by_bundle["TILE:5,5"] == WorkerId(1)
+    assert result.farmer_action != ("PASS",)
+    assert result.diagnostics["claim_hiring"]["wanted_hires"] == 1
+    assert result.diagnostics["wanted_hires"] == 1
+    assert len(result.diagnostics["claim_hiring"]["planned_workers"]) == 1
+
+
+def test_unconfirmed_claim_hire_releases_claim_before_retry():
+    from tests.test_executor_v0_idle_cleanup import empty_plan, make_obs
+
+    work = plan(item("WATER", (0, 0)), item("WATER", (5, 5)))
+    controller = StripExecutorController(
+        config=StripExecutorConfig(enable_row_claim_board=True),
+        work_builder=lambda _obs, _daily, **_kwargs: work,
+    )
+    first = controller.act(make_obs(hour=19, farmer=(0, 0), money=100), empty_plan())
+    assert first.market_actions == (("HIRE",),)
+    assert controller._claim_board is not None
+    assert controller._claim_board.owner_by_bundle["TILE:5,5"] == WorkerId(1)
+
+    retry = controller.act(make_obs(hour=20, farmer=(0, 0), money=100), empty_plan())
+    assert retry.market_actions == (("HIRE",),)
+    assert controller._claim_board.owner_by_bundle["TILE:5,5"] == WorkerId(1)
+    assert retry.diagnostics["claim_hiring"]["wanted_hires"] == 1
+    assert retry.diagnostics["failed_hires"] == 1
+
+
+def test_claim_hiring_plans_two_sequential_spawns_and_escalating_costs():
+    from tests.test_executor_v0_idle_cleanup import make_obs
+
+    work = _intensive_row_work(0, 2, 4, 6)
+    controller, orders = _claim_hiring_case(
+        work, make_obs(hour=0, farmer=(0, 0), money=100)
+    )
+    assert orders == (("HIRE",), ("HIRE",), ("HIRE",))
+    planned = controller._claim_hiring_diagnostics["planned_workers"]
+    assert [record["spawn"] for record in planned] == [[4, 4], [4, 5], [5, 4]]
+    assert controller._claim_hiring_diagnostics["sequential_hire_costs"] == [1, 1, 2]
+    assert len({tuple(record["bundle_ids"]) for record in planned}) == 3
+    assert set(controller._claim_board.owner_by_bundle.values()) == {
+        WorkerId(0), WorkerId(1), WorkerId(2), WorkerId(3),
+    }
+
+
+def test_claim_hiring_cash_allows_first_but_not_second_hire():
+    from tests.test_executor_v0_idle_cleanup import make_obs
+
+    controller, orders = _claim_hiring_case(
+        _intensive_row_work(0, 2, 4),
+        make_obs(hour=0, farmer=(0, 0), money=1),
+    )
+    assert orders == (("HIRE",),)
+    assert controller._claim_hiring_diagnostics["hire_stop_reason"] == "CASH"
+    assert controller._claim_hiring_diagnostics["sequential_hire_costs"] == [1]
+    assert controller._claim_board is not None
+    assert len(controller._claim_board.owner_by_bundle) < 3
+
+
+def test_claim_hiring_respects_per_turn_order_cap():
+    from tests.test_executor_v0_idle_cleanup import make_obs
+
+    obs = make_obs(hour=0, farmer=(0, 0), money=100)
+    obs["configuration"] = {"maxMarketOrdersPerTurn": 1, "boardSize": 10}
+    controller, orders = _claim_hiring_case(_intensive_row_work(0, 2, 4), obs)
+    assert orders == (("HIRE",),)
+    assert controller._claim_hiring_diagnostics["hire_stop_reason"] == "ORDER_CAP"
+
+
+def test_claim_hiring_does_not_hire_for_optional_only_leftovers():
+    from tests.test_executor_v0_idle_cleanup import make_obs
+
+    work = plan(item("DIG", (0, 1), source="dig_cleanup"))
+    controller, orders = _claim_hiring_case(
+        work, make_obs(hour=22, farmer=(0, 0), money=100)
+    )
+    assert orders == ()
+    assert controller._claim_hiring_diagnostics["wanted_hires"] == 0
+
+
+def test_claim_hiring_does_not_add_worker_for_shared_resource_block():
+    from tests.test_executor_v0_idle_cleanup import make_obs
+
+    seeds = (SupplyRequirement("WHEAT", 1, "global_seed"),)
+    work = plan(
+        item("PLANT", (0, 0), crop="WHEAT", requirements=seeds),
+        item("PLANT", (5, 5), crop="WHEAT", key="PLANT:5:5", requirements=seeds),
+    )
+    obs = make_obs(hour=0, farmer=(0, 0), money=100)
+    obs["private"]["seeds"] = {"WHEAT": 1}
+    controller, orders = _claim_hiring_case(work, obs)
+    assert orders == ()
+    assert controller._claim_hiring_diagnostics["hire_stop_reason"] == (
+        "RESOURCE_BLOCKED_REQUIRED_LEFTOVERS"
+    )
+    assert controller._claim_board is not None
+    assert controller._claim_board.owner_by_bundle == {"TILE:0,0": WorkerId(0)}
+
+
+def test_claim_hiring_is_deterministic_for_same_observation():
+    from tests.test_executor_v0_idle_cleanup import make_obs
+
+    work = _intensive_row_work(0, 2, 4)
+    obs = make_obs(hour=0, farmer=(0, 0), money=100)
+    first, first_orders = _claim_hiring_case(work, copy.deepcopy(obs))
+    second, second_orders = _claim_hiring_case(work, copy.deepcopy(obs))
+    assert first_orders == second_orders
+    assert first._claim_hiring_diagnostics == second._claim_hiring_diagnostics
+    assert first._claim_board.owner_by_bundle == second._claim_board.owner_by_bundle
+
+
+def test_route_less_worker_claims_unclaimed_required_work_before_pass():
+    from tests.test_executor_v0_idle_cleanup import empty_plan, make_obs
+
+    hand = WorkerId(1)
+    controller = StripExecutorController(
+        config=StripExecutorConfig(enable_row_claim_board=True),
+        work_builder=lambda obs, _daily, **_kwargs: (
+            plan(item("FEED", (5, 5), requirements=(SupplyRequirement("WHEAT", 1),)))
+            if obs["hour"] > 0 else plan()
+        ),
+    )
+    initial = make_obs(hour=0, farmer=(0, 0), hands=((5, 5),), unlocked=("NW",))
+    initial["private"]["inventories"] = [{}, {"WHEAT": 1}]
+    controller.act(initial, empty_plan())
+    observed = make_obs(hour=1, farmer=(0, 0), hands=((5, 5),), unlocked=("NW",))
+    observed["private"]["inventories"] = [{}, {"WHEAT": 1}]
+    result = controller.act(observed, empty_plan())
+    assert result.hands_actions[0] == ("FEED",)
+    assert result.hands_actions[0] != ("PASS",)
+    assert controller._claim_board.owner_by_bundle["TILE:5,5"] == hand

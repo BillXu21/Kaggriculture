@@ -32,7 +32,9 @@ __all__ = [
     "HireStopReason",
     "RouteLaborEstimate",
     "StripHiringPlan",
+    "future_worker_actions",
     "plan_strip_hiring",
+    "predict_hire_spawns",
 ]
 
 
@@ -129,13 +131,13 @@ def _positive_counts(value: Any) -> dict[str, int]:
     }
 
 
-def _future_worker_actions(obs: Mapping[str, Any]) -> int:
+def future_worker_actions(obs: Mapping[str, Any]) -> int:
     # A HIRE is processed after this turn's unit actions, so the new worker
     # receives the shared horizon with the current turn excluded.
     return remaining_day_action_slots(obs, include_current_turn=False)
 
 
-def _spawn_positions(
+def predict_hire_spawns(
     observed: Sequence[tuple[int, int]], hires: int, board_size: int
 ) -> tuple[tuple[int, int], ...]:
     half = board_size // 2
@@ -323,11 +325,11 @@ def plan_strip_hiring(
     private = obs.get("private") or {}
     observed_workers = tuple(sorted(worker_positions))
     current_workers = len(observed_workers)
-    future_slots = _future_worker_actions(obs)
+    future_slots = future_worker_actions(obs)
     configuration = obs.get("configuration")
     config = configuration if isinstance(configuration, Mapping) else {}
     board_size = max(2, int(config.get("boardSize", 10)))
-    predicted_spawns = _spawn_positions(
+    predicted_spawns = predict_hire_spawns(
         tuple(worker_positions[worker] for worker in observed_workers),
         max(0, 2 * len(candidates) - current_workers),
         board_size,

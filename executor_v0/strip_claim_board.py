@@ -81,6 +81,7 @@ class BundleCoverageView:
     inventory_demand: tuple[tuple[str, int], ...]
     global_demand: tuple[tuple[str, int], ...]
     hard_required: bool
+    source_rank: int
 
 
 @dataclass(frozen=True)
@@ -108,7 +109,8 @@ class UncoveredRequiredWork:
                  "effective_interactions": view.effective_interactions,
                  "inventory_demand": dict(view.inventory_demand),
                  "global_demand": dict(view.global_demand),
-                 "hard_required": view.hard_required}
+                 "hard_required": view.hard_required,
+                 "source_rank": view.source_rank}
                 for view in self.bundle_views
             ],
             "remaining_shed": dict(self.remaining_shed),
@@ -401,6 +403,7 @@ class ClaimBoard:
                     bundle_id, bundle.tile, bundle.effective_interactions,
                     bundle.inventory_demand, bundle.global_demand,
                     bundle.service_class == ServiceClass.HARD_REQUIRED,
+                    bundle.source_rank,
                 )
                 for bundle_id, bundle in sorted(self.bundles.items())
                 if bundle_id in ids

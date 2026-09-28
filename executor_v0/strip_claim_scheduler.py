@@ -418,7 +418,6 @@ def evaluate_hypothetical_worker(uncovered: UncoveredRequiredWork,
     if future_slots < 0:
         raise ValueError("future_slots must be nonnegative")
     views = {view.bundle_id: view for view in uncovered.bundle_views}
-    fragments = list(uncovered.fragments)
     shed = dict(uncovered.remaining_shed)
     global_stock = dict(uncovered.remaining_global)
     initial_shed = dict(shed)
@@ -427,75 +426,114 @@ def evaluate_hypothetical_worker(uncovered: UncoveredRequiredWork,
     remaining = future_slots
     claimed: list[RowFragment] = []
     pickup_items: set[str] = set()
+    first_route_entry: tuple[int, int] | None = None
     reasons: set[str] = set()
-    while fragments:
+
+    def candidates_for(fragment: RowFragment, start: tuple[int, int],
+                       slots: int, held_pickups: set[str],
+                       shed_stock: Mapping[str, int],
+                       global_resources: Mapping[str, int],
+                       route_entry: tuple[int, int] | None):
         choices = []
-        for fragment_index, fragment in enumerate(fragments):
-            for reverse in (False, True):
-                ordered = (fragment.bundle_ids[::-1] if reverse
-                           else fragment.bundle_ids)
-                for width in range(len(ordered), 0, -1):
-                    ids = ordered[:width]
-                    traversed = _span_traversal(
-                        tuple(views[bundle_id].tile for bundle_id in ids)
+        for reverse in (False, True):
+            ordered = fragment.bundle_ids[::-1] if reverse else fragment.bundle_ids
+            for width in range(len(ordered), 0, -1):
+                ids = ordered[:width]
+                traversal = _span_traversal(
+                    tuple(views[bundle_id].tile for bundle_id in ids)
+                )
+                demand: dict[str, int] = {}
+                seed_demand: dict[str, int] = {}
+                for bundle_id in ids:
+                    for key, amount in views[bundle_id].inventory_demand:
+                        demand[key] = demand.get(key, 0) + amount
+                    for key, amount in views[bundle_id].global_demand:
+                        seed_demand[key] = seed_demand.get(key, 0) + amount
+                if (any(shed_stock.get(key, 0) < amount
+                        for key, amount in demand.items())
+                        or any(global_resources.get(key, 0) < amount
+                               for key, amount in seed_demand.items())):
+                    reasons.add("RESOURCE_SHORTAGE")
+                    continue
+                new_pickups = set(demand) - held_pickups
+                travel = _distance(start, traversal[0])
+                pickup_setup = 0
+                if new_pickups and not held_pickups:
+                    first_entry = route_entry or traversal[0]
+                    shed_tile = nearest_shed_access(spawn)
+                    pickup_setup = (
+                        _distance(spawn, shed_tile)
+                        + _distance(shed_tile, first_entry)
+                        - _distance(spawn, first_entry)
                     )
-                    demand: dict[str, int] = {}
-                    seed_demand: dict[str, int] = {}
-                    for bundle_id in ids:
-                        for key, amount in views[bundle_id].inventory_demand:
-                            demand[key] = demand.get(key, 0) + amount
-                        for key, amount in views[bundle_id].global_demand:
-                            seed_demand[key] = seed_demand.get(key, 0) + amount
-                    if (any(shed.get(key, 0) < amount for key, amount in demand.items())
-                            or any(global_stock.get(key, 0) < amount
-                                   for key, amount in seed_demand.items())):
-                        reasons.add("RESOURCE_SHORTAGE")
-                        continue
-                    travel = _distance(position, traversed[0])
-                    new_pickups = set(demand) - pickup_items
-                    if new_pickups and not pickup_items:
-                        shed_tile = nearest_shed_access(position)
-                        travel = (_distance(position, shed_tile)
-                                  + _distance(shed_tile, traversed[0]))
-                    travel += sum(_distance(left, right) for left, right
-                                  in zip(traversed, traversed[1:]))
-                    interactions = sum(views[bundle_id].effective_interactions
-                                       for bundle_id in ids)
-                    cost = travel + len(new_pickups) + interactions
-                    if cost > remaining:
-                        reasons.add("HORIZON_SHORTAGE")
-                        continue
-                    hard = any(views[bundle_id].hard_required for bundle_id in ids)
-                    density = interactions / max(1, cost)
-                    part = RowFragment(fragment.row_key, ids, traversed,
-                                       "REQUIRED_TAIL")
-                    choices.append(((0 if hard else 1, -density, -interactions,
-                                     cost, traversed), fragment_index, part,
-                                    demand, seed_demand, cost, new_pickups))
-                    break
-        if not choices:
-            break
-        _, fragment_index, part, demand, seed_demand, cost, new_pickups = min(
-            choices, key=lambda value: value[0]
+                travel += sum(_distance(left, right)
+                              for left, right in zip(traversal, traversal[1:]))
+                interactions = sum(views[bundle_id].effective_interactions
+                                   for bundle_id in ids)
+                cost = travel + pickup_setup + len(new_pickups) + interactions
+                if cost > slots:
+                    reasons.add("HORIZON_SHORTAGE")
+                    continue
+                hard = any(views[bundle_id].hard_required for bundle_id in ids)
+                density = interactions / max(1, cost)
+                part = RowFragment(fragment.row_key, ids, traversal, "REQUIRED_TAIL")
+                choices.append((
+                    (0 if hard else 1, -density, -interactions, cost, traversal),
+                    part, demand, seed_demand, cost, new_pickups,
+                ))
+                # The widest feasible contiguous end is enough for this side.
+                break
+        return choices
+
+    # Rank each original row run once from the predicted spawn. Each selected
+    # row can then be split at most five times, preserving O(B * A) work.
+    initial_order = []
+    for fragment in uncovered.fragments:
+        choices = candidates_for(
+            fragment, position, remaining, pickup_items, shed, global_stock, None
         )
-        claimed.append(part)
-        remaining -= cost
-        position = part.traversal[-1]
-        pickup_items.update(new_pickups)
-        for key, amount in demand.items():
-            shed[key] -= amount
-        for key, amount in seed_demand.items():
-            global_stock[key] -= amount
-        old = fragments.pop(fragment_index)
-        used = set(part.bundle_ids)
-        leftovers = tuple(bundle_id for bundle_id in old.bundle_ids
-                          if bundle_id not in used)
-        if leftovers:
-            fragments.append(RowFragment(
-                old.row_key, leftovers,
-                _span_traversal(tuple(views[bundle_id].tile for bundle_id in leftovers)),
+        best = min((choice[0] for choice in choices), default=None)
+        hard = any(views[bundle_id].hard_required for bundle_id in fragment.bundle_ids)
+        source_rank = min(views[bundle_id].source_rank
+                          for bundle_id in fragment.bundle_ids)
+        total = sum(views[bundle_id].effective_interactions
+                    for bundle_id in fragment.bundle_ids)
+        initial_order.append((
+            (0 if hard else 1, source_rank, best[1] if best else 0,
+             -total, fragment.row_key, fragment.traversal),
+            fragment,
+        ))
+    for _, original in sorted(initial_order, key=lambda pair: pair[0]):
+        outstanding = original.bundle_ids
+        while outstanding:
+            fragment = RowFragment(
+                original.row_key, outstanding,
+                _span_traversal(tuple(views[bundle_id].tile
+                                      for bundle_id in outstanding)),
                 "REQUIRED_TAIL",
-            ))
+            )
+            choices = candidates_for(
+                fragment, position, remaining, pickup_items, shed, global_stock,
+                first_route_entry,
+            )
+            if not choices:
+                break
+            _, part, demand, seed_demand, cost, new_pickups = min(
+                choices, key=lambda value: value[0]
+            )
+            claimed.append(part)
+            if first_route_entry is None:
+                first_route_entry = part.traversal[0]
+            remaining -= cost
+            position = part.traversal[-1]
+            pickup_items.update(new_pickups)
+            for key, amount in demand.items():
+                shed[key] -= amount
+            for key, amount in seed_demand.items():
+                global_stock[key] -= amount
+            used = set(part.bundle_ids)
+            outstanding = tuple(bundle_id for bundle_id in outstanding
+                                if bundle_id not in used)
     return HypotheticalWorkerCoverage(
         tuple(claimed),
         sum(views[bundle_id].effective_interactions
@@ -508,6 +546,79 @@ def evaluate_hypothetical_worker(uncovered: UncoveredRequiredWork,
                      for key, amount in initial_global.items()
                      if amount > global_stock.get(key, 0))),
         position, tuple(sorted(reasons)),
+    )
+
+
+def hypothetical_worker_route(
+    board: ClaimBoard,
+    work_plan: StripWorkPlan,
+    worker: WorkerId,
+    spawn: tuple[int, int],
+    coverage: HypotheticalWorkerCoverage,
+    future_slots: int,
+    assignment_hour: int,
+) -> StripRoute | None:
+    """Materialize a selected hypothetical claim as one ordinary strip route."""
+    if not coverage.claimed_fragments:
+        return None
+    reserved_inventory = dict(coverage.reservation_shed)
+    pickup_tile = nearest_shed_access(spawn) if reserved_inventory else None
+    prefix = AppendCostState(
+        pickup_tile or spawn,
+        (_distance(spawn, pickup_tile) + len(reserved_inventory)
+         if pickup_tile is not None else 0),
+        future_slots,
+        pickup_items=tuple(sorted(reserved_inventory)),
+        pickup_tile=pickup_tile,
+    )
+    segments: list[RouteSegment] = []
+    for index, fragment in enumerate(coverage.claimed_fragments):
+        segment_id, cost = _fragment_segment(
+            board, fragment, fragment.traversal, work_plan, index
+        )
+        estimate = estimate_append_cost(prefix, cost)
+        if not estimate.complete_before_deadline:
+            return None
+        segments.append(RouteSegment(
+            segment_id, fragment.traversal, fragment.traversal[0],
+            estimate.travel_turns,
+            physical_row_id=(f"ROW:{fragment.row_key.quadrant}:"
+                             f"{fragment.row_key.global_row}:"
+                             f"{fragment.row_key.x_start}-{fragment.row_key.x_end}"),
+            represented_interactions=sum(
+                work.represented_turns for tile in cost.work_by_tile for work in tile
+            ),
+            known_continuation_interactions=sum(
+                work.continuation_turns for tile in cost.work_by_tile for work in tile
+            ),
+            forecast_tile_interactions=tuple(
+                sum(work.effective_turns for work in tile) for tile in cost.work_by_tile
+            ),
+            cost_segment=cost,
+        ))
+        prefix = estimate.next_state
+    canonical = simulate_route_cost(
+        spawn,
+        tuple(segment.cost_segment for segment in segments
+              if segment.cost_segment is not None),
+        carried_inventory={},
+        remaining_action_slots=future_slots,
+        assignment_turn=assignment_hour,
+        reserved_supply=reserved_inventory,
+        global_resources=dict(coverage.reservation_global),
+        include_segment_results=False,
+    )
+    if (not canonical.route_complete_before_deadline
+            or canonical.total_turns != coverage.incremental_turns):
+        return None
+    traversal = tuple(tile for segment in segments for tile in segment.traversal)
+    return StripRoute(
+        f"CLAIM:{worker.label}:HYPOTHETICAL", traversal, traversal, worker,
+        traversal[0], _distance(spawn, traversal[0]), assignment_hour,
+        workload_interactions=sum(segment.represented_interactions
+                                  for segment in segments),
+        source_shape="horizontal_claim_segments", phase=RoutePhase.TRAVEL_TO_ENTRY,
+        segments=tuple(segments),
     )
 
 
