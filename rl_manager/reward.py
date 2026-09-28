@@ -9,7 +9,8 @@ from typing import Any, Mapping, Sequence
 
 TERMINAL_WLT = "terminal_wlt"
 TERMINAL_OWN_BANK = "terminal_own_bank"
-REWARD_MODES = (TERMINAL_WLT, TERMINAL_OWN_BANK)
+TERMINAL_OWN_BANK_LINEAR = "terminal_own_bank_linear"
+REWARD_MODES = (TERMINAL_WLT, TERMINAL_OWN_BANK, TERMINAL_OWN_BANK_LINEAR)
 
 BEHAVIOR_SHAPING_FEATURES = (
     "goose", "cow", "sheep",
@@ -202,6 +203,9 @@ def terminal_rewards(final_banks: Sequence[float], config: RewardConfig) -> list
     if config.mode == TERMINAL_OWN_BANK:
         return [math.tanh((bank - config.bank_baseline) / config.bank_scale)
                 for bank in banks]
+    if config.mode == TERMINAL_OWN_BANK_LINEAR:
+        return [(bank - config.bank_baseline) / config.bank_scale
+                for bank in banks]
     margin = banks[0] - banks[1]
     if margin == 0:
         return [0.0, 0.0]
@@ -213,6 +217,7 @@ __all__ = [
     "MAX_TOTAL_SHAPING_WEIGHT",
     "REWARD_MODES",
     "TERMINAL_OWN_BANK",
+    "TERMINAL_OWN_BANK_LINEAR",
     "TERMINAL_WLT",
     "BehaviorShapingConfig",
     "BehaviorShapingFeature",

@@ -67,7 +67,12 @@ from rl_manager.stage25_provider import (
 )
 from rl_manager.stage25_types import (
     Stage25BehaviorIdentity, Stage25PolicyOutputs, stage25_rng_namespace)
-from rl_manager.reward import RewardConfig, TERMINAL_OWN_BANK, terminal_rewards
+from rl_manager.reward import (
+    RewardConfig,
+    TERMINAL_OWN_BANK,
+    TERMINAL_OWN_BANK_LINEAR,
+    terminal_rewards,
+)
 from rl_manager.rollout_profile import new_worker_metrics
 from rl_manager.trajectory import TrajectoryBuffer, Transition, \
     TransitionMetadata
@@ -945,9 +950,11 @@ class SelfPlayRunner:
             return []
         for spec in specs:
             if spec.composition == CURRENT_VS_CURRENT_ECONOMIC:
-                if self.config.reward_config.mode != TERMINAL_OWN_BANK:
+                if self.config.reward_config.mode not in (
+                        TERMINAL_OWN_BANK, TERMINAL_OWN_BANK_LINEAR):
                     raise ValueError(
-                        "current_vs_current_economic requires terminal_own_bank; "
+                        "current_vs_current_economic requires terminal_own_bank "
+                        "or terminal_own_bank_linear; "
                         "symmetric double-sided terminal_wlt training is rejected")
                 if spec.trainable_seats != (0, 1):
                     raise ValueError(

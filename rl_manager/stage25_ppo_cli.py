@@ -20,6 +20,7 @@ from rl_manager.parallel import ParallelSelfPlayRunner
 from rl_manager.reward import (
     BEHAVIOR_SHAPING_FEATURES,
     TERMINAL_OWN_BANK,
+    TERMINAL_OWN_BANK_LINEAR,
     TERMINAL_WLT,
     BehaviorShapingConfig,
     BehaviorShapingFeature,
@@ -437,7 +438,8 @@ def _parser() -> argparse.ArgumentParser:
         default=CANDIDATE_VS_FROZEN,
     )
     parser.add_argument(
-        "--reward-mode", choices=(TERMINAL_WLT, TERMINAL_OWN_BANK),
+        "--reward-mode", choices=(
+            TERMINAL_WLT, TERMINAL_OWN_BANK, TERMINAL_OWN_BANK_LINEAR),
         default=TERMINAL_WLT,
     )
     parser.add_argument("--bank-reward-baseline", type=float, default=3000.0)
@@ -512,10 +514,11 @@ def _reward_config(args: argparse.Namespace) -> RewardConfig:
         behavior_shaping=_behavior_shaping_config(args),
     )
     if (args.training_composition == CURRENT_VS_CURRENT_ECONOMIC
-            and config.mode != TERMINAL_OWN_BANK):
+            and config.mode not in (
+                TERMINAL_OWN_BANK, TERMINAL_OWN_BANK_LINEAR)):
         raise ValueError(
             "current_vs_current_economic requires --reward-mode "
-            "terminal_own_bank")
+            "terminal_own_bank or terminal_own_bank_linear")
     return config
 
 

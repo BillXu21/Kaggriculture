@@ -16,7 +16,11 @@ from rl_manager import stage25_ppo as ppo
 from rl_manager import stage25_ppo_cli as cli
 from rl_manager.executor_factory import (
     make_default_executor_factory, make_stage25_executor_factory)
-from rl_manager.reward import RewardConfig
+from rl_manager.reward import (
+    RewardConfig,
+    TERMINAL_OWN_BANK,
+    TERMINAL_OWN_BANK_LINEAR,
+)
 from rl_manager.runner import _executor_factory_provenance
 from rl_manager.stage25_inference import Stage25InferenceAdapter
 from rl_manager.stage25_policy import init_stage25_params, tiny_stage25_config
@@ -166,6 +170,16 @@ def test_current_current_cli_contract_requires_own_bank_reward() -> None:
         "--output-dir", "out"])
     with pytest.raises(ValueError, match="requires --reward-mode"):
         cli._reward_config(args)
+
+
+@pytest.mark.parametrize(
+    "reward_mode", (TERMINAL_OWN_BANK, TERMINAL_OWN_BANK_LINEAR))
+def test_current_current_cli_accepts_both_own_bank_modes(reward_mode) -> None:
+    args = cli._parser().parse_args([
+        "--scratch", "--training-composition", CURRENT_VS_CURRENT_ECONOMIC,
+        "--reward-mode", reward_mode, "--output-dir", "out"])
+
+    assert cli._reward_config(args).mode == reward_mode
 
 
 def test_behavior_shaping_rollout_diagnostics_are_compact_and_deterministic():
@@ -514,12 +528,16 @@ def test_executor_modes_have_distinct_canonical_provenance() -> None:
         assert json.loads(json.dumps(provenance, allow_nan=False)) == provenance
 
 
-def _write_resume_checkpoint(tmp_path, executor_name: str = "legacy"):
-    args = cli._parser().parse_args([
+def _write_resume_checkpoint(
+        tmp_path, executor_name: str = "legacy", reward_mode: str | None = None):
+    argv = [
         "--resume", str(tmp_path / f"{executor_name}-source.npz"),
         "--executor", executor_name, "--model-size", "tiny",
         "--physical-batch-size", "1", "--minibatch-size", "1",
-        "--epochs", "1", "--seed", "7", "--output-dir", str(tmp_path)])
+        "--epochs", "1", "--seed", "7", "--output-dir", str(tmp_path)]
+    if reward_mode is not None:
+        argv.extend(("--reward-mode", reward_mode))
+    args = cli._parser().parse_args(argv)
     config = cli._config(args)
     fresh = ppo.init_stage25_ppo_state(config, seed=7)
     frozen = init_stage25_params(config.model, seed=8)
@@ -626,6 +644,26 @@ def test_shaping_override_cannot_change_base_reward_mode(tmp_path) -> None:
         "--reward-mode", "terminal_own_bank",
         "--allow-shaping-change-on-resume", "--output-dir", str(tmp_path),
     ])
+    with pytest.raises(ValueError, match="training/reward contract"):
+        cli._new_state(args, cli._config(args))
+
+
+@pytest.mark.parametrize(
+    ("saved_mode", "requested_mode"), [
+        (TERMINAL_OWN_BANK, TERMINAL_OWN_BANK_LINEAR),
+        (TERMINAL_OWN_BANK_LINEAR, TERMINAL_OWN_BANK),
+    ])
+def test_resume_rejects_tanh_linear_reward_mode_changes(
+        tmp_path, saved_mode, requested_mode) -> None:
+    saved_args, *_ = _write_resume_checkpoint(
+        tmp_path, reward_mode=saved_mode)
+    args = cli._parser().parse_args([
+        "--resume", str(saved_args.resume), "--executor", "legacy",
+        "--model-size", "tiny", "--physical-batch-size", "1",
+        "--minibatch-size", "1", "--epochs", "1", "--seed", "7",
+        "--reward-mode", requested_mode, "--output-dir", str(tmp_path),
+    ])
+
     with pytest.raises(ValueError, match="training/reward contract"):
         cli._new_state(args, cli._config(args))
 

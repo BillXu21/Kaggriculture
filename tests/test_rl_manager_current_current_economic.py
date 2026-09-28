@@ -15,8 +15,13 @@ from rl_manager.land import farm_utilization_snapshot, observed_land_purchase_ev
 from rl_manager.ppo import build_ppo_batch, init_train_state, ppo_update
 from rl_manager.ppo_policy import PPOConfig
 from rl_manager.parallel import ParallelSelfPlayRunner
-from rl_manager.reward import (RewardConfig, TERMINAL_OWN_BANK, TERMINAL_WLT,
-                               terminal_rewards)
+from rl_manager.reward import (
+    RewardConfig,
+    TERMINAL_OWN_BANK,
+    TERMINAL_OWN_BANK_LINEAR,
+    TERMINAL_WLT,
+    terminal_rewards,
+)
 from rl_manager.runner import GAME_TURNS, RunnerConfig, SelfPlayRunner, build_episode_spec
 from rl_manager.trajectory import TrajectoryBuffer, e_input_spec
 from rl_manager.types import CURRENT_VS_CURRENT_ECONOMIC, PolicyIdentity, PolicyOutputs
@@ -74,6 +79,24 @@ def test_cli_current_current_plan_records_reward_and_52_row_budget(tmp_path: Pat
         "mode": TERMINAL_OWN_BANK, "bank_baseline": 3000.0,
         "bank_scale": 50000.0, "behavior_shaping": {}}
     assert plan["episodes_per_update"] * 52 == 19968
+
+
+def test_cli_current_current_plan_accepts_linear_own_bank_reward(
+        tmp_path: Path):
+    checkpoint = tmp_path / "bc.pt"
+    checkpoint.write_bytes(b"placeholder")
+    args = build_parser().parse_args([
+        "train", "--e-checkpoint", str(checkpoint),
+        "--executor-factory", "executor_v0@stage-a-v1", "--master-seed", "17",
+        "--training-composition", CURRENT_VS_CURRENT_ECONOMIC,
+        "--reward-mode", TERMINAL_OWN_BANK_LINEAR,
+        "--bank-reward-baseline", "3000", "--bank-reward-scale", "100000",
+        "--episodes-per-update", "384", "--minibatch-size", "256",
+        "--output-dir", "out", "--checkpoint", "out/final.npz"])
+    plan = plan_training(args)
+    assert plan["reward"] == {
+        "mode": TERMINAL_OWN_BANK_LINEAR, "bank_baseline": 3000.0,
+        "bank_scale": 100000.0, "behavior_shaping": {}}
 
 
 def test_current_current_resolves_same_live_policy_and_both_trainable():

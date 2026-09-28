@@ -567,6 +567,30 @@ def _dual_cli_args(tmp_path: Path):
     ])
 
 
+def test_dual_cli_parser_accepts_linear_own_bank_reward(tmp_path: Path):
+    from rl_manager.stage25_dual_ppo_cli import (
+        _parser,
+        _training_contract,
+    )
+
+    args = _parser().parse_args([
+        "--init", str(tmp_path / "bc.npz"),
+        "--output-dir", str(tmp_path / "run"),
+        "--workers", "1", "--physical-batch-size", "1",
+        "--rollout-size", "2", "--updates", "1",
+        "--reward-mode", "terminal_own_bank_linear",
+        "--bank-reward-baseline", "3000",
+        "--bank-reward-scale", "100000",
+    ])
+
+    assert _training_contract(args)["reward"] == {
+        "mode": "terminal_own_bank_linear",
+        "bank_baseline": 3000.0,
+        "bank_scale": 100000.0,
+        "behavior_shaping": {},
+    }
+
+
 def _patch_dual_cli_environment(monkeypatch, tmp_path, *, fail_update=False):
     import rl_manager.runner as runner
     import rl_manager.stage25_ppo_cli as shared_cli

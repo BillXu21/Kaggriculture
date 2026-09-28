@@ -13,6 +13,7 @@ from rl_manager.reward import (
     BehaviorShapingFeature,
     RewardConfig,
     TERMINAL_OWN_BANK,
+    TERMINAL_OWN_BANK_LINEAR,
     normalized_saturated_potential,
     terminal_rewards,
 )
@@ -38,6 +39,28 @@ def test_disabled_config_preserves_existing_terminal_rewards() -> None:
     assert terminal_rewards([99.0, 100.0], disabled) == [-1.0, 1.0]
     economic = RewardConfig(mode=TERMINAL_OWN_BANK)
     assert terminal_rewards([3000.0, 53000.0], economic) == [0.0, math.tanh(1.0)]
+
+
+def test_linear_own_bank_reward_is_unclipped_and_wlt_is_unchanged() -> None:
+    linear = RewardConfig(
+        mode=TERMINAL_OWN_BANK_LINEAR,
+        bank_baseline=3000.0,
+        bank_scale=100000.0,
+    )
+    assert terminal_rewards(
+        [3000.0, 53000.0], linear) == [0.0, 0.5]
+    assert terminal_rewards([103000.0, 203000.0], linear) == [1.0, 2.0]
+    assert terminal_rewards([0.0, 3000.0], linear) == pytest.approx(
+        [-0.03, 0.0])
+
+    tanh = RewardConfig(
+        mode=TERMINAL_OWN_BANK,
+        bank_baseline=3000.0,
+        bank_scale=100000.0,
+    )
+    assert terminal_rewards([203000.0, 0.0], tanh) == [
+        math.tanh(2.0), math.tanh(-0.03)]
+    assert terminal_rewards([53000.0, 3000.0], RewardConfig()) == [1.0, -1.0]
 
 
 @pytest.mark.parametrize(("count", "expected"), [
@@ -115,7 +138,9 @@ def test_maximum_valid_shaping_cannot_change_win_or_loss_sign() -> None:
     assert -1.0 + largest <= -0.75
 
 
-def test_cli_requires_complete_pairs_and_terminal_wlt() -> None:
+@pytest.mark.parametrize(
+    "reward_mode", (TERMINAL_OWN_BANK, TERMINAL_OWN_BANK_LINEAR))
+def test_cli_requires_complete_pairs_and_terminal_wlt(reward_mode) -> None:
     incomplete = _parser().parse_args([
         "--scratch", "--output-dir", "out",
         "--shape-cow-target", "6"])
@@ -124,7 +149,7 @@ def test_cli_requires_complete_pairs_and_terminal_wlt() -> None:
 
     own_bank = _parser().parse_args([
         "--scratch", "--output-dir", "out",
-        "--reward-mode", TERMINAL_OWN_BANK,
+        "--reward-mode", reward_mode,
         "--shape-cow-target", "6", "--shape-cow-weight", "0.1"])
     with pytest.raises(ValueError, match="requires reward mode terminal_wlt"):
         _reward_config(own_bank)

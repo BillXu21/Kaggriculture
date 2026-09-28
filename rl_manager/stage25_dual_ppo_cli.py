@@ -13,6 +13,7 @@ from rl_manager.parallel import ParallelSelfPlayRunner
 from rl_manager.reward import (
     BEHAVIOR_SHAPING_FEATURES,
     TERMINAL_OWN_BANK,
+    TERMINAL_OWN_BANK_LINEAR,
     TERMINAL_WLT,
     BehaviorShapingConfig,
 )
@@ -36,7 +37,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--engine", choices=("fast", "official"), default="fast")
     parser.add_argument("--executor", choices=("strip", "legacy"), default="strip")
     parser.add_argument("--opening", default="standard_mixed")
-    parser.add_argument("--reward-mode", choices=(TERMINAL_WLT, TERMINAL_OWN_BANK),
+    parser.add_argument("--reward-mode", choices=(
+                        TERMINAL_WLT, TERMINAL_OWN_BANK,
+                        TERMINAL_OWN_BANK_LINEAR),
                         default=TERMINAL_WLT)
     parser.add_argument("--bank-reward-baseline", type=float, default=3000.0)
     parser.add_argument("--bank-reward-scale", type=float, default=50000.0)

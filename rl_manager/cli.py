@@ -49,7 +49,8 @@ from rl_manager.types import E_VS_E, E_VS_PASS
 from rl_manager.types import (CANDIDATE_VS_FROZEN,
                                CURRENT_VS_CURRENT_ECONOMIC)
 from rl_manager.reward import (REWARD_MODES, RewardConfig,
-                               TERMINAL_OWN_BANK)
+                               TERMINAL_OWN_BANK,
+                               TERMINAL_OWN_BANK_LINEAR)
 if TYPE_CHECKING:  # pragma: no cover - import-time accelerator safety
     from rl_manager.ppo_policy import (CurriculumMaskConfig,
                                        TargetedExplorationConfig)
@@ -399,10 +400,12 @@ def plan_training(args: argparse.Namespace) -> dict[str, Any]:
         bank_baseline=float(getattr(args, "bank_reward_baseline", 3000.0)),
         bank_scale=float(getattr(args, "bank_reward_scale", 50000.0)))
     if (composition == CURRENT_VS_CURRENT_ECONOMIC
-            and reward_config.mode != TERMINAL_OWN_BANK):
+            and reward_config.mode not in (
+                TERMINAL_OWN_BANK, TERMINAL_OWN_BANK_LINEAR)):
         raise ValueError(
             "current_vs_current_economic requires --reward-mode "
-            "terminal_own_bank; symmetric W/L training is rejected")
+            "terminal_own_bank or terminal_own_bank_linear; "
+            "symmetric W/L training is rejected")
     for name, value in (("episodes_per_update", args.episodes_per_update),
                         ("updates", args.updates),
                         ("epochs", args.epochs),
