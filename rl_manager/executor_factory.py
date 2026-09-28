@@ -32,6 +32,13 @@ STAGE25_EXECUTOR_PROFILE_VERSION = "strip_executor_v1@stage25-packet3-v1"
 STAGE25_EXECUTOR_PROFILE_NAME = "stage25_strip_executor"
 
 
+def _strip_config_json(config: Any) -> dict[str, Any]:
+    payload = asdict(config)
+    if not payload.get("enable_row_claim_board", False):
+        payload.pop("enable_row_claim_board", None)
+    return payload
+
+
 @dataclass(frozen=True)
 class Stage25ExecutorProfile:
     """Versioned, introspectable fixed-strip settings for Stage 2.5."""
@@ -46,7 +53,7 @@ class Stage25ExecutorProfile:
                 "Stage 2.5 strip profile requires aggressive_sell_all=True")
 
     def to_json_dict(self) -> dict[str, Any]:
-        config = asdict(self.strip_config)
+        config = _strip_config_json(self.strip_config)
         config["acting_seat"] = "factory_injected_seat"
         return {
             "name": self.name,
@@ -105,7 +112,7 @@ class Stage25StripExecutorAgent:
             "schema_version": 1,
             "seat": self.seat,
             "effective_profile": copy.deepcopy(self.effective_profile),
-            "config": asdict(self.config),
+            "config": _strip_config_json(self.config),
             "days": copy.deepcopy(self._days),
             "fallback_errors": [],
         }
