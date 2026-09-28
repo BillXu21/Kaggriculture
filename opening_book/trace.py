@@ -7,11 +7,13 @@ legacy built-ins cover d0-d3 (96 turns); extended traces may end at any
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
 import os
 from typing import Any
+import zlib
 
 ENGINE_VERSION = "1.32.7"
 TRACE_FORMAT_VERSION = 1
@@ -182,19 +184,31 @@ def built_in_identities() -> tuple[str, ...]:
     return IDENTITIES
 
 
+def _read_trace_bytes(identity: str) -> bytes:
+    if identity == "dsm_d0_d6h3":
+        path = os.path.join(_DATA_DIR, f"{identity}.json.b85")
+        with open(path, "rb") as f:
+            packed = f.read().strip()
+        try:
+            return zlib.decompress(base64.b85decode(packed))
+        except (ValueError, zlib.error) as exc:
+            raise TraceError(f"{path}: invalid compressed trace: {exc}") from exc
+    path = os.path.join(_DATA_DIR, f"{identity}.json")
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def load_built_in_trace(identity: str = DEFAULT_IDENTITY) -> dict[str, Any]:
     if identity not in IDENTITIES:
         _fail(f"unknown opening identity {identity!r}; known: {list(IDENTITIES)}")
-    path = os.path.join(_DATA_DIR, f"{identity}.json")
-    with open(path, "rb") as f:
-        raw = f.read()
+    raw = _read_trace_bytes(identity)
     try:
         doc = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise TraceError(f"{path}: invalid JSON: {exc}") from exc
+        raise TraceError(f"{identity}: invalid JSON: {exc}") from exc
     validate_trace(doc)
     if doc.get("identity") != identity:
-        _fail(f"{path}: file identity {doc.get('identity')!r} does not match {identity!r}")
+        _fail(f"trace identity {doc.get('identity')!r} does not match {identity!r}")
     return copy.deepcopy(doc)
 
 
