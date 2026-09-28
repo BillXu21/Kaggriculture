@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, replace
 from types import MappingProxyType, SimpleNamespace
+from typing import Any
 
 import jax
 import numpy as np
@@ -137,6 +138,7 @@ def test_ppo_cli_records_the_real_executor_identity(
             "mode": "terminal_wlt",
             "bank_baseline": 3000.0,
             "bank_scale": 50000.0,
+            "behavior_shaping": {},
         },
     }
     assert captured["metadata"]["cli_args"]["opening"] == "standard_mixed"
@@ -164,6 +166,110 @@ def test_current_current_cli_contract_requires_own_bank_reward() -> None:
         "--output-dir", "out"])
     with pytest.raises(ValueError, match="requires --reward-mode"):
         cli._reward_config(args)
+
+
+def test_behavior_shaping_rollout_diagnostics_are_compact_and_deterministic():
+    from rl_manager.reward import BehaviorShapingConfig, BehaviorShapingFeature
+
+    shaping = BehaviorShapingConfig(
+        cow=BehaviorShapingFeature(target=6, weight=0.1),
+        wheat=BehaviorShapingFeature(target=30, weight=0.1))
+    results = [
+        SimpleNamespace(behavior_shaping={
+            0: {
+                "total": 0.1,
+                "features": {
+                    "cow": {"reward": 0.05, "initial_count": 0,
+                            "final_count": 6, "target_reached": True},
+                    "wheat": {"reward": 0.05, "initial_count": 2,
+                              "final_count": 17, "target_reached": False},
+                },
+            },
+        }),
+        SimpleNamespace(behavior_shaping={
+            1: {
+                "total": -0.05,
+                "features": {
+                    "cow": {"reward": -0.05, "initial_count": 3,
+                            "final_count": 0, "target_reached": False},
+                    "wheat": {"reward": 0.0, "initial_count": 0,
+                              "final_count": 30, "target_reached": True},
+                },
+            },
+        }),
+    ]
+
+    diagnostics = cli._behavior_shaping_rollout_diagnostics(results, shaping)
+    assert diagnostics == {
+        "total": pytest.approx(0.05),
+        "mean_per_episode": pytest.approx(0.025),
+        "learner_episodes": 2,
+        "features": {
+            "cow": {
+                "mean_episode_contribution": pytest.approx(0.0),
+                "mean_initial_count": pytest.approx(1.5),
+                "mean_final_count": pytest.approx(3.0),
+                "target_reached_fraction": pytest.approx(0.5),
+            },
+            "wheat": {
+                "mean_episode_contribution": pytest.approx(0.025),
+                "mean_initial_count": pytest.approx(1.0),
+                "mean_final_count": pytest.approx(23.5),
+                "target_reached_fraction": pytest.approx(0.5),
+            },
+        },
+    }
+
+
+def test_resume_change_is_recorded_in_checkpoint_provenance(
+        monkeypatch, tmp_path) -> None:
+    args = cli._parser().parse_args([
+        "--resume", str(tmp_path / "source.npz"),
+        "--allow-shaping-change-on-resume",
+        "--shape-cow-target", "6", "--shape-cow-weight", "0.1",
+        "--physical-batch-size", "1", "--minibatch-size", "1",
+        "--epochs", "1", "--updates", "1", "--output-dir", str(tmp_path)])
+    config = cli._config(args)
+    state = ppo.init_stage25_ppo_state(config, seed=7)
+    learner = Stage25InferenceAdapter(
+        params=state.params, config=config.model, name="stage25_learner",
+        version="ppo-native-v1", seed=7, mode="stochastic")
+    previous_contract = {
+        "training_composition": CANDIDATE_VS_FROZEN,
+        "reward": RewardConfig().to_json_dict(),
+    }
+    source_meta = {
+        "training_contract": previous_contract,
+        "payload_kind": "stage25_ppo_training_v1",
+        "update_counter": 12,
+    }
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(cli, "_new_state", lambda *_: (state, source_meta))
+    monkeypatch.setattr(cli, "_collection", lambda *a, **k: (
+        None, learner, object(), {
+            "final_banks": [100.0, 0.0],
+            "learner_rows": 1,
+            "inference_metrics": {},
+        }))
+    monkeypatch.setattr(
+        ppo, "ppo_update",
+        lambda current, _batch, _config: (
+            replace(current, update_counter=current.update_counter + 1), {}))
+
+    def capture_save(_path, *positional, **kwargs):
+        del positional
+        captured.update(kwargs)
+
+    monkeypatch.setattr(checkpoint, "save_stage25_ppo_checkpoint", capture_save)
+    cli.run(args)
+
+    transition = captured["provenance"]["run"]["behavior_shaping_resume"]
+    assert transition == {
+        "previous": {},
+        "requested": {"cow": {"target": 6, "weight": 0.1}},
+        "explicit_override": True,
+    }
 
 
 def test_rollout_control_defaults_preserve_runner_defaults() -> None:
@@ -474,12 +580,129 @@ def test_ppo_checkpoint_resumes_with_exact_state(tmp_path, executor_name) -> Non
 
 def test_resume_rejects_changed_executor_setting(tmp_path, monkeypatch) -> None:
     args, config, *_ = _write_resume_checkpoint(tmp_path, "legacy")
+    args.allow_shaping_change_on_resume = True
     original = cli._resolve_executor_factory("legacy")
     changed = make_default_executor_factory(
         replace(original.agent_config, tasks_per_worker=11))
     monkeypatch.setattr(cli, "_resolve_executor_factory", lambda _: changed)
     with pytest.raises(ValueError, match="executor provenance does not match"):
         cli._new_state(args, config)
+
+
+def test_resume_shaping_change_requires_override_and_preserves_state(
+        tmp_path) -> None:
+    saved_args, config, fresh, frozen, *_ = _write_resume_checkpoint(
+        tmp_path, "legacy")
+    common = [
+        "--resume", str(saved_args.resume), "--executor", "legacy",
+        "--model-size", "tiny", "--physical-batch-size", "1",
+        "--minibatch-size", "1", "--epochs", "1", "--seed", "7",
+        "--shape-cow-target", "6", "--shape-cow-weight", "0.1",
+        "--output-dir", str(tmp_path),
+    ]
+    strict_args = cli._parser().parse_args(common)
+    with pytest.raises(ValueError, match="training/reward contract"):
+        cli._new_state(strict_args, cli._config(strict_args))
+
+    override_args = cli._parser().parse_args([
+        *common, "--allow-shaping-change-on-resume"])
+    state, meta = cli._new_state(override_args, cli._config(override_args))
+    assert _same_tree(state.params, fresh.params)
+    assert _same_tree(state.optimizer_state, fresh.optimizer_state)
+    assert _same_tree(state.rng, fresh.rng)
+    assert _same_tree(state.opponent_params, frozen)
+    assert state.rollout_seed == 281
+    assert state.rollout_progression == {"completed_rollouts": 70}
+    assert state.update_counter == 70
+    assert meta["training_contract"]["reward"]["behavior_shaping"] == {}
+
+
+def test_shaping_override_cannot_change_base_reward_mode(tmp_path) -> None:
+    saved_args, *_ = _write_resume_checkpoint(tmp_path, "legacy")
+    args = cli._parser().parse_args([
+        "--resume", str(saved_args.resume), "--executor", "legacy",
+        "--model-size", "tiny", "--physical-batch-size", "1",
+        "--minibatch-size", "1", "--epochs", "1", "--seed", "7",
+        "--reward-mode", "terminal_own_bank",
+        "--allow-shaping-change-on-resume", "--output-dir", str(tmp_path),
+    ])
+    with pytest.raises(ValueError, match="training/reward contract"):
+        cli._new_state(args, cli._config(args))
+
+
+def test_shaping_override_keeps_model_ppo_and_physical_contracts_strict(
+        tmp_path, monkeypatch) -> None:
+    saved_args, *_ = _write_resume_checkpoint(tmp_path, "legacy")
+    common = [
+        "--resume", str(saved_args.resume), "--executor", "legacy",
+        "--physical-batch-size", "1", "--minibatch-size", "1",
+        "--epochs", "1", "--seed", "7",
+        "--shape-cow-target", "6", "--shape-cow-weight", "0.1",
+        "--allow-shaping-change-on-resume", "--output-dir", str(tmp_path),
+    ]
+    model_args = cli._parser().parse_args([
+        *common, "--model-size", "small"])
+    with pytest.raises(ValueError, match="incompatible with requested config"):
+        cli._new_state(model_args, cli._config(model_args))
+
+    ppo_args = cli._parser().parse_args([
+        *common, "--model-size", "tiny", "--epochs", "2"])
+    with pytest.raises(ValueError, match="PPO configuration does not match"):
+        cli._new_state(ppo_args, cli._config(ppo_args))
+
+    physical_args = cli._parser().parse_args([
+        *common, "--model-size", "tiny"])
+    monkeypatch.setattr(
+        cli, "_physical_contract", lambda _config: {"version": "wrong"})
+    with pytest.raises(ValueError, match="physical contract does not match"):
+        cli._new_state(physical_args, cli._config(physical_args))
+
+
+def test_old_training_contract_without_shaping_means_disabled() -> None:
+    old_contract = {
+        "training_composition": CANDIDATE_VS_FROZEN,
+        "reward": {
+            "mode": "terminal_wlt",
+            "bank_baseline": 3000.0,
+            "bank_scale": 50000.0,
+        },
+    }
+    assert cli._checkpoint_training_contract({
+        "training_contract": old_contract,
+    }) == {
+        "training_composition": CANDIDATE_VS_FROZEN,
+        "reward": {
+            "mode": "terminal_wlt",
+            "bank_baseline": 3000.0,
+            "bank_scale": 50000.0,
+            "behavior_shaping": {},
+        },
+    }
+
+
+def test_old_checkpoint_without_shaping_resumes_as_disabled(
+        tmp_path, monkeypatch) -> None:
+    current_training_contract = cli._training_contract
+
+    def legacy_training_contract(args):
+        contract = current_training_contract(args)
+        contract["reward"].pop("behavior_shaping")
+        return contract
+
+    monkeypatch.setattr(cli, "_training_contract", legacy_training_contract)
+    args, config, fresh, *_ = _write_resume_checkpoint(tmp_path, "legacy")
+    monkeypatch.setattr(cli, "_training_contract", current_training_contract)
+
+    state, meta = cli._new_state(args, config)
+    assert _same_tree(state.params, fresh.params)
+    assert _same_tree(state.optimizer_state, fresh.optimizer_state)
+    assert cli._checkpoint_training_contract(meta)["reward"][
+        "behavior_shaping"] == {}
+    with np.load(args.resume, allow_pickle=False) as archive:
+        raw_contract = json.loads(
+            archive["__meta__"].tobytes().decode("utf-8"))["training_contract"]
+    assert "behavior_shaping" not in raw_contract["reward"]
+
 
 @pytest.mark.parametrize(("saved_as", "resume_as"), [
     ("legacy", "strip"), ("strip", "legacy")])

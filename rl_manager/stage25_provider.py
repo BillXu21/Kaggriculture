@@ -45,6 +45,7 @@ from .stage25_config import (
     curriculum_fingerprint,
 )
 from .stage25_mechanics import (
+    ANIMAL_ORDER,
     ACTION_CLASS_COUNTS,
     ACTION_ORDER,
     CROP_ORDER,
@@ -60,6 +61,7 @@ from .stage25_mechanics import (
     animal_class_to_target,
     transition_crop_goal,
     unplaced_animal_counts,
+    owned_animal_counts,
 )
 from .stage25_types import (
     STAGE25_OBSERVATION_SCHEMA_VERSION,
@@ -70,6 +72,51 @@ from .stage25_types import (
 STATE_VERSION = "stage25_provider_state_v3"
 SOURCE_TRANSFER = "encoder_only"
 DecisionMode = Literal["deterministic", "stochastic"]
+
+
+def realized_behavior_counts_from_context(
+    context: PhysicalContext,
+) -> dict[str, int]:
+    """Return the eight supported counts from an already observed context.
+
+    Crop entries come from ``PhysicalContext.observed_crop_counts`` (the
+    canonical physical board baseline). Animal entries use the same owned
+    count semantics as target reconciliation: placed animals plus animals in
+    the shed and carried hands.
+    """
+    animal_counts = owned_animal_counts(context)
+    result = {
+        name.lower(): int(count)
+        for name, count in zip(ANIMAL_ORDER, animal_counts)
+    }
+    result.update({
+        name.lower(): int(count)
+        for name, count in zip(CROP_ORDER, context.observed_crop_counts)
+    })
+    return result
+
+
+def realized_behavior_counts_from_observation(
+    obs: Mapping[str, Any], seat: int,
+) -> dict[str, int]:
+    """Read only one seat's final realized board and owned inventories."""
+    if isinstance(seat, bool) or seat not in (0, 1):
+        raise ValueError("seat must be 0 or 1")
+    if not isinstance(obs, Mapping):
+        raise TypeError("observation must be a mapping")
+    try:
+        farm = obs["farms"][seat]
+        step = resolve_observation_step(obs)
+        board = canonical_board(farm["tiles"], int(obs["day"]), step)
+        private = obs.get("private") or {}
+        unplaced = unplaced_animal_counts(
+            private.get("shed") or {}, private.get("inventories") or ())
+        context = physical_context_from_board(
+            board, farm["unlocked_quadrants"], unplaced_animals=unplaced)
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"could not read realized behavior counts for seat {seat}: {exc}") from exc
+    return realized_behavior_counts_from_context(context)
 
 
 def _lower_plan(action_classes: Sequence[int], crop_goals: Sequence[int]) -> DailyPlan:
@@ -1221,4 +1268,6 @@ __all__ = [
     "STATE_VERSION", "Stage25ProviderError", "Stage25DuplicateDecisionError",
     "Stage25OutOfOrderError", "Stage25TerminalError", "Stage25DecisionKey",
     "Stage25LifecycleState", "Stage25NativePolicy", "Stage25PlanProvider",
+    "realized_behavior_counts_from_context",
+    "realized_behavior_counts_from_observation",
 ]

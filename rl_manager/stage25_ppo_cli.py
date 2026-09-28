@@ -18,8 +18,11 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 from rl_manager.parallel import ParallelSelfPlayRunner
 from rl_manager.reward import (
+    BEHAVIOR_SHAPING_FEATURES,
     TERMINAL_OWN_BANK,
     TERMINAL_WLT,
+    BehaviorShapingConfig,
+    BehaviorShapingFeature,
     RewardConfig,
 )
 from rl_manager.runner import RunnerConfig, build_episode_spec
@@ -245,6 +248,15 @@ def _format_report(record: Mapping[str, Any]) -> str:
         f"latest checkpoint: {record['checkpoint']}",
         "=" * 64,
     ]
+    shaping = record.get("behavior_shaping")
+    if isinstance(shaping, Mapping):
+        lines.extend([
+            "",
+            "BEHAVIOR SHAPING",
+            line("total / mean episode", (
+                f"{float(shaping.get('total', 0.0)):.4f} / "
+                f"{float(shaping.get('mean_per_episode', 0.0)):.5f}")),
+        ])
     report = "\n".join(lines)
     profile = record.get("rollout_profile")
     if not isinstance(profile, Mapping):
@@ -430,6 +442,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--bank-reward-baseline", type=float, default=3000.0)
     parser.add_argument("--bank-reward-scale", type=float, default=50000.0)
+    for feature in BEHAVIOR_SHAPING_FEATURES:
+        parser.add_argument(
+            f"--shape-{feature}-target", type=int, default=None,
+            help=f"temporary realized {feature} count target")
+        parser.add_argument(
+            f"--shape-{feature}-weight", type=float, default=None,
+            help=f"temporary {feature} potential-difference reward weight")
+    parser.add_argument(
+        "--allow-shaping-change-on-resume", action="store_true",
+        help="allow only the behavior-shaping subconfig to change on PPO resume")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--envs-per-worker", type=int, default=1)
     parser.add_argument("--batch-backend", action="store_true")
@@ -467,11 +489,27 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _behavior_shaping_config(args: argparse.Namespace) -> BehaviorShapingConfig:
+    features: dict[str, BehaviorShapingFeature] = {}
+    for name in BEHAVIOR_SHAPING_FEATURES:
+        target = getattr(args, f"shape_{name}_target", None)
+        weight = getattr(args, f"shape_{name}_weight", None)
+        if (target is None) != (weight is None):
+            raise ValueError(
+                f"--shape-{name}-target and --shape-{name}-weight must be "
+                "supplied together")
+        if target is not None:
+            features[name] = BehaviorShapingFeature(
+                target=target, weight=weight)
+    return BehaviorShapingConfig(**features)
+
+
 def _reward_config(args: argparse.Namespace) -> RewardConfig:
     config = RewardConfig(
         mode=args.reward_mode,
         bank_baseline=args.bank_reward_baseline,
         bank_scale=args.bank_reward_scale,
+        behavior_shaping=_behavior_shaping_config(args),
     )
     if (args.training_composition == CURRENT_VS_CURRENT_ECONOMIC
             and config.mode != TERMINAL_OWN_BANK):
@@ -504,6 +542,9 @@ def _validate_rollout_controls(args: argparse.Namespace) -> None:
             and (not math.isfinite(args.scratch_hold_prior_tau)
                  or args.scratch_hold_prior_tau <= 0.0)):
         raise ValueError("scratch-hold-prior-tau must be finite and positive")
+    if (getattr(args, "allow_shaping_change_on_resume", False)
+            and args.resume is None):
+        raise ValueError("--allow-shaping-change-on-resume requires --resume")
 
 
 def _runner_config(
@@ -526,7 +567,20 @@ def _runner_config(
 def _checkpoint_training_contract(meta: Mapping[str, Any]) -> dict[str, Any]:
     stored = meta.get("training_contract")
     if isinstance(stored, dict):
-        return dict(stored)
+        contract = dict(stored)
+        reward = contract.get("reward")
+        if isinstance(reward, Mapping):
+            canonical_reward = dict(reward)
+            try:
+                canonical_reward["behavior_shaping"] = (
+                    BehaviorShapingConfig.from_json_dict(
+                        canonical_reward.get("behavior_shaping"))
+                    .to_json_dict())
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"PPO checkpoint behavior-shaping metadata is invalid: {exc}") from exc
+            contract["reward"] = canonical_reward
+        return contract
     # Checkpoints written before this CLI exposed composition/reward options
     # were always candidate-v-frozen with the RunnerConfig W/L default.
     cli_args = meta.get("cli_args")
@@ -540,9 +594,37 @@ def _checkpoint_training_contract(meta: Mapping[str, Any]) -> dict[str, Any]:
                     cli_args.get("bank_reward_baseline", 3000.0)),
                 "bank_scale": float(
                     cli_args.get("bank_reward_scale", 50000.0)),
+                "behavior_shaping": _behavior_shaping_from_cli_metadata(
+                    cli_args),
             },
         }
     return {}
+
+
+def _behavior_shaping_from_cli_metadata(
+        cli_args: Mapping[str, Any]) -> dict[str, dict[str, int | float]]:
+    features: dict[str, BehaviorShapingFeature] = {}
+    for name in BEHAVIOR_SHAPING_FEATURES:
+        target = cli_args.get(f"shape_{name}_target")
+        weight = cli_args.get(f"shape_{name}_weight")
+        if target is None and weight is None:
+            continue
+        if target is None or weight is None:
+            raise ValueError(
+                f"checkpoint CLI metadata has an incomplete {name} shaping pair")
+        features[name] = BehaviorShapingFeature(target=target, weight=weight)
+    return BehaviorShapingConfig(**features).to_json_dict()
+
+
+def _contract_without_behavior_shaping(
+        contract: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(contract)
+    reward = result.get("reward")
+    if isinstance(reward, Mapping):
+        base_reward = dict(reward)
+        base_reward.pop("behavior_shaping", None)
+        result["reward"] = base_reward
+    return result
 
 
 def _config(args: argparse.Namespace) -> Stage25PPOConfig:
@@ -625,7 +707,14 @@ def _new_state(args: argparse.Namespace, config: Stage25PPOConfig) -> tuple[Stag
         expected_physical_contract=expected_physical, return_opponent=True)
     expected_contract = _training_contract(args)
     stored_contract = _checkpoint_training_contract(meta)
-    if stored_contract != expected_contract:
+    allow_shaping_change = getattr(
+        args, "allow_shaping_change_on_resume", False)
+    contract_matches = stored_contract == expected_contract
+    if (not contract_matches and allow_shaping_change
+            and _contract_without_behavior_shaping(stored_contract)
+            == _contract_without_behavior_shaping(expected_contract)):
+        contract_matches = True
+    if not contract_matches:
         raise ValueError(
             "PPO checkpoint training/reward contract does not match the "
             f"requested contract: {stored_contract!r} != {expected_contract!r}")
@@ -734,10 +823,50 @@ def _collection(
             "collection_seconds": collection_seconds,
         },
     }
+    if reward_config.behavior_shaping.enabled:
+        stats["behavior_shaping"] = _behavior_shaping_rollout_diagnostics(
+            results, reward_config.behavior_shaping)
     if getattr(args, "stage25_rollout_profile", False):
         stats["rollout_profile"] = getattr(runner, "rollout_profile", None)
     trajectory.validate_executor_provenance(stats["executor_provenance"])
     return trajectory, learner, batch, stats
+
+
+def _behavior_shaping_rollout_diagnostics(
+        results: list[Any], shaping: BehaviorShapingConfig,
+) -> dict[str, Any]:
+    """Aggregate compact per-trainable-seat episode shaping metrics."""
+    episodes: list[dict[str, Any]] = []
+    for result in results:
+        for seat in sorted((result.behavior_shaping or {})):
+            episodes.append(result.behavior_shaping[seat])
+    total = math.fsum(float(item["total"]) for item in episodes)
+    features: dict[str, dict[str, float]] = {}
+    for name, _feature in shaping.active_features():
+        records = [item["features"][name] for item in episodes]
+        initial = [float(row["initial_count"]) for row in records
+                   if row["initial_count"] is not None]
+        final = [float(row["final_count"]) for row in records
+                 if row["final_count"] is not None]
+        reached = [float(bool(row["target_reached"])) for row in records
+                   if row["target_reached"] is not None]
+        features[name] = {
+            "mean_episode_contribution": (
+                math.fsum(float(row["reward"]) for row in records)
+                / len(episodes) if episodes else 0.0),
+            "mean_initial_count": (
+                math.fsum(initial) / len(initial) if initial else 0.0),
+            "mean_final_count": (
+                math.fsum(final) / len(final) if final else 0.0),
+            "target_reached_fraction": (
+                math.fsum(reached) / len(reached) if reached else 0.0),
+        }
+    return {
+        "total": float(total),
+        "mean_per_episode": total / len(episodes) if episodes else 0.0,
+        "learner_episodes": len(episodes),
+        "features": features,
+    }
 
 
 def run(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -758,7 +887,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             "Packet 5A single-process collection cannot honor a physical "
             "batch larger than one; use --workers 2+ or set "
             "--physical-batch-size 1")
-    _reward_config(args)
+    reward_config = _reward_config(args)
     state, source_meta = _new_state(args, config)
     startup_seconds = time.perf_counter() - startup_started
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -821,6 +950,16 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                         "path": str(args.resume),
                         "payload_kind": source_meta.get("payload_kind"),
                         "update_counter": source_meta.get("update_counter"),
+                    }),
+                "behavior_shaping_resume": (
+                    None if not getattr(
+                        args, "allow_shaping_change_on_resume", False)
+                    else {
+                        "previous": _checkpoint_training_contract(
+                            source_meta).get("reward", {}).get(
+                                "behavior_shaping", {}),
+                        "requested": reward_config.behavior_shaping.to_json_dict(),
+                        "explicit_override": True,
                     }),
                 "initialization_migration": source_meta.get(
                     "architecture_migration"),

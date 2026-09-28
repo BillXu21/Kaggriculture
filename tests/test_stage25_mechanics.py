@@ -8,10 +8,9 @@ import pytest
 from rl_manager.stage25_mechanics import (
     ACTION_CLASS_COUNTS,
     ACTION_ORDER,
-    ANIMAL_ORDER,
-    CROP_ORDER,
     PhysicalContext,
     animal_acquisition_deficits,
+    owned_animal_counts,
     animal_prefix_is_feasible,
     animal_target_support_mask,
     available_crop_slots,
@@ -152,6 +151,10 @@ def test_owned_unplaced_animals_satisfy_acquisition_without_changing_housing():
     assert animal_acquisition_deficits(ctx, (4, 2, 1)) == (1, 0, 1)
     assert physical_crop_capacity(ctx, 1, (4, 2, 1)) == 19
     assert unplaced_animal_counts({"GOOSE": 2}, ({"COW": 3},)) == (2, 3, 0)
+    assert owned_animal_counts(ctx) == (3, 3, 0)
+    # A larger manager absolute target is only a request. The physical context
+    # and owned inventories above remain the realized shaping count.
+    assert animal_acquisition_deficits(ctx, (10, 10, 10)) == (7, 7, 10)
     with pytest.raises(ValueError):
         animal_acquisition_deficits(ctx, (0, 0, 0))
 

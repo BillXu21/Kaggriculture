@@ -246,6 +246,7 @@ class Stage25TrajectoryBuffer:
         self._last_appended_index: dict[tuple[int, int], int] = {}
         self._ended_episode_seats: set[tuple[int, int]] = set()
         self._closed_outgoing: set[tuple[int, int, int]] = set()
+        self._manager_reward_patched: set[int] = set()
 
     def __len__(self) -> int:
         return self._count
@@ -437,8 +438,6 @@ class Stage25TrajectoryBuffer:
             raise ValueError("truncated rows require bootstrap_patched")
         if bool(row.terminated) and bool(row.bootstrap_patched):
             raise ValueError("terminated rows cannot have bootstrap_patched")
-        if not bool(row.terminated) and float(reward) != 0.0:
-            raise ValueError("unpatched rows must have zero reward")
         if not bool(row.bootstrap_patched) and float(bootstrap_value) != 0.0:
             raise ValueError("unpatched rows must have zero bootstrap_value")
         self._arrays["reward"][index] = reward
@@ -519,6 +518,19 @@ class Stage25TrajectoryBuffer:
         self._arrays["terminated"][index] = 1
         self._arrays["reward_patched"][index] = 1
         self._ended_episode_seats.add(episode_seat)
+
+    def patch_manager_reward(self, index: int, reward_delta: Any) -> None:
+        """Add one signed manager-boundary reward to an outgoing decision row."""
+        self._require_open(index)
+        reward_delta = _require_patch_scalar(reward_delta, "reward_delta")
+        _finite(reward_delta, "reward_delta")
+        if not bool(self._arrays["trainable"][index]):
+            raise ValueError("manager shaping can only be applied to trainable rows")
+        if index in self._manager_reward_patched:
+            raise ValueError(f"manager shaping was already patched on row {index}")
+        self._arrays["reward"][index] = np.float32(
+            float(self._arrays["reward"][index]) + float(reward_delta))
+        self._manager_reward_patched.add(index)
 
     def patch_truncated(self, index: int, bootstrap_value: Any = None) -> None:
         self._require_open(index)

@@ -38,6 +38,7 @@ __all__ = [
     "physical_crop_counts", "available_crop_slots",
     "animal_prefix_is_feasible", "animal_target_support_mask",
     "animal_acquisition_deficits", "unplaced_animal_counts",
+    "owned_animal_counts",
     "crop_delta_support_mask",
     "decode_supported_crop_goals", "land_target_support_mask",
 ]
@@ -486,6 +487,21 @@ def animal_acquisition_deficits(
     return tuple(max(0, target - placed - owned)
                    for target, placed, owned in zip(
                        targets, context.placed_animals, context.unplaced_animals))
+
+
+def owned_animal_counts(context: PhysicalContext) -> tuple[int, ...]:
+    """Return realized ownership: placed board animals plus owned inventory.
+
+    This is the same ownership accounting used by ``animal_acquisition_deficits``:
+    executor target reconciliation subtracts both ``placed_animals`` and
+    ``unplaced_animals`` (shed plus carried hands) from requested targets.
+    Behavior shaping uses their sum so it does not redefine ownership as only
+    coop/pasture occupancy.
+    """
+    if not isinstance(context, PhysicalContext):
+        raise TypeError("context must be a PhysicalContext")
+    return tuple(placed + unplaced for placed, unplaced in zip(
+        context.placed_animals, context.unplaced_animals))
 
 
 def unplaced_animal_counts(

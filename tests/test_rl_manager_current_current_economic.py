@@ -72,7 +72,7 @@ def test_cli_current_current_plan_records_reward_and_52_row_budget(tmp_path: Pat
     assert plan["training_composition"] == CURRENT_VS_CURRENT_ECONOMIC
     assert plan["reward"] == {
         "mode": TERMINAL_OWN_BANK, "bank_baseline": 3000.0,
-        "bank_scale": 50000.0}
+        "bank_scale": 50000.0, "behavior_shaping": {}}
     assert plan["episodes_per_update"] * 52 == 19968
 
 

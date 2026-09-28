@@ -62,6 +62,8 @@ from rl_manager.provider import QueuedPlanProvider
 from rl_manager.stage25_provider import (
     Stage25InferenceContext,
     Stage25PlanProvider,
+    realized_behavior_counts_from_context,
+    realized_behavior_counts_from_observation,
 )
 from rl_manager.stage25_types import (
     Stage25BehaviorIdentity, Stage25PolicyOutputs, stage25_rng_namespace)
@@ -215,6 +217,9 @@ class RunnerConfig:
             raise ValueError(
                 "Stage 2.5 trajectory currently supports manager_start_day=4; "
                 "another day boundary is rejected at startup")
+        if (self.reward_config.behavior_shaping.enabled
+                and not self.stage25_enabled):
+            raise ValueError("behavior shaping requires Stage 2.5 mode")
         if self.stage25_mode not in ("deterministic", "stochastic"):
             raise ValueError(
                 "stage25_mode must be 'deterministic' or 'stochastic'")
@@ -327,6 +332,7 @@ class EpisodeResult:
     # One bounded scalar/vector record per manager row; never model input or
     # primitive-turn telemetry.
     manager_crop_rows: list[dict[str, Any]] = field(default_factory=list)
+    behavior_shaping: dict[int, dict[str, Any]] | None = None
 
 
 def _canonical_executor_provenance_value(value: Any) -> Any:
@@ -585,6 +591,19 @@ class _EpisodeState:
         self.hires_current_day = [0, 0]
         self.planned_days: list[set[int]] = [set(), set()]
         self.transition_index: dict[tuple[int, int], int] = {}
+        shaping = config.reward_config.behavior_shaping
+        self.behavior_shaping_stats: dict[int, dict[str, Any]] = {
+            seat: {
+                "previous_counts": None,
+                "initial_counts": None,
+                "final_counts": None,
+                "last_day": None,
+                "terminal_finalized": False,
+                "feature_rewards": {
+                    name: 0.0 for name, _feature in shaping.active_features()},
+            }
+            for seat in spec.trainable_seats
+        } if self.stage25_enabled and shaping.enabled else {}
         self.land_purchase_events: list[dict[str, Any]] = []
         self.utilization_snapshots: list[dict[str, Any]] = []
         self._snapshot_days: set[int] = set()
@@ -859,6 +878,10 @@ class SelfPlayRunner:
         self.stage25_trajectory = (stage25_trajectory
                                    if stage25_trajectory is not None
                                    else stage25_trajectory_buffer)
+        if (config.reward_config.behavior_shaping.enabled
+                and self.stage25_trajectory is None):
+            raise ValueError(
+                "behavior shaping requires a Stage 2.5 trajectory buffer")
         if executor_factory is None:
             if config.stage25_enabled:
                 from rl_manager.executor_factory import make_stage25_executor_factory
@@ -1417,6 +1440,8 @@ class SelfPlayRunner:
                 if outputs.policy_identity != context.behavior_identity:
                     raise ValueError(
                         f"Stage 2.5 response identity mismatch for {context.request_id}")
+                self._record_behavior_shaping_boundary(
+                    state, seat, day, context.physical_context)
                 accept_started = time.perf_counter() if profile is not None else 0.0
                 self._close_stage25_outgoing(
                     state, seat, day, context.inputs,
@@ -1442,6 +1467,65 @@ class SelfPlayRunner:
             profile["manager_rows"] += len(requests)
             profile["manager_boundaries"] += len({
                 (id(state), day) for state, _seat, day, _context in requests})
+
+    def _record_behavior_shaping_boundary(
+        self, state: _EpisodeState, seat: int, day: int, physical_context: Any,
+    ) -> None:
+        """Patch the outgoing learner row with one realized potential delta."""
+        stats = state.behavior_shaping_stats.get(seat)
+        if stats is None:
+            return
+        if stats["last_day"] is not None and day <= stats["last_day"]:
+            raise ValueError("behavior-shaping manager boundaries must advance")
+        shaping = self.config.reward_config.behavior_shaping
+        current = realized_behavior_counts_from_context(physical_context)
+        previous = stats["previous_counts"]
+        if previous is None:
+            stats["initial_counts"] = current
+        else:
+            contributions = shaping.contributions(previous, current)
+            delta = math.fsum(contributions.values())
+            previous_day = stats["last_day"]
+            index = state.transition_index.get((seat, previous_day))
+            collector = getattr(self, "stage25_trajectory", None)
+            patch = getattr(collector, "patch_manager_reward", None)
+            if index is None or not callable(patch):
+                raise RuntimeError(
+                    "behavior shaping requires the prior Stage 2.5 learner "
+                    "trajectory row and manager reward patch support")
+            patch(index, np.float32(delta))
+            for name, contribution in contributions.items():
+                stats["feature_rewards"][name] += contribution
+        stats["previous_counts"] = current
+        stats["final_counts"] = current
+        stats["last_day"] = day
+
+    def _finish_behavior_shaping(
+        self, state: _EpisodeState, *, terminated: bool,
+    ) -> dict[int, float]:
+        """Include the true final-state delta once; truncations only bootstrap."""
+        terminal_deltas: dict[int, float] = {}
+        if not state.behavior_shaping_stats:
+            return terminal_deltas
+        shaping = self.config.reward_config.behavior_shaping
+        for seat, stats in state.behavior_shaping_stats.items():
+            if stats["terminal_finalized"]:
+                raise RuntimeError(
+                    f"behavior shaping was already finalized for seat {seat}")
+            final_counts = realized_behavior_counts_from_observation(
+                state.obs[seat], seat)
+            stats["final_counts"] = final_counts
+            previous_counts = stats["previous_counts"]
+            delta = 0.0
+            if terminated and previous_counts is not None:
+                contributions = shaping.contributions(
+                    previous_counts, final_counts)
+                delta = math.fsum(contributions.values())
+                for name, contribution in contributions.items():
+                    stats["feature_rewards"][name] += contribution
+            terminal_deltas[seat] = delta
+            stats["terminal_finalized"] = True
+        return terminal_deltas
 
     def _close_stage25_outgoing(
         self, state: _EpisodeState, seat: int, day: int,
@@ -1770,6 +1854,8 @@ class SelfPlayRunner:
         winner_seat = 0 if margin > 0 else (1 if margin < 0 else -1)
         rewards = terminal_rewards(banks, self.config.reward_config)
         terminated = not state.truncated
+        terminal_shaping = self._finish_behavior_shaping(
+            state, terminated=terminated)
 
         if self.buffer is not None:
             for seat in range(2):
@@ -1804,7 +1890,10 @@ class SelfPlayRunner:
                             index,
                             np.float32(self._stage25_bootstrap_value(state, seat)))
                     else:
-                        patch_terminal(index, np.float32(rewards[seat]), True)
+                        patch_terminal(
+                            index, np.float32(
+                                rewards[seat] + terminal_shaping.get(seat, 0.0)),
+                            True)
             self._patch_executor_diagnostics(state)
 
         opening_diagnostics = [
@@ -1917,7 +2006,36 @@ class SelfPlayRunner:
             land_purchase_events=copy.deepcopy(state.land_purchase_events),
             utilization_snapshots=copy.deepcopy(state.utilization_snapshots),
             manager_crop_rows=manager_crop_rows,
+            behavior_shaping=(
+                self._behavior_shaping_episode_diagnostics(state)
+                if state.behavior_shaping_stats else None),
         )
+
+    def _behavior_shaping_episode_diagnostics(
+        self, state: _EpisodeState,
+    ) -> dict[int, dict[str, Any]]:
+        shaping = self.config.reward_config.behavior_shaping
+        result: dict[int, dict[str, Any]] = {}
+        for seat, stats in sorted(state.behavior_shaping_stats.items()):
+            features: dict[str, dict[str, Any]] = {}
+            for name, feature in shaping.active_features():
+                initial = stats["initial_counts"]
+                final = stats["final_counts"]
+                initial_count = None if initial is None else int(initial[name])
+                final_count = None if final is None else int(final[name])
+                features[name] = {
+                    "reward": float(stats["feature_rewards"][name]),
+                    "initial_count": initial_count,
+                    "final_count": final_count,
+                    "target_reached": (
+                        None if final_count is None
+                        else final_count >= feature.target),
+                }
+            result[seat] = {
+                "total": float(math.fsum(stats["feature_rewards"].values())),
+                "features": features,
+            }
+        return result
 
     # ------------------------------------------------------------- artifact
     def build_artifact_metadata(self, result: EpisodeResult) -> dict[str, Any]:

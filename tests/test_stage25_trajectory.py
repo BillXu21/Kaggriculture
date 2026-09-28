@@ -226,6 +226,18 @@ def test_diagnostic_summary_and_provenance_avoid_row_reconstruction():
         buffer.validate_executor_provenance({"name": "different"})
 
 
+def test_nonterminal_manager_reward_is_patchable_once():
+    buffer = Stage25TrajectoryBuffer(2)
+    buffer.append(_row(day=4, row_id="r0"))
+    buffer.patch_manager_reward(0, np.float32(0.125))
+    assert float(buffer.rows[0].reward) == pytest.approx(0.125)
+    assert not buffer.rows[0].terminated
+    assert not buffer.rows[0].reward_patched
+    assert buffer.diagnostic_summary()["reward_sum"] == pytest.approx(0.125)
+    with pytest.raises(ValueError, match="already patched"):
+        buffer.patch_manager_reward(0, np.float32(0.125))
+
+
 def test_load_reconstructs_indexes_for_subsequent_append(tmp_path: Path):
     buffer = Stage25TrajectoryBuffer(3)
     buffer.append(_row(day=4, row_id="r0"))

@@ -22,7 +22,9 @@ from rl_manager.stage25_provider import (
     Stage25PlanProvider,
     Stage25ProviderError,
     Stage25TerminalError,
+    realized_behavior_counts_from_observation,
 )
+from rl_manager.reward import BehaviorShapingConfig, BehaviorShapingFeature
 from rl_manager.stage25_types import (
     STAGE25_OBSERVATION_SCHEMA_VERSION,
     STAGE25_OBSERVATION_V3_SCHEMA_VERSION,
@@ -71,6 +73,58 @@ def _obs(day: int = 3, money: float = 3000.0, wheat_count: int = 1) -> dict:
         "town": {"unlocked_shops": []},
         "private": {"shed": {}, "seeds": {}, "inventories": []},
     }
+
+
+def test_behavior_counts_use_physical_crops_and_all_owned_animal_locations():
+    def observed_state(wheat_goal: int, cow_target: int) -> dict:
+        obs = _obs(wheat_count=3)
+        obs["crop_goals"] = {"WHEAT": wheat_goal}
+        obs["animal_targets"] = {"COW": cow_target}
+        obs["farms"][0]["tiles"][1][0] = {
+            "kind": "COOP", "animal": "COW", "placed_day": 0,
+        }
+        obs["private"] = {
+            "shed": {"COW": 2, "GOOSE": 1},
+            "inventories": [{"COW": 1}],
+        }
+        return obs
+
+    obs = observed_state(wheat_goal=40, cow_target=12)
+    counts = realized_behavior_counts_from_observation(obs, 0)
+    assert counts["wheat"] == 3
+    assert counts["cow"] == 4
+    assert counts["goose"] == 2
+    assert counts["sheep"] == 1
+    assert counts["wheat"] != obs["crop_goals"]["WHEAT"]
+    assert counts["cow"] != obs["animal_targets"]["COW"]
+
+    # Manager requests grow, but the executor has not realized either one:
+    # the board and owned inventory remain identical, so there is no reward.
+    next_obs = observed_state(wheat_goal=80, cow_target=20)
+    next_counts = realized_behavior_counts_from_observation(next_obs, 0)
+    shaping = BehaviorShapingConfig(
+        cow=BehaviorShapingFeature(target=10, weight=0.1),
+        wheat=BehaviorShapingFeature(target=50, weight=0.1),
+    )
+    assert shaping.contributions(counts, next_counts) == {
+        "cow": 0.0, "wheat": 0.0,
+    }
+
+
+def test_behavior_counts_are_seat_perspective_correct():
+    seat_zero = _obs(wheat_count=1)
+    seat_one = _obs(wheat_count=1)
+    seat_zero["farms"][0]["tiles"][1][0] = {
+        "kind": "COOP", "animal": "COW", "placed_day": 0,
+    }
+    seat_one["farms"][1]["tiles"][1][0] = {
+        "kind": "COOP", "animal": "COW", "placed_day": 0,
+    }
+    seat_zero["private"] = {"shed": {"COW": 1}, "inventories": []}
+    seat_one["private"] = {"shed": {"COW": 3}, "inventories": []}
+
+    assert realized_behavior_counts_from_observation(seat_zero, 0)["cow"] == 2
+    assert realized_behavior_counts_from_observation(seat_one, 1)["cow"] == 4
 
 
 def _identity(name: str, *, old_v3: bool = False) -> Stage25BehaviorIdentity:
