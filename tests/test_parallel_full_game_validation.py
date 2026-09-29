@@ -76,8 +76,8 @@ def _opening_diagnostics():
         "turns_replayed": validation.OPENING_TURNS,
         "divergence": {"occurred": False, "reason": None},
         "handoff": {
-            "turn": [validation.MANAGER_START_DAY, 0],
-            "clean_d4h0_handoff": True,
+            "turn": list(validation.HANDOFF_TURN),
+            "clean_handoff": True,
         },
     }
 

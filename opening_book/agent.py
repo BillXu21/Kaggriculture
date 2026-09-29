@@ -1,8 +1,9 @@
 """Runtime opening-book wrapper (issue #4, stage 2).
 
-Replays one built-in elite trace literally for days 0-3 (exactly 96 turns),
-then delegates unchanged to an injected downstream agent starting exactly at
-day 4 hour 0. Guards are fail-closed and minimal:
+Replays one built-in elite trace literally through its inclusive end turn,
+then delegates unchanged to an injected downstream agent. Legacy traces end
+at day 3 hour 23; extended traces declare their own horizon. Guards are
+fail-closed and minimal:
 
 - observation ``day``/``hour`` must parse and equal the expected trace cursor;
 - observed hand count for the configured seat must match the trace action's
@@ -29,11 +30,11 @@ from typing import Any, Callable, Mapping
 from .trace import (
     DEFAULT_IDENTITY,
     FIRST_DAY,
-    LAST_DAY,
     TURNS_PER_DAY,
     TraceError,
     action_for,
     load_built_in_trace,
+    trace_end_turn,
     validate_action,
 )
 
@@ -88,7 +89,7 @@ def _crop_animal_counts(tiles: Any) -> tuple[dict[str, int], dict[str, int]]:
 
 
 class OpeningAgent:
-    """Stateful callable: literal trace playback for d0-d3, then delegate."""
+    """Stateful callable: literal trace playback through its end, then delegate."""
 
     def __init__(self, trace: Mapping[str, Any], downstream: AgentCallable,
                  seat: int) -> None:
@@ -98,6 +99,7 @@ class OpeningAgent:
             raise ValueError(f"seat must be 0 or 1, got {seat!r}")
         self._trace = trace
         self._identity = trace["identity"]
+        self._last_turn = trace_end_turn(dict(trace))
         self._provenance = dict(trace.get("provenance") or {})
         self._downstream = downstream
         self.seat = seat
@@ -123,7 +125,7 @@ class OpeningAgent:
             return self._diverge(obs, DIVERGENCE_MALFORMED_PHASE)
 
         day, hour = phase
-        if day > LAST_DAY or (day == LAST_DAY and hour >= TURNS_PER_DAY):
+        if (day, hour) > self._last_turn:
             # Beyond the trace horizon: clean handoff (never a divergence).
             return self._handoff(obs, day, hour)
 
@@ -275,7 +277,10 @@ class OpeningAgent:
             "handoff": {
                 "turn": list(self._handoff_turn)
                 if self._handoff_turn is not None else None,
-                "clean_d4h0_handoff": self._clean_handoff_done,
+                "clean_handoff": self._clean_handoff_done,
+                "clean_d4h0_handoff": (
+                    self._clean_handoff_done
+                    and self._handoff_turn == [4, 0]),
                 "farm_summary": {
                     key: (dict(value) if isinstance(value, dict) else value)
                     for key, value in self._handoff_farm_summary.items()

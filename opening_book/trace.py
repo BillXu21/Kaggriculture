@@ -2,8 +2,9 @@
 
 A trace is the literal, ordered sequence of submitted primitive action dicts
 (raw/executor shape ``{"farmer": ..., "hands": [...], "market": [...]}``) for
-one source seat over days 0-3 inclusive (4 x 24 = 96 turns). The handoff turn
-day 4 hour 0 is outside the trace by construction.
+one source seat from day 0 hour 0 through an inclusive trace-specific end turn.
+Legacy traces end at day 3 hour 23; longer openings record ``last_hour`` in
+their horizon metadata.
 
 Traces are literal source-seat playback data, not interpreted workload
 bundles. All validation fails closed with :class:`TraceError`.
@@ -36,7 +37,13 @@ IDENTITIES = (
     "carrot_start",
     "fourth_quadrant_s0",
     "fourth_quadrant_s1",
+    "tetsuya_s1",
+    "standard_mixed_d6h3",
 )
+
+_IDENTITY_END_TURNS = {
+    "standard_mixed_d6h3": (6, 3),
+}
 
 VALID_SEATS = (0, 1)
 
@@ -125,12 +132,40 @@ def _validate_provenance(provenance: Any) -> None:
         )
 
 
+def horizon_for_identity(identity: str) -> dict[str, int]:
+    """Return the fixed trace horizon for one registered opening identity."""
+    if identity not in IDENTITIES:
+        _fail(f"unknown opening identity {identity!r}; known: {list(IDENTITIES)}")
+    last_day, last_hour = _IDENTITY_END_TURNS.get(
+        identity, (LAST_DAY, TURNS_PER_DAY - 1))
+    horizon = {
+        "first_day": FIRST_DAY,
+        "last_day": last_day,
+        "turns_per_day": TURNS_PER_DAY,
+    }
+    if last_hour != TURNS_PER_DAY - 1:
+        horizon["last_hour"] = last_hour
+    return horizon
+
+
+def trace_end_turn(doc: Any) -> tuple[int, int]:
+    """Return the inclusive final turn after checking identity-bound horizon."""
+    if not isinstance(doc, dict):
+        _fail(f"trace document must be a dict, got {type(doc).__name__}")
+    horizon = doc.get("horizon")
+    expected_horizon = horizon_for_identity(doc.get("identity"))
+    if horizon != expected_horizon:
+        _fail(f"horizon must be {expected_horizon}, got {horizon!r}")
+    return expected_horizon["last_day"], expected_horizon.get(
+        "last_hour", TURNS_PER_DAY - 1)
+
+
 def validate_trace(doc: Any) -> None:
     """Fail-closed validation of a full trace document.
 
-    Checks format/version/horizon metadata, provenance shape, exactly 96 turns
-    strictly ordered and contiguous over (day 0..3, hour 0..23), per-turn
-    action shape and market cap, and the content digest.
+    Checks format/version/horizon metadata, provenance shape, the exact number
+    of turns through the inclusive horizon, strict ordering/contiguity,
+    per-turn action shape and market cap, and the content digest.
     """
     if not isinstance(doc, dict):
         _fail(f"trace document must be a dict, got {type(doc).__name__}")
@@ -144,21 +179,17 @@ def validate_trace(doc: Any) -> None:
         _fail(f"identity must be one of {list(IDENTITIES)}, got {identity!r}")
     if doc.get("module_version") != ENGINE_VERSION:
         _fail(f"module_version must be {ENGINE_VERSION!r}, got {doc.get('module_version')!r}")
-    horizon = doc.get("horizon")
-    expected_horizon = {
-        "first_day": FIRST_DAY,
-        "last_day": LAST_DAY,
-        "turns_per_day": TURNS_PER_DAY,
-    }
-    if horizon != expected_horizon:
-        _fail(f"horizon must be {expected_horizon}, got {horizon!r}")
+    last_day, last_hour = trace_end_turn(doc)
     _validate_provenance(doc.get("provenance"))
 
     turns = doc.get("turns")
     if not isinstance(turns, list):
         _fail(f"turns must be a list, got {type(turns).__name__}")
-    if len(turns) != EXPECTED_TURNS:
-        _fail(f"trace must contain exactly {EXPECTED_TURNS} turns, got {len(turns)}")
+    expected_turns = ((last_day - FIRST_DAY) * TURNS_PER_DAY
+                      + last_hour + 1)
+    if len(turns) != expected_turns:
+        _fail(
+            f"trace must contain exactly {expected_turns} turns, got {len(turns)}")
 
     seen: set[tuple[int, int]] = set()
     expected_index = 0
@@ -222,11 +253,13 @@ def action_for(trace_doc: dict[str, Any], day: int, hour: int) -> dict[str, Any]
     """Return a defensive deep copy of the action for one (day, hour) turn."""
     if not isinstance(day, int) or not isinstance(hour, int):
         raise TraceError(f"(day, hour) must be ints, got day={day!r} hour={hour!r}")
-    if not (FIRST_DAY <= day <= LAST_DAY) or not (0 <= hour < TURNS_PER_DAY):
+    last_day, last_hour = trace_end_turn(trace_doc)
+    if (not (0 <= hour < TURNS_PER_DAY)
+            or (day, hour) < (FIRST_DAY, 0)
+            or (day, hour) > (last_day, last_hour)):
         raise TraceError(
             f"(day={day}, hour={hour}) is outside the opening horizon "
-            f"days {FIRST_DAY}-{LAST_DAY}, hours 0-{TURNS_PER_DAY - 1}; "
-            "the day 4 hour 0 handoff turn is not part of the trace"
+            f"({FIRST_DAY}, 0)-({last_day}, {last_hour})"
         )
     index = (day - FIRST_DAY) * TURNS_PER_DAY + hour
     turn = trace_doc["turns"][index]

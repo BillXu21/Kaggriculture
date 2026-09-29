@@ -1,8 +1,10 @@
 """Run checkpoint-backed Stage 2.5 full-game matches concurrently.
 
 Each spawned worker owns one independent 720-step fast-engine episode. A
-literal built-in opening handles days 0-3, then the native Stage 2.5 policy
-plans once per day from day 4 through the end of the game.
+literal built-in opening is replayed through its own declared end turn, then
+the native Stage 2.5 policy plans once per day from the opening's manager
+start day through the end of the game. Opening horizon, manager start day and
+handoff turn are all derived from the selected opening's own metadata.
 """
 
 from __future__ import annotations
@@ -17,11 +19,12 @@ import os
 from pathlib import Path
 import subprocess
 import time
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 from bc_manager.constants import TOTAL_DAYS
 from evaluation.agent_match import MatchResult, run_match
 from opening_book.agent import make_opening_agent
+from opening_book.trace import load_built_in_trace, trace_end_turn
 from executor_v0.strip_executor import StripExecutorConfig
 from rl_manager.executor_factory import (
     STAGE25_EXECUTOR_PROFILE_VERSION,
@@ -33,12 +36,56 @@ from rl_manager.provenance import (
 )
 from rl_manager.stage25_provider import Stage25PlanProvider
 
+DEFAULT_OPENING_NAME = "standard_mixed_d6h3"
+TURNS_PER_DAY = 24
+LAST_HOUR_OF_DAY = TURNS_PER_DAY - 1
+
+
+class OpeningTiming(NamedTuple):
+    """Execution timing implied by one opening identity's own metadata.
+
+    ``manager_start_day`` is the first whole-day manager plan that can affect
+    execution: a trace ending mid-day starts the manager on that same day (so
+    the day-N plan is already available at dNh0), while a trace ending at
+    h23 hands off cleanly at the next day's h0.
+    """
+
+    identity: str
+    last_day: int
+    last_hour: int
+    manager_start_day: int
+    handoff_turn: tuple[int, int]
+    opening_turns: int
+
+
+def opening_timing(identity: str) -> OpeningTiming:
+    """Derive horizon, manager start day and handoff turn from a trace."""
+    last_day, last_hour = trace_end_turn(load_built_in_trace(identity))
+    if last_hour < LAST_HOUR_OF_DAY:
+        manager_start_day = last_day
+        handoff_turn = (last_day, last_hour + 1)
+    else:
+        manager_start_day = last_day + 1
+        handoff_turn = (last_day + 1, 0)
+    return OpeningTiming(
+        identity=identity,
+        last_day=last_day,
+        last_hour=last_hour,
+        manager_start_day=manager_start_day,
+        handoff_turn=handoff_turn,
+        opening_turns=last_day * TURNS_PER_DAY + last_hour + 1,
+    )
+
+
 FULL_GAME_TURNS = 719  # Reset is step 0 in a 720-step episode.
 EPISODE_STEPS = FULL_GAME_TURNS + 1
-MANAGER_START_DAY = 4
+OPENING_NAME = DEFAULT_OPENING_NAME
+OPENING_TIMING = opening_timing(OPENING_NAME)
+# Derived from the selected opening, never hard-coded per opening identity.
+MANAGER_START_DAY = OPENING_TIMING.manager_start_day
 MANAGER_ACTIVE_DAYS = TOTAL_DAYS - MANAGER_START_DAY
-OPENING_TURNS = MANAGER_START_DAY * 24
-OPENING_NAME = "standard_mixed"
+OPENING_TURNS = OPENING_TIMING.opening_turns
+HANDOFF_TURN = list(OPENING_TIMING.handoff_turn)
 DEFAULT_SEEDS = (7,)
 DEFAULT_WORKERS = 2
 # "symmetric": the same checkpoint and executor configuration drive both seats,
@@ -81,6 +128,8 @@ class _StripController:
         configuration: Mapping[str, Any],
         provider: Stage25PlanProvider,
         executor_factory: Any,
+        opening_name: str = OPENING_NAME,
+        manager_start_day: int = MANAGER_START_DAY,
     ) -> None:
         self._agent = executor_factory.create(
             backend_name="fast",
@@ -88,8 +137,9 @@ class _StripController:
             configuration=configuration,
             provider=provider,
         )
+        self._manager_start_day = manager_start_day
         self._opening = make_opening_agent(
-            OPENING_NAME, downstream=self._agent, seat=seat)
+            opening_name, downstream=self._agent, seat=seat)
         self._actions = 0
         self._observed_days: set[int] = set()
         self._manager_days: set[int] = set()
@@ -104,7 +154,7 @@ class _StripController:
         action = self._opening(observation)
         self._actions += 1
         self._observed_days.add(day)
-        if day >= MANAGER_START_DAY and hour == 0:
+        if day >= self._manager_start_day and hour == 0:
             self._manager_days.add(day)
         for order in (action.get("market") or ()):
             if not order:
@@ -156,17 +206,19 @@ class _StripControllerFactory:
         episode_index: int,
         seed: int,
         enable_row_claim_board: bool = False,
+        opening_name: str = OPENING_NAME,
     ) -> None:
         self._checkpoint_path = Path(checkpoint_path)
         self._episode_index = episode_index
         self._seed = seed
         self._enable_row_claim_board = bool(enable_row_claim_board)
+        self._timing = opening_timing(opening_name)
         self._strip_config = StripExecutorConfig(
             aggressive_sell_all=True,
             enable_row_claim_board=self._enable_row_claim_board,
         )
         self._executor_factory = make_stage25_executor_factory(self._strip_config)
-        opening = opening_provenance(OPENING_NAME)
+        opening = opening_provenance(self._timing.identity)
         self.provenance = {
             "display_name": "Stage 2.5 native checkpoint + strip executor",
             "kind": "stage25_native_inference_checkpoint",
@@ -178,7 +230,7 @@ class _StripControllerFactory:
             "policy": {
                 "provider": "rl_manager.stage25_provider.Stage25PlanProvider",
                 "mode": "deterministic",
-                "manager_start_day": MANAGER_START_DAY,
+                "manager_start_day": self._timing.manager_start_day,
             },
             "opening": opening,
             "executor_profile": {
@@ -197,7 +249,7 @@ class _StripControllerFactory:
                 f"parallel-full-game-{self._episode_index}-seed-{self._seed}"
             ),
             seat=seat,
-            manager_start_day=MANAGER_START_DAY,
+            manager_start_day=self._timing.manager_start_day,
             native_checkpoint=self._checkpoint_path,
             mode="deterministic",
             seed=self._seed,
@@ -210,6 +262,8 @@ class _StripControllerFactory:
             configuration=configuration,
             provider=provider,
             executor_factory=self._executor_factory,
+            opening_name=self._timing.identity,
+            manager_start_day=self._timing.manager_start_day,
         )
 
 
@@ -291,6 +345,9 @@ def _validation_failures(
     observed_days: Sequence[int],
     manager_days: Sequence[int],
     opening_diagnostics: Mapping[str, Any] | None,
+    manager_start_day: int = MANAGER_START_DAY,
+    opening_turns: int = OPENING_TURNS,
+    handoff_turn: Sequence[int] = HANDOFF_TURN,
 ) -> list[str]:
     failures: list[str] = []
     if not terminated:
@@ -314,7 +371,7 @@ def _validation_failures(
         failures.append(
             f"expected observations across days {expected_observed_days}, "
             f"got {list(observed_days)}")
-    expected_manager_days = list(range(MANAGER_START_DAY, TOTAL_DAYS))
+    expected_manager_days = list(range(manager_start_day, TOTAL_DAYS))
     if list(manager_days) != expected_manager_days:
         failures.append(
             f"expected Stage 2.5 manager days {expected_manager_days}, "
@@ -324,16 +381,18 @@ def _validation_failures(
     else:
         divergence = opening_diagnostics.get("divergence", {})
         handoff = opening_diagnostics.get("handoff", {})
-        if int(opening_diagnostics.get("turns_replayed", -1)) != OPENING_TURNS:
+        if int(opening_diagnostics.get("turns_replayed", -1)) != opening_turns:
             failures.append(
                 f"opening replayed {opening_diagnostics.get('turns_replayed')!r} "
-                f"turns, expected {OPENING_TURNS}")
+                f"turns, expected {opening_turns}")
         if not isinstance(divergence, Mapping) or divergence.get("occurred"):
             failures.append("opening trace diverged")
         if (not isinstance(handoff, Mapping)
-                or handoff.get("turn") != [MANAGER_START_DAY, 0]
-                or not handoff.get("clean_d4h0_handoff")):
-            failures.append("opening did not hand off cleanly at day 4 hour 0")
+                or handoff.get("turn") != handoff_turn
+                or not handoff.get("clean_handoff")):
+            failures.append(
+                f"opening did not hand off cleanly at day {handoff_turn[0]} "
+                f"hour {handoff_turn[1]}")
     return failures
 
 
@@ -353,6 +412,7 @@ def _strip_detail_by_seat(result: MatchResult) -> dict[int, Mapping[str, Any]]:
 def _seat_validation(
     result: MatchResult, detail: Mapping[str, Any],
     opening_detail: Mapping[str, Any] | None,
+    timing: OpeningTiming = OPENING_TIMING,
 ) -> tuple[list[str], dict[str, Any]]:
     """Validate one strip seat and return (failures, summary counters)."""
     validation = detail.get("validation", {})
@@ -377,6 +437,9 @@ def _seat_validation(
         observed_days=observed_days,
         manager_days=manager_days,
         opening_diagnostics=opening_detail,
+        manager_start_day=timing.manager_start_day,
+        opening_turns=timing.opening_turns,
+        handoff_turn=list(timing.handoff_turn),
     )
     worker_actions = int(validation.get("worker_actions", 0))
     worker_pass_actions = int(validation.get("worker_pass_actions", 0))
@@ -399,6 +462,7 @@ def _seat_validation(
 
 def _summarize_match(
     result: MatchResult, *, worker_pid: int, require_both_seats: bool = False,
+    timing: OpeningTiming = OPENING_TIMING,
 ) -> dict[str, Any]:
     details = _strip_detail_by_seat(result)
     opening_by_seat: dict[int, Mapping[str, Any]] = {}
@@ -428,13 +492,13 @@ def _summarize_match(
         }
     else:
         failures, counters = _seat_validation(
-            result, strip_detail, opening_detail)
+            result, strip_detail, opening_detail, timing)
 
     by_seat: dict[str, Any] = {}
     all_failures: list[str] = []
     for seat in sorted(details):
         seat_failures, seat_counters = _seat_validation(
-            result, details[seat], opening_by_seat.get(seat))
+            result, details[seat], opening_by_seat.get(seat), timing)
         by_seat[str(seat)] = {
             "passed": not seat_failures,
             "failures": seat_failures,
@@ -493,8 +557,10 @@ def _summarize_match(
 def _run_full_game_task(
     task: tuple[int, int, int], checkpoint_path: str, checkpoint_sha256: str,
     *, enable_row_claim_board: bool = False, opponent: str = OPPONENT_SYMETRIC,
+    opening_name: str = OPENING_NAME,
 ) -> dict[str, Any]:
     episode_index, seed, controller_a_seat = task
+    timing = opening_timing(opening_name)
     started = time.perf_counter()
     backend_configuration = {
         "seed": seed,
@@ -507,6 +573,7 @@ def _run_full_game_task(
         episode_index=episode_index,
         seed=seed,
         enable_row_claim_board=enable_row_claim_board,
+        opening_name=timing.identity,
     )
     if opponent == OPPONENT_SYMETRIC:
         # Identical checkpoint and executor configuration on both seats, so
@@ -517,6 +584,7 @@ def _run_full_game_task(
             episode_index=episode_index,
             seed=seed,
             enable_row_claim_board=enable_row_claim_board,
+            opening_name=timing.identity,
         )
     else:
         controller_b = _PassControllerFactory()
@@ -534,6 +602,7 @@ def _run_full_game_task(
         result,
         worker_pid=os.getpid(),
         require_both_seats=opponent == OPPONENT_SYMETRIC,
+        timing=timing,
     )
     record["worker_wall_seconds"] = time.perf_counter() - started
     return record
@@ -638,6 +707,7 @@ def run_validation(
     workers: int = DEFAULT_WORKERS,
     row_claim: bool = False,
     opponent: str = OPPONENT_SYMETRIC,
+    opening_name: str = OPENING_NAME,
 ) -> dict[str, Any]:
     """Run one full game per seed using one explicit native policy checkpoint.
 
@@ -649,6 +719,9 @@ def run_validation(
     if opponent not in OPPONENT_MODES:
         raise ValueError(
             f"opponent must be one of {OPPONENT_MODES!r}, got {opponent!r}")
+    # Fail closed at startup: an unknown or malformed opening never reaches a
+    # worker, and the expected horizon/manager days come from its own metadata.
+    timing = opening_timing(opening_name)
     checkpoint = _resolve_checkpoint_path(checkpoint_path)
     checkpoint_sha256 = _sha256_file(checkpoint)
     normalized_seeds = tuple(seeds)
@@ -687,6 +760,7 @@ def run_validation(
                         _run_full_game_task, task, str(checkpoint),
                         checkpoint_sha256,
                         enable_row_claim_board=row_claim, opponent=opponent,
+                        opening_name=timing.identity,
                     )] = task
                 except Exception as exc:  # noqa: BLE001 - retain per-game failure.
                     index, seed, seat = task
@@ -738,6 +812,7 @@ def run_validation(
         episode_index=0,
         seed=normalized_seeds[0],
         enable_row_claim_board=row_claim,
+        opening_name=timing.identity,
     )
     if opponent == OPPONENT_SYMETRIC:
         controller_b_provenance: Mapping[str, Any] = dict(factory.provenance)
@@ -763,6 +838,16 @@ def run_validation(
             "aggressive_sell_all": True,
             "opponent": opponent,
             "symmetric": opponent == OPPONENT_SYMETRIC,
+        },
+        "opening_timing": {
+            "identity": timing.identity,
+            "last_day": timing.last_day,
+            "last_hour": timing.last_hour,
+            "opening_turns": timing.opening_turns,
+            "manager_start_day": timing.manager_start_day,
+            "manager_days": list(range(timing.manager_start_day, TOTAL_DAYS)),
+            "manager_day_count": TOTAL_DAYS - timing.manager_start_day,
+            "handoff_turn": list(timing.handoff_turn),
         },
         "engine_provenance": _fast_engine_provenance(),
         "source_provenance": _source_provenance(),
@@ -808,6 +893,14 @@ def main(argv: list[str] | None = None) -> int:
         help="comma-separated seeds or inclusive ranges such as 7,10..12",
     )
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument(
+        "--opening", default=OPENING_NAME,
+        help=(
+            "built-in opening identity replayed before the Stage 2.5 policy "
+            "takes over; the manager start day, expected manager days and "
+            "handoff turn are derived from the selected opening's metadata"
+        ),
+    )
     row_claim_group = parser.add_mutually_exclusive_group()
     row_claim_group.add_argument(
         "--row-claim", dest="row_claim", action="store_true", default=False,
@@ -833,6 +926,7 @@ def main(argv: list[str] | None = None) -> int:
             workers=args.workers,
             row_claim=args.row_claim,
             opponent=args.opponent,
+            opening_name=args.opening,
         )
     except Exception as exc:  # noqa: BLE001 - CLI returns a stable JSON failure.
         print(json.dumps({
