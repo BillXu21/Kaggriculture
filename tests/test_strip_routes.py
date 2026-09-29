@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 
 from executor_v0.strip_cost import simulate_route_cost
 from executor_v0.strip_routes import (
@@ -8,6 +9,7 @@ from executor_v0.strip_routes import (
     assign_horizontal_routes,
     assign_horizontal_routes_frontier,
     generate_horizontal_route_candidates,
+    route_assignment_fingerprint,
 )
 from executor_v0.strip_work import (
     RowSummary,
@@ -414,3 +416,62 @@ def test_assignment_frontier_matches_each_large_board_prefix():
     assert actual[1].large_route_assignment_mode is True
     assert len(actual[1].unassigned) > 0
     assert len(actual[4].routes) <= 4
+
+
+def test_assignment_fingerprint_uses_complete_values_not_object_identity():
+    candidates = _frontier_candidates(2)
+    positions = {WorkerId(0): (1, 1), WorkerId(1): (8, 8)}
+    slots = {WorkerId(0): 12, WorkerId(1): 11}
+    inventories = {WorkerId(0): {"WHEAT": 2}, WorkerId(1): {}}
+    args = {
+        "assignment_hour": 3,
+        "remaining_action_slots": 12,
+        "worker_action_slots": slots,
+        "worker_inventories": inventories,
+        "shed_stock": {"WHEAT": 4},
+        "global_resources": {"WHEAT": 9},
+        "enable_row_helpers": False,
+    }
+
+    first = route_assignment_fingerprint(candidates, positions, **args)
+    equivalent = route_assignment_fingerprint(
+        tuple(candidates), dict(positions), **{
+            **args,
+            "worker_action_slots": dict(slots),
+            "worker_inventories": {
+                worker: dict(inventory)
+                for worker, inventory in inventories.items()
+            },
+            "shed_stock": dict(args["shed_stock"]),
+            "global_resources": dict(args["global_resources"]),
+        }
+    )
+    assert first == equivalent
+    assert hash(first) == hash(equivalent)
+
+    changed_inputs = (
+        ((replace(
+            candidates[0],
+            workload_interactions=candidates[0].workload_interactions + 1,
+        ), candidates[1]), positions, args),
+        (candidates, {WorkerId(0): (1, 2), WorkerId(1): (8, 8)}, args),
+        (candidates, positions, {**args, "assignment_hour": 4}),
+        (candidates, positions, {**args, "remaining_action_slots": 11}),
+        (candidates, positions, {
+            **args,
+            "worker_action_slots": {**slots, WorkerId(0): 13},
+        }),
+        (candidates, positions, {
+            **args,
+            "worker_inventories": {
+                WorkerId(0): {"WHEAT": 3}, WorkerId(1): {},
+            },
+        }),
+        (candidates, positions, {**args, "shed_stock": {"WHEAT": 5}}),
+        (candidates, positions, {**args, "global_resources": {"WHEAT": 8}}),
+        (candidates, positions, {**args, "enable_row_helpers": True}),
+    )
+    for changed_candidates, changed_positions, changed_args in changed_inputs:
+        assert route_assignment_fingerprint(
+            changed_candidates, changed_positions, **changed_args
+        ) != first

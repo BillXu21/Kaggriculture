@@ -31,6 +31,7 @@ from executor_v0.strip_work import (
 __all__ = [
     "HorizontalRouteCandidate",
     "RouteAssignment",
+    "RouteAssignmentFingerprint",
     "RoutePhase",
     "RouteSegment",
     "StripRoute",
@@ -40,6 +41,7 @@ __all__ = [
     "forecast_row_overloads",
     "generate_horizontal_route_candidates",
     "remaining_day_action_slots",
+    "route_assignment_fingerprint",
     "route_cursor_invariants_hold",
 ]
 
@@ -314,6 +316,65 @@ class RouteAssignment:
             bool(row.get("helper_required")) and not bool(row.get("row_overload_resolved"))
             for row in self.row_diagnostics
         )
+
+
+@dataclass(frozen=True)
+class RouteAssignmentFingerprint:
+    """Complete value key for one public route-assignment question."""
+
+    candidates: tuple[HorizontalRouteCandidate, ...]
+    worker_positions: tuple[tuple[WorkerId, tuple[int, int]], ...]
+    assignment_hour: int
+    remaining_action_slots: int | None
+    worker_action_slots: tuple[tuple[WorkerId, int], ...] | None
+    worker_inventories: (
+        tuple[tuple[WorkerId, tuple[tuple[str, int], ...]], ...] | None
+    )
+    shed_stock: tuple[tuple[str, int], ...] | None
+    global_resources: tuple[tuple[str, int], ...] | None
+    enable_row_helpers: bool
+
+
+def route_assignment_fingerprint(
+    candidates: Iterable[HorizontalRouteCandidate],
+    worker_positions: Mapping[WorkerId, tuple[int, int]],
+    *,
+    assignment_hour: int,
+    remaining_action_slots: int | None = None,
+    worker_action_slots: Mapping[WorkerId, int] | None = None,
+    worker_inventories: Mapping[WorkerId, Mapping[str, int]] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
+    enable_row_helpers: bool = True,
+) -> RouteAssignmentFingerprint:
+    """Return an identity-independent key for all public assignment inputs."""
+
+    return RouteAssignmentFingerprint(
+        candidates=tuple(sorted(candidates, key=lambda item: item.row_key)),
+        worker_positions=tuple(sorted(worker_positions.items())),
+        assignment_hour=assignment_hour,
+        remaining_action_slots=remaining_action_slots,
+        worker_action_slots=(
+            None
+            if worker_action_slots is None
+            else tuple(sorted(worker_action_slots.items()))
+        ),
+        worker_inventories=(
+            None
+            if worker_inventories is None
+            else tuple(
+                (worker, tuple(sorted(inventory.items())))
+                for worker, inventory in sorted(worker_inventories.items())
+            )
+        ),
+        shed_stock=None if shed_stock is None else tuple(sorted(shed_stock.items())),
+        global_resources=(
+            None
+            if global_resources is None
+            else tuple(sorted(global_resources.items()))
+        ),
+        enable_row_helpers=enable_row_helpers,
+    )
 
 
 def _manhattan_distance(left: tuple[int, int], right: tuple[int, int]) -> int:
