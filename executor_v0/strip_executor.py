@@ -26,9 +26,9 @@ from executor_v0.strip_claim_board import (
 )
 from executor_v0.strip_claim_scheduler import (
     HypotheticalWorkerCoverage,
+    canonical_hypothetical_worker_plan,
     claim_runtime_fragment,
     evaluate_hypothetical_worker,
-    hypothetical_worker_route,
     schedule_claim_board,
 )
 from executor_v0.tasks import generate_optional_idle_cleanup_tasks
@@ -539,7 +539,32 @@ class StripExecutorController:
             spawn = spawns[0]
             worker = WorkerId(next_worker_index + hire_index)
             considered += 1
-            coverage = evaluate_hypothetical_worker(snapshot, spawn, slots)
+            optimistic_coverage = evaluate_hypothetical_worker(
+                snapshot, spawn, slots
+            )
+            if (
+                not optimistic_coverage.claimed_fragments
+                or optimistic_coverage.effective_interactions <= 0
+            ):
+                stop_reason = (
+                    "RESOURCE_BLOCKED_REQUIRED_LEFTOVERS"
+                    if "RESOURCE_SHORTAGE" in optimistic_coverage.rejection_reasons
+                    else "NO_MEANINGFUL_REQUIRED_COVERAGE"
+                )
+                break
+            canonical_plan = canonical_hypothetical_worker_plan(
+                board,
+                work_plan,
+                worker,
+                spawn,
+                optimistic_coverage,
+                slots,
+                int(obs.get("hour", 0)),
+            )
+            if canonical_plan is None:
+                stop_reason = "NO_CANONICAL_REQUIRED_COVERAGE"
+                break
+            coverage, route = canonical_plan
             if not coverage.claimed_fragments or coverage.effective_interactions <= 0:
                 stop_reason = (
                     "RESOURCE_BLOCKED_REQUIRED_LEFTOVERS"
@@ -575,13 +600,6 @@ class StripExecutorController:
                 stop_reason = "CASH"
                 break
 
-            route = hypothetical_worker_route(
-                board, work_plan, worker, spawn, coverage, slots,
-                int(obs.get("hour", 0)),
-            )
-            if route is None:
-                stop_reason = "HORIZON_SHORTAGE"
-                break
             route.route_id = f"CLAIM:{worker.label}"
             reservation = board.trial(worker, bundle_ids)
             if reservation is None:

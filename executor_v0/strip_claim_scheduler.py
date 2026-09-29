@@ -735,6 +735,97 @@ def evaluate_hypothetical_worker(uncovered: UncoveredRequiredWork,
     )
 
 
+def canonical_hypothetical_worker_plan(
+    board: ClaimBoard,
+    work_plan: StripWorkPlan,
+    worker: WorkerId,
+    spawn: tuple[int, int],
+    coverage: HypotheticalWorkerCoverage,
+    future_slots: int,
+    assignment_hour: int,
+) -> tuple[HypotheticalWorkerCoverage, StripRoute] | None:
+    """Trim optimistic coverage until the canonical route completes in full."""
+    fragments = coverage.claimed_fragments
+    while fragments:
+        bundle_ids = tuple(
+            bundle_id for fragment in fragments for bundle_id in fragment.bundle_ids
+        )
+        reservation = board.trial(worker, bundle_ids)
+        if reservation is None:
+            return None
+        costs = tuple(
+            _fragment_segment(board, fragment, fragment.traversal, work_plan, index)[1]
+            for index, fragment in enumerate(fragments)
+        )
+        canonical = simulate_route_cost(
+            spawn,
+            costs,
+            carried_inventory={},
+            remaining_action_slots=future_slots,
+            assignment_turn=assignment_hour,
+            reserved_supply=dict(reservation.shed),
+            global_resources=dict(reservation.global_resources),
+            include_segment_results=False,
+        )
+        effective_interactions = sum(
+            board.bundles[bundle_id].effective_interactions
+            for bundle_id in bundle_ids
+        )
+        if (
+            canonical.route_complete_before_deadline
+            and canonical.effective_interactions_completed_before_deadline
+            == effective_interactions
+        ):
+            exact = HypotheticalWorkerCoverage(
+                fragments,
+                effective_interactions,
+                canonical.total_turns,
+                reservation.shed,
+                reservation.global_resources,
+                canonical.end_position,
+                coverage.rejection_reasons,
+            )
+            route = hypothetical_worker_route(
+                board,
+                work_plan,
+                worker,
+                spawn,
+                exact,
+                future_slots,
+                assignment_hour,
+            )
+            if route is not None:
+                return exact, route
+
+        unfinished_tile = canonical.first_unfinished_tile
+        drop_id = next(
+            (
+                bundle_id
+                for bundle_id in bundle_ids
+                if board.bundles[bundle_id].tile == unfinished_tile
+            ),
+            bundle_ids[-1],
+        )
+        trimmed: list[RowFragment] = []
+        for fragment in fragments:
+            kept = tuple(
+                bundle_id
+                for bundle_id in fragment.bundle_ids
+                if bundle_id != drop_id
+            )
+            if not kept:
+                continue
+            trimmed.append(replace(
+                fragment,
+                bundle_ids=kept,
+                traversal=_span_traversal(tuple(
+                    board.bundles[bundle_id].tile for bundle_id in kept
+                )),
+            ))
+        fragments = tuple(trimmed)
+    return None
+
+
 def hypothetical_worker_route(
     board: ClaimBoard,
     work_plan: StripWorkPlan,
@@ -763,8 +854,6 @@ def hypothetical_worker_route(
             board, fragment, fragment.traversal, work_plan, index
         )
         estimate = estimate_append_cost(prefix, cost)
-        if not estimate.complete_before_deadline:
-            return None
         segments.append(RouteSegment(
             segment_id, fragment.traversal, fragment.traversal[0],
             estimate.travel_turns,
@@ -795,7 +884,9 @@ def hypothetical_worker_route(
         include_segment_results=False,
     )
     if (not canonical.route_complete_before_deadline
-            or canonical.total_turns != coverage.incremental_turns):
+            or canonical.total_turns != coverage.incremental_turns
+            or canonical.effective_interaction_turns
+            != coverage.effective_interactions):
         return None
     traversal = tuple(tile for segment in segments for tile in segment.traversal)
     return StripRoute(
