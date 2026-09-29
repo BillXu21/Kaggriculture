@@ -427,10 +427,19 @@ def _summarize_match(
 
     failures = all_failures if require_both_seats else failures
 
+    # Derive the label from the seats that actually ran the checkpoint so a
+    # symmetric game is never reported as if seat B were the PASS baseline.
+    symmetric = len(details) == 2
+    if symmetric:
+        orientation = "checkpoint_symmetric_both_seats"
+    else:
+        orientation = f"checkpoint_seat_{result.controller_a_seat}_vs_pass"
+
     return {
         "episode_index": result.episode_index,
         "seed": result.seed,
-        "orientation": f"checkpoint_seat_{result.controller_a_seat}_vs_pass",
+        "orientation": orientation,
+        "symmetric": symmetric,
         "controller_a_seat": result.controller_a_seat,
         "final_banks": result.final_banks,
         "margin": result.margin,
