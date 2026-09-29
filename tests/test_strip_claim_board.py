@@ -1035,6 +1035,20 @@ def test_claim_hiring_plans_two_sequential_spawns_and_escalating_costs():
     assert [record["spawn"] for record in planned] == [[4, 4], [4, 5], [5, 4]]
     assert controller._claim_hiring_diagnostics["sequential_hire_costs"] == [1, 1, 2]
     assert len({tuple(record["bundle_ids"]) for record in planned}) == 3
+    uncovered = [
+        (record["uncovered_required_interactions_before"],
+         record["uncovered_required_interactions_after"])
+        for record in planned
+    ]
+    assert all(before > after for before, after in uncovered)
+    assert all(uncovered[index][1] == uncovered[index + 1][0]
+               for index in range(len(uncovered) - 1))
+    assert [record["marginal_required_interactions"] for record in planned] == [
+        before - after for before, after in uncovered
+    ]
+    assert sum(record["marginal_required_interactions"] for record in planned) == (
+        controller._claim_hiring_diagnostics["required_interactions_reserved"]
+    )
     assert set(controller._claim_board.owner_by_bundle.values()) == {
         WorkerId(0), WorkerId(1), WorkerId(2), WorkerId(3),
     }
@@ -1126,3 +1140,54 @@ def test_route_less_worker_claims_unclaimed_required_work_before_pass():
     assert result.hands_actions[0] == ("FEED",)
     assert result.hands_actions[0] != ("PASS",)
     assert controller._claim_board.owner_by_bundle["TILE:5,5"] == hand
+
+
+def test_claim_hiring_bounds_hypothetical_workers_per_bootstrap_pass():
+    from tests.test_executor_v0_idle_cleanup import empty_plan, make_obs
+
+    obs = make_obs(hour=0, farmer=(0, 0), money=10**9)
+    obs["configuration"] = {
+        "maxMarketOrdersPerTurn": 240,
+        "boardSize": 10,
+    }
+    work = plan(*(
+        item("CARE", (row, col), key=f"CARE:{row}:{col}:{index}")
+        for row in range(10)
+        for col in range(10)
+        for index in range(12)
+    ))
+    controller = StripExecutorController(
+        config=StripExecutorConfig(enable_row_claim_board=True),
+        work_builder=lambda _obs, _daily, **_kwargs: work,
+    )
+
+    first = controller.act(obs, empty_plan())
+
+    first_diagnostics = first.diagnostics["claim_hiring"]
+    assert len(first.market_actions) == 10
+    assert first_diagnostics["hypothetical_workers_considered"] == 10
+    assert first_diagnostics["hypothetical_hire_batch_cap"] == 10
+    assert first_diagnostics["hypothetical_hire_batch_limit"] == 10
+    assert first_diagnostics["hire_stop_reason"] == "HYPOTHETICAL_HIRE_BATCH_CAP"
+    assert controller._claim_board is not None
+    assert controller._claim_board.uncovered_snapshot(23).fragments
+
+    spawns = tuple(
+        tuple(record["spawn"])
+        for record in first_diagnostics["planned_workers"]
+    )
+    spent = sum(first_diagnostics["sequential_hire_costs"])
+    confirmed = make_obs(
+        hour=1, farmer=(0, 0), hands=spawns,
+        money=obs["farms"][0]["money"] - spent,
+    )
+    confirmed["configuration"] = obs["configuration"]
+    second = controller.act(confirmed, empty_plan())
+
+    second_diagnostics = second.diagnostics["claim_hiring"]
+    assert 0 < len(second.market_actions) <= 10
+    assert second_diagnostics["hypothetical_workers_considered"] <= 20
+    assert second_diagnostics["submitted_this_round"] <= 10
+    assert second_diagnostics["hire_stop_reason"] in {
+        "HYPOTHETICAL_HIRE_BATCH_CAP", "NO_REQUIRED_LEFTOVERS",
+    }
