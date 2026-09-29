@@ -36,6 +36,7 @@ __all__ = [
     "StripRoute",
     "WorkerId",
     "assign_horizontal_routes",
+    "assign_horizontal_routes_frontier",
     "forecast_row_overloads",
     "generate_horizontal_route_candidates",
     "remaining_day_action_slots",
@@ -497,6 +498,39 @@ class _LargeRoutePacking:
     idle_workers_with_unassigned_feasible_rows: int
 
 
+@dataclass(frozen=True, eq=False)
+class _RoutePlanContext:
+    candidates: tuple[HorizontalRouteCandidate, ...]
+    oriented_cost_segments: tuple[
+        tuple[RouteCostSegment, RouteCostSegment], ...
+    ]
+    stable_hash: int
+
+    @classmethod
+    def create(
+        cls, candidates: tuple[HorizontalRouteCandidate, ...]
+    ) -> _RoutePlanContext:
+        oriented_cost_segments = tuple(
+            (
+                _candidate_cost_segment(candidate, candidate.owned_tiles),
+                _candidate_cost_segment(
+                    candidate, tuple(reversed(candidate.owned_tiles))
+                ),
+            )
+            for candidate in candidates
+        )
+        return cls(candidates, oriented_cost_segments, hash(candidates))
+
+    def __hash__(self) -> int:
+        return self.stable_hash
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, _RoutePlanContext)
+            and self.candidates == other.candidates
+        )
+
+
 def _compute_chain_plan_for_mask(
     candidates: tuple[HorizontalRouteCandidate, ...],
     worker_position: tuple[int, int],
@@ -505,6 +539,9 @@ def _compute_chain_plan_for_mask(
     worker_inventory: Mapping[str, int] | None = None,
     shed_stock: Mapping[str, int] | None = None,
     global_resources: Mapping[str, int] | None = None,
+    _oriented_cost_segments: tuple[
+        tuple[RouteCostSegment, RouteCostSegment], ...
+    ] | None = None,
 ) -> _ChainPlan:
     """Find the cheapest ordered/oriented chain for one candidate subset."""
 
@@ -538,13 +575,17 @@ def _compute_chain_plan_for_mask(
 
     def path_result(path_value):
         route_segments = tuple(
-            _candidate_cost_segment(
-                candidates[index],
-                (
-                    candidates[index].owned_tiles
-                    if side == 0
-                    else tuple(reversed(candidates[index].owned_tiles))
-                ),
+            (
+                _oriented_cost_segments[index][side]
+                if _oriented_cost_segments is not None
+                else _candidate_cost_segment(
+                    candidates[index],
+                    (
+                        candidates[index].owned_tiles
+                        if side == 0
+                        else tuple(reversed(candidates[index].owned_tiles))
+                    ),
+                )
             )
             for index, side, _distance in path_value
         )
@@ -609,7 +650,11 @@ def _compute_chain_plan_for_mask(
                         if side == 0
                         else tuple(reversed(candidate.forecasted_tile_interactions))
                     ),
-                    _candidate_cost_segment(candidate, traversal),
+                    (
+                        _oriented_cost_segments[index][side]
+                        if _oriented_cost_segments is not None
+                        else _candidate_cost_segment(candidate, traversal)
+                    ),
                 ),
             )
         )
@@ -714,6 +759,33 @@ def _pack_small_route_sets(
 ) -> dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]]:
     """Pack at most eight rows while retaining exact load/travel tradeoffs."""
 
+    return _pack_small_route_sets_frontier(
+        candidates,
+        workers,
+        positions,
+        (len(workers),),
+        worker_action_slots,
+        worker_inventories,
+        shed_stock,
+        global_resources,
+    )[len(workers)]
+
+
+def _pack_small_route_sets_frontier(
+    candidates: tuple[HorizontalRouteCandidate, ...],
+    workers: tuple[WorkerId, ...],
+    positions: Mapping[WorkerId, tuple[int, int]],
+    worker_counts: Iterable[int],
+    worker_action_slots: Mapping[WorkerId, int] | None = None,
+    worker_inventories: Mapping[WorkerId, Mapping[str, int]] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
+) -> dict[
+    int,
+    dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]],
+]:
+    """Return exact packing answers for worker prefixes from one DP pass."""
+
     full_mask = (1 << len(candidates)) - 1
     plans = {
         worker: {
@@ -730,10 +802,15 @@ def _pack_small_route_sets(
         }
         for worker in workers
     }
+    requested = frozenset(worker_counts)
+    frontier: dict[
+        int,
+        dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]],
+    ] = {0: {}} if 0 in requested else {}
     states: dict[int, list[tuple[int, int, int, int, int, int, tuple[int, ...]]]] = {
         0: [(0, 0, 0, 0, 0, 0, ())]
     }
-    for worker in workers:
+    for worker_count, worker in enumerate(workers, start=1):
         next_states: dict[
             int, list[tuple[int, int, int, int, int, int, tuple[int, ...]]]
         ] = {}
@@ -770,15 +847,19 @@ def _pack_small_route_sets(
                     break
                 subset = (subset - 1) & remaining
         states = next_states
-
-    if worker_action_slots is None:
-        winning = min(states[full_mask], key=lambda value: value[3:])
-    else:
-        winning = min(states[full_mask])
-    grouped: dict[WorkerId, tuple[tuple[HorizontalRouteCandidate, RouteSegment], ...]] = {}
-    for worker, mask in zip(workers, winning[6]):
-        grouped[worker] = plans[worker][mask].assigned
-    return grouped
+        if worker_count not in requested:
+            continue
+        if worker_action_slots is None:
+            winning = min(states[full_mask], key=lambda value: value[3:])
+        else:
+            winning = min(states[full_mask])
+        frontier[worker_count] = {
+            assigned_worker: plans[assigned_worker][mask].assigned
+            for assigned_worker, mask in zip(
+                workers[:worker_count], winning[6], strict=True
+            )
+        }
+    return frontier
 
 
 def _pack_large_route_set(
@@ -789,8 +870,27 @@ def _pack_large_route_set(
     worker_inventories: Mapping[WorkerId, Mapping[str, int]] | None = None,
     shed_stock: Mapping[str, int] | None = None,
     global_resources: Mapping[str, int] | None = None,
-    ) -> _LargeRoutePacking:
+) -> _LargeRoutePacking:
     """Spread feasible primary rows before greedily packing overflow rows."""
+
+    context = _RoutePlanContext.create(candidates)
+    plan_cache: dict[tuple[WorkerId, int], _ChainPlan] = {}
+
+    def plan_for(worker: WorkerId, mask: int) -> _ChainPlan:
+        key = (worker, mask)
+        plan = plan_cache.get(key)
+        if plan is None:
+            plan = _chain_plan_for_context(
+                context,
+                positions[worker],
+                mask,
+                None if worker_action_slots is None else worker_action_slots[worker],
+                (worker_inventories or {}).get(worker),
+                shed_stock,
+                global_resources,
+            )
+            plan_cache[key] = plan
+        return plan
 
     masks = {worker: 0 for worker in workers}
     preferences: dict[WorkerId, tuple[int, ...]] = {}
@@ -800,15 +900,7 @@ def _pack_large_route_set(
         )
         choices = []
         for index, candidate in enumerate(candidates):
-            plan = _chain_plan_for_mask(
-                candidates,
-                positions[worker],
-                1 << index,
-                slots,
-                (worker_inventories or {}).get(worker),
-                shed_stock,
-                global_resources,
-            )
+            plan = plan_for(worker, 1 << index)
             if slots is not None and plan.useful_interactions <= 0:
                 continue
             choices.append(
@@ -849,24 +941,8 @@ def _pack_large_route_set(
         choices = []
         for worker in overflow_workers:
             mask = masks[worker] | (1 << index)
-            base = _chain_plan_for_mask(
-                candidates,
-                positions[worker],
-                masks[worker],
-                None if worker_action_slots is None else worker_action_slots[worker],
-                (worker_inventories or {}).get(worker),
-                shed_stock,
-                global_resources,
-            )
-            plan = _chain_plan_for_mask(
-                candidates,
-                positions[worker],
-                mask,
-                None if worker_action_slots is None else worker_action_slots[worker],
-                (worker_inventories or {}).get(worker),
-                shed_stock,
-                global_resources,
-            )
+            base = plan_for(worker, masks[worker])
+            plan = plan_for(worker, mask)
             unfinished = plan.unfinished_interactions
             choices.append(
                 (
@@ -894,15 +970,7 @@ def _pack_large_route_set(
         masks[worker] |= 1 << index
 
     grouped = {
-        worker: _chain_plan_for_mask(
-            candidates,
-            positions[worker],
-            masks[worker],
-            None if worker_action_slots is None else worker_action_slots[worker],
-            (worker_inventories or {}).get(worker),
-            shed_stock,
-            global_resources,
-        ).assigned
+        worker: plan_for(worker, masks[worker]).assigned
         for worker in workers
     }
     assigned_indices = {
@@ -916,15 +984,7 @@ def _pack_large_route_set(
     idle_feasible = sum(
         any(
             worker_action_slots is None
-            or _chain_plan_for_mask(
-                candidates,
-                positions[worker],
-                1 << index,
-                worker_action_slots[worker],
-                (worker_inventories or {}).get(worker),
-                shed_stock,
-                global_resources,
-            ).useful_interactions > 0
+            or plan_for(worker, 1 << index).useful_interactions > 0
             for index in unassigned_indices
         )
         for worker in idle_workers
@@ -937,6 +997,201 @@ def _pack_large_route_set(
         overflow_rows_assigned=max(0, assigned_count - primary_count),
         idle_workers_with_unassigned_feasible_rows=idle_feasible,
     )
+
+
+@lru_cache(maxsize=4096)
+def _cached_chain_plan_for_context(
+    context: _RoutePlanContext,
+    worker_position: tuple[int, int],
+    mask: int,
+    remaining_action_slots: int | None,
+    worker_inventory: tuple[tuple[str, int], ...],
+    shed_stock: tuple[tuple[str, int], ...] | None,
+    global_resources: tuple[tuple[str, int], ...] | None,
+) -> _ChainPlan:
+    return _compute_chain_plan_for_mask(
+        context.candidates,
+        worker_position,
+        mask,
+        remaining_action_slots,
+        dict(worker_inventory),
+        None if shed_stock is None else dict(shed_stock),
+        None if global_resources is None else dict(global_resources),
+        context.oriented_cost_segments,
+    )
+
+
+def _chain_plan_for_context(
+    context: _RoutePlanContext,
+    worker_position: tuple[int, int],
+    mask: int,
+    remaining_action_slots: int | None = None,
+    worker_inventory: Mapping[str, int] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
+) -> _ChainPlan:
+    return _cached_chain_plan_for_context(
+        context,
+        worker_position,
+        mask,
+        remaining_action_slots,
+        tuple(sorted((worker_inventory or {}).items())),
+        None if shed_stock is None else tuple(sorted(shed_stock.items())),
+        None if global_resources is None else tuple(sorted(global_resources.items())),
+    )
+
+
+def _pack_large_route_set_frontier(
+    candidates: tuple[HorizontalRouteCandidate, ...],
+    workers: tuple[WorkerId, ...],
+    positions: Mapping[WorkerId, tuple[int, int]],
+    worker_counts: Iterable[int],
+    worker_action_slots: Mapping[WorkerId, int] | None = None,
+    worker_inventories: Mapping[WorkerId, Mapping[str, int]] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
+) -> dict[int, _LargeRoutePacking]:
+    """Reuse singleton preferences and prefix matching across worker counts."""
+
+    requested = frozenset(worker_counts)
+    max_count = max(requested, default=0)
+    if max_count == 0:
+        return {0: _LargeRoutePacking({}, 0, 0, 0)}
+    context = _RoutePlanContext.create(candidates)
+    plan_cache: dict[tuple[WorkerId, int], _ChainPlan] = {}
+
+    def plan_for(worker: WorkerId, mask: int) -> _ChainPlan:
+        key = (worker, mask)
+        plan = plan_cache.get(key)
+        if plan is None:
+            plan = _chain_plan_for_context(
+                context,
+                positions[worker],
+                mask,
+                None if worker_action_slots is None else worker_action_slots[worker],
+                (worker_inventories or {}).get(worker),
+                shed_stock,
+                global_resources,
+            )
+            plan_cache[key] = plan
+        return plan
+
+    preferences: dict[WorkerId, tuple[int, ...]] = {}
+    for worker in workers[:max_count]:
+        slots = (
+            None if worker_action_slots is None else worker_action_slots[worker]
+        )
+        choices = []
+        for index, candidate in enumerate(candidates):
+            plan = plan_for(worker, 1 << index)
+            if slots is not None and plan.useful_interactions <= 0:
+                continue
+            choices.append(
+                (
+                    -plan.useful_interactions if slots is not None else 0,
+                    -plan.useful_segments if slots is not None else 0,
+                    plan.completion_turns,
+                    plan.movement_turns,
+                    candidate.row_key,
+                    index,
+                )
+            )
+        preferences[worker] = tuple(choice[-1] for choice in sorted(choices))
+
+    primary_owner: dict[int, WorkerId] = {}
+    owner_prefixes: dict[int, dict[int, WorkerId]] = {}
+
+    def assign_primary(worker: WorkerId, seen: set[int]) -> bool:
+        for index in preferences[worker]:
+            if index in seen:
+                continue
+            seen.add(index)
+            owner = primary_owner.get(index)
+            if owner is None or assign_primary(owner, seen):
+                primary_owner[index] = worker
+                return True
+        return False
+
+    for worker_count, worker in enumerate(workers[:max_count], start=1):
+        assign_primary(worker, set())
+        if worker_count in requested:
+            owner_prefixes[worker_count] = dict(primary_owner)
+
+    frontier: dict[int, _LargeRoutePacking] = {}
+    for worker_count in sorted(requested):
+        prefix_workers = workers[:worker_count]
+        prefix_owner = owner_prefixes.get(worker_count, {})
+        masks = {worker: 0 for worker in prefix_workers}
+        for index, worker in prefix_owner.items():
+            masks[worker] |= 1 << index
+
+        primary_workers = tuple(worker for worker in prefix_workers if masks[worker])
+        overflow_workers = primary_workers
+        for index, _candidate in enumerate(candidates):
+            if index in prefix_owner:
+                continue
+            choices = []
+            for worker in overflow_workers:
+                mask = masks[worker] | (1 << index)
+                base = plan_for(worker, masks[worker])
+                plan = plan_for(worker, mask)
+                unfinished = plan.unfinished_interactions
+                choices.append(
+                    (
+                        -(
+                            plan.useful_interactions - base.useful_interactions
+                        ) if worker_action_slots is not None else 0,
+                        -(
+                            plan.useful_segments - base.useful_segments
+                        ) if worker_action_slots is not None else 0,
+                        -plan.useful_interactions if worker_action_slots is not None else 0,
+                        -plan.useful_segments if worker_action_slots is not None else 0,
+                        unfinished,
+                        plan.completion_turns,
+                        plan.movement_turns,
+                        worker.index,
+                        worker,
+                    )
+                )
+            if not choices or (
+                worker_action_slots is not None
+                and max(-choice[0] for choice in choices) <= 0
+            ):
+                continue
+            worker = min(choices)[-1]
+            masks[worker] |= 1 << index
+
+        grouped = {
+            worker: plan_for(worker, masks[worker]).assigned
+            for worker in prefix_workers
+        }
+        assigned_indices = {
+            index
+            for mask in masks.values()
+            for index in range(len(candidates))
+            if mask & (1 << index)
+        }
+        idle_workers = tuple(worker for worker in prefix_workers if not grouped[worker])
+        unassigned_indices = set(range(len(candidates))) - assigned_indices
+        idle_feasible = sum(
+            any(
+                worker_action_slots is None
+                or plan_for(worker, 1 << index).useful_interactions > 0
+                for index in unassigned_indices
+            )
+            for worker in idle_workers
+        )
+        primary_count = len(prefix_owner)
+        assigned_count = len(assigned_indices)
+        frontier[worker_count] = _LargeRoutePacking(
+            grouped=grouped,
+            primary_rows_assigned=primary_count,
+            overflow_rows_assigned=max(0, assigned_count - primary_count),
+            idle_workers_with_unassigned_feasible_rows=idle_feasible,
+        )
+    if 0 in requested:
+        frontier[0] = _LargeRoutePacking({}, 0, 0, 0)
+    return frontier
 
 
 def _assign_horizontal_routes_unsplit(
@@ -1054,6 +1309,123 @@ def _assign_horizontal_routes_unsplit(
             idle_workers_with_unassigned_feasible_rows
         ),
     )
+
+
+def _assign_horizontal_routes_unsplit_frontier(
+    candidates: Iterable[HorizontalRouteCandidate],
+    worker_positions: Mapping[WorkerId, tuple[int, int]],
+    worker_counts: Iterable[int],
+    *,
+    assignment_hour: int,
+    remaining_action_slots: int | None = None,
+    worker_action_slots: Mapping[WorkerId, int] | None = None,
+    worker_inventories: Mapping[WorkerId, Mapping[str, int]] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
+) -> dict[int, RouteAssignment]:
+    """Build unsplit route assignments for worker prefixes in one packing pass."""
+
+    ordered_candidates = tuple(candidates)
+    ordered_workers = tuple(sorted(worker_positions))
+    requested = frozenset(worker_counts)
+    large_route_assignment_mode = len(ordered_candidates) > 8
+    slots = worker_action_slots
+    if slots is None and remaining_action_slots is not None:
+        slots = {worker: remaining_action_slots for worker in ordered_workers}
+
+    if not large_route_assignment_mode:
+        grouped_frontier = _pack_small_route_sets_frontier(
+            ordered_candidates,
+            ordered_workers,
+            worker_positions,
+            requested,
+            slots,
+            worker_inventories,
+            shed_stock,
+            global_resources,
+        )
+        large_frontier: dict[int, _LargeRoutePacking] = {}
+    else:
+        large_frontier = _pack_large_route_set_frontier(
+            ordered_candidates,
+            ordered_workers,
+            worker_positions,
+            requested,
+            slots,
+            worker_inventories,
+            shed_stock,
+            global_resources,
+        )
+        grouped_frontier = {}
+
+    results: dict[int, RouteAssignment] = {}
+    for worker_count in sorted(requested):
+        prefix_workers = ordered_workers[:worker_count]
+        if large_route_assignment_mode:
+            large = large_frontier[worker_count]
+            grouped = large.grouped
+            primary_rows_assigned = large.primary_rows_assigned
+            overflow_rows_assigned = large.overflow_rows_assigned
+            idle_workers_with_unassigned_feasible_rows = (
+                large.idle_workers_with_unassigned_feasible_rows
+            )
+        else:
+            grouped = grouped_frontier[worker_count]
+            primary_rows_assigned = 0
+            overflow_rows_assigned = 0
+            idle_workers_with_unassigned_feasible_rows = 0
+
+        routes: list[StripRoute] = []
+        assigned_ids: set[str] = set()
+        for worker in prefix_workers:
+            assigned = grouped[worker]
+            if not assigned:
+                continue
+            segments = tuple(segment for _, segment in assigned)
+            traversal = tuple(tile for segment in segments for tile in segment.traversal)
+            owned_tiles = tuple(
+                tile for candidate, _ in assigned for tile in candidate.owned_tiles
+            )
+            route_id = segments[0].segment_id if len(segments) == 1 else (
+                f"CHAIN:{worker.label}:" + ",".join(
+                    segment.segment_id for segment in segments
+                )
+            )
+            assigned_ids.update(segment.segment_id for segment in segments)
+            routes.append(
+                StripRoute(
+                    route_id=route_id,
+                    owned_tiles=owned_tiles,
+                    traversal=traversal,
+                    owner=worker,
+                    entry_tile=segments[0].entry_tile,
+                    entry_distance=segments[0].entry_distance,
+                    assignment_hour=assignment_hour,
+                    workload_interactions=sum(
+                        candidate.workload_interactions for candidate, _ in assigned
+                    ),
+                    source_shape=segments[0].source_shape,
+                    segments=segments,
+                )
+            )
+        results[worker_count] = RouteAssignment(
+            routes=tuple(routes),
+            unassigned=tuple(
+                candidate
+                for candidate in ordered_candidates
+                if candidate.route_id not in assigned_ids
+            ),
+            idle_workers=tuple(
+                worker for worker in prefix_workers if not grouped[worker]
+            ),
+            large_route_assignment_mode=large_route_assignment_mode,
+            primary_rows_assigned=primary_rows_assigned,
+            overflow_rows_assigned=overflow_rows_assigned,
+            idle_workers_with_unassigned_feasible_rows=(
+                idle_workers_with_unassigned_feasible_rows
+            ),
+        )
+    return results
 
 
 def _candidate_tile_values(
@@ -1309,20 +1681,28 @@ def assign_horizontal_routes(
     shed_stock: Mapping[str, int] | None = None,
     global_resources: Mapping[str, int] | None = None,
     enable_row_helpers: bool = True,
+    _precomputed_base: RouteAssignment | None = None,
+    _ordered_candidates: tuple[HorizontalRouteCandidate, ...] | None = None,
 ) -> RouteAssignment:
     """Pack rows and split any overloaded physical row across one helper."""
 
-    ordered_candidates = tuple(sorted(candidates, key=lambda item: item.row_key))
-    base = _assign_horizontal_routes_unsplit(
-        ordered_candidates,
-        worker_positions,
-        assignment_hour=assignment_hour,
-        remaining_action_slots=remaining_action_slots,
-        worker_action_slots=worker_action_slots,
-        worker_inventories=worker_inventories,
-        shed_stock=shed_stock,
-        global_resources=global_resources,
+    ordered_candidates = (
+        _ordered_candidates
+        if _ordered_candidates is not None
+        else tuple(sorted(candidates, key=lambda item: item.row_key))
     )
+    base = _precomputed_base
+    if base is None:
+        base = _assign_horizontal_routes_unsplit(
+            ordered_candidates,
+            worker_positions,
+            assignment_hour=assignment_hour,
+            remaining_action_slots=remaining_action_slots,
+            worker_action_slots=worker_action_slots,
+            worker_inventories=worker_inventories,
+            shed_stock=shed_stock,
+            global_resources=global_resources,
+        )
     row_diagnostics = list(
         forecast_row_overloads(
             ordered_candidates,
@@ -1664,3 +2044,114 @@ def assign_horizontal_routes(
         idle_workers=tuple(worker for worker in sorted(worker_positions) if worker not in assigned_workers),
         row_diagnostics=tuple(row_diagnostics),
     )
+
+
+def assign_horizontal_routes_frontier(
+    candidates: Iterable[HorizontalRouteCandidate],
+    worker_positions: Mapping[WorkerId, tuple[int, int]],
+    *,
+    worker_counts: Iterable[int],
+    assignment_hour: int,
+    remaining_action_slots: int | None = None,
+    worker_action_slots: Mapping[WorkerId, int] | None = None,
+    worker_inventories: Mapping[WorkerId, Mapping[str, int]] | None = None,
+    shed_stock: Mapping[str, int] | None = None,
+    global_resources: Mapping[str, int] | None = None,
+    enable_row_helpers: bool = True,
+) -> dict[int, RouteAssignment]:
+    """Assign every requested sorted-worker prefix while sharing route work.
+
+    Each result has the same semantics as an independent
+    ``assign_horizontal_routes`` call with only the first ``k`` workers.
+    Candidate ordering and route-cost plans are built once; small boards share
+    the exact subset DP, while large boards share singleton preferences and
+    primary matching prefixes.
+    """
+
+    raw_counts = tuple(worker_counts)
+    if any(
+        isinstance(count, bool) or not isinstance(count, int)
+        for count in raw_counts
+    ):
+        raise ValueError("worker_counts must contain integers")
+    requested = tuple(sorted(set(raw_counts)))
+    if not requested:
+        return {}
+    if any(
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 0
+        or count > len(worker_positions)
+        for count in requested
+    ):
+        raise ValueError(
+            "worker_counts must be integers within the available worker prefix"
+        )
+    ordered_workers = tuple(sorted(worker_positions))
+    ordered_candidates = tuple(sorted(candidates, key=lambda item: item.row_key))
+    frontier_workers = ordered_workers[: max(requested)]
+    frontier_positions = {
+        worker: worker_positions[worker] for worker in frontier_workers
+    }
+    frontier_slots = (
+        None
+        if worker_action_slots is None
+        else {worker: worker_action_slots[worker] for worker in frontier_workers}
+    )
+    frontier_inventories = (
+        None
+        if worker_inventories is None
+        else {
+            worker: worker_inventories[worker]
+            for worker in frontier_workers
+            if worker in worker_inventories
+        }
+    )
+    bases = _assign_horizontal_routes_unsplit_frontier(
+        ordered_candidates,
+        frontier_positions,
+        requested,
+        assignment_hour=assignment_hour,
+        remaining_action_slots=remaining_action_slots,
+        worker_action_slots=frontier_slots,
+        worker_inventories=frontier_inventories,
+        shed_stock=shed_stock,
+        global_resources=global_resources,
+    )
+    results: dict[int, RouteAssignment] = {}
+    for worker_count in requested:
+        prefix_workers = ordered_workers[:worker_count]
+        prefix_positions = {
+            worker: worker_positions[worker] for worker in prefix_workers
+        }
+        prefix_slots = (
+            None
+            if worker_action_slots is None
+            else {
+                worker: worker_action_slots[worker]
+                for worker in prefix_workers
+            }
+        )
+        prefix_inventories = (
+            None
+            if worker_inventories is None
+            else {
+                worker: worker_inventories[worker]
+                for worker in prefix_workers
+                if worker in worker_inventories
+            }
+        )
+        results[worker_count] = assign_horizontal_routes(
+            ordered_candidates,
+            prefix_positions,
+            assignment_hour=assignment_hour,
+            remaining_action_slots=remaining_action_slots,
+            worker_action_slots=prefix_slots,
+            worker_inventories=prefix_inventories,
+            shed_stock=shed_stock,
+            global_resources=global_resources,
+            enable_row_helpers=enable_row_helpers,
+            _precomputed_base=bases[worker_count],
+            _ordered_candidates=ordered_candidates,
+        )
+    return results
