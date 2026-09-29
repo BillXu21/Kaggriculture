@@ -5,7 +5,9 @@ from __future__ import annotations
 import copy
 from dataclasses import replace
 
-from executor_v0.strip_claim_board import ClaimPhase, SchedulerMode, build_claim_board
+from executor_v0.strip_claim_board import (
+    ClaimPhase, SchedulerMode, ServiceClass, build_claim_board,
+)
 from executor_v0.strip_claim_scheduler import (
     claim_runtime_fragment, evaluate_hypothetical_worker, schedule_claim_board,
 )
@@ -16,8 +18,8 @@ from executor_v0.strip_routes import (
     remaining_day_action_slots, route_cursor_invariants_hold,
 )
 from executor_v0.strip_work import (
-    RowSummary, StripWorkPlan, SupplyRequirement, SupplySnapshot,
-    WorkDiagnostics, WorkItem, row_key_for_tile,
+    RowSummary, StripWorkPlan, SupplyRequirement, SupplySnapshot, WorkChain,
+    WorkDiagnostics, WorkItem, WorkStatus, row_key_for_tile,
 )
 
 
@@ -42,6 +44,49 @@ def board(work: StripWorkPlan, positions: dict[WorkerId, tuple[int, int]],
                                     epoch_id="test")
     result = schedule_claim_board(claim_board, work, positions, 24, 0)
     return claim_board, result
+
+
+def test_bundle_service_classes_match_the_claim_contract():
+    work = plan(
+        item("DIG", (0, 0), source="survival_weed_prevention"),
+        item("WATER", (0, 1), source="yield_improving"),
+        item("WATER", (0, 2), source="optional_deferrable"),
+        item("DIG", (0, 3), source="dig_cleanup"),
+        item("WATER", (0, 4), source="water_optional_spare"),
+        item("FERTILIZE", (1, 0), source="fertilizer_policy"),
+        item("WATER", (1, 1), source="fertilizer_linked_productive"),
+        item("FERTILIZE", (1, 2), source="manager_reconciliation"),
+        item("FERTILIZE", (1, 3)),
+    )
+    work = replace(work, chains=(WorkChain(
+        "FERTILIZER_UPKEEP:CHAIN", "FERTILIZER_UPKEEP",
+        ("FERTILIZE:1,3",), WorkStatus.READY,
+    ),))
+
+    bundles = build_claim_board(work, {}, {}, {}, epoch_id="test").bundles
+
+    assert bundles["TILE:0,0"].service_class == ServiceClass.HARD_REQUIRED
+    assert bundles["TILE:0,0"].source_rank == 0
+    assert bundles["TILE:0,1"].service_class == ServiceClass.REQUIRED
+    assert {
+        bundles[bundle_id].service_class
+        for bundle_id in (
+            "TILE:0,2", "TILE:0,3", "TILE:0,4", "TILE:1,0", "TILE:1,1",
+            "TILE:1,3",
+        )
+    } == {ServiceClass.OPTIONAL}
+    assert bundles["TILE:1,2"].service_class == ServiceClass.REQUIRED
+
+
+def test_required_service_dominates_optional_work_on_the_same_tile():
+    work = plan(
+        item("WATER", (0, 0), source="yield_improving"),
+        item("DIG", (0, 0), key="CLEANUP:0,0", source="dig_cleanup"),
+    )
+
+    bundle = build_claim_board(work, {}, {}, {}, epoch_id="test").bundles["TILE:0,0"]
+
+    assert bundle.service_class == ServiceClass.REQUIRED
 
 
 def test_primary_is_full_horizontal_row_and_coverage_appends():

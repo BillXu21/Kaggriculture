@@ -147,7 +147,7 @@ def _bundle(tile: tuple[int, int], items: tuple[WorkItem, ...],
         item.source in {"optional_deferrable", "fertilizer_policy",
                         "fertilizer_linked_productive", "dig_cleanup",
                         "water_optional_spare"}
-        or item.id in fertilizer_ids or item.kind == "FERTILIZE"
+        or item.id in fertilizer_ids
         for item in items
     )
     service = (ServiceClass.HARD_REQUIRED
