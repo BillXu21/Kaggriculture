@@ -21,9 +21,11 @@ from executor_v0.strip_cost import (
 )
 from executor_v0.strip_routes import (
     HorizontalRouteCandidate,
+    RouteAssignment,
     WorkerId,
     _candidate_cost_segment,
     assign_horizontal_routes,
+    assign_horizontal_routes_frontier,
     remaining_day_action_slots,
 )
 from executor_v0.strip_work import StripWorkPlan
@@ -236,25 +238,27 @@ def _estimate_packed_workers(
     shed: Mapping[str, int],
     seeds: Mapping[str, int],
     fertilizer_item_ids: frozenset[str],
+    assignment: RouteAssignment | None = None,
 ) -> tuple[tuple[RouteLaborEstimate, ...], int, int]:
     """Estimate candidate completion under one deterministic packed assignment."""
 
     if not candidates or not worker_positions:
         return (), 0, 0
-    assignment = assign_horizontal_routes(
-        candidates,
-        worker_positions,
-        assignment_hour=0,
-        worker_action_slots={
-            worker: future_action_slots
-            + int(worker.index < current_workers)
-            for worker in worker_positions
-        },
-        worker_inventories=worker_inventories,
-        shed_stock=shed,
-        global_resources=seeds,
-        enable_row_helpers=False,
-    )
+    if assignment is None:
+        assignment = assign_horizontal_routes(
+            candidates,
+            worker_positions,
+            assignment_hour=0,
+            worker_action_slots={
+                worker: future_action_slots
+                + int(worker.index < current_workers)
+                for worker in worker_positions
+            },
+            worker_inventories=worker_inventories,
+            shed_stock=shed,
+            global_resources=seeds,
+            enable_row_helpers=False,
+        )
     by_id = {candidate.route_id: candidate for candidate in candidates}
     index_by_id = {candidate.route_id: index for index, candidate in enumerate(candidates)}
     estimates: dict[str, RouteLaborEstimate] = {}
@@ -349,18 +353,44 @@ def plan_strip_hiring(
         }
     )
     packed_results: dict[int, tuple[tuple[RouteLaborEstimate, ...], int, int]] = {}
-    for worker_count in range(current_workers, max_workers + 1):
-        packed_results[worker_count] = _estimate_packed_workers(
+    assignment_workers = tuple(sorted(all_positions)[:max_workers])
+    assignment_positions = {
+        worker: all_positions[worker] for worker in assignment_workers
+    }
+    if candidates:
+        estimator_slots = {
+            worker: future_slots + int(worker.index < current_workers)
+            for worker in assignment_workers
+        }
+        assignment_frontier = assign_horizontal_routes_frontier(
             candidates,
-            {worker: all_positions[worker] for worker in sorted(all_positions)[:worker_count]},
-            worker_inventories,
-            work_plan,
-            future_action_slots=future_slots,
-            current_workers=current_workers,
-            shed=private.get("shed"),
-            seeds=private.get("seeds"),
-            fertilizer_item_ids=fertilizer_item_ids,
+            assignment_positions,
+            worker_counts=range(current_workers, max_workers + 1),
+            assignment_hour=0,
+            worker_action_slots=estimator_slots,
+            worker_inventories=worker_inventories,
+            shed_stock=private.get("shed"),
+            global_resources=private.get("seeds"),
+            enable_row_helpers=False,
         )
+        for worker_count in range(current_workers, max_workers + 1):
+            packed_results[worker_count] = _estimate_packed_workers(
+                candidates,
+                {
+                    worker: assignment_positions[worker]
+                    for worker in assignment_workers[:worker_count]
+                },
+                worker_inventories,
+                work_plan,
+                future_action_slots=future_slots,
+                current_workers=current_workers,
+                shed=private.get("shed"),
+                seeds=private.get("seeds"),
+                fertilizer_item_ids=fertilizer_item_ids,
+                assignment=assignment_frontier[worker_count],
+            )
+    else:
+        packed_results[current_workers] = ((), 0, 0)
     driving_total = max((result[2] for result in packed_results.values()), default=0)
     target_workers = current_workers
     hire_reason = "no_useful_work"
