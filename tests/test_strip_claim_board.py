@@ -18,8 +18,8 @@ from executor_v0.strip_routes import (
     remaining_day_action_slots, route_cursor_invariants_hold,
 )
 from executor_v0.strip_work import (
-    RowSummary, StripWorkPlan, SupplyRequirement, SupplySnapshot, WorkChain,
-    WorkDiagnostics, WorkItem, WorkStatus, row_key_for_tile,
+    BlockReason, RowSummary, StripWorkPlan, SupplyRequirement, SupplySnapshot,
+    WorkChain, WorkDiagnostics, WorkItem, WorkStatus, row_key_for_tile,
 )
 
 
@@ -952,6 +952,27 @@ def _intensive_row_work(*rows, interactions=12):
     ))
 
 
+def _seven_interactions_with_one_blocked():
+    retained = [item("CARE", (0, 0), key=f"LEAD:{index}") for index in range(6)]
+    candidate = []
+    for col in range(7):
+        kind = "FEED" if col == 0 else "WATER"
+        requirements = (
+            (SupplyRequirement("WHEAT", 1),) if col == 0 else
+            (SupplyRequirement("CARROT", 1),) if col == 6 else ()
+        )
+        work = item(kind, (5, col), key=f"TAIL:{col}", requirements=requirements)
+        if col == 6:
+            work = replace(
+                work,
+                status=WorkStatus.BLOCKED,
+                block_reason=BlockReason.DEPENDENCY_BLOCKED,
+                depends_on=("MISSING:PREDECESSOR",),
+            )
+        candidate.append(work)
+    return plan(*(retained + candidate))
+
+
 def test_claim_hiring_noops_when_existing_workers_cover_required_work():
     from tests.test_executor_v0_idle_cleanup import make_obs
 
@@ -1046,12 +1067,134 @@ def test_claim_hiring_plans_two_sequential_spawns_and_escalating_costs():
     assert [record["marginal_required_interactions"] for record in planned] == [
         before - after for before, after in uncovered
     ]
+    assert [record["effective_interactions"] for record in planned] == [
+        record["marginal_required_interactions"] for record in planned
+    ]
     assert sum(record["marginal_required_interactions"] for record in planned) == (
         controller._claim_hiring_diagnostics["required_interactions_reserved"]
     )
     assert set(controller._claim_board.owner_by_bundle.values()) == {
         WorkerId(0), WorkerId(1), WorkerId(2), WorkerId(3),
     }
+
+
+def test_claim_hiring_trims_optimistic_seven_to_six_canonical_interactions():
+    from executor_v0.strip_hiring import future_worker_actions
+    from tests.test_executor_v0_idle_cleanup import empty_plan, make_obs
+
+    obs = make_obs(hour=0, farmer=(0, 0), money=100)
+    obs["private"]["shed"] = {"WHEAT": 1, "CARROT": 1}
+    work = _seven_interactions_with_one_blocked()
+    controller = StripExecutorController(
+        config=StripExecutorConfig(enable_row_claim_board=True),
+        work_builder=lambda _obs, _daily, **_kwargs: work,
+    )
+    daily = empty_plan()
+    controller._start_day(obs, daily)
+    positions = controller._worker_positions(obs)
+    inventories = {
+        worker: controller._worker_inventory(obs, worker) for worker in positions
+    }
+    controller._finalize_claim_day(obs, work, positions, inventories)
+    snapshot = controller._claim_board.uncovered_snapshot(
+        future_worker_actions(obs)
+    )
+    optimistic = evaluate_hypothetical_worker(snapshot, (4, 4), 23)
+    assert optimistic.effective_interactions == 7
+    assert optimistic.reservation_shed == (("CARROT", 1), ("WHEAT", 1))
+    orders = controller._plan_claim_hires(obs, work, positions)
+
+    assert orders == (("HIRE",),)
+    record = controller._claim_hiring_diagnostics["planned_workers"][0]
+    assert record["effective_interactions"] == 6
+    assert record["marginal_required_interactions"] == 6
+    assert record["uncovered_required_interactions_before"] - record[
+        "uncovered_required_interactions_after"
+    ] == 6
+    assert record["reservation_shed"] == {"WHEAT": 1}
+    assert "TILE:5,6" not in record["bundle_ids"]
+    assert "TILE:5,0" in record["bundle_ids"]
+    assert controller._claim_board is not None
+    assert "TILE:5,6" not in controller._claim_board.owner_by_bundle
+    assert controller._claim_board.claim_source_by_bundle.get("TILE:5,6") is None
+    assert controller._claim_board.reservations["TILE:5,0"].shed == (
+        ("WHEAT", 1),
+    )
+    assert controller._claim_board.available_shed() == {
+        "CARROT": 1,
+        "WHEAT": 0,
+    }
+    assert [fragment.bundle_ids for fragment in
+            controller._claim_board.uncovered_snapshot(23).fragments] == [
+        ("TILE:5,6",),
+    ]
+
+
+def test_claim_hiring_preserves_exact_fit_optimistic_coverage():
+    from executor_v0.strip_claim_scheduler import canonical_hypothetical_worker_plan
+    from tests.test_executor_v0_idle_cleanup import make_obs
+
+    exact_work = plan(item("WATER", (5, 5)))
+    exact_board = build_claim_board(exact_work, {}, {}, {}, epoch_id="exact-fit")
+    exact_snapshot = exact_board.uncovered_snapshot(20)
+    exact_coverage = evaluate_hypothetical_worker(exact_snapshot, (4, 4), 20)
+    canonical_plan = canonical_hypothetical_worker_plan(
+        exact_board,
+        exact_work,
+        WorkerId(1),
+        (4, 4),
+        exact_coverage,
+        20,
+        0,
+    )
+    assert canonical_plan is not None
+    assert canonical_plan[0] == exact_coverage
+
+    work = plan(
+        *(item("CARE", (0, 0), key=f"LEAD:{index}") for index in range(6)),
+        *(item("WATER", (5, col), key=f"TAIL:{col}") for col in range(7)),
+    )
+    controller, orders = _claim_hiring_case(
+        work, make_obs(hour=0, farmer=(0, 0), money=100)
+    )
+
+    assert orders == (("HIRE",),)
+    record = controller._claim_hiring_diagnostics["planned_workers"][0]
+    assert record["effective_interactions"] == 5
+    assert record["marginal_required_interactions"] == 5
+    assert record["uncovered_required_interactions_before"] - record[
+        "uncovered_required_interactions_after"
+    ] == 5
+    assert len(record["bundle_ids"]) == 5
+    assert controller._claim_board is not None
+    assert not controller._claim_board.uncovered_snapshot(23).fragments
+
+
+def test_claim_hiring_rejects_zero_canonically_feasible_work_without_respawn():
+    from tests.test_executor_v0_idle_cleanup import make_obs
+
+    work = plan(*(
+        replace(
+            item("WATER", (5, col), key=f"BLOCKED:{col}"),
+            status=WorkStatus.BLOCKED,
+            block_reason=BlockReason.DEPENDENCY_BLOCKED,
+            depends_on=(f"MISSING:{col}",),
+        )
+        for col in range(7)
+    ))
+    controller, orders = _claim_hiring_case(
+        work, make_obs(hour=0, farmer=(0, 0), money=100)
+    )
+
+    assert orders == ()
+    assert controller._claim_hiring_diagnostics["hypothetical_workers_considered"] == 1
+    assert controller._claim_hiring_diagnostics["hire_stop_reason"] == (
+        "NO_CANONICAL_REQUIRED_COVERAGE"
+    )
+    assert controller._claim_hiring_diagnostics["planned_workers"] == []
+    assert controller._claim_board is not None
+    assert set(controller._claim_board.owner_by_bundle.values()) <= {WorkerId(0)}
+    assert len(controller._claim_board.uncovered_snapshot(23).fragments) == 1
 
 
 def test_claim_hiring_cash_allows_first_but_not_second_hire():
