@@ -158,6 +158,7 @@ def test_match_summary_extracts_full_game_diagnostics():
     report = validation._summarize_match(result, worker_pid=123)
 
     assert report["orientation"] == "checkpoint_seat_0_vs_pass"
+    assert report["symmetric"] is False
     assert report["validation"]["passed"] is True
     assert report["validation"]["active_days"] == validation.TOTAL_DAYS
     assert report["validation"]["stage25_manager_days"] == (
@@ -217,6 +218,8 @@ def test_symmetric_summary_requires_and_reports_both_seats():
         result, worker_pid=9, require_both_seats=True)
 
     assert report["validation"]["passed"] is True, report["validation"]["failures"]
+    assert report["symmetric"] is True
+    assert report["orientation"] == "checkpoint_symmetric_both_seats"
     assert set(report["validation"]["strips_by_seat"]) == {"0", "1"}
     assert all(
         seat["passed"] for seat in report["validation"]["strips_by_seat"].values()
