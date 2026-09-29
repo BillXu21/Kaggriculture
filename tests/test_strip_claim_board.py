@@ -901,6 +901,20 @@ def test_claim_hiring_plans_two_sequential_spawns_and_escalating_costs():
     assert [record["spawn"] for record in planned] == [[4, 4], [4, 5], [5, 4]]
     assert controller._claim_hiring_diagnostics["sequential_hire_costs"] == [1, 1, 2]
     assert len({tuple(record["bundle_ids"]) for record in planned}) == 3
+    uncovered = [
+        (record["uncovered_required_interactions_before"],
+         record["uncovered_required_interactions_after"])
+        for record in planned
+    ]
+    assert all(before > after for before, after in uncovered)
+    assert all(uncovered[index][1] == uncovered[index + 1][0]
+               for index in range(len(uncovered) - 1))
+    assert [record["marginal_required_interactions"] for record in planned] == [
+        before - after for before, after in uncovered
+    ]
+    assert sum(record["marginal_required_interactions"] for record in planned) == (
+        controller._claim_hiring_diagnostics["required_interactions_reserved"]
+    )
     assert set(controller._claim_board.owner_by_bundle.values()) == {
         WorkerId(0), WorkerId(1), WorkerId(2), WorkerId(3),
     }

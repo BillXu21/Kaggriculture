@@ -129,6 +129,15 @@ class _ClaimHireRecord:
     spawn: tuple[int, int]
     coverage: HypotheticalWorkerCoverage
     route: StripRoute
+    marginal_required_interactions: int
+    uncovered_required_interactions_before: int
+    uncovered_required_interactions_after: int
+
+
+def _uncovered_required_interactions(
+    snapshot: UncoveredRequiredWork,
+) -> int:
+    return sum(view.effective_interactions for view in snapshot.bundle_views)
 
 
 class StripExecutorController:
@@ -520,6 +529,7 @@ class StripExecutorController:
         if snapshot.fragments:
             stop_reason = "NO_MEANINGFUL_REQUIRED_COVERAGE"
         for hire_index in range(limit):
+            uncovered_before = _uncovered_required_interactions(snapshot)
             spawns = predict_hire_spawns(
                 tuple(existing_positions), 1, board_size
             )
@@ -538,6 +548,28 @@ class StripExecutorController:
                 )
                 break
 
+            bundle_ids = tuple(
+                bundle_id for fragment in coverage.claimed_fragments
+                for bundle_id in fragment.bundle_ids
+            )
+            snapshot_interactions = {
+                view.bundle_id: view.effective_interactions
+                for view in snapshot.bundle_views
+            }
+            marginal_interactions = sum(
+                snapshot_interactions.get(bundle_id, 0)
+                for bundle_id in bundle_ids
+            )
+            if (
+                len(bundle_ids) != len(set(bundle_ids))
+                or any(bundle_id not in snapshot_interactions
+                       for bundle_id in bundle_ids)
+                or marginal_interactions <= 0
+                or marginal_interactions != coverage.effective_interactions
+            ):
+                stop_reason = "NON_MARGINAL_REQUIRED_COVERAGE"
+                break
+
             cost = hire_cost(hires_today + len(planned), cost_mult)
             if remaining_cash < cost:
                 stop_reason = "CASH"
@@ -551,10 +583,6 @@ class StripExecutorController:
                 stop_reason = "HORIZON_SHORTAGE"
                 break
             route.route_id = f"CLAIM:{worker.label}"
-            bundle_ids = tuple(
-                bundle_id for fragment in coverage.claimed_fragments
-                for bundle_id in fragment.bundle_ids
-            )
             reservation = board.trial(worker, bundle_ids)
             if reservation is None:
                 stop_reason = "RESOURCE_RESERVATION_MISMATCH"
@@ -568,8 +596,18 @@ class StripExecutorController:
                 stop_reason = "RESOURCE_RESERVATION_MISMATCH"
                 break
             board.record_claim_source(bundle_ids, "HIRE_RESERVATION")
+            snapshot = board.uncovered_snapshot(slots)
+            uncovered_after = _uncovered_required_interactions(snapshot)
+            if uncovered_before - uncovered_after != marginal_interactions:
+                raise AssertionError(
+                    "claim hire did not reduce uncovered required work by its "
+                    "evaluated marginal coverage"
+                )
 
-            record = _ClaimHireRecord(worker, spawn, coverage, route)
+            record = _ClaimHireRecord(
+                worker, spawn, coverage, route, marginal_interactions,
+                uncovered_before, uncovered_after,
+            )
             planned.append(record)
             costs.append(cost)
             self._claim_hire_records[worker] = record
@@ -582,7 +620,6 @@ class StripExecutorController:
                            else RoutePhase.TRAVEL_TO_ENTRY)
             remaining_cash -= cost
             existing_positions.append(spawn)
-            snapshot = board.uncovered_snapshot(slots)
             stop_reason = "NO_REQUIRED_LEFTOVERS"
             if not snapshot.fragments:
                 break
@@ -605,6 +642,15 @@ class StripExecutorController:
                     for bundle_id in fragment.bundle_ids
                 ],
                 "effective_interactions": record.coverage.effective_interactions,
+                "marginal_required_interactions": (
+                    record.marginal_required_interactions
+                ),
+                "uncovered_required_interactions_before": (
+                    record.uncovered_required_interactions_before
+                ),
+                "uncovered_required_interactions_after": (
+                    record.uncovered_required_interactions_after
+                ),
                 "incremental_turns": record.coverage.incremental_turns,
                 "reservation_shed": dict(record.coverage.reservation_shed),
                 "reservation_global": dict(record.coverage.reservation_global),
@@ -612,7 +658,7 @@ class StripExecutorController:
             for record in planned
         ]
         self._claim_hiring_diagnostics = {
-            "schema_version": 2,
+            "schema_version": 3,
             "existing_workers": int(previous_diagnostics.get(
                 "existing_workers", current_worker_count
             )),
