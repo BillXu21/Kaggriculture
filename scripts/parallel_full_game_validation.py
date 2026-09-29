@@ -94,6 +94,9 @@ class _StripController:
         self._observed_days: set[int] = set()
         self._manager_days: set[int] = set()
         self._sell_orders_by_product: dict[str, int] = {}
+        self._hire_orders = 0
+        self._worker_actions = 0
+        self._worker_pass_actions = 0
 
     def act(self, observation: Mapping[str, Any]) -> Mapping[str, Any]:
         day = int(observation["day"])
@@ -104,11 +107,19 @@ class _StripController:
         if day >= MANAGER_START_DAY and hour == 0:
             self._manager_days.add(day)
         for order in (action.get("market") or ()):
-            if order and order[0] == "SELL" and len(order) > 1:
+            if not order:
+                continue
+            if order[0] == "SELL" and len(order) > 1:
                 product = str(order[1])
                 self._sell_orders_by_product[product] = (
                     self._sell_orders_by_product.get(product, 0) + 1
                 )
+            elif order[0] == "HIRE":
+                self._hire_orders += 1
+        for worker_action in (action.get("hands") or ()):
+            self._worker_actions += 1
+            if list(worker_action) == ["PASS"]:
+                self._worker_pass_actions += 1
         return action
 
     __call__ = act
@@ -125,6 +136,9 @@ class _StripController:
                     "automatic_sell_orders_by_product": dict(
                         self._sell_orders_by_product
                     ),
+                    "hire_orders": self._hire_orders,
+                    "worker_actions": self._worker_actions,
+                    "worker_pass_actions": self._worker_pass_actions,
                 },
             },
         }
@@ -364,6 +378,8 @@ def _seat_validation(
         manager_days=manager_days,
         opening_diagnostics=opening_detail,
     )
+    worker_actions = int(validation.get("worker_actions", 0))
+    worker_pass_actions = int(validation.get("worker_pass_actions", 0))
     return failures, {
         "active_days": len(observed_days),
         "stage25_manager_days": len(manager_days),
@@ -371,6 +387,13 @@ def _seat_validation(
         "interaction_turns": interaction_turns,
         "automatic_sell_orders_by_product": dict(
             validation.get("automatic_sell_orders_by_product", {})),
+        "hire_orders": int(validation.get("hire_orders", 0)),
+        "worker_actions": worker_actions,
+        "worker_pass_actions": worker_pass_actions,
+        "worker_pass_rate": (
+            round(worker_pass_actions / worker_actions, 6)
+            if worker_actions else 0.0
+        ),
     }
 
 
@@ -398,6 +421,10 @@ def _summarize_match(
             "primitive_actions": 0,
             "interaction_turns": 0,
             "automatic_sell_orders_by_product": {},
+            "hire_orders": 0,
+            "worker_actions": 0,
+            "worker_pass_actions": 0,
+            "worker_pass_rate": 0.0,
         }
     else:
         failures, counters = _seat_validation(
