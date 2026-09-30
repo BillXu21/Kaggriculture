@@ -100,12 +100,34 @@ class Stage25StripExecutorAgent:
     def __call__(self, obs: Mapping[str, Any]) -> dict[str, Any]:
         day = int(obs["day"])
         if self._day != day:
+            self._freeze_completed_day()
             self._plan = self.provider.daily_plan(obs, self.seat)
             self._day = day
         result = self.controller.act(obs, self._plan)
         if not self.low_telemetry:
-            self._days[str(day)] = copy.deepcopy(result.diagnostics)
+            # Store the live reference. ``StripExecutorController._diagnostics``
+            # returns a fresh top-level dict whose *values* alias mutable
+            # controller state, so the snapshot has to be detached before that
+            # state is reused -- but only once, for the last turn of the day.
+            # Freezing on every turn copied 1,142 diagnostics per seat to retain
+            # 24, which was the largest single CPU cost in a full game.
+            self._days[str(day)] = result.diagnostics
         return result.action_dict()
+
+    def _freeze_completed_day(self) -> None:
+        """Detach the retained diagnostics of the day that just ended.
+
+        Called at the first turn of a new day, before the controller runs
+        again, so the stored entry is still the exact object the old per-turn
+        ``copy.deepcopy`` would have captured. The final day needs no freeze:
+        ``diagnostics_json`` already deep-copies the whole mapping, and the
+        controller is not invoked again once the game is over.
+        """
+        if self.low_telemetry or self._day is None:
+            return
+        key = str(self._day)
+        if key in self._days:
+            self._days[key] = copy.deepcopy(self._days[key])
 
     def diagnostics_json(self) -> dict[str, Any]:
         diagnostics = {
