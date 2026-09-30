@@ -112,23 +112,44 @@ run's changes.
 
 ## Remaining bottlenecks after this run
 
-Seed-41003 process CPU is ~46 s, of which:
+Seed-41003 process CPU is ~46 s, of which (measured with
+`scripts/phase_timing.py`, which wraps call sites in `process_time`
+accumulators because cProfile distorts this workload by ~4x on `copy.py`):
 
-- `trie.evaluate` **8.52 s** (45% of `act`). The 2^k ordered/oriented path
-  enumeration is inherent to the exact semantics: the trie root depends on the
-  whole mask's pickup demand, so nodes cannot be shared across masks and the
-  per-mask DP is demand-driven already. Further gains need an admissible
-  bound to prune the enumeration, which is delicate because the final tie-break
-  is the path tuple itself.
-- manager inference **~8.3 s**, of which **~5.7 s is one-time JAX tracing on the
-  first `daily_plan` call** (47 warm calls total ~2.6 s). This is a per-process
-  startup cost: it amortises to nothing across a training rollout that reuses a
-  worker for many games, so it inflates the 4-game panel by roughly 14% without
-  reflecting sustained rollout throughput. The compilation cache does not
-  remove it.
-- the remaining ~10 s of `act` outside `trie.evaluate`: hiring/frontier
-  assembly, work-plan rebuild, supply, market and reconciliation, none of which
-  profiled above 0.8 s individually.
+| phase | CPU | share of process CPU |
+|---|---:|---:|
+| `StripExecutorController.act` | 18.73 s | 40.5% |
+| .. `plan_strip_hiring` | 14.42 s | 31.2% |
+| .. .. `_pack_large_route_set_frontier` | 10.73 s | 23.2% |
+| .. .. .. `trie.evaluate` | 8.23 s | 17.8% |
+| .. .. .. .. `trie._extend` | 4.89 s | 10.6% |
+| .. .. frontier DP / assembly outside the trie | ~2.5 s | 5.4% |
+| .. `_estimate_packed_workers` (hiring estimator) | 0.52 s | 1.1% |
+| manager inference (JAX), incl. ~5.8 s one-time tracing | ~8.2 s | 17.8% |
+| `copy.deepcopy` (all sites) | 1.34 s | 2.9% |
+| `build_diagnostics` | 0.36 s | 0.8% |
+
+- **`trie.evaluate` 8.23 s** is the largest single item. The `2^k`
+  ordered/oriented path enumeration is inherent to the exact semantics: a trie
+  root depends on the whole mask's pickup demand, so nodes cannot be shared
+  across masks, and the per-mask DP is already demand-driven. Further gains need
+  an admissible bound to prune the enumeration, which is delicate because the
+  final tie-break key *is* the path tuple -- a pruned branch could tie on the
+  primary objective and still win lexicographically.
+- **manager inference ~8.2 s**, of which **~5.8 s is one-time JAX tracing on the
+  first `daily_plan` call** (47 warm calls total ~2.4 s). This is a per-process
+  startup cost that amortises to nothing across a training rollout reusing a
+  worker for many games, so it inflates a 4-game panel by roughly 14% without
+  reflecting sustained rollout throughput. A persistent compilation cache does
+  not remove it (measured).
+- **frontier DP/assembly ~2.5 s + ~3.2 s of hiring bookkeeping** is the last
+  sizeable target, but it is tie-break-delicate (a 10-element comparison tuple
+  per overflow row, ending in the worker object) and the smallest honest
+  remaining win looked well under 1% of process CPU.
+- Note `trie.root` (0.61 s over 294,652 calls) is called once per *path* while
+  the mask is constant across all `2^k` paths of one mask, but the measured cost
+  is almost entirely the call plus the unavoidable `_mask_roots` lookup, so a
+  one-entry mask cache was not worth the added state.
 
 ### Why the money track is bounded (evidence, seed 41003, both seats)
 

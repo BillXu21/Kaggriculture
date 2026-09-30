@@ -107,6 +107,8 @@ def main(argv: list[str] | None = None) -> int:
         (strip_prefix_trie.RouteCostTrie, "evaluate", "trie.evaluate"),
         (strip_prefix_trie.RouteCostTrie, "_extend", "trie.extend"),
         (strip_prefix_trie.RouteCostTrie, "_root", "trie.root"),
+        (strip_hiring, "simulate_route_cost", "hiring.simulate_route_cost"),
+        (strip_hiring, "_estimate_packed_workers", "hiring.estimate_packed"),
         (strip_cost, "simulate_route_cost", "cost.simulate_route_cost"),
         (agent_match, "_controller_observation", "agent.observation_copy"),
         (agent_match, "_call_controller", "agent.call_controller"),
