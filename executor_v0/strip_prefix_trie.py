@@ -256,25 +256,43 @@ class RouteCostTrie:
     def evaluate(self, mask: int, path: Sequence[tuple[int, int, int]]) -> _ChainCost:
         node = self._root(mask)
         self.segment_visits_before += len(path)
-        for index, side, _distance_to_entry in path:
-            started = perf_counter() if self.profile else 0.0
-            key = (index, side)
-            child = node.children.get(key)
-            if self.profile:
+        if self.profile:
+            for index, side, _distance_to_entry in path:
+                started = perf_counter()
+                key = (index, side)
+                child = node.children.get(key)
                 self.trie_lookup_creation_seconds += perf_counter() - started
-            if child is None:
-                state = self._extend(node.state, key)
-                started = perf_counter() if self.profile else 0.0
-                child = _Node(state)
-                node.children[key] = child
-                self.nodes_created += 1
-                if self.profile:
+                if child is None:
+                    state = self._extend(node.state, key)
+                    started = perf_counter()
+                    child = _Node(state)
+                    node.children[key] = child
+                    self.nodes_created += 1
                     self.trie_lookup_creation_seconds += perf_counter() - started
-            else:
-                self.lookup_hits += 1
-            node = child
+                else:
+                    self.lookup_hits += 1
+                node = child
+        else:
+            # Unprofiled hot path: the instrumentation above costs a clock read
+            # per path element, which dominates a walk that is otherwise one
+            # dict lookup. Counters are folded into locals and flushed once;
+            # nothing reads them between the loop and the flush.
+            extend = self._extend
+            created = hits = 0
+            for index, side, _distance_to_entry in path:
+                key = (index, side)
+                child = node.children.get(key)
+                if child is None:
+                    node.children[key] = child = _Node(extend(node.state, key))
+                    created += 1
+                else:
+                    hits += 1
+                node = child
+            self.nodes_created += created
+            self.lookup_hits += hits
         if node.result is None:
-            started = perf_counter() if self.profile else 0.0
+            if self.profile:
+                started = perf_counter()
             state = node.state
             node.result = _ChainCost(
                 state.elapsed,
