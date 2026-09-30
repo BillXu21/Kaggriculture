@@ -22,39 +22,52 @@ bit-exact.
 
 ## Current best speed-only candidate
 
-- branch/SHA: `overnight/strip-speed-money` @ `9c5f85e`
-- **panel wall: 40.8 s** (4 workers, seeds 41001-41004)
+- branch/SHA: `overnight/strip-speed-money` @ `34cc55d`
+- **panel wall: 42.1 s** (4 workers, seeds 41001-41004)
 - exact-parity status: **PASS** -- 4/4 final bank pairs, 4/4 action digests
-  bit-identical to the validated baseline
-- bank: mean 71,353.1, min 61,591 (unchanged)
+  bit-identical, 719 turns, 24 manager days, DONE/DONE, 0 errors
+- bank: mean 71,353.1, min 61,591 (both unchanged)
+
+### Final validated panel (base vs final, same session, quiet machine)
+
+| | panel wall | mean/game | sum of games | turns/s | mean bank | min bank |
+|---|---:|---:|---:|---:|---:|---:|
+| base `a01e75c` | 48.3 s | 39.4 s | 157.5 s | 59.54 | 71,353.1 | 61,591 |
+| final `34cc55d` | **42.1 s** | **34.2 s** | **136.7 s** | **68.28** | 71,353.1 | 61,591 |
+| delta | **-6.2 s (1.15x)** | **-13.2%** | -13.2% | +14.7% | +0.0 | +0 |
+
+Per-game wall: 41001 -13.1%, 41002 -12.1%, 41003 -13.8%, 41004 -13.4%.
+All four action digests are **identical between the base and final panels**.
+
+Panel-wall readings bounce by ~3% with machine load (an intermediate commit
+measured 40.8 s at 1.7/20 cores busy, the final measured 42.1 s at 2.83/20), so
+the honest panel claim is **1.15-1.18x** and the per-game figure **-13% to -17%**.
+The contention-insensitive CPU numbers are the reliable signal:
+
+| phase (seed 41003, process CPU) | base | final | delta |
+|---|---:|---:|---:|
+| `StripExecutorController.act` | 21.28 s | 18.86 s | **-11.4%** |
+| `trie.evaluate` | 9.72 s | 8.52 s | **-12.3%** |
+| `trie.extend` | 6.80 s | 5.06 s | **-25.6%** |
+| `pack_large_route_set_frontier` | 12.25 s | 11.31 s | -7.7% |
+| total `copy.deepcopy` CPU | 6.02 s | 1.34 s | **-77.7%** |
+| total process CPU | ~50.2 s | 46.2 s | -8.0% |
 
 ### Speed measurement honesty note
 
 The inherited "84.1 s" panel figure was measured with ~3.8 of 20 cores busy
 from unrelated load. Re-measuring the **unmodified base `a01e75c`** on a quiet
-machine gives a **48.3 s** panel wall, so the old number was inflated by
-roughly 74% by contention. The controlled, back-to-back comparison is:
+machine gives **48.3 s**, so the old number was inflated by roughly 74%.
 
-| | panel wall | mean/game | sum of games | turns/s | mean bank |
-|---|---:|---:|---:|---:|---:|
-| base `a01e75c` | 48.3 s | 39.4 s | 157.5 s | 59.54 | 71,353.1 |
-| candidate `9c5f85e` | **40.8 s** | **32.6 s** | **130.5 s** | **70.48** | 71,353.1 |
-| delta | **-7.5 s (1.18x)** | -17.3% | -17.1% | +18.4% | 0.0 |
-
-Per-game wall: 41001 -18.1%, 41002 -15.9%, 41003 -17.8%, 41004 -16.6% --
-consistent across all four seeds, which is what makes the number credible. The
-base was measured on a *quieter* machine (0.64 of 20 cores) than the candidate
-(1.7 of 20), so 1.18x is, if anything, slightly understated.
-
-**The honest claim is 1.18x panel wall / ~17% per-game, not 2.06x.** Anyone
-comparing against the historical 84.1 s would overstate the gain by ~1.7x.
+**The honest claim is ~1.15x panel wall / ~13-17% per-game, not 2.06x.**
+Comparing against the historical 84.1 s would overstate the gain by ~1.8x.
 
 ## Current best economic candidate
 
-- branch/SHA: `overnight/strip-speed-money` @ `9c5f85e`
+- branch/SHA: `overnight/strip-speed-money` @ `34cc55d`
 - mean bank: 71,353.1
 - per-seed: 72587/70810, 74061/75159, 79167/73221, 64229/61591
-- speed: 40.8 s panel wall
+- speed: 42.1 s panel wall
 
 No behaviour-changing candidate survived: both money experiments regressed
 (see Dead ends). The best economic candidate is therefore the same commit as
@@ -67,10 +80,23 @@ the executor is already execution-saturated.
 |---|---:|---:|---:|---|---|
 | `a01e75c` (base) | 48.3 s | 71,353.1 | 61,591 | exact | reference, re-timed quietly |
 | `c0fdffe` | - | 71,353.1 | 61,591 | exact | diagnostics freeze; single game 40.9 -> 32.2 s |
-| `1717fd9` | - | 71,353.1 | 61,591 | exact | farms copy removed |
+| `1717fd9` | - | 71,353.1 | 61,591 | exact | farms copy removed (7,361 -> 1,155 nodes) |
 | `9ecdcd2` | - | 71,353.1 | 61,591 | exact | traversal tuples shared; 315,696-path parity |
 | `b3c0967` | - | 71,353.1 | 61,591 | exact | `_extend` accumulators hoisted |
-| **`9c5f85e`** | **40.8 s** | **71,353.1** | **61,591** | **exact** | **recommended** |
+| `9c5f85e` | 40.8 s | 71,353.1 | 61,591 | exact | unprofiled trie walk |
+| `2d65cc7` | - | 71,353.1 | 61,591 | exact | `_work_can_progress` ledger copies removed |
+| **`34cc55d`** | **42.1 s** | **71,353.1** | **61,591** | **exact** | **recommended for self-play** |
+
+## Test status
+
+Broad sweep of all 38 `test_strip_*.py` + `test_stage25_*.py` files:
+**692 passed, 3 failed**. All three failures are in `test_strip_adversarial.py`
+(`test_controller_aggressive_selling_never_liquidates_wheat_or_fertilizer`,
+`test_carried_product_delivery_seam_is_unreachable`,
+`test_randomized_synthetic_cases_hold_strong_invariants`) and were **proven
+pre-existing** by running the identical three tests on the clean, untouched
+`a01e75c` worktree, where all three fail the same way. None are caused by this
+run's changes.
 
 ## Dead ends
 
@@ -81,6 +107,28 @@ the executor is already execution-saturated.
 | Larger chain-plan LRU | already proven zero capacity misses at `a01e75c` | not retried |
 | Memo keyed on full simulator state | already proven a regression | not retried |
 | Eager `RouteCostSegment` summaries | already proven a regression | not retried |
+| JAX persistent compilation cache (`JAX_COMPILATION_CACHE_DIR`) | cache populated (302 KB) but the first `daily_plan` call stayed at 5.7-5.8 s; the cost is tracing/lowering, not a cacheable artifact | **rejected** |
+| Building executor diagnostics lazily | measured `build_diagnostics` at only 0.44 s over 1,142 turns (383 us each); the 70k-node document is cheap to build and expensive only to deep-copy, which the freeze already fixed | **rejected, not a bottleneck** |
+
+## Remaining bottlenecks after this run
+
+Seed-41003 process CPU is ~46 s, of which:
+
+- `trie.evaluate` **8.52 s** (45% of `act`). The 2^k ordered/oriented path
+  enumeration is inherent to the exact semantics: the trie root depends on the
+  whole mask's pickup demand, so nodes cannot be shared across masks and the
+  per-mask DP is demand-driven already. Further gains need an admissible
+  bound to prune the enumeration, which is delicate because the final tie-break
+  is the path tuple itself.
+- manager inference **~8.3 s**, of which **~5.7 s is one-time JAX tracing on the
+  first `daily_plan` call** (47 warm calls total ~2.6 s). This is a per-process
+  startup cost: it amortises to nothing across a training rollout that reuses a
+  worker for many games, so it inflates the 4-game panel by roughly 14% without
+  reflecting sustained rollout throughput. The compilation cache does not
+  remove it.
+- the remaining ~10 s of `act` outside `trie.evaluate`: hiring/frontier
+  assembly, work-plan rebuild, supply, market and reconciliation, none of which
+  profiled above 0.8 s individually.
 
 ### Why the money track is bounded (evidence, seed 41003, both seats)
 
