@@ -96,6 +96,28 @@ class Stage25StripExecutorAgent:
         self._day: int | None = None
         self._plan: Any | None = None
         self._days: dict[str, dict[str, Any]] = {}
+        # Only the final turn of a day survives in ``_days`` (each turn
+        # overwrites the same key), so the per-turn diagnostics tree is held by
+        # reference and snapshotted once when the day rolls over.  The
+        # controller rebuilds every nested container on each call, so the
+        # retained tree is not aliased into live executor state.
+        self._pending_day: str | None = None
+        self._pending_diagnostics: dict[str, Any] | None = None
+
+    def _retain_diagnostics(self, day: str,
+                            diagnostics: dict[str, Any]) -> None:
+        if self._pending_day is not None and self._pending_day != day:
+            self._days[self._pending_day] = copy.deepcopy(
+                self._pending_diagnostics or {})
+        self._pending_day = day
+        self._pending_diagnostics = diagnostics
+
+    def _flush_diagnostics(self) -> None:
+        if self._pending_day is not None:
+            self._days[self._pending_day] = copy.deepcopy(
+                self._pending_diagnostics or {})
+            self._pending_day = None
+            self._pending_diagnostics = None
 
     def __call__(self, obs: Mapping[str, Any]) -> dict[str, Any]:
         day = int(obs["day"])
@@ -104,10 +126,12 @@ class Stage25StripExecutorAgent:
             self._day = day
         result = self.controller.act(obs, self._plan)
         if not self.low_telemetry:
-            self._days[str(day)] = copy.deepcopy(result.diagnostics)
+            self._retain_diagnostics(str(day), result.diagnostics)
         return result.action_dict()
 
     def diagnostics_json(self) -> dict[str, Any]:
+        if not self.low_telemetry:
+            self._flush_diagnostics()
         diagnostics = {
             "schema_version": 1,
             "seat": self.seat,

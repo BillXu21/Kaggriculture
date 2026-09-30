@@ -2842,6 +2842,12 @@ class StripExecutorController:
         routes = self.routes
         completed = sum(route.phase == RoutePhase.DONE for route in routes)
         payload = dict(self._daily)
+        # ``_daily`` holds references to two live counters.  Detach them so a
+        # retained per-turn diagnostics tree never observes later mutations.
+        for live_key in ("row_claim_timing_ms", "claim_hiring"):
+            live = payload.get(live_key)
+            if isinstance(live, dict):
+                payload[live_key] = dict(live)
         farm_values = self._observation_for_diagnostics.get("farms") or ()
         positions = (
             self._worker_positions(self._observation_for_diagnostics)
