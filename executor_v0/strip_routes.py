@@ -623,17 +623,28 @@ def _compute_chain_plan_for_mask(
         allowed_orders.append(tuple(reversed(indices)))
 
     choices: list[tuple[tuple[int, int, int], ...]] = []
+    # Traversal tables are built once per call. The enumeration below visits
+    # ``|orders| * 2**k`` paths and each element previously materialised a fresh
+    # ``tuple(reversed(owned_tiles))``; the tiles are immutable, so one shared
+    # tuple per (index, side) is equivalent and removes that per-element churn.
+    traversals: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
+
+    def traversal_for(index: int, side: int) -> tuple[tuple[int, int], ...]:
+        key = (index, side)
+        value = traversals.get(key)
+        if value is None:
+            owned = candidates[index].owned_tiles
+            value = owned if side == 0 else tuple(reversed(owned))
+            traversals[key] = value
+        return value
+
     for order in allowed_orders:
         for orientation_bits in range(1 << len(order)):
             path: list[tuple[int, int, int]] = []
             previous_end = worker_position
             for offset, index in enumerate(order):
                 side = (orientation_bits >> offset) & 1
-                traversal = (
-                    candidates[index].owned_tiles
-                    if side == 0
-                    else tuple(reversed(candidates[index].owned_tiles))
-                )
+                traversal = traversal_for(index, side)
                 distance = _manhattan_distance(previous_end, traversal[0])
                 path.append((index, side, distance))
                 previous_end = traversal[-1]
@@ -700,7 +711,7 @@ def _compute_chain_plan_for_mask(
     assigned: list[tuple[HorizontalRouteCandidate, RouteSegment]] = []
     for index, side, distance in path:
         candidate = candidates[index]
-        traversal = candidate.owned_tiles if side == 0 else tuple(reversed(candidate.owned_tiles))
+        traversal = traversal_for(index, side)
         assigned.append(
             (
                 candidate,
