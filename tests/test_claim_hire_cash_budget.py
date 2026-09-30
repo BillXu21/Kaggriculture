@@ -134,6 +134,43 @@ def test_fibonacci_escalation_is_what_the_budget_stops():
     assert sum(fib(i) for i in range(23)) > cash
 
 
+def test_budget_is_floored_at_a_minimal_crew():
+    """A near-bankrupt farm must still be able to field a working crew."""
+    from test_executor_v0_agent import make_obs, simple_plan
+
+    ctl = _controller(0.005)
+    ctl._daily_plan = simple_plan()
+    obs = make_obs(day=6, hour=0)
+    _day(obs, 6, 0)
+    _, diagnostics = _budget_after(ctl, obs, money=1.0, hires_today=0)
+    # fib(0..3) = 1 + 1 + 2 + 3
+    assert diagnostics["hire_cash_budget"] == pytest.approx(7.0)
+    # 1 cash * 0.005 = 0.005, so the crew floor is what actually applies.
+    assert 1.0 * 0.005 < diagnostics["hire_cash_budget"]
+
+
+def test_crew_floor_scales_with_the_cost_multiplier():
+    from executor_v0.strip_executor import _minimum_daily_hire_budget
+
+    assert _minimum_daily_hire_budget(1) == pytest.approx(7.0)
+    assert _minimum_daily_hire_budget(10) == pytest.approx(70.0)
+
+
+def test_crew_floor_does_not_use_the_current_fibonacci_index():
+    """A runaway day must not be able to raise its own ceiling."""
+    from test_executor_v0_agent import make_obs, simple_plan
+
+    ctl = _controller(0.005)
+    ctl._daily_plan = simple_plan()
+    obs = make_obs(day=6, hour=0)
+    _day(obs, 6, 0)
+    _, low = _budget_after(ctl, obs, money=1_000.0, hires_today=0)
+    ctl2 = _controller(0.005)
+    ctl2._daily_plan = simple_plan()
+    _, high = _budget_after(ctl2, obs, money=1_000.0, hires_today=20)
+    assert low["hire_cash_budget"] == high["hire_cash_budget"]
+
+
 def test_daily_spend_counter_resets_on_new_day():
     from test_executor_v0_agent import make_obs, simple_plan
 

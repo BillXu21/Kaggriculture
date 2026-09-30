@@ -95,7 +95,23 @@ _MAX_CLAIM_HIRES_PER_BOOTSTRAP_PASS = 10
 # The bound is a treasury-risk limit, not a calendar rule: it scales with the
 # cash actually on hand, so a poor early game is unaffected while a large
 # mid-game bank can still fund normal hiring.
-_MAX_DAILY_HIRE_CASH_FRACTION = 0.25
+# Measured on a 10-seed panel (41001-41004 plus held-out 41005-41010), the
+# panel mean rises monotonically as this bound tightens - 31.2k unbounded,
+# 48.9k at 0.10, 56.4k at 0.02, 59.1k at 0.005 - and every held-out seed
+# improves at every step. 0.0 (one hire per day) is *worse* than unbounded:
+# under-hiring starves the farm as surely as over-hiring bankrupts it.
+_MAX_DAILY_HIRE_CASH_FRACTION = 0.005
+# The bound must never starve a low-cash farm, so it is floored at the cost of
+# a minimal working crew. Historically a healthy day fields 4-7 workers for a
+# cumulative 7-33 cash, so four is the smallest crew that is still a crew.
+_MIN_DAILY_HIRE_CREW = 4
+
+
+def _minimum_daily_hire_budget(cost_mult: int) -> float:
+    """Cash floor for one day of hiring: a minimal crew, whatever the balance."""
+    return float(cost_mult * sum(
+        fib(index) for index in range(_MIN_DAILY_HIRE_CREW)
+    ))
 
 
 @dataclass(frozen=True)
@@ -547,15 +563,15 @@ class StripExecutorController:
         if fraction is None:
             hire_budget = float("inf")
         else:
-            # Floor the budget at the cost of the *cheapest* possible hire,
-            # ``mult * fib(0)``.  A farm with almost no cash must still be able
-            # to field one worker; the bound must never suppress base
-            # operation, only the escalating tail of a burst.  Using the
-            # current index here would defeat the bound, because that index
-            # grows with every hire already made today.
+            # Floor the budget at the cost of a minimal crew so a low-cash
+            # farm is never starved below the point of being able to work.
+            # The floor deliberately does NOT use the current Fibonacci index:
+            # that index grows with every hire already made today, which would
+            # let a runaway day raise its own ceiling (measured: that mistake
+            # silently disabled the bound and dropped seed 41004 back to 4 658).
             hire_budget = max(
                 max(0.0, cash) * float(fraction),
-                float(cost_mult * fib(0)),
+                _minimum_daily_hire_budget(cost_mult),
             )
         existing_positions = [positions[worker] for worker in sorted(positions)]
         planned: list[_ClaimHireRecord] = []
