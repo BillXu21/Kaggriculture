@@ -1714,6 +1714,27 @@ class StripExecutorController:
             return _interaction_action(item) or ("PASS",)
         return ("PASS",)
 
+    def _release_claim_hire_assignment(self, record: _ClaimHireRecord) -> None:
+        """Drop one claim hire's planned route and release its claim.
+
+        The claim is always released so no bundle can be double-owned, and the
+        route is dropped so the next dispatch re-derives work from the live
+        board. The worker itself is untouched: it is real labour the engine
+        already produced, and a kept worker simply has no route, so the next
+        dispatch calls ``_claim_refill`` for it.
+        """
+        board = self._claim_board
+        if board is not None:
+            for fragment in record.coverage.claimed_fragments:
+                for claimed_id in fragment.bundle_ids:
+                    if board.owner_by_bundle.get(claimed_id) == record.worker:
+                        board.release(claimed_id)
+        self._routes.pop(record.worker, None)
+        self._supply_plans.pop(record.route.route_id, None)
+        self._supply_states.pop(record.route.route_id, None)
+        self._passed_work.pop(record.route.route_id, None)
+        self._claim_hire_records.pop(record.worker, None)
+
     def _reconcile_hire_observation(self, obs: Mapping[str, Any]) -> None:
         pending = self._pending_hires
         if pending is None or int(obs.get("step", 0)) <= pending["submitted_step"]:
@@ -1727,27 +1748,33 @@ class StripExecutorController:
         if self.config.enable_row_claim_board and self._pending_claim_hires:
             positions = self._worker_positions(obs)
             spawn_mismatches = []
+            replanned_workers = set()
             rejected_workers = set()
             for index, record in enumerate(self._pending_claim_hires):
-                confirmed_at_expected_spawn = (
-                    index < observed and positions.get(record.worker) == record.spawn
-                )
-                if confirmed_at_expected_spawn:
+                hired = index < observed
+                actual = positions.get(record.worker) if hired else None
+                if hired and actual is not None:
+                    # The worker exists. ``predict_hire_spawns`` forecasts the
+                    # engine's least-occupied access tile, but a worker can act
+                    # before the next observation, so the observed tile is
+                    # routinely one or two steps from the forecast. Rejecting
+                    # the hire on that basis threw away a real worker, and every
+                    # route discard on every measured seed came from this test.
+                    # Keep the labour, but do not keep the route: it was
+                    # planned against the board at submission time and a worker
+                    # that has already acted may have consumed part of it.
+                    # Release the claim and drop the route so the next dispatch
+                    # re-derives work from the live board. This also returns the
+                    # reserved coverage to the budget, so the bootstrap loop
+                    # keeps escalating across the day while uncovered required
+                    # work remains.
+                    if actual != record.spawn:
+                        spawn_mismatches.append(record.worker.label)
+                    replanned_workers.add(record.worker.label)
+                    self._release_claim_hire_assignment(record)
                     continue
                 rejected_workers.add(record.worker.label)
-                if index < observed:
-                    spawn_mismatches.append(record.worker.label)
-                board = self._claim_board
-                if board is not None:
-                    for bundle_id in record.coverage.claimed_fragments:
-                        for claimed_id in bundle_id.bundle_ids:
-                            if board.owner_by_bundle.get(claimed_id) == record.worker:
-                                board.release(claimed_id)
-                self._routes.pop(record.worker, None)
-                self._supply_plans.pop(record.route.route_id, None)
-                self._supply_states.pop(record.route.route_id, None)
-                self._passed_work.pop(record.route.route_id, None)
-                self._claim_hire_records.pop(record.worker, None)
+                self._release_claim_hire_assignment(record)
             self._pending_claim_hires = ()
             if rejected_workers:
                 planned_workers = list(
@@ -1785,6 +1812,14 @@ class StripExecutorController:
             if spawn_mismatches:
                 self._claim_hiring_diagnostics["spawn_mismatches"] = spawn_mismatches
                 self._claim_hiring_diagnostics["runtime_refill_required"] = True
+            if replanned_workers:
+                # Real workers kept, but their day-start routes are re-derived
+                # from the live board. They stay in ``planned_workers`` and keep
+                # their reserved interaction budget: the labour was paid for and
+                # is still on the board.
+                self._claim_hiring_diagnostics["spawn_replanned"] = sorted(
+                    replanned_workers
+                )
         self._pending_hires = None
         if observed:
             self._hire_no_progress = 0

@@ -1015,13 +1015,26 @@ def test_claim_hire_covers_contiguous_row_tail_and_is_observation_confirmed():
         hour=20, farmer=(0, 0), hands=((4, 4),), money=99
     )
     result = controller.act(confirmed, empty_plan())
+    # The hire is confirmed and kept as real labour, but its day-start route
+    # is released rather than trusted: it was planned against the board at
+    # submission time. Releasing it returns the reserved coverage, so the
+    # bootstrap loop keeps escalating while uncovered work remains instead
+    # of finalising on a stale plan.
+    assert controller._claim_hiring_diagnostics["wanted_hires"] >= 1
+    assert controller._claim_board.owner_by_bundle.get("TILE:5,5") != WorkerId(1)
+    assert result.diagnostics["wanted_hires"] >= 1
+    assert len(result.diagnostics["claim_hiring"]["planned_workers"]) >= 1
+
+    # The loop keeps escalating while uncovered required work exists, and
+    # only finalises once no further canonical coverage is available.
+    hands = ((4, 4), (4, 4))
+    for hour in (21, 22):
+        later = make_obs(
+            hour=hour, farmer=(0, 0), hands=hands, money=99
+        )
+        controller.act(later, empty_plan())
+        hands = hands + ((4, 4),)
     assert controller._routes_finalized
-    assert WorkerId(1) in controller._routes
-    assert controller._claim_board.owner_by_bundle["TILE:5,5"] == WorkerId(1)
-    assert result.farmer_action != ("PASS",)
-    assert result.diagnostics["claim_hiring"]["wanted_hires"] == 1
-    assert result.diagnostics["wanted_hires"] == 1
-    assert len(result.diagnostics["claim_hiring"]["planned_workers"]) == 1
 
 
 def test_unconfirmed_claim_hire_releases_claim_before_retry():
