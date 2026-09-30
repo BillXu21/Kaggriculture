@@ -333,6 +333,12 @@ def _factory_from_wire(factory: Any, *, low_telemetry: bool = False) -> Any:
         from rl_manager.executor_factory import make_stage25_executor_factory
 
         return make_stage25_executor_factory(factory[1])
+    if (isinstance(factory, tuple) and len(factory) == 3
+            and factory[0] == "stage25_strip_executor@config:v2"):
+        from rl_manager.executor_factory import make_stage25_executor_factory
+
+        return make_stage25_executor_factory(
+            factory[1], low_telemetry=bool(factory[2]))
     if factory == "executor_v0@default":
         from rl_manager.executor_factory import make_default_executor_factory
         return make_default_executor_factory()

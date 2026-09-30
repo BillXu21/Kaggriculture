@@ -104,11 +104,33 @@ class RowKey:
         return asdict(self)
 
 
+_ROW_KEYS: tuple[tuple[RowKey, ...], ...] = tuple(
+    tuple(
+        RowKey(
+            quadrant_of(y, x),
+            y % 5,
+            y,
+            0 if x < 5 else 5,
+            4 if x < 5 else 9,
+        )
+        for x in range(10)
+    )
+    for y in range(10)
+)
+_ROW_SUMMARY_GEOMETRY: tuple[tuple[RowKey, int], ...] = tuple(sorted({
+    (_ROW_KEYS[y][x], 5)
+    for y in range(10)
+    for x in (0, 5)
+}))
+
+
 def row_key_for_tile(tile: tuple[int, int]) -> RowKey:
     """Return the stable five-tile row segment containing ``(y, x)``."""
     y, x = tile
     if not (0 <= y < 10 and 0 <= x < 10):
         raise ValueError(f"tile must be a board (y, x) coordinate, got {tile!r}")
+    if type(y) is int and type(x) is int:
+        return _ROW_KEYS[y][x]
     return RowKey(quadrant_of(y, x), y % 5, y, 0 if x < 5 else 5, 4 if x < 5 else 9)
 
 
@@ -930,7 +952,8 @@ def build_strip_work_plan(
     }
     step = resolve_observation_step(obs)
     current_crops, current_animals = _unlocked_counts(board, unlocked)
-    target_crops, target_animals = plan.crop_targets_dict, plan.animal_targets_dict
+    target_crops = plan.crop_targets_dict
+    target_animals = plan.animal_targets_dict
     crop_need = {c: max(0, target_crops[c] - current_crops[c]) for c in CROP_ORDER}
     animal_need = {
         a: max(0, target_animals[a] - current_animals[a]) for a in ANIMAL_ORDER
@@ -1552,6 +1575,8 @@ def build_strip_work_plan(
     rows = _row_summaries(board, items, chains)
     diagnostics = _diagnostics(
         plan,
+        target_crops,
+        target_animals,
         current_crops,
         current_animals,
         current_land,
@@ -1571,25 +1596,18 @@ def build_strip_work_plan(
 def _row_summaries(
     board, items: tuple[WorkItem, ...], chains: tuple[WorkChain, ...]
 ) -> tuple[RowSummary, ...]:
-    rows: dict[RowKey, dict[str, Any]] = {}
-    for y, row in enumerate(board):
-        for x, _ in enumerate(row):
-            key = row_key_for_tile((y, x))
-            rows.setdefault(
-                key,
-                {
-                    "tile_count": 0,
-                    "ready": 0,
-                    "future": 0,
-                    "turns": 0,
-                    "feed": 0,
-                    "fert": 0,
-                    "animal": 0,
-                    "seed": 0,
-                    "chains": 0,
-                    "reasons": Counter(),
-                },
-            )["tile_count"] += 1
+    if len(board) == 10 and all(len(row) == 10 for row in board):
+        rows: dict[RowKey, dict[str, Any]] = {
+            key: _new_row_summary_data(tile_count)
+            for key, tile_count in _ROW_SUMMARY_GEOMETRY
+        }
+    else:
+        rows = {}
+        for y, row in enumerate(board):
+            for x, _ in enumerate(row):
+                key = row_key_for_tile((y, x))
+                data = rows.setdefault(key, _new_row_summary_data())
+                data["tile_count"] += 1
     for chain in chains:
         if chain.row_key is not None:
             rows[chain.row_key]["chains"] += 1
@@ -1634,8 +1652,25 @@ def _row_summaries(
     )
 
 
+def _new_row_summary_data(tile_count: int = 0) -> dict[str, Any]:
+    return {
+        "tile_count": tile_count,
+        "ready": 0,
+        "future": 0,
+        "turns": 0,
+        "feed": 0,
+        "fert": 0,
+        "animal": 0,
+        "seed": 0,
+        "chains": 0,
+        "reasons": Counter(),
+    }
+
+
 def _diagnostics(
     plan,
+    target_crops,
+    target_animals,
     current_crops,
     current_animals,
     current_land,
@@ -1661,7 +1696,7 @@ def _diagnostics(
     )
     for crop in CROP_ORDER:
         residual = (
-            plan.crop_targets_dict[crop]
+            target_crops[crop]
             - current_crops[crop]
             - represented_crops[crop]
         )

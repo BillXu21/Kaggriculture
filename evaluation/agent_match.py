@@ -153,17 +153,22 @@ def _controller_observation(
     controller: PrimitiveController,
     canonical_farms: Sequence[Mapping[str, Any]] | None,
 ) -> dict[str, Any]:
-    observation = copy.deepcopy(dict(raw))
     mode = getattr(controller, "observation_mode", "raw")
     if mode == "canonical":
         if canonical_farms is None:
             raise RuntimeError("canonical controller observation unavailable")
+        # The raw "farms" value is discarded immediately below, so deep-copying
+        # it first is pure waste on the largest part of the observation.
+        observation = {key: copy.deepcopy(value)
+                       for key, value in raw.items() if key != "farms"}
         observation["farms"] = copy.deepcopy(list(canonical_farms))
         observation.setdefault(
             "step",
             int(observation["day"]) * 24 + int(observation.get("hour", 0)),
         )
-    elif mode != "raw":
+    elif mode == "raw":
+        observation = copy.deepcopy(dict(raw))
+    else:
         raise ValueError(f"unknown controller observation mode {mode!r}")
     return observation
 

@@ -14,10 +14,13 @@ import pytest
 from opening_book import DEFAULT_IDENTITY, EXPECTED_TURNS, TraceError
 from opening_book.extract import extract_opening_trace, write_trace
 from opening_book.trace import (
+    FIRST_DAY,
+    TURNS_PER_DAY,
     action_for,
     built_in_identities,
     compute_content_digest,
     load_built_in_trace,
+    trace_end_turn,
     validate_trace,
 )
 
@@ -70,7 +73,9 @@ def synthetic_replay_path(tmp_path):
 def test_built_in_identities_and_default():
     assert built_in_identities() == (
         "standard_mixed", "pasture_heavy", "carrot_start",
-        "fourth_quadrant_s0", "fourth_quadrant_s1", "tetsuya_s1"
+        "fourth_quadrant_s0", "fourth_quadrant_s1", "tetsuya_s1",
+        "standard_mixed_d6h3",
+        "dsm_d0_d6h3",
     )
     assert DEFAULT_IDENTITY == "standard_mixed"
     for identity in built_in_identities():
@@ -84,17 +89,45 @@ def test_load_rejects_unknown_identity():
         load_built_in_trace("wheat_monoculture")
 
 
-def test_builtin_traces_are_96_ordered_unique_turns():
+def test_builtin_traces_are_contiguous_ordered_unique_turns():
+    """Every built-in trace is contiguous from d0h0 to its own declared end.
+
+    Legacy traces still assert the 96-turn d0-d3 shape; the extended
+    ``standard_mixed_d6h3`` identity declares its own 148-turn d0h0-d6h3
+    horizon, so the end turn is derived per identity rather than hard-coded.
+    """
     for identity in built_in_identities():
         doc = load_built_in_trace(identity)
         turns = doc["turns"]
-        assert len(turns) == EXPECTED_TURNS == 96
+        last_day, last_hour = trace_end_turn(doc)
+        assert (turns[0]["day"], turns[0]["hour"]) == (FIRST_DAY, 0)
+        assert (turns[-1]["day"], turns[-1]["hour"]) == (last_day, last_hour)
+        expected_turns = last_day * TURNS_PER_DAY + last_hour + 1
+        assert len(turns) == expected_turns
         keys = [(t["day"], t["hour"]) for t in turns]
-        assert keys == [(d, h) for d in range(4) for h in range(24)]
-        assert len(set(keys)) == 96
-        # handoff turn d4h0 must not exist anywhere in the document
-        assert all(day <= 3 for day, _ in keys)
+        assert keys == [
+            (index // TURNS_PER_DAY, index % TURNS_PER_DAY)
+            for index in range(expected_turns)
+        ]
+        assert len(set(keys)) == expected_turns
+        # the handoff turn itself is never part of the document
+        assert not any(
+            day == last_day and hour == last_hour + 1
+            for day, hour in keys
+        )
         assert doc["module_version"] == "1.32.7"
+    # Legacy identities keep the original fixed shape.
+    assert EXPECTED_TURNS == 96
+    for identity in ("standard_mixed", "pasture_heavy", "carrot_start",
+                     "fourth_quadrant_s0", "fourth_quadrant_s1", "tetsuya_s1"):
+        doc = load_built_in_trace(identity)
+        assert len(doc["turns"]) == EXPECTED_TURNS == 96
+        assert all(day <= 3 for day, _ in
+                   ((t["day"], t["hour"]) for t in doc["turns"]))
+    # The extended identity is exactly d0h0..d6h3.
+    extended = load_built_in_trace("standard_mixed_d6h3")
+    assert len(extended["turns"]) == 148
+    assert (extended["turns"][-1]["day"], extended["turns"][-1]["hour"]) == (6, 3)
 
 
 def test_builtin_indexing_d0h0_d3h23_and_d4h0_rejected():

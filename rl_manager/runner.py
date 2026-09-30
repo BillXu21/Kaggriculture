@@ -26,6 +26,7 @@ rewards from the final observed state.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import math
 import time
@@ -906,10 +907,15 @@ class SelfPlayRunner:
                 # Preserve the zero-argument factory seam used by callers and
                 # tests; the default factory already creates strict agents.
                 executor_factory = make_default_executor_factory()
-        configure_telemetry = getattr(
-            executor_factory, "with_low_telemetry", None)
-        if callable(configure_telemetry):
-            executor_factory = configure_telemetry(config.low_telemetry)
+        if getattr(executor_factory, "name", None) == "stage25_strip_executor":
+            executor_factory = dataclasses.replace(
+                executor_factory,
+                low_telemetry=(
+                    (config.low_telemetry
+                     or getattr(executor_factory, "low_telemetry", False))
+                    and not config.record_executor_full_diagnostics
+                ),
+            )
         self.executor_factory = executor_factory
         self.master_seed = master_seed
         self.rollout_profile = (new_worker_metrics()

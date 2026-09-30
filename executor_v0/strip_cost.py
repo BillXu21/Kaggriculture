@@ -24,12 +24,15 @@ from executor_v0.strip_work import (
 )
 
 __all__ = [
+    "AppendCostEstimate",
+    "AppendCostState",
     "LOCAL_ACTION_PRIORITY",
     "RouteCostResult",
     "RouteCostSegment",
     "RouteCostWork",
     "SegmentCostResult",
     "inventory_requirements",
+    "estimate_append_cost",
     "nearest_shed_access",
     "ordered_inventory_demand",
     "ordered_route_items",
@@ -184,6 +187,86 @@ class _CostSegmentSummary:
     statuses_resource_feasible: bool
     tile_movement_turns: tuple[int, ...]
     horizontal_sweep_turns: int
+
+
+@dataclass(frozen=True)
+class AppendCostState:
+    """Small prefix state for one worker; candidate estimates scan one fragment."""
+
+    position: tuple[int, int]
+    elapsed_turns: int
+    remaining_action_slots: int
+    carried_available: tuple[tuple[str, int], ...] = ()
+    pickup_items: tuple[str, ...] = ()
+    pickup_tile: tuple[int, int] | None = None
+    pickup_confirmed: bool = False
+
+
+@dataclass(frozen=True)
+class AppendCostEstimate:
+    incremental_turns: int
+    travel_turns: int
+    pickup_action_turns: int
+    interaction_turns: int
+    useful_interactions: int
+    completed_interactions: int
+    end_position: tuple[int, int]
+    inventory_demand: tuple[tuple[str, int], ...]
+    global_demand: tuple[tuple[str, int], ...]
+    next_state: AppendCostState
+
+    @property
+    def complete_before_deadline(self) -> bool:
+        return self.next_state.elapsed_turns <= self.next_state.remaining_action_slots
+
+
+def estimate_append_cost(
+    prefix: AppendCostState,
+    segment: RouteCostSegment,
+) -> AppendCostEstimate:
+    """Estimate a local append using canonical segment demand and movement.
+
+    The shared board checks resources before committing this estimate.
+    """
+
+    summary = _summarize_cost_segment(segment)
+    carried = dict(prefix.carried_available)
+    pickup = set(prefix.pickup_items)
+    new_pickup: list[str] = []
+    for item, quantity in summary.inventory_demand:
+        used = min(carried.get(item, 0), quantity)
+        carried[item] = carried.get(item, 0) - used
+        if quantity > used and (item not in pickup or prefix.pickup_confirmed):
+            new_pickup.append(item)
+    travel = _distance(prefix.position, segment.traversal[0])
+    pickup_tile = prefix.pickup_tile
+    if new_pickup:
+        if prefix.pickup_confirmed or not prefix.pickup_items:
+            pickup_tile = nearest_shed_access(prefix.position)
+            travel = (_distance(prefix.position, pickup_tile)
+                      + _distance(pickup_tile, segment.traversal[0]))
+    travel += summary.horizontal_sweep_turns
+    pickup_turns = len(new_pickup)
+    interactions = (summary.represented_interactions
+                    + summary.known_continuation_interactions)
+    incremental = travel + pickup_turns + interactions
+    useful = summary.hire_driving_interactions
+    remaining = max(0, prefix.remaining_action_slots - prefix.elapsed_turns)
+    completed = min(interactions, max(0, remaining - travel - pickup_turns))
+    next_state = AppendCostState(
+        position=segment.traversal[-1],
+        elapsed_turns=prefix.elapsed_turns + incremental,
+        remaining_action_slots=prefix.remaining_action_slots,
+        carried_available=_pairs(carried),
+        pickup_items=tuple(sorted(pickup | set(new_pickup))),
+        pickup_tile=pickup_tile,
+        pickup_confirmed=prefix.pickup_confirmed,
+    )
+    return AppendCostEstimate(
+        incremental, travel, pickup_turns, interactions, useful, completed,
+        segment.traversal[-1], summary.inventory_demand,
+        summary.global_demand, next_state,
+    )
 
 
 @lru_cache(maxsize=16384)

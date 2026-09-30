@@ -10,7 +10,7 @@ injected plan provider, so swapping the factory does not change RL semantics.
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Mapping, Protocol
 
 from rl_manager.provider import QueuedPlanProvider
@@ -32,6 +32,13 @@ STAGE25_EXECUTOR_PROFILE_VERSION = "strip_executor_v1@stage25-packet3-v1"
 STAGE25_EXECUTOR_PROFILE_NAME = "stage25_strip_executor"
 
 
+def _strip_config_json(config: Any) -> dict[str, Any]:
+    payload = asdict(config)
+    if not payload.get("enable_row_claim_board", False):
+        payload.pop("enable_row_claim_board", None)
+    return payload
+
+
 @dataclass(frozen=True)
 class Stage25ExecutorProfile:
     """Versioned, introspectable fixed-strip settings for Stage 2.5."""
@@ -46,7 +53,7 @@ class Stage25ExecutorProfile:
                 "Stage 2.5 strip profile requires aggressive_sell_all=True")
 
     def to_json_dict(self) -> dict[str, Any]:
-        config = asdict(self.strip_config)
+        config = _strip_config_json(self.strip_config)
         config["acting_seat"] = "factory_injected_seat"
         return {
             "name": self.name,
@@ -76,62 +83,76 @@ class Stage25StripExecutorAgent:
     """
 
     def __init__(self, *, provider: Any, seat: int, strip_config: Any,
-                 profile: Mapping[str, Any],
-                 materialize_diagnostics: bool = True) -> None:
+                 profile: Mapping[str, Any], low_telemetry: bool = False) -> None:
         from executor_v0.strip_executor import StripExecutorController
 
         self.provider = provider
         self.seat = int(seat)
-        self.materialize_diagnostics = bool(materialize_diagnostics)
+        self.low_telemetry = bool(low_telemetry)
         self.config = replace(strip_config, acting_seat=self.seat)
         self.controller = StripExecutorController(
-            config=self.config,
-            materialize_diagnostics=self.materialize_diagnostics)
+            config=self.config, low_telemetry=self.low_telemetry)
         self.effective_profile = copy.deepcopy(dict(profile))
         self._day: int | None = None
         self._plan: Any | None = None
         self._days: dict[str, dict[str, Any]] = {}
+        # Only the final turn of a day survives in ``_days`` (each turn
+        # overwrites the same key), so the per-turn diagnostics tree is held by
+        # reference and snapshotted once when the day rolls over.  The
+        # controller rebuilds every nested container on each call, so the
+        # retained tree is not aliased into live executor state.
+        self._pending_day: str | None = None
+        self._pending_diagnostics: dict[str, Any] | None = None
 
-    def _capture_current_day(self) -> None:
-        if self.materialize_diagnostics or self._day is None:
-            return
-        day = str(self._day)
-        if day not in self._days:
-            # ``controller.diagnostics`` constructs a fresh snapshot from the
-            # observation held for the last action of this day.  Capturing
-            # before the next day starts preserves the historical snapshot
-            # meaning without copying on every primitive turn.
-            self._days[day] = self.controller.diagnostics
+    def _retain_diagnostics(self, day: str,
+                            diagnostics: dict[str, Any]) -> None:
+        if self._pending_day is not None and self._pending_day != day:
+            self._days[self._pending_day] = copy.deepcopy(
+                self._pending_diagnostics or {})
+        self._pending_day = day
+        self._pending_diagnostics = diagnostics
+
+    def _flush_diagnostics(self) -> None:
+        if self._pending_day is not None:
+            self._days[self._pending_day] = copy.deepcopy(
+                self._pending_diagnostics or {})
+            self._pending_day = None
+            self._pending_diagnostics = None
+
+    def finalize_diagnostics(self, obs: Mapping[str, Any], seat: int) -> None:
+        """Complete the final day's retained diagnostics before collection.
+
+        Diagnostic-only and idempotent; the runner calls it at episode end so
+        the in-flight day is not lost when diagnostics are reduced.
+        """
+        del obs, seat
+        if not self.low_telemetry:
+            self._flush_diagnostics()
 
     def __call__(self, obs: Mapping[str, Any]) -> dict[str, Any]:
         day = int(obs["day"])
         if self._day != day:
-            self._capture_current_day()
             self._plan = self.provider.daily_plan(obs, self.seat)
             self._day = day
         result = self.controller.act(obs, self._plan)
-        if self.materialize_diagnostics:
-            self._days[str(day)] = copy.deepcopy(result.diagnostics)
+        if not self.low_telemetry:
+            self._retain_diagnostics(str(day), result.diagnostics)
         return result.action_dict()
 
-    def finalize_diagnostics(self, obs: Mapping[str, Any], seat: int) -> None:
-        del obs, seat
-        self._capture_current_day()
-
     def diagnostics_json(self) -> dict[str, Any]:
-        days = copy.deepcopy(self._days)
-        if not self.materialize_diagnostics and self._day is not None:
-            day = str(self._day)
-            if day not in days:
-                days[day] = self.controller.diagnostics
+        if not self.low_telemetry:
+            self._flush_diagnostics()
         diagnostics = {
             "schema_version": 1,
             "seat": self.seat,
             "effective_profile": copy.deepcopy(self.effective_profile),
-            "config": asdict(self.config),
-            "days": days,
+            "config": _strip_config_json(self.config),
+            "days": copy.deepcopy(self._days),
             "fallback_errors": [],
         }
+        if self.low_telemetry:
+            diagnostics["telemetry_mode"] = "reduced"
+            diagnostics["diagnostics_reduced"] = True
         provider_diagnostics = getattr(self.provider, "diagnostics_json", None)
         if callable(provider_diagnostics):
             diagnostics["provider_diagnostics"] = provider_diagnostics()
@@ -143,7 +164,7 @@ class Stage25ExecutorFactory:
     """Factory carrying the complete Stage 2.5 profile across rollouts."""
 
     profile: Stage25ExecutorProfile
-    materialize_diagnostics: bool = True
+    low_telemetry: bool = field(default=False, compare=False, repr=False)
 
     @property
     def name(self) -> str:
@@ -167,7 +188,7 @@ class Stage25ExecutorFactory:
         return self.profile.to_json_dict()
 
     def with_low_telemetry(self, enabled: bool) -> "Stage25ExecutorFactory":
-        return replace(self, materialize_diagnostics=not bool(enabled))
+        return replace(self, low_telemetry=bool(enabled))
 
     def create(
         self,
@@ -182,7 +203,7 @@ class Stage25ExecutorFactory:
             provider=provider, seat=seat,
             strip_config=self.profile.strip_config,
             profile=self.profile.to_json_dict(),
-            materialize_diagnostics=self.materialize_diagnostics,
+            low_telemetry=self.low_telemetry,
         )
 
 
@@ -199,7 +220,7 @@ def make_stage25_executor_factory(
     _validate_stage25_config(resolved_config, StripExecutorConfig)
     return Stage25ExecutorFactory(
         profile=Stage25ExecutorProfile(strip_config=resolved_config),
-        materialize_diagnostics=not bool(low_telemetry))
+        low_telemetry=bool(low_telemetry))
 
 
 class RlExecutorFactory(Protocol):

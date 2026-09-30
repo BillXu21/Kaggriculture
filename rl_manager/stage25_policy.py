@@ -251,6 +251,21 @@ def _empty_params(config: Stage25ModelConfig) -> dict[str, Any]:
     }
 
 
+def stage25_params_template(config: Stage25ModelConfig) -> dict[str, Any]:
+    """Build the parameter *structure* without drawing any random values.
+
+    Checkpoint loading only needs the tree skeleton to validate leaf names,
+    shapes and dtypes and to rebuild the stored arrays into.  Every leaf of the
+    result is overwritten by the loader, so the values are irrelevant; skipping
+    the ``jax.random`` draws avoids compiling one primitive per leaf, which
+    dominated cold-start latency.  The returned structure, leaf shapes and leaf
+    dtypes are identical to :func:`init_stage25_params`.
+    """
+    if not isinstance(config, Stage25ModelConfig):
+        raise TypeError("config must be Stage25ModelConfig")
+    return _empty_params(config)
+
+
 def _assert_projection_embedding_count(params: Mapping[str, Any], d: int) -> int:
     total = 0
     projections = params["output_projections"]

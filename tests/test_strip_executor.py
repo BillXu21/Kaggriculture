@@ -1478,6 +1478,48 @@ def test_day_boundary_discards_old_cursor_and_assignment():
     assert new_route.entry_tile == (0, 0)
 
 
+def test_act_reuses_finalization_work_plan_and_standalone_finalization_builds():
+    daily_plan = plan()
+    built = fake_plan((work_item("WATER", (0, 4)),))
+    work_builds = []
+
+    def builder(obs, supplied_plan, **kwargs):
+        del obs, supplied_plan, kwargs
+        work_builds.append(True)
+        return built
+
+    controller = StripExecutorController(work_builder=builder)
+    observed_finalization_plans = []
+    original_finalize = controller._finalize_day
+
+    def capture_finalize(obs, supplied_plan, work_plan=None):
+        observed_finalization_plans.append(work_plan)
+        return original_finalize(obs, supplied_plan, work_plan=work_plan)
+
+    controller._finalize_day = capture_finalize
+    controller.act(observation(), daily_plan)
+
+    assert len(work_builds) == 1
+    assert observed_finalization_plans == [built]
+    assert controller._plan is built
+
+    standalone_builds = []
+    standalone_plan = fake_plan(())
+
+    def standalone_builder(obs, supplied_plan, **kwargs):
+        del obs, supplied_plan, kwargs
+        standalone_builds.append(True)
+        return standalone_plan
+
+    standalone = StripExecutorController(work_builder=standalone_builder)
+    standalone_obs = observation()
+    standalone._start_day(standalone_obs, daily_plan)
+    finalized = standalone._finalize_day(standalone_obs, daily_plan)
+
+    assert finalized is standalone_plan
+    assert len(standalone_builds) == 1
+
+
 def test_failed_departure_does_not_mark_tile_passed():
     def builder(obs, plan, **kwargs):
         del obs, plan, kwargs

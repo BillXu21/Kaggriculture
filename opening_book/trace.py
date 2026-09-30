@@ -1,8 +1,18 @@
 """Opening-trace contract and fail-closed validation.
 
-Traces are literal, ordered primitive action dicts for one source seat.  The
-legacy built-ins cover d0-d3 (96 turns); extended traces may end at any
+A trace is the literal, ordered sequence of submitted primitive action dicts
+(raw/executor shape ``{"farmer": ..., "hands": [...], "market": [...]}``) for
+one source seat from day 0 hour 0 through an inclusive trace-specific end turn.
+Traces are literal source-seat playback data, not interpreted workload bundles.
+
+Legacy built-ins cover d0-d3 (96 turns); extended traces may end at any
 (day, hour) boundary and hand off on the immediately following primitive turn.
+Each trace declares its own ``horizon`` block, so horizon, handoff phase and
+turn count are read from the document rather than hard-coded per identity. The
+``_IDENTITY_END_TURNS`` table additionally pins the canonical end turn of the
+identities that have one, so a trace cannot silently claim a shorter horizon.
+
+All validation fails closed with :class:`TraceError`.
 """
 
 from __future__ import annotations
@@ -31,8 +41,18 @@ IDENTITIES = (
     "fourth_quadrant_s0",
     "fourth_quadrant_s1",
     "tetsuya_s1",
+    "standard_mixed_d6h3",
     "dsm_d0_d6h3",
 )
+
+# Canonical inclusive end turn for the identities that do not end at d3h23.
+# Traces still declare their own horizon; this table is a fail-closed
+# cross-check so a d6h3 opening cannot quietly record a shorter horizon.
+_IDENTITY_END_TURNS = {
+    "standard_mixed_d6h3": (6, 3),
+    "dsm_d0_d6h3": (6, 3),
+}
+
 VALID_SEATS = (0, 1)
 _ACTION_KEYS = frozenset({"farmer", "hands", "market"})
 
@@ -128,7 +148,41 @@ def _expected_turn_phases(last_day: int, last_hour: int) -> list[tuple[int, int]
     return phases
 
 
+def canonical_end_turn(identity: str) -> tuple[int, int]:
+    """Return the canonical inclusive end turn bound to one opening identity.
+
+    Identities absent from :data:`_IDENTITY_END_TURNS` keep the legacy d0-d3h23
+    horizon. This is a cross-check on a trace's self-declared ``horizon``, not
+    a replacement for it: a trace may legitimately carry extra horizon fields
+    (for example explicit ``handoff_day``/``turn_count``).
+    """
+    if identity not in IDENTITIES:
+        _fail(f"unknown opening identity {identity!r}; known: {list(IDENTITIES)}")
+    return _IDENTITY_END_TURNS.get(identity, (LAST_DAY, TURNS_PER_DAY - 1))
+
+
+def trace_end_turn(doc: Any) -> tuple[int, int]:
+    """Return the inclusive final turn, cross-checked against the identity."""
+    if not isinstance(doc, dict):
+        _fail(f"trace document must be a dict, got {type(doc).__name__}")
+    last_day, last_hour = trace_last_phase(doc)
+    expected = canonical_end_turn(doc.get("identity"))
+    if (last_day, last_hour) != expected:
+        _fail(
+            f"horizon must end at (day={expected[0]}, hour={expected[1]}) for "
+            f"identity {doc.get('identity')!r}, got "
+            f"(day={last_day}, hour={last_hour})"
+        )
+    return last_day, last_hour
+
+
 def validate_trace(doc: Any) -> None:
+    """Fail-closed validation of a full trace document.
+
+    Checks format/version/horizon metadata, provenance shape, the exact number
+    of turns through the inclusive horizon, strict ordering/contiguity,
+    per-turn action shape and market cap, and the content digest.
+    """
     if not isinstance(doc, dict):
         _fail(f"trace document must be a dict, got {type(doc).__name__}")
     if doc.get("format_version") != TRACE_FORMAT_VERSION:
@@ -157,19 +211,36 @@ def validate_trace(doc: Any) -> None:
         _fail(f"horizon.handoff_hour must be {handoff_hour}")
     if "turn_count" in horizon and horizon["turn_count"] != len(expected_phases):
         _fail(f"horizon.turn_count must be {len(expected_phases)}")
+    # Fail closed if this identity has a canonical end turn that the trace's
+    # self-declared horizon contradicts.
+    trace_end_turn(doc)
     _validate_provenance(doc.get("provenance"))
 
     turns = doc.get("turns")
     if not isinstance(turns, list):
         _fail(f"turns must be a list, got {type(turns).__name__}")
     if len(turns) != len(expected_phases):
-        _fail(f"trace must contain exactly {len(expected_phases)} turns, got {len(turns)}")
+        _fail(
+            f"trace must contain exactly {len(expected_phases)} turns, "
+            f"got {len(turns)}"
+        )
+
+    seen: set[tuple[int, int]] = set()
     for pos, (turn, expected) in enumerate(zip(turns, expected_phases)):
         if not isinstance(turn, dict):
             _fail(f"turn[{pos}] must be a dict, got {type(turn).__name__}")
         day, hour = turn.get("day"), turn.get("hour")
         if (day, hour) != expected:
-            _fail(f"turn[{pos}]: expected (day,hour)={expected}, got ({day},{hour})")
+            _fail(
+                f"turn[{pos}]: expected (day,hour)={expected}, got ({day},{hour}); "
+                f"trace must be contiguous and ordered"
+            )
+        if (day, hour) in seen:
+            _fail(
+                f"turn[{pos}]: duplicate (day,hour)=({day},{hour}); "
+                f"trace must be contiguous and ordered"
+            )
+        seen.add((day, hour))
         validate_action(turn.get("action"), label=f"turn (day={day}, hour={hour})")
     digest = doc.get("content_digest")
     actual = compute_content_digest(turns)
@@ -185,14 +256,21 @@ def built_in_identities() -> tuple[str, ...]:
 
 
 def _read_trace_bytes(identity: str) -> bytes:
-    if identity == "dsm_d0_d6h3":
-        path = os.path.join(_DATA_DIR, f"{identity}.json.b85")
-        with open(path, "rb") as f:
+    """Return raw trace JSON bytes, transparently decompressing packed traces.
+
+    A ``<identity>.json.b85`` sidecar (zlib over base85) wins when present so a
+    large extended opening can stay compact in the repository; otherwise the
+    plain ``<identity>.json`` is read. Loading is uniform either way.
+    """
+    packed_path = os.path.join(_DATA_DIR, f"{identity}.json.b85")
+    if os.path.exists(packed_path):
+        with open(packed_path, "rb") as f:
             packed = f.read().strip()
         try:
             return zlib.decompress(base64.b85decode(packed))
         except (ValueError, zlib.error) as exc:
-            raise TraceError(f"{path}: invalid compressed trace: {exc}") from exc
+            raise TraceError(
+                f"{packed_path}: invalid compressed trace: {exc}") from exc
     path = os.path.join(_DATA_DIR, f"{identity}.json")
     with open(path, "rb") as f:
         return f.read()
@@ -215,11 +293,17 @@ def load_built_in_trace(identity: str = DEFAULT_IDENTITY) -> dict[str, Any]:
 def action_for(trace_doc: dict[str, Any], day: int, hour: int) -> dict[str, Any]:
     if not isinstance(day, int) or not isinstance(hour, int):
         raise TraceError(f"(day, hour) must be ints, got day={day!r} hour={hour!r}")
-    last_day, last_hour = trace_last_phase(trace_doc)
-    if day < FIRST_DAY or day > last_day or not 0 <= hour < TURNS_PER_DAY or (day == last_day and hour > last_hour):
-        hd, hh = trace_handoff_phase(trace_doc)
-        raise TraceError(f"(day={day}, hour={hour}) is outside opening horizon; handoff is ({hd},{hh})")
-    index = day * TURNS_PER_DAY + hour
+    last_day, last_hour = trace_end_turn(trace_doc)
+    if (not (0 <= hour < TURNS_PER_DAY)
+            or (day, hour) < (FIRST_DAY, 0)
+            or (day, hour) > (last_day, last_hour)):
+        handoff_day, handoff_hour = trace_handoff_phase(trace_doc)
+        raise TraceError(
+            f"(day={day}, hour={hour}) is outside the opening horizon "
+            f"({FIRST_DAY},0)-({last_day},{last_hour}); "
+            f"handoff is ({handoff_day},{handoff_hour})"
+        )
+    index = (day - FIRST_DAY) * TURNS_PER_DAY + hour
     turn = trace_doc["turns"][index]
     if (turn.get("day"), turn.get("hour")) != (day, hour):
         raise TraceError(f"trace turn at index {index} is not (day={day}, hour={hour})")

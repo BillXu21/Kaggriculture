@@ -6,6 +6,7 @@ from executor_v0.strip_cost import simulate_route_cost
 from executor_v0.strip_routes import (
     WorkerId,
     assign_horizontal_routes,
+    assign_horizontal_routes_frontier,
     generate_horizontal_route_candidates,
 )
 from executor_v0.strip_work import (
@@ -261,3 +262,155 @@ def test_one_helper_insufficient_is_reported_without_a_third_worker():
     assert assignment.unresolved_overloaded_rows == 1
     assert assignment.row_helpers_assigned == 0
     assert len(assignment.routes) == 1
+
+
+def _frontier_candidates(count: int, *, blocked: bool = False):
+    values = []
+    for row in range(count):
+        if blocked and row == 1:
+            values.append(
+                item(
+                    "FEED",
+                    (row, 0),
+                    supplies=(SupplyRequirement("WHEAT", 1),),
+                )
+            )
+        else:
+            values.append(item("WATER", (row, 0)))
+    return generate_horizontal_route_candidates(work_plan(*values))
+
+
+def _assert_frontier_matches_independent_calls(
+    candidates,
+    worker_positions,
+    *,
+    worker_action_slots=None,
+    remaining_action_slots=None,
+    worker_inventories=None,
+    shed_stock=None,
+    global_resources=None,
+    enable_row_helpers=True,
+):
+    workers = tuple(sorted(worker_positions))
+    counts = tuple(range(len(workers) + 1))
+    actual = assign_horizontal_routes_frontier(
+        candidates,
+        worker_positions,
+        worker_counts=counts,
+        assignment_hour=7,
+        remaining_action_slots=remaining_action_slots,
+        worker_action_slots=worker_action_slots,
+        worker_inventories=worker_inventories,
+        shed_stock=shed_stock,
+        global_resources=global_resources,
+        enable_row_helpers=enable_row_helpers,
+    )
+    for count in counts:
+        prefix = workers[:count]
+        expected = assign_horizontal_routes(
+            candidates,
+            {worker: worker_positions[worker] for worker in prefix},
+            assignment_hour=7,
+            remaining_action_slots=remaining_action_slots,
+            worker_action_slots=(
+                None
+                if worker_action_slots is None
+                else {worker: worker_action_slots[worker] for worker in prefix}
+            ),
+            worker_inventories=(
+                None
+                if worker_inventories is None
+                else {
+                    worker: worker_inventories[worker]
+                    for worker in prefix
+                    if worker in worker_inventories
+                }
+            ),
+            shed_stock=shed_stock,
+            global_resources=global_resources,
+            enable_row_helpers=enable_row_helpers,
+        )
+        assert actual[count] == expected
+    return actual
+
+
+def test_assignment_frontier_matches_each_exact_small_board_prefix():
+    candidates = _frontier_candidates(4, blocked=True)
+    positions = {
+        WorkerId(0): (2, 2),
+        WorkerId(1): (0, 4),
+        WorkerId(2): (4, 0),
+        WorkerId(3): (8, 8),
+        WorkerId(4): (1, 9),
+        WorkerId(5): (9, 1),
+    }
+    slots = {worker: 4 + worker.index for worker in positions}
+    inventories = {worker: {} for worker in positions}
+    actual = _assert_frontier_matches_independent_calls(
+        candidates,
+        positions,
+        worker_action_slots=slots,
+        worker_inventories=inventories,
+        shed_stock={},
+        global_resources={},
+    )
+
+    # The last two workers are surplus to this four-route exact-packer case.
+    assert len(actual[6].idle_workers) >= 2
+    assert len(actual[1].routes[0].segments) == len(candidates)
+
+
+def test_assignment_frontier_preserves_orientation_ties_and_is_repeatable():
+    candidates = _frontier_candidates(1)
+    positions = {WorkerId(0): (2, 2), WorkerId(1): (8, 8), WorkerId(2): (2, 4)}
+    first = _assert_frontier_matches_independent_calls(candidates, positions)
+    second = assign_horizontal_routes_frontier(
+        candidates,
+        positions,
+        worker_counts=range(len(positions) + 1),
+        assignment_hour=7,
+    )
+    assert first == second
+    assert first[1].routes[0].segments[0].traversal == candidates[0].owned_tiles
+
+
+def test_assignment_frontier_matches_global_remaining_slot_budget():
+    _assert_frontier_matches_independent_calls(
+        _frontier_candidates(3),
+        {WorkerId(0): (4, 0), WorkerId(1): (0, 4), WorkerId(2): (9, 9)},
+        remaining_action_slots=11,
+    )
+
+
+def test_assignment_frontier_matches_each_large_board_prefix():
+    candidates = _frontier_candidates(9, blocked=True)
+    positions = {
+        WorkerId(0): (0, 0),
+        WorkerId(1): (8, 4),
+        WorkerId(2): (4, 9),
+        WorkerId(3): (9, 0),
+    }
+    slots = {WorkerId(0): 18, WorkerId(1): 18, WorkerId(2): 7, WorkerId(3): 7}
+    inventories = {worker: {} for worker in positions}
+    actual = _assert_frontier_matches_independent_calls(
+        candidates,
+        positions,
+        worker_action_slots=slots,
+        worker_inventories=inventories,
+        shed_stock={},
+        global_resources={},
+    )
+    repeated = assign_horizontal_routes_frontier(
+        candidates,
+        positions,
+        worker_counts=range(len(positions) + 1),
+        assignment_hour=7,
+        worker_action_slots=slots,
+        worker_inventories=inventories,
+        shed_stock={},
+        global_resources={},
+    )
+    assert actual == repeated
+    assert actual[1].large_route_assignment_mode is True
+    assert len(actual[1].unassigned) > 0
+    assert len(actual[4].routes) <= 4

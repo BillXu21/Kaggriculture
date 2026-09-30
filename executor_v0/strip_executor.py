@@ -9,11 +9,29 @@ day; only the Packet 1 forecast is refreshed on later turns.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from time import perf_counter
 from typing import Any
 
 from executor_v0.plan import DailyPlan
-from executor_v0.strip_cost import route_cost_segment_from_items, simulate_route_cost
+from replay_daily.constants import FARM_HAND_COST_MULT_DEFAULT, fib, hire_cost
+from executor_v0.strip_cost import (
+    nearest_shed_access, ordered_inventory_demand, route_cost_segment_from_items,
+    simulate_route_cost,
+)
+from executor_v0.strip_claim_board import (
+    ClaimBoard, ClaimPhase, RowFragment, SchedulerMode, ServiceClass,
+    UncoveredRequiredWork,
+    build_claim_board, reconcile_claim_board,
+)
+from executor_v0.strip_claim_scheduler import (
+    HypotheticalWorkerCoverage,
+    canonical_hypothetical_worker_plan,
+    claim_runtime_fragment,
+    evaluate_hypothetical_worker,
+    schedule_claim_board,
+)
+from executor_v0.tasks import generate_optional_idle_cleanup_tasks
 from executor_v0.strip_market import (
     MarketBootstrapState,
     build_market_turn_plan,
@@ -29,10 +47,16 @@ from executor_v0.strip_routes import (
     remaining_day_action_slots,
     route_cursor_invariants_hold,
 )
-from executor_v0.strip_hiring import StripHiringPlan, plan_strip_hiring
+from executor_v0.strip_hiring import (
+    StripHiringPlan,
+    plan_strip_hiring,
+    predict_hire_spawns,
+    future_worker_actions,
+)
 from executor_v0.strip_supply import (
     LOCAL_ACTION_PRIORITY,
     PendingPickup,
+    PickupBatch,
     RouteSupplyPlan,
     RouteSupplyState,
     build_route_supply_plans,
@@ -45,6 +69,7 @@ from executor_v0.strip_work import (
     WorkItem,
     WorkStatus,
     build_strip_work_plan,
+    row_key_for_tile,
 )
 
 
@@ -58,6 +83,35 @@ __all__ = [
 
 
 _LOCAL_PRIORITY = LOCAL_ACTION_PRIORITY
+# Keep one claim-planning pass bounded even when the runtime order cap is raised.
+_MAX_CLAIM_HIRES_PER_BOOTSTRAP_PASS = 10
+# Capital-preservation bound on speculative same-day labour.
+#
+# Hire cost is `mult * fib(hires_today)`, so a single day that reaches a high
+# Fibonacci index can commit far more cash than the day can possibly earn back.
+# Measured on seed 41004 the claim-hire loop reached 23 hires in one turn
+# (fib(0..22) = 75 024) against a 68 368 bank, and 50-57 % of the resulting
+# workers immediately PASSed, collapsing the final bank from ~68 k to ~4.7 k.
+# The bound is a treasury-risk limit, not a calendar rule: it scales with the
+# cash actually on hand, so a poor early game is unaffected while a large
+# mid-game bank can still fund normal hiring.
+# Measured on a 10-seed panel (41001-41004 plus held-out 41005-41010), the
+# panel mean rises monotonically as this bound tightens - 31.2k unbounded,
+# 48.9k at 0.10, 56.4k at 0.02, 59.1k at 0.005 - and every held-out seed
+# improves at every step. 0.0 (one hire per day) is *worse* than unbounded:
+# under-hiring starves the farm as surely as over-hiring bankrupts it.
+_MAX_DAILY_HIRE_CASH_FRACTION = 0.005
+# The bound must never starve a low-cash farm, so it is floored at the cost of
+# a minimal working crew. Historically a healthy day fields 4-7 workers for a
+# cumulative 7-33 cash, so four is the smallest crew that is still a crew.
+_MIN_DAILY_HIRE_CREW = 4
+
+
+def _minimum_daily_hire_budget(cost_mult: int) -> float:
+    """Cash floor for one day of hiring: a minimal crew, whatever the balance."""
+    return float(cost_mult * sum(
+        fib(index) for index in range(_MIN_DAILY_HIRE_CREW)
+    ))
 
 
 @dataclass(frozen=True)
@@ -73,6 +127,10 @@ class StripExecutorConfig:
     allow_live_crop_sacrifice: bool = False
     allow_productive_recurring_crop_sacrifice: bool = False
     allow_older_crop_sacrifice: bool = False
+    enable_row_claim_board: bool = False
+    # Fraction of current cash one day of claim hiring may commit. ``None``
+    # restores the unbounded historical behaviour.
+    max_daily_hire_cash_fraction: float | None = _MAX_DAILY_HIRE_CASH_FRACTION
 
 
 @dataclass(frozen=True)
@@ -95,6 +153,23 @@ class StripExecutorResult:
 WorkPlanBuilder = Callable[..., StripWorkPlan]
 
 
+@dataclass(frozen=True)
+class _ClaimHireRecord:
+    worker: WorkerId
+    spawn: tuple[int, int]
+    coverage: HypotheticalWorkerCoverage
+    route: StripRoute
+    marginal_required_interactions: int
+    uncovered_required_interactions_before: int
+    uncovered_required_interactions_after: int
+
+
+def _uncovered_required_interactions(
+    snapshot: UncoveredRequiredWork,
+) -> int:
+    return sum(view.effective_interactions for view in snapshot.bundle_views)
+
+
 class StripExecutorController:
     """Fixed daily ownership and a one-pass deterministic route executor."""
 
@@ -103,11 +178,11 @@ class StripExecutorController:
         *,
         config: StripExecutorConfig = StripExecutorConfig(),
         work_builder: WorkPlanBuilder = build_strip_work_plan,
-        materialize_diagnostics: bool = True,
+        low_telemetry: bool = False,
     ) -> None:
         self.config = config
         self._work_builder = work_builder
-        self._materialize_diagnostics = bool(materialize_diagnostics)
+        self._low_telemetry = bool(low_telemetry)
         self._day: int | None = None
         self._routes: dict[WorkerId, StripRoute] = {}
         self._assignment: RouteAssignment | None = None
@@ -134,6 +209,17 @@ class StripExecutorController:
         self._hire_failures = 0
         self._animal_revisit_tiles: dict[str, tuple[int, int]] = {}
         self._observation_for_diagnostics: Mapping[str, Any] = {}
+        self._claim_board: ClaimBoard | None = None
+        self._claim_timings: dict[str, float] = {}
+        self._claim_pass_reasons: dict[str, dict[str, Any]] = {}
+        self._claim_hire_records: dict[WorkerId, _ClaimHireRecord] = {}
+        # Treasury-risk accounting for one day of claim hiring.
+        self._hire_spend_day: int | None = None
+        self._hire_spend_cash: int = 0
+        self._hire_budget_stops: int = 0
+        self._pending_claim_hires: tuple[_ClaimHireRecord, ...] = ()
+        self._claim_schedule_prepared = False
+        self._claim_hiring_diagnostics: dict[str, Any] = {}
 
     @property
     def routes(self) -> tuple[StripRoute, ...]:
@@ -141,24 +227,35 @@ class StripExecutorController:
 
     @property
     def diagnostics(self) -> dict[str, Any]:
-        return self._diagnostics()
+        return self._result_diagnostics()
 
-    def _result_diagnostics(self) -> dict[str, Any]:
-        """Build turn diagnostics only when the caller requested full telemetry."""
+    @property
+    def uncovered_required_work(self) -> UncoveredRequiredWork | None:
+        if self._claim_board is None:
+            return None
+        return self._claim_board.uncovered_snapshot(
+            remaining_day_action_slots(self._observation_for_diagnostics)
+        )
 
-        return self._diagnostics() if self._materialize_diagnostics else {}
-
-    def _finalize_day(self, obs: Mapping[str, Any], plan: DailyPlan) -> StripWorkPlan:
+    def _finalize_day(
+        self,
+        obs: Mapping[str, Any],
+        plan: DailyPlan,
+        work_plan: StripWorkPlan | None = None,
+    ) -> StripWorkPlan:
         """Freeze Packet 2 ownership and Packet 3 reservations once."""
 
         day = int(obs.get("day", 0))
         bootstrap_diagnostics = self._daily.get("hiring_diagnostics")
         hire_stop_reason = self._daily.get("hire_stop_reason")
-        work_plan = self._build_work_plan(obs, plan)
+        if work_plan is None:
+            work_plan = self._build_work_plan(obs, plan)
         positions = self._worker_positions(obs)
         inventories = {
             worker: self._worker_inventory(obs, worker) for worker in positions
         }
+        if self.config.enable_row_claim_board:
+            return self._finalize_claim_day(obs, work_plan, positions, inventories)
         candidates = generate_horizontal_route_candidates(work_plan)
         assignment = assign_horizontal_routes(
             candidates,
@@ -204,6 +301,9 @@ class StripExecutorController:
                 route.phase = RoutePhase.TRAVEL_TO_ENTRY
             else:
                 route.phase = RoutePhase.PREPARE_SUPPLIES
+        if self._low_telemetry:
+            self._daily = {}
+            return work_plan
         self._daily = {
             "day": day,
             "assignment_hour": int(obs.get("hour", 0)),
@@ -289,6 +389,746 @@ class StripExecutorController:
             and estimates[candidate.route_id].fertilizer_only
         ]
         return work_plan
+
+    def _claim_execution_plan(
+        self, obs: Mapping[str, Any], work_plan: StripWorkPlan
+    ) -> StripWorkPlan:
+        """Add current safe cleanup only to opt-in execution work."""
+
+        occupied = {item.tile for item in work_plan.items if item.tile is not None}
+        cleanup = generate_optional_idle_cleanup_tasks(
+            obs, self.config.acting_seat, mode="weed_water"
+        )
+        added = tuple(
+            WorkItem(
+                id=task.key, kind=task.kind, tile=task.tile,
+                crop=task.crop, source=task.source,
+                row_key=row_key_for_tile(task.tile),
+            )
+            for task in cleanup
+            if task.tile is not None and task.tile not in occupied
+        )
+        return replace(work_plan, items=work_plan.items + added) if added else work_plan
+
+    def _claim_supply_plan(
+        self, route: StripRoute, position: tuple[int, int]
+    ) -> RouteSupplyPlan:
+        board = self._claim_board
+        assert board is not None
+        items = tuple(
+            item for bundle_id, bundle in board.bundles.items()
+            if board.owner_by_bundle.get(bundle_id) == route.owner
+            and bundle.tile in route.owned_tiles
+            for item in bundle.items
+        )
+        demand_pairs, order = ordered_inventory_demand(items)
+        carried: dict[str, int] = {}
+        reserved: dict[str, int] = {}
+        for claim in board.reservations.values():
+            if claim.worker != route.owner or not all(
+                board.bundles[bundle_id].tile in route.owned_tiles
+                for bundle_id in claim.bundle_ids
+            ):
+                continue
+            for key, amount in claim.carried:
+                carried[key] = carried.get(key, 0) + amount
+            for key, amount in claim.shed:
+                reserved[key] = reserved.get(key, 0) + amount
+        demand = dict(demand_pairs)
+        missing = {
+            key: max(0, amount - carried.get(key, 0) - reserved.get(key, 0))
+            for key, amount in demand_pairs
+        }
+        sequence = tuple(PickupBatch(key, reserved[key]) for key in order
+                         if reserved.get(key, 0) > 0)
+        return RouteSupplyPlan(
+            route_id=route.route_id, owner=route.owner,
+            pickup_tile=nearest_shed_access(position) if sequence else None,
+            demand=demand_pairs,
+            already_carried=tuple(sorted((k, min(v, demand.get(k, 0)))
+                                         for k, v in carried.items() if v > 0)),
+            reserved_from_shed=tuple(sorted((k, min(v, demand.get(k, 0)))
+                                            for k, v in reserved.items() if v > 0)),
+            missing_stock=tuple(sorted((k, v) for k, v in missing.items() if v > 0)),
+            capacity_limited=(), pickup_sequence=sequence,
+        )
+
+    def _finalize_claim_day(
+        self, obs: Mapping[str, Any], work_plan: StripWorkPlan,
+        positions: Mapping[WorkerId, tuple[int, int]],
+        inventories: Mapping[WorkerId, Mapping[str, int]],
+    ) -> StripWorkPlan:
+        start = perf_counter()
+        private = obs.get("private") or {}
+        execution_plan = self._claim_execution_plan(obs, work_plan)
+        board = build_claim_board(
+            execution_plan, inventories, private.get("shed") or {},
+            private.get("seeds") or {}, epoch_id=f"DAY:{int(obs.get('day', 0))}",
+        )
+        built = perf_counter()
+        result = schedule_claim_board(
+            board, execution_plan, positions, remaining_day_action_slots(obs),
+            int(obs.get("hour", 0)), mode=SchedulerMode.NORMAL,
+        )
+        self._claim_board = board
+        self._claim_timings = {
+            "board_build": (built - start) * 1000,
+            **result.timings_ms,
+        }
+        self._day = int(obs.get("day", 0))
+        self._plan = work_plan
+        self._assignment = result.assignment
+        self._routes = {route.owner: route for route in result.assignment.routes}
+        self._unassigned_ids = ()
+        self._passed_work = {route.route_id: {} for route in result.assignment.routes}
+        self._latest_inventories = {worker: dict(stock)
+                                    for worker, stock in inventories.items()}
+        self._initial_shed = dict(board.observed_shed)
+        self._supply_plans = {
+            route.route_id: self._claim_supply_plan(route, positions[route.owner])
+            for route in result.assignment.routes
+        }
+        self._supply_states = {route.route_id: RouteSupplyState()
+                               for route in result.assignment.routes}
+        for route in result.assignment.routes:
+            route.phase = (RoutePhase.PREPARE_SUPPLIES
+                           if self._supply_plans[route.route_id].requires_pickup
+                           else RoutePhase.TRAVEL_TO_ENTRY)
+        self._daily = {} if self._low_telemetry else {
+            "day": self._day,
+            "assignment_hour": int(obs.get("hour", 0)),
+            "workers": len(positions),
+            "assigned_routes": len(result.assignment.routes),
+            "row_claim_board": board.diagnostics(),
+            "row_claim_timing_ms": self._claim_timings,
+            "uncovered_required_snapshot": board.uncovered_snapshot(
+                remaining_day_action_slots(obs)
+            ).to_json_dict(),
+        }
+        self._claim_timings["total_finalization"] = (perf_counter() - start) * 1000
+        self._claim_schedule_prepared = True
+        return work_plan
+
+    def _plan_claim_hires(
+        self,
+        obs: Mapping[str, Any],
+        work_plan: StripWorkPlan,
+        positions: Mapping[WorkerId, tuple[int, int]],
+    ) -> tuple[tuple[str], ...]:
+        """Reserve affordable hires against only uncovered required fragments."""
+        board = self._claim_board
+        if board is None:
+            return ()
+        started = perf_counter()
+        slots = future_worker_actions(obs)
+        snapshot = board.uncovered_snapshot(slots)
+        farm = (obs.get("farms") or ())[self.config.acting_seat]
+        hands = tuple(farm.get("hands") or ())
+        remaining_headcount = max(0, 240 - len(hands))
+        order_cap = self._max_market_orders(obs)
+        configuration = obs.get("configuration")
+        config = configuration if isinstance(configuration, Mapping) else {}
+        board_size = max(2, int(config.get("boardSize", 10)))
+        current_worker_count = len(positions)
+        previous_diagnostics = self._claim_hiring_diagnostics
+        previous_workers = list(previous_diagnostics.get("planned_workers", ()))
+        previous_costs = list(
+            previous_diagnostics.get("sequential_hire_costs", ())
+        )
+        previous_considered = int(
+            previous_diagnostics.get("hypothetical_workers_considered", 0)
+        )
+        previous_reserved = int(
+            previous_diagnostics.get("required_interactions_reserved", 0)
+        )
+        next_worker_index = max(
+            (worker.index for worker in positions), default=-1
+        ) + 1
+        hires_today = max(0, int(farm.get("hires_today", 0)))
+        cost_mult = self._hire_cost_mult(obs)
+        cash = float(farm.get("money", 0.0))
+        remaining_cash = cash
+        # Treasury-risk budget for this day, recomputed from the cash actually
+        # on hand. ``committed`` is what earlier bootstrap passes already spent
+        # on hires today; it is recovered from the engine's ``hires_today``
+        # count so it survives restarts of the bootstrap stage.
+        day = int(obs.get("day", 0))
+        if self._hire_spend_day != day:
+            self._hire_spend_day = day
+            self._hire_spend_cash = cost_mult * sum(
+                fib(index) for index in range(hires_today)
+            )
+            self._hire_budget_stops = 0
+        fraction = self.config.max_daily_hire_cash_fraction
+        if fraction is None:
+            hire_budget = float("inf")
+        else:
+            # Floor the budget at the cost of a minimal crew so a low-cash
+            # farm is never starved below the point of being able to work.
+            # The floor deliberately does NOT use the current Fibonacci index:
+            # that index grows with every hire already made today, which would
+            # let a runaway day raise its own ceiling (measured: that mistake
+            # silently disabled the bound and dropped seed 41004 back to 4 658).
+            hire_budget = max(
+                max(0.0, cash) * float(fraction),
+                _minimum_daily_hire_budget(cost_mult),
+            )
+        existing_positions = [positions[worker] for worker in sorted(positions)]
+        planned: list[_ClaimHireRecord] = []
+        costs: list[int] = []
+        considered = 0
+        stop_reason = "NO_REQUIRED_LEFTOVERS"
+
+        limit = min(
+            remaining_headcount,
+            order_cap,
+            len(snapshot.bundle_views),
+            _MAX_CLAIM_HIRES_PER_BOOTSTRAP_PASS,
+        )
+        if snapshot.fragments:
+            stop_reason = "NO_MEANINGFUL_REQUIRED_COVERAGE"
+        for hire_index in range(limit):
+            uncovered_before = _uncovered_required_interactions(snapshot)
+            spawns = predict_hire_spawns(
+                tuple(existing_positions), 1, board_size
+            )
+            if not spawns:
+                stop_reason = "NO_LEGAL_SPAWN"
+                break
+            spawn = spawns[0]
+            worker = WorkerId(next_worker_index + hire_index)
+            considered += 1
+            optimistic_coverage = evaluate_hypothetical_worker(
+                snapshot, spawn, slots
+            )
+            if (
+                not optimistic_coverage.claimed_fragments
+                or optimistic_coverage.effective_interactions <= 0
+            ):
+                stop_reason = (
+                    "RESOURCE_BLOCKED_REQUIRED_LEFTOVERS"
+                    if "RESOURCE_SHORTAGE" in optimistic_coverage.rejection_reasons
+                    else "NO_MEANINGFUL_REQUIRED_COVERAGE"
+                )
+                break
+            canonical_plan = canonical_hypothetical_worker_plan(
+                board,
+                work_plan,
+                worker,
+                spawn,
+                optimistic_coverage,
+                slots,
+                int(obs.get("hour", 0)),
+            )
+            if canonical_plan is None:
+                stop_reason = "NO_CANONICAL_REQUIRED_COVERAGE"
+                break
+            coverage, route = canonical_plan
+            if not coverage.claimed_fragments or coverage.effective_interactions <= 0:
+                stop_reason = (
+                    "RESOURCE_BLOCKED_REQUIRED_LEFTOVERS"
+                    if "RESOURCE_SHORTAGE" in coverage.rejection_reasons
+                    else "NO_MEANINGFUL_REQUIRED_COVERAGE"
+                )
+                break
+
+            bundle_ids = tuple(
+                bundle_id for fragment in coverage.claimed_fragments
+                for bundle_id in fragment.bundle_ids
+            )
+            snapshot_interactions = {
+                view.bundle_id: view.effective_interactions
+                for view in snapshot.bundle_views
+            }
+            marginal_interactions = sum(
+                snapshot_interactions.get(bundle_id, 0)
+                for bundle_id in bundle_ids
+            )
+            if (
+                len(bundle_ids) != len(set(bundle_ids))
+                or any(bundle_id not in snapshot_interactions
+                       for bundle_id in bundle_ids)
+                or marginal_interactions <= 0
+                or marginal_interactions != coverage.effective_interactions
+            ):
+                stop_reason = "NON_MARGINAL_REQUIRED_COVERAGE"
+                break
+
+            cost = hire_cost(hires_today + len(planned), cost_mult)
+            if remaining_cash < cost:
+                stop_reason = "CASH"
+                break
+            # Treasury-risk bound: refuse to commit more than the configured
+            # fraction of the cash on hand to one day of speculative labour.
+            # Fibonacci escalation makes the last few hires of a burst cost more
+            # than everything before them combined, so this is where a
+            # runaway day is stopped.
+            if self._hire_spend_cash + sum(costs) + cost > hire_budget:
+                stop_reason = "HIRE_CASH_BUDGET"
+                self._hire_budget_stops += 1
+                break
+
+            route.route_id = f"CLAIM:{worker.label}"
+            reservation = board.trial(worker, bundle_ids)
+            if reservation is None:
+                stop_reason = "RESOURCE_RESERVATION_MISMATCH"
+                break
+            if (dict(reservation.shed) != dict(coverage.reservation_shed)
+                    or dict(reservation.global_resources)
+                    != dict(coverage.reservation_global)):
+                stop_reason = "RESOURCE_RESERVATION_MISMATCH"
+                break
+            if not board.claim(reservation):
+                stop_reason = "RESOURCE_RESERVATION_MISMATCH"
+                break
+            board.record_claim_source(bundle_ids, "HIRE_RESERVATION")
+            snapshot = board.uncovered_snapshot(slots)
+            uncovered_after = _uncovered_required_interactions(snapshot)
+            if uncovered_before - uncovered_after != marginal_interactions:
+                raise AssertionError(
+                    "claim hire did not reduce uncovered required work by its "
+                    "evaluated marginal coverage"
+                )
+
+            record = _ClaimHireRecord(
+                worker, spawn, coverage, route, marginal_interactions,
+                uncovered_before, uncovered_after,
+            )
+            planned.append(record)
+            costs.append(cost)
+            self._claim_hire_records[worker] = record
+            self._routes[worker] = route
+            self._passed_work[route.route_id] = {}
+            supply = self._claim_supply_plan(route, spawn)
+            self._supply_plans[route.route_id] = supply
+            self._supply_states[route.route_id] = RouteSupplyState()
+            route.phase = (RoutePhase.PREPARE_SUPPLIES if supply.requires_pickup
+                           else RoutePhase.TRAVEL_TO_ENTRY)
+            remaining_cash -= cost
+            existing_positions.append(spawn)
+            stop_reason = "NO_REQUIRED_LEFTOVERS"
+            if not snapshot.fragments:
+                break
+
+        if snapshot.fragments and len(planned) >= order_cap:
+            stop_reason = "ORDER_CAP"
+        elif snapshot.fragments and len(planned) >= remaining_headcount:
+            stop_reason = "WORKER_LIMIT"
+        elif (snapshot.fragments
+              and len(planned) >= _MAX_CLAIM_HIRES_PER_BOOTSTRAP_PASS):
+            stop_reason = "HYPOTHETICAL_HIRE_BATCH_CAP"
+
+        self._pending_claim_hires = tuple(planned)
+        planned_workers = [
+            {
+                "worker": record.worker.label,
+                "spawn": list(record.spawn),
+                "bundle_ids": [
+                    bundle_id for fragment in record.coverage.claimed_fragments
+                    for bundle_id in fragment.bundle_ids
+                ],
+                "effective_interactions": record.coverage.effective_interactions,
+                "marginal_required_interactions": (
+                    record.marginal_required_interactions
+                ),
+                "uncovered_required_interactions_before": (
+                    record.uncovered_required_interactions_before
+                ),
+                "uncovered_required_interactions_after": (
+                    record.uncovered_required_interactions_after
+                ),
+                "incremental_turns": record.coverage.incremental_turns,
+                "reservation_shed": dict(record.coverage.reservation_shed),
+                "reservation_global": dict(record.coverage.reservation_global),
+            }
+            for record in planned
+        ]
+        self._claim_hiring_diagnostics = {
+            "schema_version": 3,
+            "existing_workers": int(previous_diagnostics.get(
+                "existing_workers", current_worker_count
+            )),
+            "hypothetical_workers_considered": previous_considered + considered,
+            "wanted_hires": len(previous_workers) + len(planned),
+            "submittable_hires": len(previous_workers) + len(planned),
+            "submitted_this_round": len(planned),
+            "sequential_hire_costs": previous_costs + costs,
+            "cash_before_hiring": float(previous_diagnostics.get(
+                "cash_before_hiring", cash
+            )),
+            "cash_after_planned_hiring": remaining_cash,
+            "future_action_slots": slots,
+            "hypothetical_hire_batch_cap": (
+                _MAX_CLAIM_HIRES_PER_BOOTSTRAP_PASS
+            ),
+            "hypothetical_hire_batch_limit": limit,
+            "required_interactions_reserved": previous_reserved + sum(
+                record.coverage.effective_interactions for record in planned
+            ),
+            "hire_stop_reason": stop_reason,
+            "planned_workers": previous_workers + planned_workers,
+            "hire_cash_budget": None if fraction is None else hire_budget,
+            "hire_cash_committed_before_pass": self._hire_spend_cash,
+            "hire_cash_committed_after_pass": (
+                self._hire_spend_cash + sum(costs)
+            ),
+            "hire_cash_budget_stops_today": self._hire_budget_stops,
+        }
+        elapsed = (perf_counter() - started) * 1000
+        self._claim_timings["hypothetical_hiring"] = (
+            self._claim_timings.get("hypothetical_hiring", 0.0) + elapsed
+        )
+        self._claim_timings["hypothetical_hires_considered"] = (
+            self._claim_timings.get("hypothetical_hires_considered", 0) + considered
+        )
+        self._claim_timings["total_finalization"] = (
+            self._claim_timings.get("total_finalization", 0.0) + elapsed
+        )
+        if not self._low_telemetry:
+            self._daily["claim_hiring"] = self._claim_hiring_diagnostics
+            self._daily["row_claim_timing_ms"] = self._claim_timings
+        return tuple(("HIRE",) for _ in planned)
+
+    def _reconcile_prepared_claim_schedule(
+        self, obs: Mapping[str, Any], work_plan: StripWorkPlan
+    ) -> StripWorkPlan:
+        """Apply an observed bootstrap delta while retaining committed owners."""
+        board = self._claim_board
+        if board is None:
+            return work_plan
+        started = perf_counter()
+        private = obs.get("private") or {}
+        execution_plan = self._claim_execution_plan(obs, work_plan)
+        changed_owners = reconcile_claim_board(
+            board, execution_plan,
+            {worker: self._worker_inventory(obs, worker)
+             for worker in self._worker_positions(obs)},
+            private.get("shed") or {}, private.get("seeds") or {},
+        )
+        self._refresh_claim_route_supply(obs, changed_owners)
+        self._claim_timings["bootstrap_reconciliation"] = (
+            self._claim_timings.get("bootstrap_reconciliation", 0.0)
+            + (perf_counter() - started) * 1000
+        )
+        return work_plan
+
+    def _claim_bootstrap_result(
+        self, obs: Mapping[str, Any], work_plan: StripWorkPlan,
+        market_actions: tuple[tuple, ...],
+    ) -> StripExecutorResult:
+        """Keep observed workers productive while a hire awaits confirmation."""
+        started = perf_counter()
+        positions = self._worker_positions(obs)
+        execution_plan = self._claim_execution_plan(obs, work_plan)
+        self._claim_pass_reasons = {}
+        actions: list[tuple] = []
+        for worker in sorted(positions):
+            route = self._routes.get(worker)
+            if route is None:
+                route = self._claim_refill(worker, positions[worker], execution_plan, obs)
+                if route is None:
+                    staging = self._claim_stage(worker, positions[worker], obs)
+                    if staging is not None:
+                        actions.append(staging)
+                        continue
+                    self._record_claim_pass(worker, positions[worker], obs, None)
+                    actions.append(("PASS",))
+                    continue
+            action = self._act_worker(route, positions[worker], execution_plan, obs)
+            if action == ("PASS",):
+                self._record_claim_pass(worker, positions[worker], obs, route)
+            actions.append(action)
+        self._claim_timings["bootstrap_worker_dispatch"] = (
+            self._claim_timings.get("bootstrap_worker_dispatch", 0.0)
+            + (perf_counter() - started) * 1000
+        )
+        # The loop above already follows sorted WorkerId order; keep farmer first.
+        ordered = actions
+        return StripExecutorResult(
+            farmer_action=ordered[0] if ordered else ("PASS",),
+            hands_actions=tuple(ordered[1:]),
+            market_actions=market_actions,
+            diagnostics=self._result_diagnostics(),
+        )
+
+    def _finish_prepared_claim_schedule(
+        self, obs: Mapping[str, Any], work_plan: StripWorkPlan
+    ) -> StripWorkPlan:
+        """Finalize the already planned claims after hire reconciliation."""
+        started = perf_counter()
+        positions = self._worker_positions(obs)
+        self._latest_inventories = {
+            worker: self._worker_inventory(obs, worker) for worker in positions
+        }
+        self._plan = work_plan
+        self._day = int(obs.get("day", 0))
+        routes = tuple(sorted(self._routes.values(), key=lambda route: route.route_id))
+        self._assignment = RouteAssignment(
+            routes, (), tuple(worker for worker in sorted(positions)
+                              if worker not in self._routes),
+            primary_rows_assigned=sum(bool(route.segments and
+                                           ":PRIMARY:" in route.segments[0].segment_id)
+                                      for route in routes),
+            overflow_rows_assigned=sum(max(0, len(route.segments) - 1)
+                                       for route in routes),
+        )
+        self._unassigned_ids = ()
+        private = obs.get("private") or {}
+        self._initial_shed = {
+            str(item): max(0, int(amount))
+            for item, amount in (private.get("shed") or {}).items()
+        }
+        if not self._low_telemetry:
+            self._daily.update({
+                "workers": len(positions),
+                "assigned_routes": len(routes),
+                "row_claim_board": self._claim_board.diagnostics()
+                if self._claim_board is not None else {},
+                "uncovered_required_snapshot": (
+                    self._claim_board.uncovered_snapshot(
+                        remaining_day_action_slots(obs)
+                    ).to_json_dict()
+                    if self._claim_board is not None else {}
+                ),
+                "claim_hiring": self._claim_hiring_diagnostics,
+                "row_claim_pass_reasons": dict(self._claim_pass_reasons),
+            })
+            self._daily["row_claim_timing_ms"] = self._claim_timings
+        elapsed = (perf_counter() - started) * 1000
+        self._claim_timings["final_assignment"] = (
+            self._claim_timings.get("final_assignment", 0.0) + elapsed
+        )
+        self._claim_timings["total_finalization"] = (
+            self._claim_timings.get("total_finalization", 0.0) + elapsed
+        )
+        self._claim_schedule_prepared = False
+        return work_plan
+
+    def _claim_refill(
+        self, worker: WorkerId, position: tuple[int, int],
+        work_plan: StripWorkPlan, obs: Mapping[str, Any],
+    ) -> StripRoute | None:
+        board = self._claim_board
+        if board is None:
+            return None
+        started = perf_counter()
+        segment = claim_runtime_fragment(
+            board, work_plan, worker, position, remaining_day_action_slots(obs),
+            mode=SchedulerMode.NORMAL,
+        )
+        self._claim_timings["runtime_refill"] = (
+            self._claim_timings.get("runtime_refill", 0.0)
+            + (perf_counter() - started) * 1000
+        )
+        if segment is None:
+            return None
+        traversal = segment.traversal
+        route_id = f"CLAIM:{worker.label}:REFILL:{board.observation_version}"
+        route = StripRoute(
+            route_id, traversal, traversal, worker, traversal[0],
+            abs(position[0] - traversal[0][0]) + abs(position[1] - traversal[0][1]),
+            int(obs.get("hour", 0)),
+            workload_interactions=segment.represented_interactions,
+            source_shape="horizontal_claim_segments", segments=(segment,),
+        )
+        self._routes[worker] = route
+        self._passed_work[route_id] = {}
+        supply = self._claim_supply_plan(route, position)
+        self._supply_plans[route_id] = supply
+        self._supply_states[route_id] = RouteSupplyState()
+        route.phase = (RoutePhase.PREPARE_SUPPLIES if supply.requires_pickup
+                       else RoutePhase.TRAVEL_TO_ENTRY)
+        return route
+
+    def _refresh_claim_route_supply(
+        self, obs: Mapping[str, Any], changed_owners: set[WorkerId]
+    ) -> None:
+        positions = self._worker_positions(obs)
+        for worker in sorted(changed_owners):
+            route = self._routes.get(worker)
+            if route is None or worker not in positions:
+                continue
+            refreshed = self._claim_supply_plan(route, positions[worker])
+            old = self._supply_plans.get(route.route_id)
+            if old == refreshed:
+                continue
+            self._supply_plans[route.route_id] = refreshed
+            state = self._supply_states.setdefault(route.route_id, RouteSupplyState())
+            if state.pending is not None:
+                continue
+            if refreshed.requires_pickup and (
+                old is None or refreshed.reserved_from_shed != old.reserved_from_shed
+            ):
+                self._supply_states[route.route_id] = RouteSupplyState()
+                route.phase = RoutePhase.PREPARE_SUPPLIES
+                route.completion_hour = None
+            elif not refreshed.requires_pickup and route.phase == RoutePhase.PREPARE_SUPPLIES:
+                route.phase = RoutePhase.TRAVEL_TO_ENTRY
+
+    def _claim_stage(
+        self, worker: WorkerId, position: tuple[int, int],
+        obs: Mapping[str, Any], route: StripRoute | None = None,
+    ) -> tuple | None:
+        started = perf_counter()
+        try:
+            return self._claim_stage_target(worker, position, obs, route)
+        finally:
+            self._claim_timings["staging"] = (
+                self._claim_timings.get("staging", 0.0)
+                + (perf_counter() - started) * 1000
+            )
+
+    def _claim_stage_target(
+        self, worker: WorkerId, position: tuple[int, int],
+        obs: Mapping[str, Any], route: StripRoute | None,
+    ) -> tuple | None:
+        board = self._claim_board
+        slots = remaining_day_action_slots(obs)
+        if board is None or slots <= 1:
+            return None
+
+        fragments = board.required_fragments()
+
+        def required_tier(fragment: RowFragment) -> int:
+            return int(not any(
+                item.status == WorkStatus.READY
+                for bundle_id in fragment.bundle_ids
+                for item in board.bundles[bundle_id].items
+            ))
+
+        targets_by_tier = (
+            tuple(fragment for fragment in fragments if required_tier(fragment) == 0),
+            tuple(fragment for fragment in fragments if required_tier(fragment) == 1),
+        )
+        target: tuple[int, int] | None = None
+        for candidates in targets_by_tier:
+            feasible = []
+            for fragment in candidates:
+                entry = fragment.traversal[0]
+                distance = abs(position[0] - entry[0]) + abs(position[1] - entry[1])
+                action_turns = min(
+                    board.bundles[bundle_id].effective_interactions
+                    for bundle_id in fragment.bundle_ids
+                )
+                if distance + max(1, action_turns) <= slots:
+                    feasible.append((distance, entry, fragment.row_key))
+            if feasible:
+                target = min(feasible)[1]
+                break
+
+        if target is not None and target == position:
+            return None
+
+        if target is None:
+            supply_work = any(
+                bundle.service_class != ServiceClass.OPTIONAL
+                and board.phase_by_bundle[bundle.bundle_id] == ClaimPhase.UNCLAIMED
+                and any(board.remaining_shed.get(item, 0) > 0
+                        for item, _ in bundle.inventory_demand)
+                for bundle in board.bundles.values()
+            )
+            if route is not None:
+                supply_plan = self._supply_plans.get(route.route_id)
+                supply_state = self._supply_states.get(route.route_id)
+                if (supply_plan is not None and supply_plan.requires_pickup
+                        and supply_state is not None and supply_state.pending is None):
+                    supply_work = supply_work or any(
+                        supply_state.acquired.get(item, 0) < quantity
+                        for item, quantity in supply_plan.reserved_from_shed
+                    )
+            if supply_work:
+                shed_target = nearest_shed_access(position)
+                distance = abs(position[0] - shed_target[0]) + abs(position[1] - shed_target[1])
+                if shed_target != position and distance + 1 <= slots:
+                    target = shed_target
+
+        if target is None:
+            center = (4, 4)
+            distance = abs(position[0] - center[0]) + abs(position[1] - center[1])
+            if center != position and distance + 1 <= slots:
+                target = center
+
+        if target is None or target == position:
+            return None
+        movement = _vertical_first_step(position, target)
+        if movement is not None:
+            if route is not None:
+                self._record_movement(route, obs)
+            self._claim_pass_reasons.pop(worker.label, None)
+        return movement
+
+    def _record_claim_pass(
+        self, worker: WorkerId, position: tuple[int, int],
+        obs: Mapping[str, Any], route: StripRoute | None, *,
+        submitted_market_action: bool = False,
+    ) -> None:
+        board = self._claim_board
+        slots = remaining_day_action_slots(obs)
+        if board is None:
+            if self._pending_hires is not None:
+                reason = "AWAITING_OBSERVATION_CONFIRMATION"
+            elif self._market_state.pending_buys:
+                reason = "PENDING_MARKET_OR_SUPPLY_EFFECT"
+            elif submitted_market_action:
+                reason = "AWAITING_OBSERVATION_CONFIRMATION"
+            elif slots <= 1:
+                reason = "TERMINAL_OR_DEADLINE_BOUNDARY"
+            else:
+                reason = "INVALID_OR_MISSING_WORKER_STATE"
+            self._claim_pass_reasons[worker.label] = {
+                "reason": reason,
+                "owned_candidates": 0,
+                "nearby_required_candidates": 0,
+                "other_required_candidates": 0,
+                "optional_candidates": 0,
+                "staging_candidates": 0,
+                "scheduler_miss": False,
+            }
+            return
+        required = [
+            bundle for bundle_id, bundle in board.bundles.items()
+            if board.phase_by_bundle[bundle_id] == ClaimPhase.UNCLAIMED
+            and bundle.claimable
+            and bundle.service_class != ServiceClass.OPTIONAL
+        ]
+        nearby = sum(
+            abs(position[0] - bundle.tile[0]) + abs(position[1] - bundle.tile[1]) <= 1
+            for bundle in required
+        )
+        optional = len(board.unclaimed(ServiceClass.OPTIONAL))
+        feasible = any(
+            board.trial(worker, (bundle.bundle_id,)) is not None
+            and (abs(position[0] - bundle.tile[0])
+                 + abs(position[1] - bundle.tile[1])
+                 + bundle.effective_interactions <= slots)
+            for bundle in required
+        )
+        supply = self._supply_states.get(route.route_id) if route is not None else None
+        if route is not None and route.phase == RoutePhase.INVALID:
+            reason = "INVALID_OR_MISSING_WORKER_STATE"
+        elif supply is not None and supply.pending is not None:
+            reason = "AWAITING_OBSERVATION_CONFIRMATION"
+        elif self._pending_hires is not None:
+            reason = "AWAITING_OBSERVATION_CONFIRMATION"
+        elif self._market_state.pending_buys:
+            reason = "PENDING_MARKET_OR_SUPPLY_EFFECT"
+        elif slots <= 1:
+            reason = "TERMINAL_OR_DEADLINE_BOUNDARY"
+        elif ((required and any(bundle.tile == position for bundle in required))
+              or position == (4, 4)):
+            reason = "ALREADY_AT_STAGING_TARGET"
+        else:
+            reason = "NO_LEGAL_REACHABLE_WORK"
+        self._claim_pass_reasons[worker.label] = {
+            "reason": reason,
+            "owned_candidates": sum(owner == worker for owner in
+                                    board.owner_by_bundle.values()),
+            "nearby_required_candidates": nearby,
+            "other_required_candidates": len(required) - nearby,
+            "optional_candidates": optional,
+            "staging_candidates": sum(bundle.tile != position for bundle in required),
+            "scheduler_miss": bool(feasible and reason == "NO_LEGAL_REACHABLE_WORK"),
+        }
 
     def _deadline_assignment_diagnostics(
         self,
@@ -467,6 +1307,7 @@ class StripExecutorController:
         work_plan = self._build_work_plan(obs, active_plan)
         self._plan = work_plan
         self._confirm_pending_supply_pickups(obs)
+        execution_plan: StripWorkPlan | None = None
 
         if not self._routes_finalized:
             self._reconcile_market_observation(obs)
@@ -493,14 +1334,51 @@ class StripExecutorController:
                 self._worker_count_before_hiring = len(self._worker_positions(obs))
 
             if self._bootstrap_stage == "HIRING":
-                if self._pending_hires is not None:
+                if self.config.enable_row_claim_board:
+                    if self._pending_hires is not None:
+                        if int(obs.get("step", 0)) <= self._pending_hires["submitted_step"]:
+                            return self._bootstrap_pass_result(obs, ())
+                        self._reconcile_hire_observation(obs)
+                        work_plan = self._reconcile_prepared_claim_schedule(
+                            obs, work_plan
+                        )
+                    positions = self._worker_positions(obs)
+                    if not self._claim_schedule_prepared:
+                        inventories = {
+                            worker: self._worker_inventory(obs, worker)
+                            for worker in positions
+                        }
+                        self._finalize_claim_day(
+                            obs, work_plan, positions, inventories
+                        )
+                    claim_orders: tuple[tuple, ...] = ()
+                    if not self._hiring_blocked:
+                        claim_orders = self._plan_claim_hires(
+                            obs, work_plan, positions
+                        )
+                    else:
+                        self._claim_hiring_diagnostics["hire_stop_reason"] = "FAILED"
+                    if claim_orders:
+                        farm = obs["farms"][self.config.acting_seat]
+                        self._pending_hires = {
+                            "submitted_step": int(obs.get("step", 0)),
+                            "hands_before": len(farm.get("hands") or ()),
+                            "hires_before": int(farm.get("hires_today", 0)),
+                            "submitted": len(claim_orders),
+                        }
+                        self._hire_submitted += len(claim_orders)
+                        return self._claim_bootstrap_result(
+                            obs, work_plan, claim_orders
+                        )
+                elif self._pending_hires is not None:
                     if int(obs.get("step", 0)) <= self._pending_hires["submitted_step"]:
                         return self._bootstrap_pass_result(obs, ())
                     # Reconciliation always clears the pending record on this path.
                     self._reconcile_hire_observation(obs)
-                if self._hiring_blocked:
-                    self._daily["hire_stop_reason"] = "FAILED"
-                else:
+                if not self.config.enable_row_claim_board and self._hiring_blocked:
+                    if not self._low_telemetry:
+                        self._daily["hire_stop_reason"] = "FAILED"
+                elif not self.config.enable_row_claim_board:
                     candidates = generate_horizontal_route_candidates(work_plan)
                     positions = self._worker_positions(obs)
                     inventories = {
@@ -518,8 +1396,11 @@ class StripExecutorController:
                         max_orders=self._max_market_orders(obs),
                         farm_hand_cost_mult=self._hire_cost_mult(obs),
                     )
-                    self._daily["hiring_diagnostics"] = self._hire_plan.to_json_dict()
-                    self._daily["hire_stop_reason"] = self._hire_plan.stop_reason.value
+                    if not self._low_telemetry:
+                        self._daily["hiring_diagnostics"] = (
+                            self._hire_plan.to_json_dict())
+                        self._daily["hire_stop_reason"] = (
+                            self._hire_plan.stop_reason.value)
                     if self._hire_plan.orders:
                         submitted = len(self._hire_plan.orders)
                         farm = obs["farms"][self.config.acting_seat]
@@ -534,13 +1415,29 @@ class StripExecutorController:
                             obs, work_plan, self._hire_plan.orders
                         )
                 self._bootstrap_stage = "FINALIZED"
-            work_plan = self._finalize_day(obs, active_plan)
+            if self.config.enable_row_claim_board and self._claim_schedule_prepared:
+                work_plan = self._finish_prepared_claim_schedule(obs, work_plan)
+            else:
+                work_plan = self._finalize_day(
+                    obs, active_plan, work_plan=work_plan
+                )
             self._routes_finalized = True
             self._market_state.finalized_hour = int(obs.get("hour", 0))
         else:
             # Already finalized: still reconcile each new observation exactly once.
             self._reconcile_market_observation(obs)
-            self._refresh_route_supply_plans(obs, work_plan)
+            if self.config.enable_row_claim_board and self._claim_board is not None:
+                private = obs.get("private") or {}
+                execution_plan = self._claim_execution_plan(obs, work_plan)
+                changed_owners = reconcile_claim_board(
+                    self._claim_board, execution_plan,
+                    {worker: self._worker_inventory(obs, worker)
+                     for worker in self._worker_positions(obs)},
+                    private.get("shed") or {}, private.get("seeds") or {},
+                )
+                self._refresh_claim_route_supply(obs, changed_owners)
+            else:
+                self._refresh_route_supply_plans(obs, work_plan)
         protected = self._observed_reservations(
             obs, self._outstanding_reservations()
         )
@@ -577,12 +1474,31 @@ class StripExecutorController:
             ):
                 route.phase = RoutePhase.INVALID
         actions: list[tuple] = []
+        if self.config.enable_row_claim_board:
+            self._claim_pass_reasons = {}
+        if execution_plan is None:
+            execution_plan = (
+                self._claim_execution_plan(obs, work_plan)
+                if self.config.enable_row_claim_board else work_plan
+            )
         for worker in sorted(positions):
             route = self._routes.get(worker)
             if route is None:
-                actions.append(("PASS",))
-                continue
-            actions.append(self._act_worker(route, positions[worker], work_plan, obs))
+                if self.config.enable_row_claim_board:
+                    route = self._claim_refill(worker, positions[worker], execution_plan, obs)
+                if route is None:
+                    if self.config.enable_row_claim_board:
+                        staging = self._claim_stage(worker, positions[worker], obs)
+                        if staging is not None:
+                            actions.append(staging)
+                            continue
+                        self._record_claim_pass(worker, positions[worker], obs, None)
+                    actions.append(("PASS",))
+                    continue
+            action = self._act_worker(route, positions[worker], execution_plan, obs)
+            if self.config.enable_row_claim_board and action == ("PASS",):
+                self._record_claim_pass(worker, positions[worker], obs, route)
+            actions.append(action)
 
         farmer_action = actions[0] if actions else ("PASS",)
         hands_actions = tuple(actions[1:])
@@ -620,7 +1536,20 @@ class StripExecutorController:
         self._hire_failures = 0
         self._animal_revisit_tiles = {}
         self._observation_for_diagnostics = obs
-        self._daily = {"day": self._day, "assignment_hour": int(obs.get("hour", 0))}
+        self._claim_board = None
+        self._claim_timings = {}
+        self._claim_pass_reasons = {}
+        self._claim_hire_records = {}
+        self._pending_claim_hires = ()
+        self._claim_schedule_prepared = False
+        self._claim_hiring_diagnostics = {}
+        self._hire_spend_day = None
+        self._hire_spend_cash = 0
+        self._hire_budget_stops = 0
+        self._daily = (
+            {"day": self._day, "assignment_hour": int(obs.get("hour", 0))}
+            if not self._low_telemetry else {}
+        )
 
     def _shed_capacity(self, obs: Mapping[str, Any]) -> int:
         configuration = obs.get("configuration")
@@ -638,7 +1567,7 @@ class StripExecutorController:
         configuration = obs.get("configuration")
         if isinstance(configuration, Mapping):
             return max(0, int(configuration.get("farmHandCostMult", 1)))
-        return 1
+        return FARM_HAND_COST_MULT_DEFAULT
 
     def _market_params(self, obs: Mapping[str, Any]) -> Mapping[str, Mapping[str, Any]] | None:
         if self.config.market_params is not None:
@@ -660,6 +1589,13 @@ class StripExecutorController:
         self, obs: Mapping[str, Any], market_actions: tuple[tuple, ...] | tuple
     ) -> StripExecutorResult:
         positions = self._worker_positions(obs)
+        if self.config.enable_row_claim_board:
+            self._claim_pass_reasons = {}
+            for worker in sorted(positions):
+                self._record_claim_pass(
+                    worker, positions[worker], obs, self._routes.get(worker),
+                    submitted_market_action=bool(market_actions),
+                )
         actions = tuple(("PASS",) for _ in sorted(positions))
         return StripExecutorResult(
             farmer_action=actions[0] if actions else ("PASS",),
@@ -709,9 +1645,9 @@ class StripExecutorController:
             )
             for worker in sorted(positions)
         )
-        diagnostics = self._diagnostics()
-        diagnostics.update(
-            {
+        diagnostics = self._result_diagnostics()
+        if not self._low_telemetry:
+            diagnostics.update({
                 "assigned_routes": len(assignment.routes),
                 "unassigned_routes": len(assignment.unassigned),
                 "idle_workers": [
@@ -736,8 +1672,7 @@ class StripExecutorController:
                 "row_helpers_required": assignment.overloaded_rows_detected,
                 "row_helpers_assigned": assignment.row_helpers_assigned,
                 "unresolved_overloaded_rows": assignment.unresolved_overloaded_rows,
-            }
-        )
+            })
         return StripExecutorResult(
             farmer_action=actions[0] if actions else ("PASS",),
             hands_actions=actions[1:],
@@ -779,6 +1714,27 @@ class StripExecutorController:
             return _interaction_action(item) or ("PASS",)
         return ("PASS",)
 
+    def _release_claim_hire_assignment(self, record: _ClaimHireRecord) -> None:
+        """Drop one claim hire's planned route and release its claim.
+
+        The claim is always released so no bundle can be double-owned, and the
+        route is dropped so the next dispatch re-derives work from the live
+        board. The worker itself is untouched: it is real labour the engine
+        already produced, and a kept worker simply has no route, so the next
+        dispatch calls ``_claim_refill`` for it.
+        """
+        board = self._claim_board
+        if board is not None:
+            for fragment in record.coverage.claimed_fragments:
+                for claimed_id in fragment.bundle_ids:
+                    if board.owner_by_bundle.get(claimed_id) == record.worker:
+                        board.release(claimed_id)
+        self._routes.pop(record.worker, None)
+        self._supply_plans.pop(record.route.route_id, None)
+        self._supply_states.pop(record.route.route_id, None)
+        self._passed_work.pop(record.route.route_id, None)
+        self._claim_hire_records.pop(record.worker, None)
+
     def _reconcile_hire_observation(self, obs: Mapping[str, Any]) -> None:
         pending = self._pending_hires
         if pending is None or int(obs.get("step", 0)) <= pending["submitted_step"]:
@@ -789,6 +1745,81 @@ class StripExecutorController:
         observed = min(pending["submitted"], hands_delta, hires_delta)
         self._hire_observed += observed
         self._hire_failures += max(0, pending["submitted"] - observed)
+        if self.config.enable_row_claim_board and self._pending_claim_hires:
+            positions = self._worker_positions(obs)
+            spawn_mismatches = []
+            replanned_workers = set()
+            rejected_workers = set()
+            for index, record in enumerate(self._pending_claim_hires):
+                hired = index < observed
+                actual = positions.get(record.worker) if hired else None
+                if hired and actual is not None:
+                    # The worker exists. ``predict_hire_spawns`` forecasts the
+                    # engine's least-occupied access tile, but a worker can act
+                    # before the next observation, so the observed tile is
+                    # routinely one or two steps from the forecast. Rejecting
+                    # the hire on that basis threw away a real worker, and every
+                    # route discard on every measured seed came from this test.
+                    # Keep the labour, but do not keep the route: it was
+                    # planned against the board at submission time and a worker
+                    # that has already acted may have consumed part of it.
+                    # Release the claim and drop the route so the next dispatch
+                    # re-derives work from the live board. This also returns the
+                    # reserved coverage to the budget, so the bootstrap loop
+                    # keeps escalating across the day while uncovered required
+                    # work remains.
+                    if actual != record.spawn:
+                        spawn_mismatches.append(record.worker.label)
+                    replanned_workers.add(record.worker.label)
+                    self._release_claim_hire_assignment(record)
+                    continue
+                rejected_workers.add(record.worker.label)
+                self._release_claim_hire_assignment(record)
+            self._pending_claim_hires = ()
+            if rejected_workers:
+                planned_workers = list(
+                    self._claim_hiring_diagnostics.get("planned_workers", ())
+                )
+                costs = list(
+                    self._claim_hiring_diagnostics.get("sequential_hire_costs", ())
+                )
+                rejected_interactions = 0
+                retained_workers = []
+                retained_costs = []
+                for index, worker_record in enumerate(planned_workers):
+                    if worker_record.get("worker") in rejected_workers:
+                        rejected_interactions += int(
+                            worker_record.get("effective_interactions", 0)
+                        )
+                        continue
+                    retained_workers.append(worker_record)
+                    if index < len(costs):
+                        retained_costs.append(costs[index])
+                self._claim_hiring_diagnostics["planned_workers"] = retained_workers
+                self._claim_hiring_diagnostics["sequential_hire_costs"] = retained_costs
+                self._claim_hiring_diagnostics["wanted_hires"] = len(retained_workers)
+                self._claim_hiring_diagnostics["submittable_hires"] = len(
+                    retained_workers
+                )
+                self._claim_hiring_diagnostics[
+                    "required_interactions_reserved"
+                ] = max(
+                    0,
+                    int(self._claim_hiring_diagnostics.get(
+                        "required_interactions_reserved", 0
+                    )) - rejected_interactions,
+                )
+            if spawn_mismatches:
+                self._claim_hiring_diagnostics["spawn_mismatches"] = spawn_mismatches
+                self._claim_hiring_diagnostics["runtime_refill_required"] = True
+            if replanned_workers:
+                # Real workers kept, but their day-start routes are re-derived
+                # from the live board. They stay in ``planned_workers`` and keep
+                # their reserved interaction budget: the labour was paid for and
+                # is still on the board.
+                self._claim_hiring_diagnostics["spawn_replanned"] = sorted(
+                    replanned_workers
+                )
         self._pending_hires = None
         if observed:
             self._hire_no_progress = 0
@@ -796,8 +1827,9 @@ class StripExecutorController:
             self._hire_no_progress += 1
             if self._hire_no_progress >= 2:
                 self._hiring_blocked = True
-        self._daily["hires_observed"] = self._hire_observed
-        self._daily["failed_hires"] = self._hire_failures
+        if not self._low_telemetry:
+            self._daily["hires_observed"] = self._hire_observed
+            self._daily["failed_hires"] = self._hire_failures
 
     def _reconcile_market_observation(self, obs: Mapping[str, Any]) -> None:
         """Confirm pending buys from observed deltas, with two no-progress tries."""
@@ -846,6 +1878,10 @@ class StripExecutorController:
                 supply_state.acquired[pending.item] = (
                     supply_state.acquired.get(pending.item, 0) + acquired
                 )
+                if self._claim_board is not None:
+                    self._claim_board.confirm_pickup(
+                        self._supply_plans[route_id].owner, pending.item, acquired
+                    )
             remaining = pending.quantity - acquired
             supply_state.pending = None
             if remaining:
@@ -855,6 +1891,10 @@ class StripExecutorController:
                     supply_state.failed_or_unfulfilled[pending.item] = (
                         supply_state.failed_or_unfulfilled.get(pending.item, 0) + remaining
                     )
+                    if self._claim_board is not None:
+                        self._claim_board.release_failed_pickup(
+                            self._supply_plans[route_id].owner, pending.item, remaining
+                        )
 
     def _bootstrap_reservations(
         self, work_plan: StripWorkPlan, obs: Mapping[str, Any]
@@ -904,6 +1944,8 @@ class StripExecutorController:
         routes_by_id = {route.route_id: route for route in self._routes.values()}
         for route_id, plan in self._supply_plans.items():
             route = routes_by_id.get(route_id)
+            if self.config.enable_row_claim_board and route is None:
+                continue
             if route is not None and route.phase == RoutePhase.INVALID:
                 continue
             state = self._supply_states.get(route_id, RouteSupplyState())
@@ -946,6 +1988,19 @@ class StripExecutorController:
                 self.config.allow_productive_recurring_crop_sacrifice),
             allow_older_crop_sacrifice=self.config.allow_older_crop_sacrifice,
         )
+
+    def _result_diagnostics(self) -> dict[str, Any]:
+        if self._low_telemetry:
+            payload = {
+                "schema_version": 1,
+                "telemetry_mode": "reduced",
+                "diagnostics_reduced": True,
+            }
+            if self.config.enable_row_claim_board and self._claim_board is not None:
+                payload["row_claim_board"] = self._claim_board.diagnostics()
+                payload["row_claim_pass_reasons"] = dict(self._claim_pass_reasons)
+            return payload
+        return self._diagnostics()
 
     def _refresh_route_supply_plans(
         self, obs: Mapping[str, Any], work_plan: StripWorkPlan
@@ -1089,7 +2144,37 @@ class StripExecutorController:
             if action is not None:
                 return action
         self._reopen_crop_continuation(route, position, work_plan)
+        if (
+            self.config.enable_row_claim_board
+            and self._claim_board is not None
+            and route.phase != RoutePhase.DONE
+            and route.continuation_item_id is None
+            and not any(
+                self._claim_board.owner_by_bundle.get(
+                    f"TILE:{tile[0]},{tile[1]}"
+                ) == route.owner
+                for tile in route.traversal[route.cursor:]
+            )
+        ):
+            route.phase = RoutePhase.DONE
+            route.completion_hour = hour
         if route.phase == RoutePhase.DONE:
+            if self.config.enable_row_claim_board:
+                if (
+                    route.continuation_item_id is not None
+                    and route.continuation_tile == position == route.current_tile
+                ):
+                    action = self._try_local_action(route, position, work_plan, obs)
+                    if action is not None:
+                        return action
+                refill = self._claim_refill(route.owner, position, work_plan, obs)
+                if refill is not None:
+                    return self._act_worker(refill, position, work_plan, obs)
+                staging = self._claim_stage(route.owner, position, obs, route)
+                if staging is not None:
+                    return staging
+                route.pass_turns_after_completion += 1
+                return ("PASS",)
             if self._help_untouched_segment(
                 route, work_plan, position=position, obs=obs
             ):
@@ -1177,11 +2262,19 @@ class StripExecutorController:
             self._mark_tile_passed(route, target)
             route.phase = RoutePhase.DONE
             route.completion_hour = hour
-            supply_state.remaining_at_completion = {
-                item: int(inventory.get(item, 0))
-                for item, _ in supply_plan.demand
-                if int(inventory.get(item, 0)) > 0
-            }
+            if supply_plan is not None:
+                supply_state.remaining_at_completion = {
+                    item: int(inventory.get(item, 0))
+                    for item, _ in supply_plan.demand
+                    if int(inventory.get(item, 0)) > 0
+                }
+            if self.config.enable_row_claim_board:
+                refill = self._claim_refill(route.owner, position, work_plan, obs)
+                if refill is not None:
+                    return self._act_worker(refill, position, work_plan, obs)
+                staging = self._claim_stage(route.owner, position, obs, route)
+                if staging is not None:
+                    return staging
             return ("PASS",)
         route.pending_cursor = route.cursor + 1
         return _vertical_first_step(position, route.traversal[route.pending_cursor]) or (
@@ -1577,6 +2670,10 @@ class StripExecutorController:
 
         inventory = self._worker_inventory(obs, route.owner)
         local_items = tuple(item for item in work_plan.items if item.tile == tile)
+        if self.config.enable_row_claim_board and self._claim_board is not None:
+            bundle_id = f"TILE:{tile[0]},{tile[1]}"
+            if self._claim_board.owner_by_bundle.get(bundle_id) != route.owner:
+                local_items = ()
         continuation_items = tuple(
             item
             for item in local_items
@@ -1638,6 +2735,10 @@ class StripExecutorController:
         route.actions_performed[item.kind] = (
             route.actions_performed.get(item.kind, 0) + 1
         )
+        if self.config.enable_row_claim_board and self._claim_board is not None:
+            bundle_id = f"TILE:{tile[0]},{tile[1]}"
+            if self._claim_board.owner_by_bundle.get(bundle_id) == route.owner:
+                self._claim_board.phase_by_bundle[bundle_id] = ClaimPhase.IN_PROGRESS
         route.interaction_turns += item.interaction_turns
         route.last_useful_action_step = int(obs.get("step", 0))
         successor = next(
@@ -1853,6 +2954,12 @@ class StripExecutorController:
         routes = self.routes
         completed = sum(route.phase == RoutePhase.DONE for route in routes)
         payload = dict(self._daily)
+        # ``_daily`` holds references to two live counters.  Detach them so a
+        # retained per-turn diagnostics tree never observes later mutations.
+        for live_key in ("row_claim_timing_ms", "claim_hiring"):
+            live = payload.get(live_key)
+            if isinstance(live, dict):
+                payload[live_key] = dict(live)
         farm_values = self._observation_for_diagnostics.get("farms") or ()
         positions = (
             self._worker_positions(self._observation_for_diagnostics)
@@ -1918,9 +3025,15 @@ class StripExecutorController:
                 "coverage_prefix": list(
                     self._hire_plan.coverage_prefix if self._hire_plan else ()
                 ),
-                "wanted_hires": self._hire_plan.wanted_hires if self._hire_plan else 0,
+                "wanted_hires": (
+                    int(self._claim_hiring_diagnostics.get("wanted_hires", 0))
+                    if self.config.enable_row_claim_board
+                    else self._hire_plan.wanted_hires if self._hire_plan else 0
+                ),
                 "affordable_hires": (
-                    self._hire_plan.affordable_hires if self._hire_plan else 0
+                    int(self._claim_hiring_diagnostics.get("submittable_hires", 0))
+                    if self.config.enable_row_claim_board
+                    else self._hire_plan.affordable_hires if self._hire_plan else 0
                 ),
                 "submitted_hires": self._hire_submitted,
                 "observed_hires": self._hire_observed,
@@ -1931,14 +3044,23 @@ class StripExecutorController:
                     "LAST_ATTEMPT" if self._hiring_blocked else "CURRENT"
                 ),
                 "sequential_hire_costs": list(
-                    self._hire_plan.sequential_hire_costs if self._hire_plan else ()
+                    self._claim_hiring_diagnostics.get("sequential_hire_costs", ())
+                    if self.config.enable_row_claim_board
+                    else self._hire_plan.sequential_hire_costs
+                    if self._hire_plan else ()
                 ),
                 "cash_before_hiring": (
-                    self._hire_plan.cash_before_hiring if self._hire_plan else None
+                    self._claim_hiring_diagnostics.get("cash_before_hiring")
+                    if self.config.enable_row_claim_board
+                    else self._hire_plan.cash_before_hiring
+                    if self._hire_plan else None
                 ),
                 "cash_after_observed_hiring": float(farm.get("money", 0.0)),
                 "future_action_slots": (
-                    self._hire_plan.future_action_slots if self._hire_plan else 0
+                    int(self._claim_hiring_diagnostics.get("future_action_slots", 0))
+                    if self.config.enable_row_claim_board
+                    else self._hire_plan.future_action_slots
+                    if self._hire_plan else 0
                 ),
             }
         )
@@ -1948,6 +3070,10 @@ class StripExecutorController:
             )
         payload["market_diagnostics"] = self._market_state.to_json_dict()
         payload["routes_finalized"] = self._routes_finalized
+        if self.config.enable_row_claim_board and self._claim_board is not None:
+            payload["row_claim_board"] = self._claim_board.diagnostics()
+            payload["row_claim_pass_reasons"] = dict(self._claim_pass_reasons)
+            payload["row_claim_timing_ms"] = dict(self._claim_timings)
         return payload
 
 

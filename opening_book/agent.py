@@ -1,4 +1,27 @@
-"""Runtime opening-book wrapper with per-trace handoff horizons."""
+"""Runtime opening-book wrapper with per-trace handoff horizons.
+
+Replays one built-in elite trace literally through its inclusive end turn,
+then delegates unchanged to an injected downstream agent. Legacy traces end
+at day 3 hour 23; extended traces declare their own horizon and hand off on
+the immediately following primitive turn (a d6h3 opening hands off at d6h4).
+Guards are fail-closed and minimal:
+
+- observation ``day``/``hour`` must parse and equal the expected trace cursor;
+- observed hand count for the configured seat must match the trace action's
+  ``hands`` length;
+- every emitted action passes Stage 1 shape/market-cap validation
+  (``opening_book.trace.validate_action``).
+
+Any guard failure records one divergence (reason + observed turn), captures a
+best-effort farm summary, and immediately delegates the same original
+observation to downstream. Delegation is permanent: the script never resumes
+after divergence or handoff.
+
+Bounded contract: the wrapper never seeds or mutates downstream private
+state, never touches ``previous_execution``, and performs no planning,
+repair, or heuristic purchases. It is literal playback plus delegation only.
+No official-engine claim is made by this module (stage 3 validates).
+"""
 
 from __future__ import annotations
 
@@ -10,6 +33,7 @@ from .trace import (
     TraceError,
     action_for,
     load_built_in_trace,
+    trace_end_turn,
     trace_handoff_phase,
     validate_action,
 )
@@ -57,13 +81,17 @@ def _crop_animal_counts(tiles: Any) -> tuple[dict[str, int], dict[str, int]]:
 
 
 class OpeningAgent:
-    def __init__(self, trace: Mapping[str, Any], downstream: AgentCallable, seat: int) -> None:
+    """Stateful callable: literal trace playback through its end, then delegate."""
+
+    def __init__(self, trace: Mapping[str, Any], downstream: AgentCallable,
+                 seat: int) -> None:
         if not callable(downstream):
             raise TypeError(f"downstream must be callable, got {downstream!r}")
         if seat not in (0, 1):
             raise ValueError(f"seat must be 0 or 1, got {seat!r}")
         self._trace = dict(trace)
         self._identity = trace["identity"]
+        self._last_turn = trace_end_turn(dict(trace))
         self._provenance = dict(trace.get("provenance") or {})
         self._downstream = downstream
         self.seat = seat
@@ -86,6 +114,7 @@ class OpeningAgent:
             return self._diverge(obs, DIVERGENCE_MALFORMED_PHASE)
         day, hour = phase
         if (day, hour) >= self._handoff_phase:
+            # Beyond the trace horizon: clean handoff (never a divergence).
             return self._handoff(obs, day, hour)
         expected_day = self._cursor // TURNS_PER_DAY
         expected_hour = self._cursor % TURNS_PER_DAY
@@ -175,11 +204,18 @@ class OpeningAgent:
             "fallback_active": self._divergence_reason is not None,
             "delegated_calls": self._delegated_calls,
             "handoff": {
-                "turn": list(self._handoff_turn) if self._handoff_turn is not None else None,
-                "clean_d4h0_handoff": self._clean_handoff_done and self._handoff_phase == (4, 0),
+                "turn": list(self._handoff_turn)
+                if self._handoff_turn is not None else None,
                 "clean_handoff": self._clean_handoff_done,
+                # True only for the legacy d0-d3 opening that hands off at d4h0.
+                "clean_d4h0_handoff": (
+                    self._clean_handoff_done
+                    and list(self._handoff_phase) == [4, 0]),
                 "expected_turn": list(self._handoff_phase),
-                "farm_summary": {key: (dict(value) if isinstance(value, dict) else value) for key, value in self._handoff_farm_summary.items()},
+                "farm_summary": {
+                    key: (dict(value) if isinstance(value, dict) else value)
+                    for key, value in self._handoff_farm_summary.items()
+                },
             },
         }
 
