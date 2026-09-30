@@ -14,7 +14,7 @@ from time import perf_counter
 from typing import Any
 
 from executor_v0.plan import DailyPlan
-from replay_daily.constants import FARM_HAND_COST_MULT_DEFAULT, hire_cost
+from replay_daily.constants import FARM_HAND_COST_MULT_DEFAULT, fib, hire_cost
 from executor_v0.strip_cost import (
     nearest_shed_access, ordered_inventory_demand, route_cost_segment_from_items,
     simulate_route_cost,
@@ -85,6 +85,17 @@ __all__ = [
 _LOCAL_PRIORITY = LOCAL_ACTION_PRIORITY
 # Keep one claim-planning pass bounded even when the runtime order cap is raised.
 _MAX_CLAIM_HIRES_PER_BOOTSTRAP_PASS = 10
+# Capital-preservation bound on speculative same-day labour.
+#
+# Hire cost is `mult * fib(hires_today)`, so a single day that reaches a high
+# Fibonacci index can commit far more cash than the day can possibly earn back.
+# Measured on seed 41004 the claim-hire loop reached 23 hires in one turn
+# (fib(0..22) = 75 024) against a 68 368 bank, and 50-57 % of the resulting
+# workers immediately PASSed, collapsing the final bank from ~68 k to ~4.7 k.
+# The bound is a treasury-risk limit, not a calendar rule: it scales with the
+# cash actually on hand, so a poor early game is unaffected while a large
+# mid-game bank can still fund normal hiring.
+_MAX_DAILY_HIRE_CASH_FRACTION = 0.25
 
 
 @dataclass(frozen=True)
@@ -101,6 +112,9 @@ class StripExecutorConfig:
     allow_productive_recurring_crop_sacrifice: bool = False
     allow_older_crop_sacrifice: bool = False
     enable_row_claim_board: bool = False
+    # Fraction of current cash one day of claim hiring may commit. ``None``
+    # restores the unbounded historical behaviour.
+    max_daily_hire_cash_fraction: float | None = _MAX_DAILY_HIRE_CASH_FRACTION
 
 
 @dataclass(frozen=True)
@@ -183,6 +197,10 @@ class StripExecutorController:
         self._claim_timings: dict[str, float] = {}
         self._claim_pass_reasons: dict[str, dict[str, Any]] = {}
         self._claim_hire_records: dict[WorkerId, _ClaimHireRecord] = {}
+        # Treasury-risk accounting for one day of claim hiring.
+        self._hire_spend_day: int | None = None
+        self._hire_spend_cash: int = 0
+        self._hire_budget_stops: int = 0
         self._pending_claim_hires: tuple[_ClaimHireRecord, ...] = ()
         self._claim_schedule_prepared = False
         self._claim_hiring_diagnostics: dict[str, Any] = {}
@@ -514,6 +532,31 @@ class StripExecutorController:
         cost_mult = self._hire_cost_mult(obs)
         cash = float(farm.get("money", 0.0))
         remaining_cash = cash
+        # Treasury-risk budget for this day, recomputed from the cash actually
+        # on hand. ``committed`` is what earlier bootstrap passes already spent
+        # on hires today; it is recovered from the engine's ``hires_today``
+        # count so it survives restarts of the bootstrap stage.
+        day = int(obs.get("day", 0))
+        if self._hire_spend_day != day:
+            self._hire_spend_day = day
+            self._hire_spend_cash = cost_mult * sum(
+                fib(index) for index in range(hires_today)
+            )
+            self._hire_budget_stops = 0
+        fraction = self.config.max_daily_hire_cash_fraction
+        if fraction is None:
+            hire_budget = float("inf")
+        else:
+            # Floor the budget at the cost of the *cheapest* possible hire,
+            # ``mult * fib(0)``.  A farm with almost no cash must still be able
+            # to field one worker; the bound must never suppress base
+            # operation, only the escalating tail of a burst.  Using the
+            # current index here would defeat the bound, because that index
+            # grows with every hire already made today.
+            hire_budget = max(
+                max(0.0, cash) * float(fraction),
+                float(cost_mult * fib(0)),
+            )
         existing_positions = [positions[worker] for worker in sorted(positions)]
         planned: list[_ClaimHireRecord] = []
         costs: list[int] = []
@@ -598,6 +641,15 @@ class StripExecutorController:
             cost = hire_cost(hires_today + len(planned), cost_mult)
             if remaining_cash < cost:
                 stop_reason = "CASH"
+                break
+            # Treasury-risk bound: refuse to commit more than the configured
+            # fraction of the cash on hand to one day of speculative labour.
+            # Fibonacci escalation makes the last few hires of a burst cost more
+            # than everything before them combined, so this is where a
+            # runaway day is stopped.
+            if self._hire_spend_cash + sum(costs) + cost > hire_budget:
+                stop_reason = "HIRE_CASH_BUDGET"
+                self._hire_budget_stops += 1
                 break
 
             route.route_id = f"CLAIM:{worker.label}"
@@ -699,6 +751,12 @@ class StripExecutorController:
             ),
             "hire_stop_reason": stop_reason,
             "planned_workers": previous_workers + planned_workers,
+            "hire_cash_budget": None if fraction is None else hire_budget,
+            "hire_cash_committed_before_pass": self._hire_spend_cash,
+            "hire_cash_committed_after_pass": (
+                self._hire_spend_cash + sum(costs)
+            ),
+            "hire_cash_budget_stops_today": self._hire_budget_stops,
         }
         elapsed = (perf_counter() - started) * 1000
         self._claim_timings["hypothetical_hiring"] = (
@@ -1469,6 +1527,9 @@ class StripExecutorController:
         self._pending_claim_hires = ()
         self._claim_schedule_prepared = False
         self._claim_hiring_diagnostics = {}
+        self._hire_spend_day = None
+        self._hire_spend_cash = 0
+        self._hire_budget_stops = 0
         self._daily = (
             {"day": self._day, "assignment_hour": int(obs.get("hour", 0))}
             if not self._low_telemetry else {}
