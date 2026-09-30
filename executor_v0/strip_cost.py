@@ -596,22 +596,41 @@ def _work_can_progress(
         BlockReason.MISSING_PURCHASE,
     }:
         return False
-    inventory_trial = dict(inventory)
+    # Validate the whole requirement set before consuming anything: the check
+    # is all-or-nothing, and a work item may list the same item twice, so
+    # per-item running totals are needed. Only the touched items are tracked
+    # rather than copying both ledgers and restoring them on success.
+    taken_inventory: dict[str, int] = {}
     for item, quantity in work.inventory_requirements:
-        if inventory_trial.get(item, 0) < quantity:
-            return False
-        inventory_trial[item] -= quantity
-    global_trial = None if global_resources is None else dict(global_resources)
-    if global_trial is not None:
-        for item, quantity in work.global_requirements:
-            if global_trial.get(item, 0) < quantity:
+        already = taken_inventory.get(item)
+        if already is None:
+            if inventory.get(item, 0) < quantity:
                 return False
-            global_trial[item] -= quantity
-    inventory.clear()
-    inventory.update(inventory_trial)
-    if global_resources is not None and global_trial is not None:
-        global_resources.clear()
-        global_resources.update(global_trial)
+            taken_inventory[item] = quantity
+        else:
+            total = already + quantity
+            if inventory.get(item, 0) < total:
+                return False
+            taken_inventory[item] = total
+    if global_resources is not None:
+        taken_global: dict[str, int] = {}
+        for item, quantity in work.global_requirements:
+            already = taken_global.get(item)
+            if already is None:
+                if global_resources.get(item, 0) < quantity:
+                    return False
+                taken_global[item] = quantity
+            else:
+                total = already + quantity
+                if global_resources.get(item, 0) < total:
+                    return False
+                taken_global[item] = total
+        for item, quantity in taken_global.items():
+            global_resources[item] = global_resources.get(item, 0) - quantity
+    for item, quantity in taken_inventory.items():
+        # ``get`` rather than ``-=`` so an absent item is created at zero, as
+        # the previous copy/commit round trip did.
+        inventory[item] = inventory.get(item, 0) - quantity
     return True
 
 
