@@ -38,7 +38,11 @@ from rl_manager.stage25_mechanics import (
     ACTION_ORDER,
     ACTION_SCHEMA_VERSION,
 )
-from rl_manager.stage25_policy import Stage25ModelConfig, init_stage25_params
+from rl_manager.stage25_policy import (
+    Stage25ModelConfig,
+    init_stage25_params,
+    stage25_params_template,
+)
 
 
 STAGE25_CHECKPOINT_VERSION = "stage25_native_checkpoint_v1"
@@ -500,7 +504,17 @@ def _validate_flat_against_manifest(flat: Mapping[str, np.ndarray], meta: Mappin
             raise Stage25CheckpointError(f"{path}: corrupt leaf manifest for {key!r}")
 
 
-def _load_params(path: str | Path, expected_kind: str) -> tuple[dict[str, np.ndarray], dict[str, Any], Stage25ModelConfig]:
+def _load_params(path: str | Path, expected_kind: str,
+                 *, zero_template: bool = False
+                 ) -> tuple[dict[str, np.ndarray], dict[str, Any], Stage25ModelConfig]:
+    """Read and validate one archive, optionally using the zero-cost template.
+
+    The parameter tree here is used only to validate leaf names, shapes and
+    dtypes against the stored manifest.  ``stage25_params_template`` builds the
+    identical structure without drawing random values, which avoids compiling
+    one primitive per leaf.  ``zero_template`` is opt-in so the training-state
+    and provenance readers keep their existing construction path.
+    """
     path = Path(path)
     flat, meta = _read_archive(path)
     _validate_meta(meta, path, expected_kind)
@@ -509,7 +523,10 @@ def _load_params(path: str | Path, expected_kind: str) -> tuple[dict[str, np.nda
                      {key: value for key, value in flat.items()
                       if not key.startswith("opponent:")})
     _validate_flat_against_manifest(manifest_flat, meta, path)
-    params = init_stage25_params(config, seed=int(meta["init_params"]["seed"]))
+    params = (
+        stage25_params_template(config) if zero_template
+        else init_stage25_params(config, seed=int(meta["init_params"]["seed"]))
+    )
     param_items = {key[len("param:"):]: value for key, value in flat.items()
                    if key.startswith("param:")}
     non_param = {key: value for key, value in flat.items() if not key.startswith("param:")}
@@ -573,7 +590,8 @@ def load_stage25_inference_checkpoint(
     allow_legacy_e: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load inference parameters, rejecting every incompatible leaf."""
-    flat, meta, stored_config = _load_params(path, INFERENCE_PAYLOAD_KIND)
+    flat, meta, stored_config = _load_params(path, INFERENCE_PAYLOAD_KIND,
+                                             zero_template=True)
     path = Path(path)
     _check_history(meta, expected=expected_e_history_version,
                    allow_legacy_e=allow_legacy_e, path=path)
@@ -582,7 +600,7 @@ def load_stage25_inference_checkpoint(
     stored_seed = int(meta["init_params"]["seed"])
     if seed is not None and int(seed) != stored_seed:
         raise Stage25CheckpointError(f"checkpoint seed {stored_seed} != requested seed {int(seed)}")
-    params = init_stage25_params(stored_config, seed=stored_seed)
+    params = stage25_params_template(stored_config)
     return _rebuild(params, {key[len("param:"):]: value for key, value in flat.items()
                              if key.startswith("param:")}), dict(meta)
 
