@@ -27,6 +27,7 @@ from executor_v0.strip_work import (
     WorkItem,
     forecast_effective_interactions,
 )
+from executor_v0.strip_prefix_trie import RouteCostTrie
 
 __all__ = [
     "HorizontalRouteCandidate",
@@ -566,6 +567,9 @@ class _RoutePlanContext:
         tuple[RouteCostSegment, RouteCostSegment], ...
     ]
     stable_hash: int
+    prefix_tries: dict[tuple[Any, ...], RouteCostTrie] = field(
+        default_factory=dict, compare=False, hash=False, repr=False
+    )
 
     @classmethod
     def create(
@@ -603,6 +607,7 @@ def _compute_chain_plan_for_mask(
     _oriented_cost_segments: tuple[
         tuple[RouteCostSegment, RouteCostSegment], ...
     ] | None = None,
+    _prefix_trie: RouteCostTrie | None = None,
 ) -> _ChainPlan:
     """Find the cheapest ordered/oriented chain for one candidate subset."""
 
@@ -635,6 +640,8 @@ def _compute_chain_plan_for_mask(
             choices.append(tuple(path))
 
     def path_result(path_value):
+        if _prefix_trie is not None:
+            return _prefix_trie.evaluate(mask, path_value)
         route_segments = tuple(
             (
                 _oriented_cost_segments[index][side]
@@ -848,21 +855,26 @@ def _pack_small_route_sets_frontier(
     """Return exact packing answers for worker prefixes from one DP pass."""
 
     full_mask = (1 << len(candidates)) - 1
+    context = _RoutePlanContext.create(candidates)
     plans = {
         worker: {
-            mask: _chain_plan_for_mask(
-                candidates,
+            mask: _chain_plan_for_context(
+                context,
                 positions[worker],
                 mask,
                 None if worker_action_slots is None else worker_action_slots[worker],
                 (worker_inventories or {}).get(worker),
                 shed_stock,
                 global_resources,
+                _small_route_set=True,
             )
             for mask in range(full_mask + 1)
         }
         for worker in workers
     }
+    # The global plan LRU retains context keys; simulator nodes are local to
+    # this packing operation and must not grow into another persistent cache.
+    context.prefix_tries.clear()
     requested = frozenset(worker_counts)
     frontier: dict[
         int,
@@ -1052,6 +1064,7 @@ def _pack_large_route_set(
     )
     primary_count = len(primary_owner)
     assigned_count = len(assigned_indices)
+    context.prefix_tries.clear()
     return _LargeRoutePacking(
         grouped=grouped,
         primary_rows_assigned=primary_count,
@@ -1060,8 +1073,7 @@ def _pack_large_route_set(
     )
 
 
-@lru_cache(maxsize=4096)
-def _cached_chain_plan_for_context(
+def _compute_chain_plan_for_context(
     context: _RoutePlanContext,
     worker_position: tuple[int, int],
     mask: int,
@@ -1070,6 +1082,18 @@ def _cached_chain_plan_for_context(
     shed_stock: tuple[tuple[str, int], ...] | None,
     global_resources: tuple[tuple[str, int], ...] | None,
 ) -> _ChainPlan:
+    key = (worker_position, remaining_action_slots, worker_inventory,
+           shed_stock, global_resources)
+    trie = context.prefix_tries.get(key)
+    if trie is None:
+        trie = RouteCostTrie(
+            context.oriented_cost_segments, worker_position,
+            remaining_action_slots=remaining_action_slots,
+            carried_inventory=dict(worker_inventory),
+            shed_stock=None if shed_stock is None else dict(shed_stock),
+            global_resources=None if global_resources is None else dict(global_resources),
+        )
+        context.prefix_tries[key] = trie
     return _compute_chain_plan_for_mask(
         context.candidates,
         worker_position,
@@ -1079,7 +1103,13 @@ def _cached_chain_plan_for_context(
         None if shed_stock is None else dict(shed_stock),
         None if global_resources is None else dict(global_resources),
         context.oriented_cost_segments,
+        trie,
     )
+
+
+# Keep the base's independent small-set and large-set plan-cache capacities.
+_cached_chain_plan_for_context = lru_cache(maxsize=4096)(_compute_chain_plan_for_context)
+_cached_small_chain_plan_for_context = lru_cache(maxsize=4096)(_compute_chain_plan_for_context)
 
 
 def _chain_plan_for_context(
@@ -1090,8 +1120,14 @@ def _chain_plan_for_context(
     worker_inventory: Mapping[str, int] | None = None,
     shed_stock: Mapping[str, int] | None = None,
     global_resources: Mapping[str, int] | None = None,
+    *,
+    _small_route_set: bool = False,
 ) -> _ChainPlan:
-    return _cached_chain_plan_for_context(
+    cached = (
+        _cached_small_chain_plan_for_context if _small_route_set
+        else _cached_chain_plan_for_context
+    )
+    return cached(
         context,
         worker_position,
         mask,
@@ -1252,6 +1288,7 @@ def _pack_large_route_set_frontier(
         )
     if 0 in requested:
         frontier[0] = _LargeRoutePacking({}, 0, 0, 0)
+    context.prefix_tries.clear()
     return frontier
 
 
