@@ -80,6 +80,14 @@ def main(argv: list[str] | None = None) -> int:
     # directly, so wrapping the defining module would not be observed.
     sites: list[tuple[Any, str, str]] = [
         (strip_executor.StripExecutorController, "act", "executor.act"),
+        (strip_executor.StripExecutorController, "_result_diagnostics",
+         "executor.build_diagnostics"),
+        (strip_executor.StripExecutorController, "_deadline_assignment_diagnostics",
+         "executor.deadline_diagnostics"),
+        (strip_executor.StripExecutorController, "_supply_daily_diagnostics",
+         "executor.supply_diagnostics"),
+        (strip_executor.StripExecutorController, "_finalize_day",
+         "executor.finalize_day"),
         (executor_factory.Stage25StripExecutorAgent, "__call__",
          "agent.__call__"),
         (strip_executor, "build_strip_work_plan", "work.build_plan"),

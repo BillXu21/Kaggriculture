@@ -189,45 +189,59 @@ class RouteCostTrie:
             started = now
         segment = self.segments[key[0]][key[1]]
         summary = self._summary(key)
+        # Hot loop: this runs once per trie node, so the accumulators and the
+        # ledger containers are hoisted into locals. The containers themselves
+        # are still the same objects, so in-place mutation is unchanged, and
+        # ``elapsed``/``feasible``/``completed`` are written back below.
+        budget = self.budget
         travel = _distance(state.position, segment.traversal[0])
-        state.elapsed += travel
+        elapsed = state.elapsed + travel
         if state.segment_count:
             state.inter_segment_travel += travel
         else:
             state.setup_travel = travel
         segment_feasible = segment_completed = 0
         segment_blocked = False
-        for tile_index, (tile, tile_work) in enumerate(
-            zip(segment.traversal, segment.work_by_tile, strict=True)
-        ):
+        feasible = state.feasible
+        completed_total = state.completed
+        feasible_ids = state.feasible_ids
+        inventory = state.inventory
+        global_resources = state.global_resources
+        movement_turns = summary.tile_movement_turns
+        # ``segment.traversal`` is only needed for its endpoints here; the
+        # previous zip/enumerate over it built a tuple per tile for nothing.
+        for tile_index, tile_work in enumerate(segment.work_by_tile):
             if tile_index:
-                state.elapsed += summary.tile_movement_turns[tile_index]
+                elapsed += movement_turns[tile_index]
             for work in tile_work:
                 if not _work_can_progress(
-                    work, state.feasible_ids, state.inventory, state.global_resources
+                    work, feasible_ids, inventory, global_resources
                 ):
                     segment_blocked = True
                     continue
-                state.feasible_ids.add(work.work_id)
+                feasible_ids.add(work.work_id)
                 feasible_turns = work.represented_turns
-                continuation_feasible = state.global_resources is None or all(
-                    state.global_resources.get(item, 0) >= quantity
-                    for item, quantity in work.continuation_global_requirements
-                )
-                if continuation_feasible:
-                    if state.global_resources is not None:
-                        for item, quantity in work.continuation_global_requirements:
-                            state.global_resources[item] -= quantity
+                continuation = work.continuation_global_requirements
+                if global_resources is None or all(
+                    global_resources.get(item, 0) >= quantity
+                    for item, quantity in continuation
+                ):
+                    if global_resources is not None:
+                        for item, quantity in continuation:
+                            global_resources[item] -= quantity
                     feasible_turns += work.continuation_turns
                 elif work.continuation_turns:
                     segment_blocked = True
-                state.feasible += feasible_turns
+                feasible += feasible_turns
                 segment_feasible += feasible_turns
                 if feasible_turns:
-                    completed = min(feasible_turns, max(0, self.budget - state.elapsed))
-                    state.completed += completed
-                    segment_completed += completed
-                    state.elapsed += feasible_turns
+                    done = min(feasible_turns, max(0, budget - elapsed))
+                    completed_total += done
+                    segment_completed += done
+                    elapsed += feasible_turns
+        state.elapsed = elapsed
+        state.feasible = feasible
+        state.completed = completed_total
         state.position = segment.traversal[-1]
         state.segment_count += 1
         state.segments_completed += int(
