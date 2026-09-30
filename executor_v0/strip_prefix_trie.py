@@ -222,16 +222,25 @@ class RouteCostTrie:
                 feasible_ids.add(work.work_id)
                 feasible_turns = work.represented_turns
                 continuation = work.continuation_global_requirements
-                if global_resources is None or all(
-                    global_resources.get(item, 0) >= quantity
-                    for item, quantity in continuation
-                ):
-                    if global_resources is not None:
+                # An explicit loop avoids building a generator per work item in
+                # the innermost loop; the branch structure is unchanged, so a
+                # blocked continuation with no continuation turns still leaves
+                # the segment unblocked.
+                if global_resources is None:
+                    feasible_turns += work.continuation_turns
+                else:
+                    shortfall = False
+                    for item, quantity in continuation:
+                        if global_resources.get(item, 0) < quantity:
+                            shortfall = True
+                            break
+                    if shortfall:
+                        if work.continuation_turns:
+                            segment_blocked = True
+                    else:
                         for item, quantity in continuation:
                             global_resources[item] -= quantity
-                    feasible_turns += work.continuation_turns
-                elif work.continuation_turns:
-                    segment_blocked = True
+                        feasible_turns += work.continuation_turns
                 feasible += feasible_turns
                 segment_feasible += feasible_turns
                 if feasible_turns:
